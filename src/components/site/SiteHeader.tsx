@@ -23,6 +23,19 @@ const NAV = [
   { key: "about", path: "about" },
 ] as const;
 
+/** On the pages of Lumenary Scientia's other subjects, the header links the subjects to one another. */
+const SCIENTIA_NAV = [
+  { key: "math", path: "math" },
+  { key: "cs", path: "cs" },
+  { key: "programming", path: "cs/languages" },
+  { key: "electives", path: "cs/electives" },
+  { key: "ee", path: "ee" },
+  { key: "robotics", path: "robotics" },
+  { key: "divisions", path: "divisions" },
+  { key: "about", path: "about" },
+] as const;
+const SCIENTIA_SUBJECTS = /^\/[^/]+\/(cs|ee|robotics)(\/|$)/;
+
 export function SiteHeader() {
   const { locale, t } = useI18n();
   const pathname = usePathname() ?? "";
@@ -39,10 +52,13 @@ export function SiteHeader() {
 
   // The front page lists the three divisions; Lumenary Math's navigation starts on its own front page.
   const home = pathname === `/${locale}/` || pathname === `/${locale}`;
+  const nav = SCIENTIA_SUBJECTS.test(pathname) ? SCIENTIA_NAV : NAV;
 
   const isActive = (path: string) => {
     const target = `/${locale}/${path}`;
     if (path === "math") return pathname === `${target}/` || pathname === target;
+    // Lumenary CS's own pages, but not its programming languages or electives, which have their own links.
+    if (path === "cs") return pathname.startsWith(target) && !pathname.startsWith(`${target}/languages`) && !pathname.startsWith(`${target}/electives`);
     if (path === "math/curriculum") return pathname.startsWith(target) || pathname.startsWith(`/${locale}/math/lessons`) || pathname.startsWith(`/${locale}/math/topics`);
     return pathname.startsWith(target);
   };
@@ -59,7 +75,7 @@ export function SiteHeader() {
         </Link>
         {!home && (
           <nav className="ms-2 hidden items-center gap-0.5 lg:flex" aria-label="Primary">
-            {NAV.map((item) => (
+            {nav.map((item) => (
               <Link
                 key={item.key}
                 href={href(locale, item.path)}
@@ -95,7 +111,10 @@ export function SiteHeader() {
       {open && !home && (
         <nav id="mobile-nav" className="border-t border-line bg-paper lg:hidden" aria-label="Primary">
           <ul className="container-page grid grid-cols-2 gap-1 py-3 sm:grid-cols-4">
-            {[...NAV, { key: "divisions", path: "divisions" }, { key: "progress", path: "progress" }, { key: "languages", path: "languages" }, { key: "contribute", path: "contribute" }, { key: "verification", path: "verification" }].map((item) => (
+            {(nav === NAV
+              ? [...NAV, { key: "divisions", path: "divisions" }, { key: "progress", path: "progress" }, { key: "languages", path: "languages" }, { key: "contribute", path: "contribute" }, { key: "verification", path: "verification" }]
+              : [...SCIENTIA_NAV, { key: "contribute", path: "contribute" }]
+            ).map((item) => (
               <li key={item.key}>
                 <Link
                   href={href(locale, item.path)}

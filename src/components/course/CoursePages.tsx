@@ -4,7 +4,7 @@ import { LOCALE_META, type Locale } from "@/i18n/config";
 import { Messages } from "@/i18n/Messages";
 import { getT } from "@/i18n/server";
 import { getTopic } from "@/lib/content";
-import { getCourseExercises, getCourseLesson, lessonCodeStatus, type LoadedCourse } from "@/lib/courses";
+import { COLLECTIONS, getCourseExercises, getCourseLesson, lessonCodeStatus, type LoadedCourse } from "@/lib/courses";
 import { renderExerciseList } from "@/lib/exercises";
 import { href } from "@/lib/href";
 import { mdInline, mdToHtml } from "@/lib/markdown";
@@ -13,18 +13,20 @@ import { widgetMessageNamespaces } from "@/lib/widget-messages";
 import { makeMdxComponents } from "@/components/lesson/mdx-components";
 import { Toc } from "@/components/lesson/LessonChrome";
 import { VerificationBadge } from "@/components/ui/Badges";
+import { NarratorAvatar } from "@/components/brand/Narrators";
+import { CatToggle } from "@/components/site/CatToggle";
 import { CodeBlock } from "./CodeBlock";
 import { Say } from "./Say";
 
 const lessonHref = (locale: string, c: LoadedCourse, slug: string) => href(locale, `${c.path}/${slug}`);
 
-/** Where a course sits: Lumenary CS's programming-language courses link back to their index. */
+/** Where a course sits: courses nested in a subject (Lumenary CS's languages and electives) link back to their index. */
 function parentOf(c: LoadedCourse, locale: string): { href: string; label: string } | null {
-  return c.dir.startsWith("cs/languages/") ? { href: href(locale, "cs/languages"), label: "Programming languages" } : null;
+  return c.collection ? { href: href(locale, c.collection), label: COLLECTIONS[c.collection].label } : null;
 }
 
-/** A course's front page: its description and every level with its lessons. */
-export async function CourseOverview({ c, locale }: { c: LoadedCourse; locale: Locale }) {
+/** A course's front page: its description, anything the subject adds (`extra`), and every level with its lessons. */
+export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; locale: Locale; extra?: React.ReactNode }) {
   const parent = parentOf(c, locale);
   const { course } = c;
   let n = 0;
@@ -64,6 +66,7 @@ export async function CourseOverview({ c, locale }: { c: LoadedCourse; locale: L
           </nav>
         </div>
       </header>
+      {extra}
       <div className="container-page space-y-14 py-12">
         {course.levels.map((level) => (
           <section key={level.id} id={level.id} className="scroll-mt-24" aria-labelledby={`${level.id}-title`}>
@@ -206,6 +209,21 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                   <VerificationBadge label="ai-drafted" text={ui.aiDrafted} />
                   <VerificationBadge label="awaiting" text={ui.awaitingReview} />
                 </div>
+                {fm.narrators.length > 0 && (
+                  <div data-cat className="mt-6 flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <div className="flex -space-x-2 rtl:space-x-reverse">
+                      {fm.narrators.map((n) => (
+                        <NarratorAvatar key={n} who={n} size={36} className="rounded-full ring-2 ring-paper" />
+                      ))}
+                    </div>
+                    <p className="text-sm text-muted">
+                      {t("lesson.narrators")}: {fm.narrators.map((n) => t(`narrators.${n}`)).join(", ")}
+                    </p>
+                    <span className="no-print">
+                      <CatToggle variant="text" />
+                    </span>
+                  </div>
+                )}
               </div>
               <aside className="card self-start p-5">
                 <p className="eyebrow">{ui.objectives}</p>

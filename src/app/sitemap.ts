@@ -1,7 +1,7 @@
 import type { MetadataRoute } from "next";
 import { LOCALES } from "@/i18n/config";
 import { getComputeReport, getGraph, getLeanReport, lessonSlugs, trailSlugs } from "@/lib/content";
-import { getCourses } from "@/lib/courses";
+import { COLLECTIONS, getCourses } from "@/lib/courses";
 import { href } from "@/lib/href";
 
 export const dynamic = "force-static";
@@ -26,6 +26,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
     "languages/",
     "verification/",
     "lingua/",
+    // the index pages of the course collections (Lumenary CS's programming languages and electives)
+    ...Object.keys(COLLECTIONS).map((c) => `${c}/`),
     ...getCourses().flatMap((c) => [`${c.path}/`, ...c.slugs.map((s) => `${c.path}/${s}/`)]),
     ...lessonSlugs().flatMap((s) => [`math/lessons/${s}/`, `practice/${s}/`]),
     ...trailSlugs().map((s) => `math/trails/${s}/`),

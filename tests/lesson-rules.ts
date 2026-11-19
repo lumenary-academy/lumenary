@@ -59,6 +59,10 @@ export const SAFETY_PATTERNS: { re: RegExp; why: string }[] = [
   },
   { re: /\b(?:look|looking|stare|staring|gaze|gazing|peek|peeking)\s+(?:directly\s+|straight\s+)?(?:at|into)\s+the\s+sun\b/gi, why: "looking at the Sun" },
   { re: /\b(?:play|playing|walk|walking|stand|standing|count|counting)\b[^.!?\n]{0,30}?\b(?:on|along|across)\s+(?:the\s+|a\s+)?(?:railway|railroad|train)\s+tracks?\b/gi, why: "being on railway tracks" },
+  {
+    re: /\b(?:touch|touching|grab|grabbing|poke|poking|probe|probing|open|opening|lick|licking)\b[^.!?\n]{0,40}?\b(?:mains|wall sockets?|power outlets?|live wires?|power lines?|plugs? sockets?)\b/gi,
+    why: "touching or opening mains electricity",
+  },
 ];
 
 /** Safety problems in a piece of learner-facing text (empty = fine). Warnings against a danger are allowed. */
