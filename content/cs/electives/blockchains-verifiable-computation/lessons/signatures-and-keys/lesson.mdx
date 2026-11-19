@@ -1,0 +1,475 @@
+---
+title: Digital signatures, keys and wallets
+subtitle: On a blockchain your private key is your account — how Schnorr, ECDSA, EdDSA and BLS signatures work, how one repeated random number gives the key away, and what wallets, custody and quantum computers mean for the people holding keys.
+minutes: 80
+objectives:
+  - State what a secure signature scheme guarantees, and the discrete-logarithm problem in a prime-order group
+  - Implement Schnorr signatures over a toy prime-order subgroup and prove that verification accepts honest signatures
+  - Describe ECDSA on secp256k1, EdDSA and BLS signatures, and what aggregation buys
+  - Recover a private key from two signatures that share a nonce, and explain the PlayStation 3 and Android wallet failures
+  - Explain how addresses, seed phrases and HD wallets are derived, and compare self-custody, exchanges, multisig, threshold signatures and account abstraction
+  - Assess the quantum threat to elliptic-curve signatures and the post-quantum signatures NIST standardised in 2024
+narrators: [chloe, margaret, gideon]
+prerequisites: [why-blockchains, hashes-and-merkle-trees]
+related: [math.applied.cryptography, math.algebra.groups, math.number.congruences, math.number.modular-arithmetic, math.number.arithmetic-geometry]
+references:
+  - title: "Efficient Signature Generation by Smart Cards"
+    author: Claus-Peter Schnorr
+    year: 1991
+    url: https://doi.org/10.1007/BF00196725
+    note: Schnorr's signature scheme, in the Journal of Cryptology.
+  - title: "BIP 340: Schnorr Signatures for secp256k1"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+    note: The Schnorr variant Bitcoin adopted with Taproot in 2021, with a careful rationale for each design choice.
+  - title: "SEC 2: Recommended Elliptic Curve Domain Parameters"
+    author: Standards for Efficient Cryptography Group
+    url: https://www.secg.org/sec2-v2.pdf
+    note: Where secp256k1 is defined.
+  - title: "RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)"
+    year: 2017
+    url: https://www.rfc-editor.org/rfc/rfc8032
+  - title: "RFC 6979: Deterministic Usage of DSA and ECDSA"
+    year: 2013
+    url: https://www.rfc-editor.org/rfc/rfc6979
+  - title: "RFC 9591: The FROST Protocol for Two-Round Schnorr Signatures"
+    year: 2024
+    url: https://www.rfc-editor.org/rfc/rfc9591
+    note: A standardised threshold Schnorr signature scheme.
+  - title: "BIP 32: Hierarchical Deterministic Wallets"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
+  - title: "BIP 39: Mnemonic code for generating deterministic keys"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+  - title: "ERC-4337: Account Abstraction Using Alt Mempool"
+    url: https://eips.ethereum.org/EIPS/eip-4337
+  - title: "EIP-7702: Set Code for EOAs"
+    url: https://eips.ethereum.org/EIPS/eip-7702
+  - title: "libsecp256k1"
+    url: https://github.com/bitcoin-core/secp256k1
+    note: The constant-time secp256k1 library used by Bitcoin Core and many other projects.
+  - title: "FIPS 204: Module-Lattice-Based Digital Signature Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/204/final
+  - title: "FIPS 205: Stateless Hash-Based Digital Signature Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/205/final
+---
+
+<Section id="motivation" kind="motivation" title="Your key is your account">
+
+At a bank, your account is a row in the bank's database, and you prove who you are with a password, a card or your face; if you forget the password, the bank resets it. On a public blockchain there is no one to reset anything. An account is controlled by a **private key**, a 256-bit number, and a transaction is valid if and only if it carries a **digital signature** made with that key. Whoever knows the key can spend; whoever loses it cannot, ever.
+
+That makes signatures the second foundation of every blockchain, after hashes. This lesson recalls what a signature guarantees, builds Schnorr signatures from scratch in a deliberately tiny group, surveys the schemes real chains use, and then breaks a signer that made one classic mistake. It ends with the human side, where most money is actually lost: addresses, seed phrases, wallets, custody, multisig — and the quantum computers that may one day threaten all of today's schemes.
+
+Everything cryptographic you run in this lesson uses **toy parameters chosen to be breakable**. It is for understanding only; never use it, or anything like it, to protect anything.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Signatures and discrete logarithms">
+
+[Applied cryptography](/en/cs/applied-cryptography/) introduced signatures with RSA. Formally:
+
+<Definition term="Signature scheme">
+
+A **signature scheme** has three algorithms. $\mathrm{KeyGen}$ outputs a private key $x$ and a public key $y$. $\mathrm{Sign}(x, m)$ outputs a signature $\sigma$. $\mathrm{Verify}(y, m, \sigma)$ outputs accept or reject, and must accept every honestly made signature. It is **secure** (existentially unforgeable under chosen-message attack) if an attacker who knows $y$, and may ask for signatures on any messages it likes, cannot produce a valid signature on any *new* message, except with negligible probability.
+
+</Definition>
+
+The schemes used by blockchains are built on a group in which one operation is easy and its inverse is hard.
+
+<Definition term="Discrete-logarithm problem">
+
+Let $p$ and $q$ be primes with $q$ dividing $p - 1$, and let $g$ be an element of order $q$ in the multiplicative group of integers modulo $p$. Then $G = \{1, g, g^2, \ldots, g^{q-1}\}$ is a cyclic group of prime order $q$. Given $y \in G$, the **discrete logarithm** of $y$ is the $x \in \{0, \ldots, q-1\}$ with $g^x \equiv y \pmod p$. The **discrete-logarithm problem** is to find $x$ from $y$.
+
+</Definition>
+
+Computing $y = g^x$ takes about $\log_2 x$ multiplications by repeated squaring. Going back is believed to be hard when the group is large and well chosen: the best generic algorithms need about $\sqrt q$ steps, and for elliptic-curve groups nothing better than generic is known. The group's order is chosen **prime** because the Pohlig–Hellman algorithm reduces a discrete logarithm in a group of order $q_1 q_2$ to logarithms in the smaller groups of orders $q_1$ and $q_2$. (The underlying algebra is that of <TopicLink id="math.algebra.groups">cyclic groups</TopicLink>.) In a key pair, $x$ is the private key and $y = g^x$ the public key.
+
+</Section>
+
+<Section id="schnorr" kind="computation" title="Schnorr signatures, from scratch">
+
+Claus-Peter Schnorr's 1989 scheme is the simplest secure signature built on discrete logarithms, and since 2021 Bitcoin uses a version of it ([BIP 340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki)).
+
+- **Sign** $m$ with private key $x$: choose a fresh secret **nonce** $k$, compute $R = g^k$, the challenge $e = H(R \,\|\, y \,\|\, m) \bmod q$, and $s = k + e x \bmod q$. The signature is $(R, s)$.
+- **Verify** $(R, s)$ on $m$ with public key $y$: recompute $e = H(R \,\|\, y \,\|\, m)$ and accept if $g^s = R \cdot y^e$.
+
+<Theorem name="Schnorr verification is correct">
+
+Every signature produced by Sign is accepted by Verify.
+
+</Theorem>
+
+<Proof>
+
+Since $g$ has order $q$, exponents can be reduced modulo $q$. With $s = k + ex \bmod q$,
+$$g^s = g^{k + ex} = g^k \cdot (g^x)^e = R \cdot y^e,$$
+and the verifier computes the same $e$ as the signer because it hashes the same $R$, $y$ and $m$.
+
+</Proof>
+
+Security is subtler. Intuitively, $R$ commits the signer to $k$ before the challenge $e$ is known, and producing $s$ for an unpredictable $e$ requires knowing $x$: an attacker who could answer *two* different challenges for the same $R$ could solve for $x$, exactly as in the nonce-reuse attack below. Pointcheval and Stern's *forking lemma* (1996) turns this into a proof that forging Schnorr signatures is as hard as computing discrete logarithms, when the hash is modelled as a random function. Hashing $y$ into the challenge, as BIP 340 does, stops attacks that exploit related keys.
+
+Here is the whole scheme in a group of order $q = 2^{31} - 1$, small enough to break in a fraction of a second:
+
+```python run
+import hashlib, math, random
+
+# TOY PARAMETERS - INSECURE, FOR LEARNING ONLY. Real groups have q of about 2**256.
+q = 2**31 - 1                    # a prime: the order of our subgroup
+p = 46 * q + 1                   # also prime, so Z_p* contains a subgroup of order q
+g = pow(2, (p - 1) // q, p)      # an element of order q (it is not 1, and g**q == 1)
+assert g != 1 and pow(g, q, p) == 1
+
+def H(*parts):
+    """Hash byte strings (each length-prefixed, so they cannot run together) to an integer mod q."""
+    data = b"".join(len(x).to_bytes(4, "big") + x for x in parts)
+    return int.from_bytes(hashlib.sha256(data).digest(), "big") % q
+
+def enc(n):
+    return n.to_bytes(8, "big")
+
+def keygen(rng):
+    x = rng.randrange(1, q)          # private key
+    return x, pow(g, x, p)           # public key y = g^x mod p
+
+def sign(x, msg):
+    k = H(b"nonce", enc(x), msg) or 1    # deterministic nonce, derived from key and message
+    R = pow(g, k, p)
+    e = H(enc(R), enc(pow(g, x, p)), msg)
+    return R, (k + e * x) % q
+
+def verify(y, msg, sig):
+    R, s = sig
+    e = H(enc(R), enc(y), msg)
+    return pow(g, s, p) == R * pow(y, e, p) % p
+
+x, y = keygen(random.Random(42))
+msg = b"Pay 3 tokens to Zanele"
+sig = sign(x, msg)
+print(f"p = {p}, q = {q}, g = {g}")
+print("public key y =", y)
+print("signature (R, s) =", sig)
+print("verifies:", verify(y, msg, sig))
+print("altered message verifies:", verify(y, b"Pay 300 tokens to Zanele", sig))
+print("altered s verifies:      ", verify(y, msg, (sig[0], (sig[1] + 1) % q)))
+
+# Why the toy is insecure: baby-step giant-step finds x in about 2*sqrt(q) group operations.
+def bsgs(y):
+    m = math.isqrt(q) + 1
+    baby = {pow(g, j, p): j for j in range(m)}
+    step = pow(g, -m, p)                 # g^(-m) mod p (Python 3.8+)
+    gamma = y
+    for i in range(m):
+        if gamma in baby:
+            return i * m + baby[gamma]
+        gamma = gamma * step % p
+print(f"\nbaby-step giant-step recovers the key after at most {2 * (math.isqrt(q) + 1):,} steps:",
+      bsgs(y) == x)
+print(f"for a 256-bit group the same attack needs about 2**128 = {2**128:.1e} steps")
+```
+
+The honest signature verifies; changing the message or $s$ by one makes it fail. The last lines show why the toy is a toy: the baby-step giant-step algorithm (store $g^j$ for $j < \sqrt q$, then step through $y g^{-im}$ until one appears in the table) recovers the private key in under 100,000 steps. In a group of order about $2^{256}$, as used in practice, the same algorithm would need about $2^{128}$ steps, which is why 256-bit groups are said to give 128-bit security.
+
+<Narrator who="gideon">
+
+Notice how the toy nonce was chosen: by hashing the private key with the message, as EdDSA and RFC 6979 do. That makes $k$ unpredictable to anyone without $x$, and different for every message, *without* needing a good random-number generator at signing time. The two things a nonce must never be are predictable and repeated, and the next section shows why.
+
+</Narrator>
+
+</Section>
+
+<Section id="curves" kind="human" title="Elliptic curves: ECDSA, EdDSA and secp256k1">
+
+Real systems use the group of points on an **elliptic curve** over a finite field instead of integers modulo $p$, because the best known discrete-logarithm attacks on well-chosen curves are only the generic $\sqrt q$ ones. A 256-bit curve therefore gives about 128-bit security with 32-byte keys, where integers modulo $p$ would need a modulus of about 3,072 bits. The group operation, "adding" two points, is defined geometrically: draw the line through them, find where it meets the curve again, and reflect. The formulas are rational functions of the coordinates, computed modulo the field prime.
+
+<Figure caption="The curve y² = x³ + 7, the same equation as Bitcoin's secp256k1, over the field of 17 elements. Its 17 points (plus a point at infinity, the group's identity) come in pairs (x, y) and (x, 17 − y), mirror images in the dashed line. The real secp256k1 uses a field of about 2²⁵⁶ elements, and its group of points has prime order of about 2²⁵⁶.">
+<svg viewBox="0 0 470 470" role="img" aria-label="A 17 by 17 grid of possible points with seventeen dots marking the solutions of y squared equals x cubed plus 7 modulo 17. The dots come in pairs placed symmetrically above and below the horizontal line y equals 8.5, except the single dot at x equals 3, y equals 0.">
+  <g stroke="currentColor" strokeOpacity="0.15" strokeWidth="1">
+    <line x1="50" y1="430" x2="50" y2="46" /><line x1="50" y1="430" x2="434" y2="430" />
+    <line x1="74" y1="430" x2="74" y2="46" /><line x1="50" y1="406" x2="434" y2="406" />
+    <line x1="98" y1="430" x2="98" y2="46" /><line x1="50" y1="382" x2="434" y2="382" />
+    <line x1="122" y1="430" x2="122" y2="46" /><line x1="50" y1="358" x2="434" y2="358" />
+    <line x1="146" y1="430" x2="146" y2="46" /><line x1="50" y1="334" x2="434" y2="334" />
+    <line x1="170" y1="430" x2="170" y2="46" /><line x1="50" y1="310" x2="434" y2="310" />
+    <line x1="194" y1="430" x2="194" y2="46" /><line x1="50" y1="286" x2="434" y2="286" />
+    <line x1="218" y1="430" x2="218" y2="46" /><line x1="50" y1="262" x2="434" y2="262" />
+    <line x1="242" y1="430" x2="242" y2="46" /><line x1="50" y1="238" x2="434" y2="238" />
+    <line x1="266" y1="430" x2="266" y2="46" /><line x1="50" y1="214" x2="434" y2="214" />
+    <line x1="290" y1="430" x2="290" y2="46" /><line x1="50" y1="190" x2="434" y2="190" />
+    <line x1="314" y1="430" x2="314" y2="46" /><line x1="50" y1="166" x2="434" y2="166" />
+    <line x1="338" y1="430" x2="338" y2="46" /><line x1="50" y1="142" x2="434" y2="142" />
+    <line x1="362" y1="430" x2="362" y2="46" /><line x1="50" y1="118" x2="434" y2="118" />
+    <line x1="386" y1="430" x2="386" y2="46" /><line x1="50" y1="94" x2="434" y2="94" />
+    <line x1="410" y1="430" x2="410" y2="46" /><line x1="50" y1="70" x2="434" y2="70" />
+    <line x1="434" y1="430" x2="434" y2="46" /><line x1="50" y1="46" x2="434" y2="46" />
+  </g>
+  <line x1="40" y1="226.0" x2="444" y2="226.0" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" />
+  <g fill="currentColor">
+    <circle cx="74" cy="310" r="5.5" />
+    <circle cx="74" cy="142" r="5.5" />
+    <circle cx="98" cy="262" r="5.5" />
+    <circle cx="98" cy="190" r="5.5" />
+    <circle cx="122" cy="430" r="5.5" />
+    <circle cx="170" cy="238" r="5.5" />
+    <circle cx="170" cy="214" r="5.5" />
+    <circle cx="194" cy="286" r="5.5" />
+    <circle cx="194" cy="166" r="5.5" />
+    <circle cx="242" cy="358" r="5.5" />
+    <circle cx="242" cy="94" r="5.5" />
+    <circle cx="290" cy="382" r="5.5" />
+    <circle cx="290" cy="70" r="5.5" />
+    <circle cx="338" cy="406" r="5.5" />
+    <circle cx="338" cy="46" r="5.5" />
+    <circle cx="410" cy="334" r="5.5" />
+    <circle cx="410" cy="118" r="5.5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="50" y="452">0</text>
+    <text x="28" y="434">0</text>
+    <text x="146" y="452">4</text>
+    <text x="28" y="338">4</text>
+    <text x="242" y="452">8</text>
+    <text x="28" y="242">8</text>
+    <text x="338" y="452">12</text>
+    <text x="28" y="146">12</text>
+    <text x="434" y="452">16</text>
+    <text x="28" y="50">16</text>
+    <text x="242.0" y="468">x</text>
+    <text x="12" y="238.0">y</text>
+  </g>
+</svg>
+</Figure>
+
+- **ECDSA on secp256k1** is used by Bitcoin (for all spending before Taproot, and still for many transactions) and by Ethereum and most chains derived from it. The curve $y^2 = x^3 + 7$ over the field of integers modulo $p = 2^{256} - 2^{32} - 977$ is defined in the SEC 2 standard; Satoshi Nakamoto chose it over the more common NIST P-256, and the reason was never stated. An ECDSA signature is a pair $(r, s)$: $r$ is the x-coordinate of $kG$ and $s = k^{-1}(z + r x) \bmod n$, where $z$ is the message hash, $G$ the base point and $n$ the group order. Two quirks matter in practice. If $(r, s)$ is valid, so is $(r, n - s)$, so Bitcoin's relay policy and Ethereum's consensus rules require the "low" $s$, to stop third parties altering a transaction's signature. And Ethereum adds a small recovery value $v$ so that the signer's public key can be computed *from* the signature, which is how Ethereum transactions name their sender without including the key.
+- **Schnorr on secp256k1** (BIP 340) came to Bitcoin with the Taproot upgrade of November 2021. Schnorr signatures are *linear* — $s$ is a linear function of $x$ — so several signers can combine their keys and signatures into one, with protocols such as MuSig2 ([BIP 327](https://github.com/bitcoin/bips/blob/master/bip-0327.mediawiki)).
+- **EdDSA**, specifically **Ed25519** (Bernstein, Duif, Lange, Schwabe and Yang, 2011; [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032)), is a Schnorr-style scheme on a twisted Edwards curve, with deterministic nonces and formulas designed to be easy to implement in constant time. It signs transactions on Solana, Stellar, Algorand, NEAR and Cardano, among others, and is widely used outside blockchains, in SSH and Signal.
+
+Never implement these from the formulas for real use. Production code must run in **constant time**, so that timing does not leak the key, must validate every point it receives, and must use vetted libraries such as [libsecp256k1](https://github.com/bitcoin-core/secp256k1), which Bitcoin Core maintains for exactly this reason.
+
+</Section>
+
+<Section id="nonce-reuse" kind="examples" title="One repeated nonce, one lost key">
+
+The Schnorr equation $s = k + ex$ has two unknowns, $k$ and $x$. One signature gives one equation, which is safe. Two signatures with the **same** $k$ give two equations, $s_1 = k + e_1 x$ and $s_2 = k + e_2 x$, and subtracting eliminates $k$:
+$$x = \frac{s_1 - s_2}{e_1 - e_2} \bmod q.$$
+ECDSA falls the same way: equal nonces give equal $r$, and then $k = (z_1 - z_2)/(s_1 - s_2)$ and $x = (s_1 k - z_1)/r$, all modulo $n$. The program below does both attacks, the second on DSA, the finite-field scheme that ECDSA adapts to curves:
+
+```python run
+import hashlib
+
+# The same TOY group as above (insecure, for learning only).
+q = 2**31 - 1
+p = 46 * q + 1
+g = pow(2, (p - 1) // q, p)
+
+def H(*parts):
+    data = b"".join(len(x).to_bytes(4, "big") + x for x in parts)
+    return int.from_bytes(hashlib.sha256(data).digest(), "big") % q
+
+def enc(n):
+    return n.to_bytes(8, "big")
+
+x = 1_234_567_891                    # the victim's private key (toy)
+y = pow(g, x, p)
+FIXED_K = 777_777_777                # the bug: the same nonce for every signature
+
+# --- Schnorr with a repeated nonce ----------------------------------------
+def schnorr_sign_buggy(msg):
+    R = pow(g, FIXED_K, p)
+    e = H(enc(R), enc(y), msg)
+    return R, (FIXED_K + e * x) % q
+
+m1, m2 = b"Pay 5 to Ayumi", b"Pay 2 to Tendai"
+(R1, s1), (R2, s2) = schnorr_sign_buggy(m1), schnorr_sign_buggy(m2)
+e1, e2 = H(enc(R1), enc(y), m1), H(enc(R2), enc(y), m2)
+print("Schnorr: same R in both signatures?", R1 == R2)
+recovered = (s1 - s2) * pow(e1 - e2, -1, q) % q          # s1 - s2 = (e1 - e2) * x
+print("  recovered private key:", recovered, " correct:", recovered == x)
+
+# --- DSA (the finite-field ancestor of ECDSA) with a repeated nonce --------
+def dsa_sign_buggy(msg):
+    z = H(msg)                                            # hash of the message
+    r = pow(g, FIXED_K, p) % q
+    s = pow(FIXED_K, -1, q) * (z + r * x) % q
+    return r, s
+
+(r1, t1), (r2, t2) = dsa_sign_buggy(m1), dsa_sign_buggy(m2)
+z1, z2 = H(m1), H(m2)
+print("DSA: same r in both signatures?", r1 == r2)
+k = (z1 - z2) * pow(t1 - t2, -1, q) % q                   # t1 - t2 = (z1 - z2) / k
+key = (t1 * k - z1) * pow(r1, -1, q) % q                  # t1 * k = z1 + r * x
+print("  recovered nonce:", k, " recovered key:", key, " correct:", key == x)
+```
+
+Both private keys come out exactly. This is not a theoretical worry:
+
+- **PlayStation 3, 2010.** Sony signed PS3 software with ECDSA but used the same $k$ for every signature. At the Chaos Communication Congress in December 2010, the fail0verflow team showed that the signing key could be computed from two signatures, after which anyone could sign software the console would accept.
+- **Android Bitcoin wallets, 2013.** A flaw in Android's Java `SecureRandom` made some wallet apps generate repeated nonces. Attackers who scanned the Bitcoin blockchain for repeated $r$ values computed the private keys and took the coins.
+- **Biased nonces.** Even nonces that are merely *predictable in a few bits* leak the key, through lattice algorithms that combine many signatures. In 2019 Joachim Breitner and Nadia Heninger used such attacks on the Bitcoin and Ethereum blockchains and recovered hundreds of private keys whose signatures had weak nonces.
+
+The defence is deterministic nonce generation (RFC 6979 for ECDSA, built into EdDSA, recommended in BIP 340 alongside fresh randomness), plus well-tested libraries.
+
+<Narrator who="chloe">
+
+The attack is a two-line piece of algebra, and it explains Schnorr's security proof as well. The nonce acts as a one-time mask for $ex$: used once, it hides $x$ perfectly; used twice, the masks cancel. The forking lemma is the same subtraction, run by a hypothetical forger who is "rewound" and asked two different challenges for one $R$.
+
+</Narrator>
+
+</Section>
+
+<Section id="bls" kind="human" title="BLS signatures and aggregation">
+
+**BLS signatures** (Boneh, Lynn and Shacham, 2001) use a **pairing**: a map $e$ that takes one point from each of two elliptic-curve groups to an element of a third group, with $e(aP, bQ) = e(P, Q)^{ab}$. The private key is $x$, the public key $P_K = xG_2$, and the signature on $m$ is $\sigma = x \cdot H(m)$, where $H$ hashes the message to a curve point. Verification checks $e(\sigma, G_2) = e(H(m), P_K)$; both sides equal $e(H(m), G_2)^x$. Signatures are deterministic (no nonce to get wrong) and short: on the BLS12-381 curve, 48 bytes in this arrangement. Ethereum swaps the roles of the two groups, giving 48-byte public keys and 96-byte signatures.
+
+The property that matters for blockchains is **aggregation**: signatures by many signers can be added into one, $\sigma = \sigma_1 + \cdots + \sigma_N$, and checked with one equation. When all signers sign the *same* message, the verifier just adds their public keys too, and one pairing check verifies them all. This is why Ethereum's proof-of-stake consensus uses BLS on BLS12-381, with every one of its hundreds of thousands of validators voting once every 6.4 minutes (<LessonLink slug="proof-of-stake-and-finality">Proof of stake</LessonLink>). Chia, Filecoin and the drand randomness beacon use BLS too.
+
+Aggregation has a trap, the **rogue-key attack**: an attacker who publishes a public key computed as $P_{\text{rogue}} = aG_2 - P_{\text{victim}}$ makes the sum of the two keys equal $aG_2$, so the attacker alone can produce a valid "aggregate" signature that seems to include the victim. The standard defence is a **proof of possession**: every key must be registered together with a signature proving its owner knows the private key. Ethereum validators provide one when they deposit.
+
+</Section>
+
+<Section id="addresses" kind="computation" title="From public key to address">
+
+Users rarely see public keys. They see **addresses**, derived from public keys by hashing and encoding:
+
+- Bitcoin's original **P2PKH** address is the Base58Check encoding of a version byte followed by RIPEMD-160(SHA-256(public key)), 20 bytes. Base58 omits the characters 0, O, I and l, which are easily confused, and Base58Check appends a 4-byte checksum, the first four bytes of a double SHA-256. Newer SegWit and Taproot addresses use the **Bech32** and **Bech32m** encodings ([BIP 173](https://github.com/bitcoin/bips/blob/master/bip-0173.mediawiki), [BIP 350](https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki)), whose checksum is an error-correcting code guaranteed to detect up to four character errors.
+- An **Ethereum** address is the last 20 bytes of the Keccak-256 hash of the 64-byte public key, written in hex. Hex has no checksum, so [EIP-55](https://eips.ethereum.org/EIPS/eip-55) encodes one in the capitalisation of the letters.
+
+The checksum is what protects you from a typo sending funds to an address nobody controls. Here is Base58Check, with a toy key and truncated SHA-256 in place of RIPEMD-160:
+
+```python run
+import hashlib
+
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"   # no 0, O, I or l
+
+def sha256d(b):
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+def base58check(version, payload):
+    data = bytes([version]) + payload
+    data += sha256d(data)[:4]                       # 4-byte checksum
+    n = int.from_bytes(data, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = ALPHABET[r] + out
+    return "1" * (len(data) - len(data.lstrip(b"\0"))) + out   # leading zero bytes become '1'
+
+def check(address):
+    n = 0
+    for ch in address:
+        n = n * 58 + ALPHABET.index(ch)
+    ones = len(address) - len(address.lstrip("1"))
+    data = b"\0" * ones + (n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b"")
+    return len(data) > 4 and sha256d(data[:-4])[:4] == data[-4:]
+
+# A TOY public key (from the toy group above), hashed to 20 bytes. Bitcoin's P2PKH uses
+# RIPEMD-160(SHA-256(compressed public key)); we use truncated SHA-256 to stay in hashlib.
+toy_public_key = (74879636653).to_bytes(8, "big")
+payload = hashlib.sha256(toy_public_key).digest()[:20]
+addr = base58check(0x6F, payload)        # 0x6F: Bitcoin's test network, whose coins have no value
+print("toy address:", addr, " checks:", check(addr))
+
+typos = [addr[:i] + c + addr[i + 1:] for i in range(len(addr)) for c in ALPHABET if c != addr[i]]
+print(f"single-character typos tried: {len(typos)}, accepted by the checksum: {sum(map(check, typos))}")
+swaps = [addr[:i] + addr[i + 1] + addr[i] + addr[i + 2:] for i in range(len(addr) - 1) if addr[i] != addr[i + 1]]
+print(f"adjacent swaps tried: {len(swaps)}, accepted: {sum(map(check, swaps))}")
+```
+
+Every one of the 1,938 single-character typos and all 33 swaps of neighbouring characters are rejected, as expected from a 32-bit checksum, which lets a random corruption through with probability $2^{-32}$. A checksum protects against *accidents*. It does nothing against **address poisoning**, a scam in which an attacker sends a tiny transaction from an address whose first and last characters match one you use, hoping you will later copy it from your history. Always check the whole address, or better, use an address book.
+
+</Section>
+
+<Section id="wallets" kind="human" title="Wallets, seed phrases and custody">
+
+A **wallet** is software (or a small device) that holds keys and signs transactions. Keeping many independent random keys backed up would be impractical, so modern wallets derive all their keys from one secret.
+
+- **HD wallets** ([BIP 32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki), 2012) derive a tree of key pairs from a single master seed with HMAC-SHA512, so a backup of the seed backs up every key, past and future.
+- **Seed phrases** ([BIP 39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki)) encode that seed's entropy as words. 128 to 256 random bits get a checksum of one bit per 32 bits of entropy, and the result is split into 11-bit chunks, each indexing a list of 2,048 words: 128 + 4 = 132 bits make 12 words, 256 + 8 = 264 bits make 24. The words are then stretched into the 512-bit seed with PBKDF2-HMAC-SHA512 (2,048 iterations), optionally with a passphrase.
+
+A seed phrase **is** the money. Anyone who sees it can take everything, so it should never be typed into a website, photographed, stored in a cloud note or given to "support staff", who will never legitimately ask for it. Phishing sites, fake wallet apps and malicious browser extensions that steal phrases are among the commonest thefts. For the same reason, this course never shows a real seed phrase, not even a famous test one.
+
+Who should hold the keys? There are two broad answers, and each has failed many people:
+
+- **Self-custody**: you hold the keys, in a wallet app or a dedicated hardware device. No company can freeze or lose your funds, but you alone carry the risks of loss (a phone dropped in a river, a forgotten backup), theft (malware, phishing, coercion) and inheritance (heirs who cannot find or use the keys).
+- **Custodial**: an exchange or custodian holds keys for you, and you hold a claim on it, like a bank account but usually without deposit insurance. Then you carry the custodian's risks: **Mt. Gox**, then the largest Bitcoin exchange, collapsed in 2014 with about 850,000 bitcoins reported missing; Canada's **QuadrigaCX** collapsed in 2019, and its regulator later concluded that its founder had committed fraud; **FTX** collapsed in November 2022 after customer funds were misused, and its founder was convicted of fraud in 2023. Custodians are also attacked directly: in February 2025 about USD 1.5 billion in ether was stolen from the exchange Bybit, an attack the FBI attributed to North Korea.
+
+Regulation increasingly requires custodians to keep customers' assets separate and audited — the EU's Markets in Crypto-Assets Regulation (MiCA), applied from 2024, is one example — but as the cases above show, rules help only where they are followed and enforced.
+
+</Section>
+
+<Section id="multisig" kind="human" title="Multisig, threshold signatures and smart accounts">
+
+One key is a single point of failure. Three ways to spread the risk:
+
+- **Multisignature (multisig)**: the chain itself requires $t$ of $n$ signatures. Bitcoin's script language has had it from the start; on Ethereum it is done by a smart contract, of which the Safe contracts are the most widely used. A 2-of-3 setup survives the loss of any one key and the theft of any one key. Every signature appears on the chain, which is transparent but costs space and reveals the policy.
+- **Threshold signatures**: the $n$ parties run a protocol that produces **one ordinary signature**, so the chain sees a single key and a single signature. Schnorr's linearity makes this clean ([FROST](https://www.rfc-editor.org/rfc/rfc9591), standardised in 2024); threshold ECDSA is much harder, and in 2023 researchers disclosed practical key-extraction attacks on several deployed implementations. Many custodians and "MPC wallets" rely on threshold schemes.
+- **Smart accounts** (account abstraction): the account is a contract whose own code decides what counts as authorisation — several keys, a daily spending limit, recovery by trusted friends ("social recovery"), or a passkey from a phone. [ERC-4337](https://eips.ethereum.org/EIPS/eip-4337), live on Ethereum since 2023, does this without changing the protocol, through a separate pool of "user operations" that bundlers package into transactions. [EIP-7702](https://eips.ethereum.org/EIPS/eip-7702), part of Ethereum's Pectra upgrade in May 2025, lets an ordinary key-controlled account delegate to such code.
+
+None of this removes the oldest risk in signing: **what you see may not be what you sign**. The Bybit theft did not break any cryptography or any multisig contract. Investigators reported that the web interface the signers used had been tampered with, so that the transaction it displayed was not the one their devices signed. Hardware wallets that show and decode the exact transaction, and signers who verify it independently, are the defence.
+
+<Narrator who="margaret">
+
+Count the cost of each design for a 2-of-3 policy on Bitcoin. Pre-Taproot multisig puts three 33-byte public keys and two signatures of about 72 bytes each into the spending transaction, roughly 250 bytes. A Taproot output spent with a MuSig2 aggregate key needs one 64-byte signature, and to the outside world it looks like any single-key payment.
+
+</Narrator>
+
+</Section>
+
+<Section id="quantum" kind="human" title="Quantum computers and post-quantum signatures">
+
+Every scheme in this lesson — Schnorr, ECDSA, EdDSA and BLS — rests on the discrete-logarithm problem, and **Shor's algorithm** (1994) solves discrete logarithms efficiently on a large, error-corrected quantum computer. Such a machine would need thousands of error-corrected logical qubits; as of 2026 none exists, and when one might is genuinely uncertain. But blockchains hold value for decades and are hard to upgrade, so the threat is taken seriously now.
+
+What is exposed? An attacker with a quantum computer needs your **public key**. Address types that hash the public key (P2PKH, P2WPKH, Ethereum addresses) reveal it only when you first spend, so funds at a never-used address are protected by the hash until then. Public keys are visible for coins in the earliest Bitcoin outputs (which paid directly to public keys), for any address that has been reused after spending, and for Taproot outputs, which contain a public key directly.
+
+In August 2024 NIST published its first post-quantum signature standards: **ML-DSA** (FIPS 204, from the lattice-based CRYSTALS-Dilithium) and **SLH-DSA** (FIPS 205, from the hash-based SPHINCS+); it has also been standardising a third, FN-DSA, based on Falcon, as FIPS 206. They are much larger than elliptic-curve signatures:
+
+| Scheme | Public key | Signature |
+| --- | --- | --- |
+| Schnorr on secp256k1 (BIP 340) | 32 bytes | 64 bytes |
+| ML-DSA-44 | 1,312 bytes | 2,420 bytes |
+| SLH-DSA-SHA2-128s | 32 bytes | 7,856 bytes |
+| Falcon-512 | 897 bytes | about 666 bytes |
+
+For a blockchain, where every byte of every signature is stored by every full node forever, a 40-fold growth in signature size is a serious cost. As of 2026, draft proposals for quantum-resistant output types are being discussed for Bitcoin, and Ethereum researchers are studying hash-based signatures for validators, aggregated with the SNARKs of the Verifiable level. Migrating coins whose owners have lost their keys, or never move them, is an unsolved social problem as much as a technical one.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A signature encrypts the message."** A signature authenticates; it hides nothing. Every blockchain transaction and its signature are public.
+
+</Misconception>
+
+<Misconception>
+
+**"The nonce only needs to be random-looking."** It must be *secret, unpredictable and never repeated*. A repeated nonce reveals the key from two signatures; a nonce with a few predictable bits reveals it from a few hundred. Prefer deterministic nonce generation and established libraries.
+
+</Misconception>
+
+<Misconception>
+
+**"My coins are stored in my wallet."** The coins are entries on the blockchain. The wallet stores keys that authorise spending them. Lose the phone and keep the seed phrase, and you have lost nothing; keep the phone and leak the phrase, and you have lost everything.
+
+</Misconception>
+
+<Misconception>
+
+**"Leaving coins on a large exchange is as safe as a bank deposit."** A claim on an exchange is only as good as the exchange's solvency, honesty and security, usually without deposit insurance. Large, well-known exchanges have failed and been hacked.
+
+</Misconception>
+
+<Misconception>
+
+**"Quantum computers will break hash functions too, so nothing can be done."** Grover's algorithm speeds up brute-force search only quadratically, so a 256-bit hash keeps about 128 bits of preimage security. Hash-based signatures such as SLH-DSA rely only on hash functions, which is exactly why they are trusted as a post-quantum option.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

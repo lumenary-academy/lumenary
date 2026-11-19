@@ -1,0 +1,557 @@
+---
+title: Sequential logic and state machines
+subtitle: Latches, flip-flops and the clock that disciplines them; registers and counters; and finite-state machines, designed, encoded, reset and verified.
+minutes: 75
+objectives:
+  - Distinguish level-sensitive latches from edge-triggered flip-flops, and show the difference in simulation
+  - Build registers, shift registers and counters, including linear-feedback shift registers, and explain why ripple counters are avoided
+  - Define Moore and Mealy machines and predict when each one's output changes
+  - Design a finite-state machine from a specification, write it in Verilog and verify it with a self-checking testbench
+  - Choose a state encoding (binary, Gray, one-hot) and handle unused states safely
+  - Choose a reset strategy, synchronous or asynchronous, and explain asynchronous assertion with synchronous release
+prerequisites: [combinational-logic]
+related: [math.algebra.fields-galois, math.prob.markov-chains]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: A method for synthesizing sequential circuits
+    author: George H. Mealy
+    year: 1955
+    note: The paper (Bell System Technical Journal) that introduced machines whose outputs depend on the input as well as the state.
+  - title: Gedanken-experiments on sequential machines
+    author: Edward F. Moore
+    year: 1956
+    note: Moore's paper (in Automata Studies, Princeton) on machines whose outputs depend on the state alone.
+  - title: SymbiYosys
+    url: https://github.com/YosysHQ/sby
+    note: An open-source front end for formally verifying hardware designs, including properties of state machines.
+  - title: Icarus Verilog
+    url: https://steveicarus.github.io/iverilog/
+    note: The simulator that runs this lesson's checks.
+---
+
+<Section id="motivation" kind="motivation" title="Circuits that remember">
+
+The circuits of <LessonLink slug="combinational-logic">Combinational logic</LessonLink> have no past: change the inputs and the outputs follow, with no memory of what came before. They cannot count, wait, take turns or follow a procedure. A pedestrian crossing must remember that someone pressed the button ten seconds ago; a serial receiver must remember how many bits of a byte have arrived; a processor must remember which instruction it is executing. All of these need **state**, and circuits get state from feedback: outputs wired back to inputs.
+
+Uncontrolled feedback is chaos, so digital design tames it with one idea, the **synchronous discipline**. All the state of a design lives in flip-flops that change together, at the edge of a shared clock. Between edges, combinational logic computes the next state from the current state and the inputs; at the edge, the flip-flops capture it. This lesson builds that picture from the bottom: latches and flip-flops, then registers and counters, then the general pattern, the **finite-state machine**, which you will design, encode, reset and verify in Verilog.
+
+</Section>
+
+<Section id="latches-flip-flops" kind="definitions" title="Latches and flip-flops">
+
+Lumenary CS's [From logic gates to a processor](/en/cs/logic-to-processor/) simulated the simplest memory, the SR latch: two cross-coupled NOR gates that hold a bit. Practical designs build on a version with a data input.
+
+<Definition term="D latch">
+
+A **D latch** has a data input $D$, an enable $E$ and an output $Q$. While $E = 1$ the latch is **transparent**: $Q$ follows $D$. While $E = 0$ it is **opaque**: $Q$ holds the value $D$ had when $E$ fell.
+
+</Definition>
+
+<Definition term="D flip-flop">
+
+An edge-triggered **D flip-flop** has inputs $D$ and clock $C$. At each **rising edge** of $C$ (the instant it goes from 0 to 1), $Q$ takes the value of $D$; at every other time $Q$ holds, whatever $D$ does.
+
+</Definition>
+
+The standard flip-flop *is* two latches in series with opposite enables, called master and slave (or leader and follower). While the clock is low, the first latch is transparent and follows $D$, and the second holds the output steady. When the clock rises, the first latch closes, capturing $D$ at that instant, and the second opens, passing the captured value to $Q$. At no moment is there a transparent path from $D$ to $Q$, which is the whole point.
+
+The difference matters as soon as the output of a storage element feeds, through logic, back to its own input, as it does in every counter and state machine. With a transparent latch, a new value can race around the loop several times while the enable is high. With a flip-flop, each value goes around exactly once per clock cycle. The simulation below drives the same data into a latch enabled by the clock and a flip-flop clocked by it.
+
+```verilog check
+// The same data into a level-sensitive D latch and an edge-triggered D flip-flop.
+module d_latch (input logic en, d, output logic q);
+  always_latch
+    if (en) q = d;               // transparent while en is 1; holds while en is 0
+endmodule
+
+module d_flip_flop (input logic clk, d, output logic q);
+  always_ff @(posedge clk)
+    q <= d;                      // copies d only at the rising edge of clk
+endmodule
+
+module tb;
+  logic clk = 0, d = 0;
+  wire  q_latch, q_ff;
+  d_latch     u1 (.en(clk), .d(d), .q(q_latch));
+  d_flip_flop u2 (.clk(clk), .d(d), .q(q_ff));
+  always #10 clk = ~clk;         // rising edges at 10, 30, 50 ns
+
+  // At time t set d, then 1 ns later check both outputs against what we expect.
+  task automatic step(input int t, input logic d_new, want_latch, want_ff);
+    #(t - $time) d = d_new;
+    #1;
+    $display("%3d ns  %b  %b |   %b       %b", $time, clk, d, q_latch, q_ff);
+    if (q_latch !== want_latch || q_ff !== want_ff) $fatal(1, "unexpected output at %0d ns", $time);
+  endtask
+
+  initial begin
+    $display("time  clk d | latch flip-flop");
+    step( 4, 1, 1'bx, 1'bx);     // clock low: neither has seen any data yet
+    step(10, 1, 1, 1);           // rising edge: both take d = 1
+    step(13, 0, 0, 1);           // clock high: the latch follows d, the flip-flop does not
+    step(16, 1, 1, 1);
+    step(24, 0, 1, 1);           // clock low: the latch holds
+    step(30, 0, 0, 0);           // rising edge: both take d = 0
+    step(34, 1, 1, 0);
+    step(44, 0, 1, 0);
+    step(50, 0, 0, 0);
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+time  clk d | latch flip-flop
+  5 ns  0  1 |   x       x
+ 11 ns  1  1 |   1       1
+ 14 ns  1  0 |   0       1
+ 17 ns  1  1 |   1       1
+ 25 ns  0  0 |   1       1
+ 31 ns  1  0 |   0       0
+ 35 ns  1  1 |   1       0
+ 45 ns  0  0 |   1       0
+ 51 ns  1  0 |   0       0
+```
+
+<Figure caption="The simulation above as waveforms. The shaded intervals are where the clock is high and the latch is transparent: its output follows D (at 13, 16 and 34 ns) and holds while the clock is low. The flip-flop's output changes only at rising clock edges, at 10 and 30 ns; the pulses on D between edges never reach it.">
+<svg viewBox="0 0 340 200" role="img" aria-label="Timing diagram with four rows over 0 to 56 nanoseconds. The clock rises at 10, 30 and 50 nanoseconds, with its high intervals shaded. D rises at 4, falls at 13, rises at 16, falls at 24, rises at 34 and falls at 44. The latch output is unknown until 10, then 1, falls at 13, rises at 16, falls at 30, rises at 34, and falls at 50. The flip-flop output is unknown until 10, then 1 until 30, then 0.">
+  <g fill="var(--sky-soft)" fillOpacity="0.7">
+    <rect x="115" y="18" width="45" height="150" />
+    <rect x="205" y="18" width="45" height="150" />
+    <rect x="295" y="18" width="27" height="150" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.6">
+    <path d="M 70 40 H 115 V 26 H 160 V 40 H 205 V 26 H 250 V 40 H 295 V 26 H 322" />
+    <path d="M 70 80 H 88 V 66 H 128.5 V 80 H 142 V 66 H 178 V 80 H 223 V 66 H 268 V 80 H 322" />
+    <path d="M 115 106 H 128.5 V 120 H 142 V 106 H 205 V 120 H 223 V 106 H 295 V 120 H 322" />
+    <path d="M 115 146 H 205 V 160 H 322" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="3 2">
+    <path d="M 70 106 H 115 M 70 120 H 115" />
+    <path d="M 70 146 H 115 M 70 160 H 115" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">
+    <text x="62" y="38">clk</text>
+    <text x="62" y="78">D</text>
+    <text x="62" y="118">latch Q</text>
+    <text x="62" y="158">flip-flop Q</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="92" y="117">x</text>
+    <text x="92" y="157">x</text>
+    <text x="115" y="185">10</text>
+    <text x="205" y="185">30</text>
+    <text x="295" y="185">50 ns</text>
+  </g>
+</svg>
+</Figure>
+
+The flip-flop never saw the brief 1 on $D$ between 34 and 44 ns, because no rising edge occurred while it was there; the latch did. Which behaviour you want depends on the design, but for state machines and pipelines you want the flip-flop's, because it makes each clock cycle a clean step.
+
+In Verilog the two are written differently. `always_latch if (en) q = d;` describes a latch; `always_ff @(posedge clk) q <= d;` a flip-flop. The `<=` is a *non-blocking* assignment, the right one for anything clocked, for reasons <LessonLink slug="verilog-and-fpgas">Verilog and FPGAs</LessonLink> demonstrates with a bug.
+
+Other flip-flop types appear in older designs and textbooks: the **T** (toggle) flip-flop inverts its output on each edge when $T = 1$, and the **JK** flip-flop sets, resets, holds or toggles according to two inputs. Both are a D flip-flop with a little logic in front, and modern design uses D flip-flops, sometimes with an **enable** (hold unless enabled) and a **reset**.
+
+<Narrator who="gideon">
+
+Why do most design guides forbid latches? Not because they are broken, but because timing analysis of a loop through transparent latches is much harder, and because a latch is easy to create by accident: an `always_comb` block that forgets to assign an output in some branch must *remember* the old value, and so describes a latch. Some high-performance custom designs use latches deliberately, to let a slow stage borrow time from the next, but they are a tool for experts.
+
+</Narrator>
+
+</Section>
+
+<Section id="registers-counters" kind="examples" title="Registers, shift registers and counters">
+
+A **register** is $n$ flip-flops sharing a clock, storing an $n$-bit word. To make a register hold its value on cycles when it should not load, put a 2:1 multiplexer in front of each flip-flop, choosing between the new value and the flip-flop's own output, controlled by an **enable**. It is tempting to save the multiplexer by switching the clock off instead (an AND gate on the clock), but a glitch on that gate's other input becomes a false clock edge, and the gate delays the clock relative to every other flip-flop. Chips do use **clock gating** to save power, but only through special glitch-free cells inserted by the tools, never with a plain AND gate.
+
+A **shift register** connects each flip-flop's output to the next one's input, so at each edge every bit moves one place. Fed one bit at a time and read in parallel, it converts serial to parallel, the first step of every serial receiver; loaded in parallel and shifted out, it converts parallel to serial, the heart of a transmitter.
+
+A **counter** is a register whose next value is its present value plus one. Variations:
+
+| Counter | States with $n$ flip-flops | Next-state logic | Typical use |
+| --- | --- | --- | --- |
+| Binary | $2^n$ | an incrementer | timers, addresses |
+| Ring (one 1 circulating) | $n$ | none: a shift register with its end fed back | sequencing, one-hot control |
+| Johnson (twisted ring) | $2n$ | one inverter in the feedback | glitch-free phase generation: one bit changes per step |
+| Gray-code | $2^n$ | more complex | counters read by another clock domain: one bit changes per step |
+| LFSR | $2^n - 1$ | a few XOR gates | test patterns, scramblers, CRCs, cheap pseudo-random numbers |
+
+A **ripple counter** connects each flip-flop's output to the *clock* of the next, so that bit $k$ toggles when bit $k-1$ falls. It needs no adder, but each bit changes one flip-flop delay after the one before, so for a moment after each edge the count is wrong (from 0111 to 1000 it passes through 0110, 0100 and 0000), and its outputs are clocked at different times. Synchronous designs avoid it; you will still meet it in very low-power clock dividers.
+
+A **linear-feedback shift register** (LFSR) is a shift register whose input is the XOR of a few of its own bits, the *taps*. With well-chosen taps it steps through all $2^n - 1$ nonzero states before repeating, in an order that looks random; with poorly chosen taps it falls into shorter cycles. The code below runs a 4-bit LFSR, then tries every tap set for widths 3 to 10 and counts those of maximal length.
+
+```python run
+from math import gcd
+
+def lfsr_period(n, taps, seed=1):
+    """Fibonacci LFSR: shift left, feeding in the XOR (parity) of the tapped bits."""
+    mask, state, steps = (1 << n) - 1, seed, 0
+    while True:
+        feedback = bin(state & taps).count("1") & 1
+        state = ((state << 1) | feedback) & mask
+        steps += 1
+        if state == seed:
+            return steps
+
+# A 4-bit LFSR with taps on bits 3 and 2 (feedback polynomial x^4 + x^3 + 1).
+state, seen = 0b0001, []
+for _ in range(16):
+    seen.append(state)
+    state = ((state << 1) | (((state >> 3) ^ (state >> 2)) & 1)) & 0b1111
+print("4-bit sequence:", " ".join(f"{s:x}" for s in seen))
+print("period:", lfsr_period(4, 0b1100), "(every nonzero state once)\n")
+
+def phi(m):
+    return sum(1 for k in range(1, m + 1) if gcd(k, m) == 1)
+
+print(" n  tap sets tried  maximal-length  phi(2^n - 1) / n")
+for n in range(3, 11):
+    top = 1 << (n - 1)                     # the oldest bit must be tapped, or the shift loses state
+    maximal = [t for t in range(top, 1 << n) if lfsr_period(n, t) == 2**n - 1]
+    print(f"{n:2} {top:15} {len(maximal):15} {phi(2**n - 1) // n:17}")
+```
+
+The 4-bit register visits all fifteen nonzero states. For each width, the number of maximal-length tap sets matches $\varphi(2^n - 1)/n$, where $\varphi$ is Euler's totient function, and that is not a coincidence.
+
+<Narrator who="chloe">
+
+Why that formula? Read the register's bits as the coefficients of a polynomial over the two-element field. Stepping the LFSR multiplies by $x$ modulo the feedback polynomial, so the period is maximal exactly when that polynomial is *primitive*: when $x$ generates the whole multiplicative group of the finite field with $2^n$ elements. That group is cyclic of order $2^n - 1$, it has $\varphi(2^n - 1)$ generators, and each primitive polynomial of degree $n$ accounts for $n$ of them. Lumenary Math's <TopicLink id="math.algebra.fields-galois">Fields and Galois theory</TopicLink> builds those fields.
+
+</Narrator>
+
+</Section>
+
+<Section id="fsm" kind="definitions" title="Finite-state machines">
+
+Every synchronous circuit, from a counter to a processor, has the same shape: a register holding the state, and combinational logic around it.
+
+<Definition term="Finite-state machine">
+
+A **finite-state machine** (FSM) has a finite set of states $S$ with an initial state $s_0$, a set of inputs $I$, a set of outputs $O$, a **next-state function** $\delta: S \times I \to S$, and an output function. In a **Moore machine** the output depends on the state alone, $\lambda: S \to O$. In a **Mealy machine** it depends on the state and the present input, $\lambda: S \times I \to O$. At each clock edge the state register loads $\delta(s, i)$.
+
+</Definition>
+
+<Figure caption="The structure of every synchronous state machine. Next-state logic computes the next state from the inputs and the current state; the state register loads it at each clock edge; output logic computes the outputs from the state. In a Mealy machine the output logic also sees the inputs directly (dashed), so outputs can change between clock edges.">
+<svg viewBox="0 0 470 190" role="img" aria-label="Block diagram. Inputs enter a box labelled next-state logic. Its output, the next state, goes to a box labelled state register, which has a clock input from below. The register's output, the current state, goes to a box labelled output logic, which produces the outputs, and also loops back underneath to the next-state logic. A dashed line labelled Mealy only runs from the inputs over the top directly to the output logic.">
+  <defs>
+    <marker id="sq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="90" y="45" width="100" height="60" rx="4" />
+    <rect x="232" y="50" width="78" height="50" rx="4" />
+    <rect x="352" y="45" width="90" height="60" rx="4" />
+    <path d="M 262 100 L 271 90 L 280 100" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" markerEnd="url(#sq-arrow)">
+    <path d="M 15 75 H 88" />
+    <path d="M 190 75 H 230" />
+    <path d="M 310 75 H 350" />
+    <path d="M 442 75 H 466" />
+    <path d="M 330 75 V 150 H 140 V 107" />
+    <path d="M 271 132 V 102" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" strokeDasharray="5 3" markerEnd="url(#sq-arrow)">
+    <path d="M 50 75 V 22 H 397 V 43" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="50" cy="75" r="2.5" />
+    <circle cx="330" cy="75" r="2.5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="140" y="72">next-state</text>
+    <text x="140" y="86">logic</text>
+    <text x="271" y="72">state</text>
+    <text x="271" y="86">register</text>
+    <text x="397" y="72">output</text>
+    <text x="397" y="86">logic</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="28" y="68">inputs</text>
+    <text x="210" y="68">next</text>
+    <text x="235" y="165">current state</text>
+    <text x="288" y="130">clk</text>
+    <text x="224" y="16">Mealy only</text>
+    <text x="466" y="95" textAnchor="end">outputs</text>
+  </g>
+</svg>
+</Figure>
+
+The two kinds differ in *when* their outputs respond. A Moore output changes only after a clock edge, because only then does the state change. A Mealy output can respond to an input in the same cycle. The program below runs both kinds of machine on the same task, detecting the pattern 1011 in a stream of bits that arrive one per clock cycle, with the machines written as tables.
+
+```python run
+# Two machines that detect the pattern 1011 in a serial bit stream (overlaps allowed).
+# A machine is just tables: next_state[state][input], and an output table.
+
+# Mealy: the output depends on the state AND the present input.
+mealy_next = {"S0": ("S0", "S1"), "S1": ("S2", "S1"), "S2": ("S0", "S3"), "S3": ("S2", "S1")}
+mealy_out  = {"S0": (0, 0),       "S1": (0, 0),       "S2": (0, 0),       "S3": (0, 1)}
+
+# Moore: the output depends on the state alone, so "just saw 1011" needs its own state, S4.
+moore_next = {"S0": ("S0", "S1"), "S1": ("S2", "S1"), "S2": ("S0", "S3"), "S3": ("S2", "S4"),
+              "S4": ("S2", "S1")}
+moore_out  = {"S0": 0, "S1": 0, "S2": 0, "S3": 0, "S4": 1}
+
+stream = [1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0]
+mealy = moore = "S0"
+print("cycle  in | Mealy state out | Moore state out")
+for cycle, x in enumerate(stream):
+    m_out = mealy_out[mealy][x]           # available during this cycle, as soon as x is
+    o_out = moore_out[moore]              # fixed for the whole cycle by the state
+    print(f"{cycle:5}  {x:2} | {mealy:>11} {m_out:3} | {moore:>11} {o_out:3}")
+    mealy, moore = mealy_next[mealy][x], moore_next[moore][x]   # the clock edge
+print("states:", len(mealy_next), "(Mealy) and", len(moore_next), "(Moore)")
+```
+
+The Mealy machine raises its output in the cycle where the final 1 arrives (cycles 3, 6 and 10); the Moore machine one cycle later (4, 7 and 11), and it needs a fifth state to represent "just saw 1011". Both find the overlapping occurrence at cycles 3 to 6.
+
+The Mealy machine is faster and smaller, but its output is a combinational function of its input, so a glitch on the input can glitch the output, and the path from the input through the machine to whatever comes next must fit in one clock cycle with the logic on both sides. A common compromise is to register Mealy outputs, which costs back the cycle. Moore outputs come straight from the state register (or from simple logic on it), which makes them clean and easy to time.
+
+</Section>
+
+<Section id="crossing" kind="examples" title="Designing a state machine: a pedestrian crossing">
+
+Here is a specification of the kind real engineers receive, simplified. A crossing on a busy road shows green to cars until a pedestrian presses the button. Cars must then get at least 6 seconds of green in total, followed by 2 seconds of amber, then 4 seconds of *walk* for pedestrians with cars on red, then 2 seconds of red for everyone to clear the crossing, and then green again. A press during any phase but green must not be forgotten. Above all: **cars must never see green while pedestrians see walk.**
+
+The design proceeds in four steps.
+
+1. **States.** GREEN, AMBER, WALK and CLEAR. Each lasts a number of seconds, so a **timer** counts the seconds spent in the current state. A separate flip-flop, **request**, remembers a press until it is served.
+2. **Transitions.** GREEN → AMBER when a request is waiting and the green has lasted at least 6 s; AMBER → WALK after 2 s; WALK → CLEAR after 4 s; CLEAR → GREEN after 2 s. Otherwise stay.
+3. **Outputs** (Moore): GREEN shows car green; AMBER shows car amber; WALK shows car red and walk; CLEAR shows car red only.
+4. **Timing.** The circuit's clock is fast, say 50 MHz, but the machine should step once per second. Rather than make a slow clock (a gated or divided clock brings exactly the problems of ripple counters), a **prescaler** counts clock cycles and raises a one-cycle **tick** every 50,000,000 cycles, and the machine acts only on cycles where tick is 1. A signal used this way is a **clock enable**: everything still runs on the one clock.
+
+<Figure caption="State diagram of the crossing controller. Each circle is a state, with its outputs below the name; each arrow is a transition, labelled with its condition. Without a waiting request, the machine stays in GREEN indefinitely.">
+<svg viewBox="0 0 460 225" role="img" aria-label="A state diagram with four states arranged in a diamond. GREEN on the left, showing cars green, is entered from a reset arrow. An arrow labelled request and 6 seconds goes up to AMBER, showing cars amber. An arrow labelled 2 seconds goes down to WALK on the right, showing cars red and walk. An arrow labelled 4 seconds goes to CLEAR at the bottom, showing cars red. An arrow labelled 2 seconds returns to GREEN.">
+  <defs>
+    <marker id="sq-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="80" cy="112" r="34" />
+    <circle cx="230" cy="42" r="34" />
+    <circle cx="380" cy="112" r="34" />
+    <circle cx="230" cy="182" r="34" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" markerEnd="url(#sq-arrow2)">
+    <path d="M 111 98 L 197 57" />
+    <path d="M 261 57 L 347 97" />
+    <path d="M 349 127 L 263 167" />
+    <path d="M 199 168 L 113 127" />
+    <path d="M 8 112 H 44" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="80" y="110">GREEN</text>
+    <text x="230" y="40">AMBER</text>
+    <text x="380" y="110">WALK</text>
+    <text x="230" y="180">CLEAR</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="80" y="124">cars green</text>
+    <text x="230" y="54">cars amber</text>
+    <text x="380" y="124">cars red, walk</text>
+    <text x="230" y="194">cars red</text>
+    <text x="22" y="104">reset</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="118" y="66">request and 6 s</text>
+    <text x="330" y="66">2 s</text>
+    <text x="330" y="166">4 s</text>
+    <text x="130" y="166">2 s</text>
+  </g>
+</svg>
+</Figure>
+
+The Verilog follows the block diagram of the previous section exactly: an `always_comb` block for the next-state logic, an `always_ff` block for the state register (with the timer and the request flip-flop), and an `always_comb` block for the outputs. The states are a SystemVerilog `enum`, which names the encodings and lets the simulator print state names. In the testbench a "second" is 4 clock cycles, so the simulation stays short; one pedestrian presses the button after 2 seconds, and a second presses while the first is crossing. The testbench records the lights once per second, compares the whole sequence with the specification, and checks the safety rule on *every* clock edge.
+
+```verilog check
+// A pelican-style pedestrian crossing: a Moore machine driven by a once-per-second tick.
+module tick_gen #(parameter int DIV = 50_000_000) (input logic clk, rst_n, output logic tick);
+  logic [$clog2(DIV)-1:0] count;
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n)                 begin count <= '0; tick <= 1'b0; end
+    else if (count == DIV - 1)  begin count <= '0; tick <= 1'b1; end
+    else                        begin count <= count + 1'b1; tick <= 1'b0; end
+endmodule
+
+module crossing #(parameter int MIN_GREEN = 6, AMBER_T = 2, WALK_T = 4, CLEAR_T = 2) (
+  input  logic       clk, rst_n, tick, button,
+  output logic [2:0] car,                 // {red, amber, green}
+  output logic       walk
+);
+  typedef enum logic [1:0] {GREEN, AMBER, WALK, CLEAR} state_t;
+  state_t     state, next;
+  logic [3:0] timer;                      // ticks spent in the current state
+  logic       request;                    // a button press waiting to be served
+
+  always_comb begin                       // next-state logic
+    next = state;
+    case (state)
+      GREEN: if (request && timer >= MIN_GREEN - 1) next = AMBER;
+      AMBER: if (timer == AMBER_T - 1)              next = WALK;
+      WALK:  if (timer == WALK_T - 1)               next = CLEAR;
+      CLEAR: if (timer == CLEAR_T - 1)              next = GREEN;
+    endcase
+  end
+
+  always_ff @(posedge clk or negedge rst_n)    // the state register, the timer and the request
+    if (!rst_n) begin
+      state <= GREEN; timer <= '0; request <= 1'b0;
+    end else begin
+      if (button)                  request <= 1'b1;
+      if (tick) begin
+        state <= next;
+        timer <= (next != state) ? '0 : timer + 1'b1;
+        if (state == AMBER && next == WALK) request <= 1'b0;   // served: walk is starting
+      end
+    end
+
+  always_comb begin                       // Moore outputs: a function of the state alone
+    car  = (state == GREEN) ? 3'b001 : (state == AMBER) ? 3'b010 : 3'b100;
+    walk = (state == WALK);
+  end
+endmodule
+
+module tb;
+  logic clk = 0, rst_n = 0, button = 0;
+  wire  tick, walk;
+  wire [2:0] car;
+  tick_gen #(.DIV(4)) prescaler (.clk(clk), .rst_n(rst_n), .tick(tick));  // a "second" is 4 clocks here
+  crossing dut (.clk(clk), .rst_n(rst_n), .tick(tick), .button(button), .car(car), .walk(walk));
+  always #5 clk = ~clk;
+
+  string cars = "", walks = "";
+  int    second = 0;
+
+  // Safety invariant, checked on every clock edge: never green for cars while pedestrians may walk.
+  always @(posedge clk) if (rst_n && car[0] && walk) $fatal(1, "green and walk together!");
+
+  always @(posedge clk) if (tick) begin   // record the lights once per second
+    cars  = {cars,  car[0] ? "G" : car[1] ? "A" : "R"};
+    walks = {walks, walk ? "W" : "."};
+    second++;
+    if (second == 2)  begin button <= 1; end      // a pedestrian presses after 2 s ...
+    if (second == 3)  begin button <= 0; end
+    if (second == 10) begin button <= 1; end      // ... and another presses while the first walks
+    if (second == 11) begin button <= 0; end
+  end
+
+  initial begin
+    #12 rst_n = 1;
+    wait (second == 30);
+    $display("second   %s", "0         1         2");
+    $display("         %s", "012345678901234567890123456789");
+    $display("cars     %s", cars);
+    $display("walk     %s", walks);
+    if (cars  != "GGGGGGAARRRRRRGGGGGGAARRRRRRGG") $fatal(1, "car lights out of sequence");
+    if (walks != "........WWWW..........WWWW....") $fatal(1, "walk light out of sequence");
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+second   0         1         2
+         012345678901234567890123456789
+cars     GGGGGGAARRRRRRGGGGGGAARRRRRRGG
+walk     ........WWWW..........WWWW....
+```
+
+Read the timeline: 6 seconds of green after reset (the first press came at second 2, so the minimum green decided), 2 of amber, 4 of walk, 2 of all-red, and then a second cycle, because the press during the walk was remembered and served after another full minimum green.
+
+<Narrator who="gideon">
+
+The first draft of this controller cleared the request on every tick spent in WALK, not just on entering it, so a press made while people were crossing was silently forgotten. The second pedestrian in the testbench exists because of that bug: the run failed until the clear was limited to the AMBER-to-WALK transition. A testbench that tests only the first press would have passed the broken design.
+
+</Narrator>
+
+<Narrator who="margaret">
+
+How big must the prescaler be? It counts from 0 to 49,999,999, and $2^{25} = 33{,}554{,}432 < 50{,}000{,}000 \le 2^{26}$, so 26 flip-flops: the `$clog2(DIV)` in the code computes exactly that. The tick then has a period of exactly 1 s if the crystal is exact; a typical ±50 ppm crystal is off by at most 4.3 s per day, harmless here, and the reason clocks that show the time of day need better references.
+
+</Narrator>
+
+</Section>
+
+<Section id="encoding" kind="human" title="State encoding">
+
+The `enum` above let the tool choose bit patterns for the four states. In general a machine with $N$ states can be encoded in several ways:
+
+| Encoding | Flip-flops | Example for 4 states | Strengths | Weaknesses |
+| --- | --- | --- | --- | --- |
+| Binary | $\lceil \log_2 N \rceil$ | 00, 01, 10, 11 | fewest flip-flops | next-state and output logic can be deep |
+| Gray | $\lceil \log_2 N \rceil$ | 00, 01, 11, 10 | one bit changes per step along a sequence: fewer glitches, less power | helps only machines that mostly step in order |
+| One-hot | $N$ | 0001, 0010, 0100, 1000 | trivial decoding (each state is one bit); shallow, fast logic | many flip-flops; $2^N - N$ illegal patterns |
+
+With 20 states, binary encoding needs 5 flip-flops and leaves 12 of its 32 patterns unused; one-hot needs 20 flip-flops and leaves $2^{20} - 20 = 1{,}048{,}556$ patterns unused. On an FPGA, flip-flops are plentiful (one beside every look-up table) and logic depth is what limits speed, so synthesis tools for FPGAs often re-encode recognised state machines as one-hot automatically. On an ASIC, where every flip-flop costs area and clock power, binary or carefully chosen encodings are more common. Yosys, for example, has a pass that extracts state machines from a design and re-encodes them.
+
+Unused patterns raise a question every safety-minded designer must answer: **what if the machine ever finds itself in one?** It cannot happen in simulation, but in silicon a voltage glitch, a radiation-induced bit flip (a real concern in space, aircraft and dense memories) or a timing violation can flip a state bit. A machine whose unused states lead nowhere may lock up. Defences include a `default` branch that returns to a safe state (and a synthesis setting that keeps it, since tools may otherwise remove unreachable logic), error-detecting encodings, and in critical systems triple modular redundancy: three copies of the state with a majority voter, the circuit you met in <LessonLink slug="logic-gates-and-boolean-algebra">Logic gates and Boolean algebra</LessonLink>. Real traffic-signal controllers go further: an independent monitoring circuit watches the outputs and forces the junction into a flashing all-red state if it ever sees conflicting greens, whatever the controller believes.
+
+</Section>
+
+<Section id="reset" kind="human" title="Reset strategies">
+
+At power-up, flip-flops wake up in arbitrary states, so every machine needs a **reset** that puts it in its initial state. There are two styles.
+
+```text
+// Synchronous reset: rst is just another input, sampled at the clock edge.
+always_ff @(posedge clk)
+  if (rst) state <= GREEN; else state <= next;
+
+// Asynchronous reset: rst_n (active low) acts immediately, clock or no clock.
+always_ff @(posedge clk or negedge rst_n)
+  if (!rst_n) state <= GREEN; else state <= next;
+```
+
+A **synchronous** reset is simple to analyse (it is ordinary logic in front of the flip-flop), but it needs a running clock and a reset pulse long enough to be seen at an edge. An **asynchronous** reset works without a clock, which matters at power-up and for putting outputs into a safe state at once, but it has a trap: if reset is *released* just before a clock edge, some flip-flops may leave reset on that edge and others on the next, and the machine starts in a state that is a mixture of both. The standard answer is **asynchronous assertion, synchronous de-assertion**: the reset enters the flip-flops asynchronously, but its release passes through a small two-flip-flop synchroniser so that every flip-flop sees it end at the same clock edge. <LessonLink slug="timing-and-clocking">Timing and clocking</LessonLink> explains why two flip-flops, and the timing rule (recovery and removal times) that asynchronous resets must meet.
+
+Not everything needs resetting. Control state (the FSM, valid flags, counters) must start in a known state; a wide data path whose contents are ignored until a valid flag is set does not, and leaving it out of reset saves wiring and lets FPGA tools pack the flip-flops more freely. FPGA vendors' design guides recommend resetting only what needs it, and FPGAs also let flip-flops take an initial value when the device is configured.
+
+</Section>
+
+<Section id="practice" kind="human" title="State machines in practice">
+
+State machines are everywhere in hardware: the controllers of serial interfaces such as the UART in <LessonLink slug="verilog-and-fpgas">the next lesson</LessonLink>, memory controllers that sequence the commands of a DRAM, cache controllers, power managers, packet parsers, and the control unit of the processor in <LessonLink slug="designing-a-processor">Designing a processor</LessonLink>. Large designs split control into several cooperating machines, because one machine with hundreds of states is impossible to verify.
+
+Verification is where most of the effort goes. Simulation with self-checking testbenches is the first line; **assertions** state rules like the crossing's "never green and walk" as part of the design, checked in every simulation; and **formal verification** tools such as the open-source [SymbiYosys](https://github.com/YosysHQ/sby) and commercial equivalents prove that an assertion holds in *every* reachable state for every input sequence, not just the ones a testbench tried. For a small controller this can be done exhaustively; for large designs, engineers prove properties of the parts. Products in functional-safety domains (vehicles under ISO 26262, industrial controls under IEC 61508) must also show how their state machines detect and recover from faults.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A latch and a flip-flop are the same thing."** A latch is level-sensitive and transparent while enabled; a flip-flop samples at an edge. Swapping one for the other changes the behaviour of any design with feedback, as the simulation showed.
+
+</Misconception>
+
+<Misconception>
+
+**"A Mealy machine is always better because it reacts a cycle sooner."** Its outputs are combinational functions of its inputs, so they can glitch and they lengthen timing paths. Many teams prefer Moore outputs, or registered Mealy outputs, for anything that leaves a block.
+
+</Misconception>
+
+<Misconception>
+
+**"To slow a state machine down, give it a slower clock."** Dividing or gating clocks with ordinary logic creates skew and glitches. Keep one clock and use a clock enable, as the crossing does with its tick.
+
+</Misconception>
+
+<Misconception>
+
+**"Unused states can't happen, so they don't matter."** They cannot happen in a correct simulation; in hardware they can, after an upset or a timing violation, and a machine that cannot leave them locks up. Decide what they do.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

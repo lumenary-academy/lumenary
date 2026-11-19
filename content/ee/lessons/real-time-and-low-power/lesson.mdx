@@ -1,0 +1,498 @@
+---
+title: Real-time and low-power design
+subtitle: Meeting every deadline, proving that you will, and making a battery last for years.
+minutes: 70
+narrators: [chloe, margaret, gideon]
+objectives:
+  - Distinguish hard, firm and soft real-time requirements, and measure and reduce interrupt latency and jitter
+  - Compare cyclic executives with a real-time operating system, and read task code for FreeRTOS and Zephyr
+  - Apply the rate-monotonic utilisation bound and exact response-time analysis, and simulate a fixed-priority scheduler
+  - Explain priority inversion, the Mars Pathfinder resets, and how priority inheritance prevents them
+  - Use a watchdog timer correctly
+  - Build an energy budget for a duty-cycled, coin-cell sensor node and judge when energy harvesting can replace the battery
+prerequisites: [microcontrollers, sensors-and-data-conversion, buses-and-interfaces]
+related: [math.comp.algorithm-design, math.analysis.sequences-series]
+references:
+  - title: Scheduling algorithms for multiprogramming in a hard-real-time environment
+    author: C. L. Liu and James W. Layland
+    year: 1973
+    url: https://doi.org/10.1145/321738.321743
+    note: The paper that proved the rate-monotonic utilisation bound and the optimality of earliest-deadline-first.
+  - title: "Priority inheritance protocols: an approach to real-time synchronization"
+    author: Lui Sha, Ragunathan Rajkumar and John P. Lehoczky
+    year: 1990
+    url: https://doi.org/10.1109/12.57058
+    note: Priority inheritance and the priority ceiling protocol, with proofs of their blocking bounds.
+  - title: FreeRTOS
+    url: https://www.freertos.org/
+    note: The most widely used open-source real-time kernel for microcontrollers (MIT licence).
+  - title: Zephyr Project documentation
+    url: https://docs.zephyrproject.org/
+    note: An open-source RTOS hosted by the Linux Foundation, with drivers, networking and Bluetooth for hundreds of boards.
+  - title: NASA Jet Propulsion Laboratory
+    url: https://www.jpl.nasa.gov/
+    note: The laboratory that built and operated Mars Pathfinder.
+---
+
+<Section id="motivation" kind="motivation" title="When late is wrong">
+
+An airbag controller samples its accelerometers thousands of times a second and must decide to fire within a few tens of milliseconds of a crash; a decision that arrives later is worse than useless. A motor controller computes a new PWM duty cycle twenty thousand times a second, and one late update makes the motor jerk. A pacemaker must never miss a beat. In these systems a correct answer delivered late is a wrong answer. They are **real-time systems**, and their designers have to *show*, not hope, that every deadline will be met.
+
+Many of the same devices also run from batteries — a wireless sensor in a field, a tracker on a pallet, a wearable — and must spend almost all their time asleep to last for years. Time and energy turn out to be two faces of one discipline: knowing exactly what your processor is doing at every moment, and why. This lesson covers both, building on <LessonLink slug="microcontrollers">Microcontrollers</LessonLink> and on the threads and locks of Lumenary CS's [operating systems](/en/cs/operating-systems/) and [concurrency](/en/cs/concurrency/) lessons.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Deadlines, latency and jitter">
+
+<Definition term="Real-time system, deadline">
+
+A **real-time system** is one whose correctness depends on when results are produced as well as on what they are. Each piece of work (a **job**) has a **release time**, when it becomes ready, and a **deadline**, by which it must finish. Requirements are **hard** when a missed deadline is a failure of the system (airbag, brakes, flight control), **firm** when a late result is worthless but occasional misses are tolerable (a dropped video frame in a vision pipeline), and **soft** when lateness merely degrades quality (a sluggish user interface).
+
+</Definition>
+
+Three measurements describe a system's timing. **Latency** is the delay from an event to the response to it. **Jitter** is the variation of latency, or of the instants at which a periodic task actually runs. The **worst-case execution time** (WCET) of a piece of code is the longest it can take on the target hardware, over all inputs and all states of caches and pipelines. Real-time engineering is about worst cases, never averages: a controller that answers in 5 µs on average but 3 ms once a day will, one day, fail.
+
+Interrupt latency on a microcontroller has several parts: the hardware's own response (12 cycles on a Cortex-M4 with zero-wait-state memory); extra cycles for flash wait states or a cache miss; the longest stretch of code that runs with interrupts disabled; and the time spent in any higher-priority interrupt that is running or arrives meanwhile. Only the first is fixed. The rest are design decisions.
+
+<Narrator who="margaret">
+
+At 48 MHz the hardware part is 12 cycles, 250 ns. If a driver somewhere disables interrupts for 200 cycles to update a shared buffer, and a higher-priority UART interrupt can take 300 cycles, the worst case is $12 + 200 + 300 = 512$ cycles, 10.7 µs — forty times the best case. The way to know is to measure: set a spare pin high at the start of the ISR, watch it against the triggering signal on an oscilloscope in persistence mode for an hour, and read the spread of the edges.
+
+</Narrator>
+
+Jitter is reduced by taking the CPU out of the timing path. A timer can trigger an ADC conversion directly in hardware and DMA can store the result, so samples are taken at exact intervals however busy the software is; a timer's PWM output updates its duty cycle at the start of the next period, not whenever the software writes it. Where software must be in the loop, give the critical interrupt the highest priority and keep every critical section short.
+
+</Section>
+
+<Section id="executives" kind="intuition" title="Cyclic executives and real-time operating systems">
+
+The simplest real-time structure is the **super-loop**: `main` calls each job in turn, forever. Its refinement is the **cyclic executive**: a timer interrupt starts a **minor frame** every few milliseconds, and a fixed table says which jobs run in each frame. With jobs needed every 10, 20 and 40 ms, a 10 ms minor frame and a 40 ms **major frame** (the table's length) work: the 10 ms job runs in every frame, the 20 ms job in frames 0 and 2, the 40 ms job in frame 1. Everything is decided before the system runs, so its timing can be checked by adding up execution times frame by frame, and for decades flight-control computers were built this way. The cost is rigidity: a long job must be split by hand to fit the frames, and every change means rebuilding the table.
+
+A **real-time operating system** (RTOS) replaces the table with a **scheduler**. Each activity is a **task** (a thread) with its own stack and a **priority**; the scheduler always runs the highest-priority task that is ready, **preempting** lower ones the moment a higher one becomes ready. Tasks block on **semaphores**, **queues** and **mutexes** instead of polling, so an idle system can sleep. An RTOS kernel for a microcontroller is small, typically a few to a few tens of kilobytes, and switching tasks takes on the order of a microsecond. Here is a 4 ms control loop and a slower telemetry task under FreeRTOS:
+
+```c
+/* FreeRTOS: a periodic control task and a background task sharing an I2C bus.
+   Not run here: needs the board. */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+static SemaphoreHandle_t bus_mutex;              /* protects the shared I2C bus */
+
+static void control_task(void *arg)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(4));   /* every 4 ms, measured from the last wake: no drift */
+        read_encoders();
+        update_motor_pwm();
+    }
+}
+
+static void telemetry_task(void *arg)
+{
+    for (;;) {
+        if (xSemaphoreTake(bus_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            read_temperature_sensor();
+            xSemaphoreGive(bus_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+int main(void)
+{
+    hardware_init();
+    bus_mutex = xSemaphoreCreateMutex();         /* FreeRTOS mutexes use priority inheritance */
+    xTaskCreate(control_task, "control", 256, NULL, 3, NULL);      /* priority 3 */
+    xTaskCreate(telemetry_task, "telemetry", 512, NULL, 1, NULL);  /* priority 1 */
+    vTaskStartScheduler();                       /* never returns */
+}
+```
+
+And the control loop as a Zephyr thread:
+
+```c
+/* Zephyr: the same control loop. Not run here: needs the board. */
+#include <zephyr/kernel.h>
+
+static void control_thread(void *p1, void *p2, void *p3)
+{
+    int64_t next = k_uptime_get();
+    for (;;) {
+        next += 4;
+        k_sleep(K_TIMEOUT_ABS_MS(next));         /* wake at absolute times, so errors do not accumulate */
+        read_encoders();
+        update_motor_pwm();
+    }
+}
+
+/* name, stack size, entry, three arguments, priority, options, start delay */
+K_THREAD_DEFINE(control_id, 1024, control_thread, NULL, NULL, NULL, 2, 0, 0);
+```
+
+<Narrator who="gideon">
+
+Read priorities with care: in FreeRTOS a *larger* number is a *higher* priority, while in Zephyr a *smaller* number is higher (and negative numbers mark cooperative threads that are never preempted by other threads). Porting code between the two without inverting the numbers produces a system that works on the bench and misses deadlines in the field.
+
+</Narrator>
+
+**FreeRTOS** (MIT licence, under Amazon's stewardship since 2017) is the most widely deployed; Espressif's ESP-IDF is built on it. **Zephyr** (Apache 2.0, a Linux Foundation project since 2016) is a fuller platform with device-tree hardware descriptions, drivers, networking and Bluetooth stacks, and is the base of Nordic's SDK. Other open-source kernels include Eclipse ThreadX, Apache NuttX and RIOT; commercial ones such as QNX, VxWorks, INTEGRITY and SAFERTOS come with the certification evidence that safety standards demand. Linux itself became much more deterministic when the long-running PREEMPT_RT patches were merged into the mainline kernel in 2024, but on a microcontroller an RTOS is still the tool.
+
+</Section>
+
+<Section id="scheduling" kind="computation" title="Rate-monotonic scheduling: proving deadlines are met">
+
+Suppose a system has $n$ periodic tasks; task $i$ runs for at most $C_i$ every $T_i$, and must finish before its next release (deadline equal to period). Its **utilisation** is $U = \sum_i C_i/T_i$, the fraction of the processor the tasks need. If $U > 1$, nothing can save it. If $U \le 1$, does a schedule exist, and which priorities find it? The classic answer is **rate-monotonic** (RM) priority assignment: the shorter the period, the higher the priority.
+
+<Theorem name="Liu and Layland's utilisation bound (1973)">
+
+For $n$ independent, preemptible periodic tasks with deadlines equal to their periods, scheduled by fixed priorities in rate-monotonic order on one processor, every deadline is met if
+
+$$
+U = \sum_{i=1}^{n} \frac{C_i}{T_i} \;\le\; n\left(2^{1/n} - 1\right).
+$$
+
+The bound decreases with $n$ towards $\ln 2 \approx 0.693$. Moreover, rate-monotonic order is optimal among fixed-priority assignments: if any fixed priorities meet every deadline, RM does too.
+
+</Theorem>
+
+The bound is **sufficient, not necessary**. Many task sets above it are schedulable; to decide exactly, compute each task's worst-case response time. The worst case for a task is the **critical instant**, when it is released together with every higher-priority task.
+
+<Theorem name="Response-time analysis">
+
+Under the same assumptions, with tasks numbered in decreasing priority, the worst-case response time $R_i$ of task $i$ is the smallest positive solution of
+
+$$
+R_i = C_i + \sum_{j < i} \left\lceil \frac{R_i}{T_j} \right\rceil C_j ,
+$$
+
+found by iterating from $R_i^{(0)} = C_i$ until the value repeats; task $i$ meets every deadline if and only if $R_i \le T_i$.
+
+</Theorem>
+
+<Proof>
+
+At a critical instant, all tasks are released at time 0. Until task $i$ completes, the processor never idles (task $i$ is ready) and runs only task $i$ or higher-priority tasks. In an interval $[0, t)$ a higher-priority task $j$ is released $\lceil t/T_j \rceil$ times and so demands at most $\lceil t/T_j\rceil C_j$, so task $i$ is finished by $t$ exactly when the total demand $C_i + \sum_{j<i}\lceil t/T_j\rceil C_j$ is at most $t$. The response time is the first $t$ at which this holds with equality. The right-hand side is a non-decreasing step function of $t$, so the iteration's values increase monotonically and either reach a fixed point, the first instant at which demand is met, or exceed $T_i$. Releasing the higher-priority tasks at any other offsets can only reduce their demand in $[0, t)$, so the critical instant is the worst case.
+
+</Proof>
+
+```python run
+import math
+
+def rm_bound(n):
+    """Liu and Layland's utilisation bound for n tasks under rate-monotonic priorities."""
+    return n * (2 ** (1 / n) - 1)
+
+print("n    bound")
+for n in (1, 2, 3, 4, 5, 10, 100):
+    print(f"{n:<4} {rm_bound(n):.4f}")
+print(f"ln 2 = {math.log(2):.4f}\n")
+
+def response_times(tasks):
+    """Exact worst-case response times for fixed priorities (tasks listed highest priority first,
+    each (name, C, T) with deadline = period). Iterate R = C + sum(ceil(R / Tj) * Cj) to a fixed point."""
+    out = []
+    for i, (name, c, t) in enumerate(tasks):
+        r = c
+        while True:
+            nxt = c + sum(math.ceil(r / tj) * cj for _, cj, tj in tasks[:i])
+            if nxt == r or nxt > t:
+                break
+            r = nxt
+        out.append((name, c, t, nxt))
+    return out
+
+task_sets = {
+    "A": [("motor", 1, 4), ("sensors", 2, 6), ("logging", 3, 12)],
+    "B": [("motor", 2, 5), ("sensors", 2, 7), ("logging", 3, 10)],
+}
+for label, tasks in task_sets.items():
+    u = sum(c / t for _, c, t in tasks)
+    print(f"task set {label}: U = {u:.3f}, bound for {len(tasks)} tasks = {rm_bound(len(tasks)):.3f}")
+    for name, c, t, r in response_times(tasks):
+        print(f"   {name:8} C={c} T={t:<3} worst response {r:>3}  {'meets' if r <= t else 'MISSES'} its deadline")
+```
+
+Task set A has $U = 0.833$, above the three-task bound of 0.780, yet response-time analysis shows every task meets its deadline: the bound was simply too cautious. Task set B, at $U = 0.986$, fails: the logging task's worst response is 11 ms against a 10 ms deadline. The simulation below runs set B through one **hyperperiod** (the least common multiple of the periods, 70 ms, after which the pattern repeats) under RM, and under **earliest deadline first** (EDF), a *dynamic*-priority policy that always runs the job whose deadline is nearest.
+
+```python run
+from math import lcm
+
+def simulate(tasks, policy, horizon):
+    """Preemptive scheduling in unit time steps. tasks: (letter, C, T) with deadline = period.
+    policy 'RM' runs the ready job with the shortest period; 'EDF' the earliest deadline."""
+    jobs, timeline, misses = [], [], []
+    for now in range(horizon):
+        for i, (letter, c, t) in enumerate(tasks):
+            if now % t == 0:
+                jobs.append({"task": i, "left": c, "deadline": now + t})
+        for job in jobs:                                   # any job past its deadline and unfinished?
+            if job["deadline"] == now and job["left"] > 0:
+                misses.append((tasks[job["task"]][0], now))
+        ready = [j for j in jobs if j["left"] > 0]
+        if not ready:
+            timeline.append(".")
+            continue
+        if policy == "RM":
+            job = min(ready, key=lambda j: (tasks[j["task"]][2], j["deadline"]))
+        else:
+            job = min(ready, key=lambda j: (j["deadline"], j["task"]))
+        job["left"] -= 1
+        timeline.append(tasks[job["task"]][0])
+    return "".join(timeline), misses
+
+tasks = [("M", 2, 5), ("S", 2, 7), ("L", 3, 10)]          # task set B: U = 0.986
+H = lcm(*(t for _, _, t in tasks))
+print(f"hyperperiod {H}; time runs left to right, one character per millisecond")
+print("     " + "".join(str(k % 10) for k in range(40)))
+for policy in ("RM", "EDF"):
+    line, misses = simulate(tasks, policy, H)
+    print(f"{policy:4} {line[:40]}")
+    print(f"     deadline misses in one hyperperiod: {misses if misses else 'none'}")
+```
+
+RM misses the logging deadlines at 10 ms and 30 ms, exactly as the analysis predicted; EDF meets them all. Liu and Layland also proved that EDF meets every deadline whenever $U \le 1$, so it can use the whole processor. Why, then, do most RTOSes use fixed priorities? Because overload is far kinder under them: when a fixed-priority system is overloaded, the *lowest*-priority tasks miss their deadlines and the important ones keep running, whereas an overloaded EDF system can miss deadlines unpredictably across all tasks. Fixed priorities are also simpler to implement and to certify.
+
+<Narrator who="chloe">
+
+Where does $\ln 2$ come from? The worst task sets for RM have periods spread so that each is a factor $2^{1/n}$ longer than the last, and each task's execution time just fills the gap the shorter tasks leave. As $n$ grows, $n(2^{1/n} - 1) = n\,(e^{(\ln 2)/n} - 1) \to \ln 2$, because $e^x - 1 \approx x$ for small $x$. And if the periods are **harmonic** — each one dividing the next, like 5, 10 and 20 ms — RM can use all of the processor, $U \le 1$, which is why designers like to choose them that way.
+
+</Narrator>
+
+</Section>
+
+<Section id="inversion" kind="examples" title="Priority inversion and the Mars Pathfinder resets">
+
+The analysis above assumed independent tasks. Real tasks share data and devices, and protect them with **mutexes**. That creates a trap. Suppose a low-priority task L locks a mutex, a high-priority task H then needs the same mutex and must wait — fine, briefly, since L will soon unlock it. But now a medium-priority task M, which does not need the mutex at all, becomes ready. It preempts L, because it has the higher priority, and L cannot finish its critical section, so H waits for M: a high-priority task is delayed by an unrelated, lower-priority one, for as long as M likes. This is **unbounded priority inversion**. The cure, **priority inheritance**, is simple: while a task holds a mutex that a higher-priority task is waiting for, it runs at that waiting task's priority, so M can no longer preempt it.
+
+<Figure caption="Priority inversion. Top: without priority inheritance, the high-priority task H blocks on a mutex held by L (gold marks L holding the mutex), and the medium-priority task M preempts L for ten units, so H finishes at time 18. Bottom: with inheritance, L runs at H's priority until it releases the mutex, and H finishes at time 8.">
+<svg viewBox="0 0 500 215" role="img" aria-label="Two Gantt charts with rows for tasks H, M and L over time 0 to 18. In the top chart, L runs from 0 to 3, holding the mutex from 1, H runs at 3 and then blocks from 4 to 16 while M runs from 4 to 14, L finishes its critical section at 14 to 16, and H runs at 16 to 18. In the bottom chart, after H blocks at 4, L finishes its critical section at 4 to 6, H runs at 6 to 8, and M runs from 8 to 18.">
+  <rect x="330" y="10" width="14" height="10" fill="var(--gold)" />
+  <text x="350" y="19" fill="currentColor" fontFamily="sans-serif" fontSize="10">L holds the mutex</text>
+  <text x="80" y="20" fill="currentColor" fontFamily="sans-serif" fontSize="11">priority inheritance off</text>
+  <text x="70" y="39" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">H</text>
+  <line x1="80" y1="42" x2="476" y2="42" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <text x="70" y="59" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">M</text>
+  <line x1="80" y1="62" x2="476" y2="62" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <text x="70" y="79" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">L</text>
+  <line x1="80" y1="82" x2="476" y2="82" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <rect x="80" y="68" width="22" height="14" fill="currentColor" fillOpacity="0.45" />
+  <rect x="102" y="68" width="44" height="14" fill="var(--gold)" />
+  <rect x="146" y="28" width="22" height="14" fill="var(--sky)" />
+  <rect x="168" y="48" width="220" height="14" fill="currentColor" fillOpacity="0.45" />
+  <rect x="388" y="68" width="44" height="14" fill="var(--gold)" />
+  <rect x="432" y="28" width="44" height="14" fill="var(--sky)" />
+  <rect x="168" y="28" width="264" height="14" fill="none" stroke="var(--sky)" strokeWidth="1.5" strokeDasharray="4 3" />
+  <text x="300" y="38" fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">blocked</text>
+  <text x="80" y="120" fill="currentColor" fontFamily="sans-serif" fontSize="11">priority inheritance on</text>
+  <text x="70" y="139" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">H</text>
+  <line x1="80" y1="142" x2="476" y2="142" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <text x="70" y="159" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">M</text>
+  <line x1="80" y1="162" x2="476" y2="162" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <text x="70" y="179" fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">L</text>
+  <line x1="80" y1="182" x2="476" y2="182" stroke="currentColor" strokeWidth="0.5" opacity="0.5" />
+  <rect x="80" y="168" width="22" height="14" fill="currentColor" fillOpacity="0.45" />
+  <rect x="102" y="168" width="44" height="14" fill="var(--gold)" />
+  <rect x="146" y="128" width="22" height="14" fill="var(--sky)" />
+  <rect x="168" y="168" width="44" height="14" fill="var(--gold)" />
+  <rect x="212" y="128" width="44" height="14" fill="var(--sky)" />
+  <rect x="256" y="148" width="220" height="14" fill="currentColor" fillOpacity="0.45" />
+  <rect x="168" y="128" width="44" height="14" fill="none" stroke="var(--sky)" strokeWidth="1.5" strokeDasharray="4 3" />
+  <text x="190" y="138" fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">blocked</text>
+  <line x1="80" y1="196" x2="476" y2="196" stroke="currentColor" strokeWidth="1" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="80" y="209">0</text><text x="124" y="209">2</text><text x="168" y="209">4</text><text x="212" y="209">6</text><text x="256" y="209">8</text><text x="300" y="209">10</text><text x="344" y="209">12</text><text x="388" y="209">14</text><text x="432" y="209">16</text><text x="476" y="209">18</text>
+  </g>
+</svg>
+</Figure>
+
+```python run
+def run(tasks, inheritance, horizon=30):
+    """Fixed-priority preemptive scheduling with one mutex, in unit time steps.
+    Each task: release time, base priority (higher runs first) and a script of steps:
+    'w' = one unit of work, 'L' = lock the mutex, 'U' = unlock it."""
+    state = {name: {"pc": 0, "done": None} for name in tasks}
+    owner, timeline = None, []
+    for now in range(horizon):
+        def priority(name):
+            p = tasks[name]["prio"]
+            if inheritance and name == owner:              # the owner inherits the priority of waiters
+                waiting = [n for n in tasks if blocked(n)]
+                p = max([p] + [tasks[n]["prio"] for n in waiting])
+            return p
+        def blocked(name):
+            s = state[name]
+            return s["done"] is None and tasks[name]["script"][s["pc"]] == "L" and owner not in (None, name)
+        ready = [n for n in tasks if tasks[n]["release"] <= now and state[n]["done"] is None and not blocked(n)]
+        if not ready:
+            timeline.append(".")
+            continue
+        name = max(ready, key=priority)
+        s, script = state[name], tasks[name]["script"]
+        while script[s["pc"]] in "LU":                     # locking and unlocking take no time here
+            owner = name if script[s["pc"]] == "L" else None
+            s["pc"] += 1
+            if s["pc"] < len(script) and script[s["pc"]] == "L" and owner not in (None, name):
+                break
+        s["pc"] += 1                                        # one unit of work
+        timeline.append(name)
+        while s["pc"] < len(script) and script[s["pc"]] == "U":
+            owner = None
+            s["pc"] += 1
+        if s["pc"] == len(script):
+            s["done"] = now + 1
+    return "".join(timeline), {n: state[n]["done"] for n in tasks}
+
+tasks = {
+    "H": {"release": 3, "prio": 3, "script": "wLwwU"},       # high: a little work, then needs the mutex
+    "M": {"release": 4, "prio": 2, "script": "w" * 10},      # medium: long, never touches the mutex
+    "L": {"release": 0, "prio": 1, "script": "wLwwwwU"},     # low: holds the mutex for 4 units
+}
+print(" " * 16 + "".join(str(k % 10) for k in range(22)))
+for inheritance in (False, True):
+    line, done = run(tasks, inheritance, horizon=22)
+    label = "inheritance on" if inheritance else "inheritance off"
+    print(f"{label:16}{line}   H released at 3, finishes at {done['H']:2}: response time {done['H'] - 3}")
+```
+
+Without inheritance, H, released at time 3, finishes at time 18; with it, at time 8. The ten units of inversion are exactly M's run, and if M ran longer, so would the inversion. The **priority ceiling protocol** goes further: each mutex has a ceiling, the priority of the highest task that ever uses it, and a task that locks it runs at that ceiling at once, which bounds blocking to at most one critical section and also prevents deadlock between mutexes.
+
+**What happened on Mars.** NASA's Mars Pathfinder landed on 4 July 1997 and, a few days into the mission, its computer began resetting itself, losing time and data. Its software ran on the VxWorks RTOS. A high-priority task managed an "information bus", a shared memory area protected by a mutex; a low-priority meteorological task occasionally took that mutex to publish its data; and medium-priority communications tasks ran for long stretches. When the communications work preempted the meteorological task while it held the mutex, the bus task was blocked past its deadline; a check that the bus task had completed its cycle noticed, and reset the whole system, exactly as designed for a "this should never happen" case. Engineers at JPL reproduced the fault on an identical spare in their laboratory, recognised priority inversion, and found that the mutex's priority-inheritance option had been left off. They uploaded a small change that turned it on, and the resets stopped. The story became famous through accounts by JPL's software lead and by the RTOS's makers in late 1997, and its lessons are still taught: shared resources break the independence that scheduling analysis assumes; turn on priority inheritance (or use ceilings); keep the tracing and debugging tools that let you diagnose a system you cannot touch; and design the failure response, here a reset that saved the mission, as carefully as the normal path.
+
+</Section>
+
+<Section id="watchdogs" kind="human" title="Watchdogs: recovering from the unexpected">
+
+A **watchdog timer** is a hardware counter, usually with its own oscillator, that resets the microcontroller if the software does not "kick" (or "feed") it within a set time. It turns a hung program — an infinite loop, a deadlock, a corrupted pointer — into a reset and a fresh start, which for an unattended device is far better than a silent hang. A **windowed** watchdog also resets the chip if it is kicked *too early*, which catches a program racing round a broken loop. After any reset, the firmware should read the chip's **reset-cause register**, log watchdog resets, and count them: a device that resets every few hours has a bug, even if users never notice.
+
+<Narrator who="gideon">
+
+A watchdog is only as good as the condition under which it is kicked. Kicking it from a timer interrupt proves only that the timer interrupt runs, which it will happily keep doing while every task is deadlocked. Kick it from one place in the main loop or a supervisor task, and only after every critical task has checked in since the last kick, so that the kick certifies the health of the whole system.
+
+</Narrator>
+
+Watchdogs work alongside a **brown-out detector**, which holds the chip in reset while the supply is too low for reliable operation, and, in safety-related products, with the systematic methods of standards such as IEC 61508 (general functional safety), ISO 26262 (road vehicles) and DO-178C (airborne software), which require the timing analysis of this lesson to be argued and documented, not assumed.
+
+</Section>
+
+<Section id="low-power" kind="examples" title="Low power: sleeping well">
+
+The dynamic power of CMOS logic is about $P = \alpha C V^2 f$: activity factor times switched capacitance times the square of the supply voltage times the clock frequency. Add **leakage**, which flows whenever the transistors are powered, and the strategy follows. Lower the voltage where the chip allows it (the square makes it the strongest lever); stop clocks that are not needed (**clock gating**); and above all do the work quickly and go to sleep, because asleep the chip can switch off its clocks and most of its power domains. Microcontrollers offer a ladder of **sleep modes**, under names that differ by vendor:
+
+| Mode (typical names) | What stops | Typical current | Wake-up |
+| --- | --- | --- | --- |
+| Run | nothing | tens to hundreds of µA per MHz | — |
+| Sleep, idle | the core's clock; peripherals run | about half of run | any interrupt, within a few cycles |
+| Stop, deep sleep | most clocks and regulators; RAM kept; RTC runs | about 1–10 µA | RTC alarm, pin, some peripherals; µs to tens of µs |
+| Standby, shutdown, hibernate | nearly everything; RAM lost | 0.1–1 µA | pin or RTC; the chip restarts from reset |
+
+A wireless sensor node is a **duty-cycled** system: it sleeps, wakes on a real-time-clock alarm, measures, sends a packet, and sleeps again. Its average current is dominated either by the brief, intense wake-ups or by the long, quiet sleep, and an **energy budget** says which.
+
+<Figure caption="The current drawn by a duty-cycled sensor node over one cycle (not to scale): a long sleep at a couple of microamps, then a wake-up of about 10 ms with a measurement, some processing and a short radio transmission at several milliamps, then sleep again until the next alarm.">
+<svg viewBox="0 0 500 190" role="img" aria-label="A current-versus-time sketch. A low flat line marks sleep current. At regular intervals a narrow pulse rises in steps: a short wake-up step, a wider measurement step, a short processing step and a tall radio step, then drops back to the sleep level. A break in the time axis indicates about sixty seconds between pulses.">
+  <g stroke="currentColor" strokeWidth="1" fill="none">
+    <line x1="50" y1="20" x2="50" y2="160" />
+    <line x1="50" y1="160" x2="480" y2="160" />
+  </g>
+  <path d="M 50 150 L 110 150 L 110 135 L 113 135 L 113 110 L 163 110 L 163 95 L 173 95 L 173 55 L 203 55 L 203 150 L 290 150 M 310 150 L 380 150 L 380 135 L 383 135 L 383 110 L 433 110 L 433 95 L 443 95 L 443 55 L 473 55 L 473 150 L 480 150" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="292" y1="157" x2="298" y2="143" />
+    <line x1="302" y1="157" x2="308" y2="143" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="138" y="104">measure</text>
+    <text x="188" y="49">radio</text>
+    <text x="168" y="89" fontSize="8">process</text>
+    <text x="245" y="143">sleep, ~2 µA</text>
+    <text x="300" y="176">~60 s</text>
+    <text x="465" y="176">time →</text>
+  </g>
+  <text x="18" y="90" fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle" transform="rotate(-90 18 90)">current</text>
+</svg>
+</Figure>
+
+```python run
+CAPACITY_MAH = 220          # a CR2032 lithium coin cell's nominal capacity at a light load
+DERATING = 0.8              # keep 20% back for pulse loads, cold, ageing and tolerance
+SELF_DISCHARGE = 0.01       # about 1% of capacity lost per year on the shelf
+
+# One wake-up of the sensor node: (name, current in amps, duration in seconds)
+WAKE = [
+    ("wake, start clocks",   1.5e-3, 0.5e-3),
+    ("measure (sensor+ADC)", 2.0e-3, 5.0e-3),
+    ("process",              3.0e-3, 1.0e-3),
+    ("radio: send a packet", 6.0e-3, 3.0e-3),
+]
+SLEEP = 2.0e-6              # deep sleep with the real-time clock running and RAM kept
+
+def budget(period, verbose=False):
+    """Average current (A) for one wake-up every `period` seconds, and battery life in years."""
+    charge_awake = sum(i * t for _, i, t in WAKE)               # coulombs per wake-up
+    t_awake = sum(t for _, _, t in WAKE)
+    charge_sleep = SLEEP * (period - t_awake)
+    avg = (charge_awake + charge_sleep) / period
+    usable = CAPACITY_MAH * 3.6 * DERATING                      # mAh -> coulombs (1 mAh = 3.6 C)
+    leak = CAPACITY_MAH * 3.6 * SELF_DISCHARGE / (365.25 * 86400)   # self-discharge as a current
+    years = usable / (avg + leak) / (365.25 * 86400)
+    if verbose:
+        for name, i, t in WAKE:
+            print(f"  {name:22} {i * 1e3:4.1f} mA for {t * 1e3:4.1f} ms = {i * t * 1e6:5.1f} uC")
+        print(f"  {'sleep':22} {SLEEP * 1e6:4.1f} uA for {period - t_awake:6.3f} s = {charge_sleep * 1e6:5.1f} uC")
+        print(f"  average current {avg * 1e6:.2f} uA; sleep is {100 * charge_sleep / (charge_awake + charge_sleep):.0f}% of the charge")
+    return avg, years
+
+print("one wake-up every 60 s:")
+avg, years = budget(60, verbose=True)
+print(f"  battery life about {years:.1f} years\n")
+print("period     average current   battery life")
+for period in (1, 10, 60, 300, 3600):
+    avg, years = budget(period)
+    print(f"{period:>6} s {avg * 1e6:14.2f} uA {years:12.2f} years")
+```
+
+With one reading a minute, the 9.5 ms awake cost 31.8 µC, but 60 seconds of sleep at 2 µA cost 120 µC: sleep is 79% of the budget. Halving the sleep current would do far more than halving the radio's energy. Reporting every second instead shortens the life from about seven years to seven months; reporting once an hour gains little over once every five minutes, because by then the sleep floor is everything. Two cautions temper the arithmetic. A coin cell's rated capacity assumes a small, steady drain; its internal resistance, tens of ohms and rising as it ages or gets cold, makes milliamp pulses sag its voltage, so radio designs put a buffer capacitor of tens to hundreds of microfarads across the cell. And a calculation that says seven years should be read as "several years, if nothing else goes wrong": shelf life, temperature and a single firmware bug that keeps the radio awake all bear on it. Measuring the real current profile with a source-measure unit or an energy-measurement probe is part of every low-power project.
+
+<Note>
+
+Coin cells are safe to use in projects, but treat them with respect. Keep new and used cells away from young children: a swallowed lithium coin cell can cause severe internal burns within hours, and needs emergency medical help at once. Never try to recharge a cell that is not designed for it, never short-circuit one, and recycle used cells.
+
+</Note>
+
+**Energy harvesting** asks whether the environment can pay for the budget. The node above draws about 2.5 µA at 3 V, under 8 µW on average. A small indoor solar cell under office lighting yields of the order of tens of microwatts per square centimetre, so a few square centimetres, a storage capacitor or small rechargeable cell, and a power-management chip that tracks the cell's best operating point could run it indefinitely; the batteryless wireless light switch, powered by the energy of pressing it, has been a commercial product for two decades. Thermoelectric generators on warm pipes, vibration harvesters on machines and rectified radio waves are other sources. The design then becomes **energy-aware**: measure the stored energy, and report less often when it runs low.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Real-time means fast."** Real-time means *predictable*: a deadline of one second is real-time if it must never be missed. A fast system with rare long stalls is not real-time; a slow one with a proven bound is.
+
+</Misconception>
+
+<Misconception>
+
+**"Using an RTOS makes a system real-time."** An RTOS provides priorities and preemption. Whether deadlines are met depends on the tasks, their execution times, their priorities and their shared resources, which still have to be analysed and measured.
+
+</Misconception>
+
+<Misconception>
+
+**"Above the Liu–Layland bound, the tasks will miss deadlines."** The bound is sufficient, not necessary. Task set A above has $U = 0.833$ and meets every deadline; only an exact test such as response-time analysis decides.
+
+</Misconception>
+
+<Misconception>
+
+**"To save energy, run the processor as slowly as possible."** Leakage and the always-on parts of the chip draw power for as long as it is awake, so finishing quickly at a higher clock and then sleeping deeply ("race to sleep") often uses less energy than crawling along at a low one.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

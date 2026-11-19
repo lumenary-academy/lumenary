@@ -1,0 +1,377 @@
+---
+title: Proof of stake and BFT finality
+subtitle: Replacing work with deposits that can be destroyed — validators and slashing, the attacks unique to stake, classical BFT consensus, and how Ethereum combines a fork-choice rule with two-thirds-majority finality.
+minutes: 80
+objectives:
+  - Explain how stake provides Sybil resistance, and describe validators, attestations, rewards, penalties and slashing
+  - Explain the nothing-at-stake and long-range problems, and why proof of stake needs weak subjectivity
+  - Recall PBFT, Tendermint/CometBFT and HotStuff, and prove that two-thirds quorums give safety with fewer than a third faulty
+  - Describe Gasper — LMD-GHOST fork choice plus Casper FFG finality — and simulate justification, finalization and a slashable double vote
+  - Contrast probabilistic and economic finality, and explain the inactivity leak
+  - Assess liquid staking, centralisation and the research directions of 2026, such as single-slot finality
+narrators: [chloe, margaret, gideon]
+prerequisites: [why-blockchains, signatures-and-keys, proof-of-work]
+related: [math.prob.probability-theory, math.discrete.graph-basics, math.discrete.combinatorics]
+references:
+  - title: "Casper the Friendly Finality Gadget"
+    author: Vitalik Buterin and Virgil Griffith
+    year: 2017
+    url: https://arxiv.org/abs/1710.09437
+  - title: "Combining GHOST and Casper"
+    author: Vitalik Buterin et al.
+    year: 2020
+    url: https://arxiv.org/abs/2003.03052
+    note: The Gasper paper, the basis of Ethereum's consensus.
+  - title: "Practical Byzantine Fault Tolerance"
+    author: Miguel Castro and Barbara Liskov
+    year: 1999
+    url: https://pmg.csail.mit.edu/papers/osdi99.pdf
+  - title: "The latest gossip on BFT consensus"
+    author: Ethan Buchman, Jae Kwon and Zarko Milosevic
+    year: 2018
+    url: https://arxiv.org/abs/1807.04938
+    note: The Tendermint algorithm, now maintained as CometBFT.
+  - title: "HotStuff: BFT Consensus in the Lens of Blockchain"
+    author: Maofan Yin, Dahlia Malkhi, Michael K. Reiter, Guy Golan Gueta and Ittai Abraham
+    year: 2018
+    url: https://arxiv.org/abs/1803.05069
+  - title: "Ouroboros: A Provably Secure Proof-of-Stake Blockchain Protocol"
+    author: Aggelos Kiayias, Alexander Russell, Bernardo David and Roman Oliynykov
+    year: 2017
+    url: https://eprint.iacr.org/2016/889
+    note: Cardano's protocol, a longest-chain design with probabilistic finality.
+  - title: "Ethereum consensus specifications"
+    url: https://github.com/ethereum/consensus-specs
+    note: The executable specification of the beacon chain, with every constant used in this lesson.
+  - title: "Ethereum: proof of stake"
+    url: https://ethereum.org/en/developers/docs/consensus-mechanisms/pos/
+    note: Includes pages on Gasper, attestations, rewards and penalties, and weak subjectivity.
+  - title: "Ethereum roadmap: single-slot finality"
+    url: https://ethereum.org/en/roadmap/single-slot-finality/
+  - title: "CometBFT documentation"
+    url: https://docs.cometbft.com/
+  - title: "EIP-7251: Increase the MAX_EFFECTIVE_BALANCE"
+    url: https://eips.ethereum.org/EIPS/eip-7251
+---
+
+<Section id="motivation" kind="motivation" title="From burning electricity to risking deposits">
+
+<LessonLink slug="proof-of-work">Proof of work</LessonLink> made votes expensive by tying them to computation. On 15 September 2022, in an upgrade called **the Merge**, Ethereum stopped doing that: blocks have been produced since then by **validators** who have locked up ether as a deposit, and its electricity use fell by more than 99.9%. Many other chains — Cardano, Cosmos, Polkadot, Solana, Tezos, Algorand — were designed around stake from the start.
+
+Proof of stake replaces an *external* cost, electricity, with an *internal* one: capital that the protocol itself can **destroy** if its owner misbehaves. That changes the security argument completely. It also opens the door to something proof of work cannot offer: borrowing forty years of research on Byzantine fault-tolerant (BFT) consensus to make blocks **final** — not merely improbable to reverse, but impossible to reverse unless a third of all stake is willingly destroyed.
+
+This lesson builds that argument: the mechanics of staking, the attacks that are new with stake, the BFT protocols it borrows, and Ethereum's combination of a fork-choice rule with a finality gadget, which you will simulate. It ends with the concerns about concentration and the research still under way in 2026.
+
+</Section>
+
+<Section id="validators" kind="definitions" title="Validators, attestations and slashing">
+
+Stake answers the Sybil problem from <LessonLink slug="why-blockchains">the first lesson</LessonLink> directly: votes are weighted by the amount deposited, so splitting a deposit across a thousand identities gains nothing.
+
+<Definition term="Validator, attestation, slashing">
+
+A **validator** is a signing key registered with a deposit (its **stake**). Time is divided into **slots**; in each slot one validator, chosen at random weighted by stake, **proposes** a block, and others **attest**: they sign a vote saying which block they consider the head of the chain and, for finality, which checkpoints they link. Validators that do their duties earn **rewards**; ones that are offline pay small **penalties**. A validator that signs two contradictory messages — two different blocks for the same slot, or two votes that break the rules below — is **slashed**: part or all of its stake is destroyed and it is forcibly removed.
+
+</Definition>
+
+On Ethereum (as of 2026): a slot is 12 seconds; 32 slots form an **epoch** of 6.4 minutes; every active validator attests once per epoch, in committees spread across its slots; a validator needs at least 32 ETH, and since the Pectra upgrade of May 2025 one validator may hold up to 2,048 ETH ([EIP-7251](https://eips.ethereum.org/EIPS/eip-7251)). Votes are BLS signatures, aggregated so that hundreds of thousands of them can be checked cheaply (<LessonLink slug="signatures-and-keys">Signatures and keys</LessonLink>). Withdrawing stake takes time: exits pass through a queue, and a slashed validator's funds are held for about 36 days, so that misbehaviour discovered later can still be punished.
+
+Slashing is designed around **correlation**. An isolated slashing, which is almost always an operator's mistake — the same key accidentally running on two machines — costs a small amount. But an extra penalty grows with the total stake slashed in the surrounding weeks: since 2022 it is three times the slashed fraction, so if a third of all stake is slashed together, it loses everything. Honest accidents are cheap; coordinated attacks are ruinous.
+
+<Narrator who="gideon">
+
+Slashing punishes only what can be *proved* from signed messages: two conflicting signatures by one key. It cannot punish a validator for being offline (that is the job of ordinary penalties), for censoring transactions, or for colluding off-chain without signing anything contradictory. Much of the remaining design work in proof of stake is about those unprovable behaviours.
+
+</Narrator>
+
+</Section>
+
+<Section id="new-problems" kind="intuition" title="Nothing at stake, long-range attacks and weak subjectivity">
+
+Stake removes the physical cost of producing blocks, and three problems follow.
+
+**Nothing at stake.** In proof of work, mining on two branches of a fork splits your hash power, so you pick one. In a naive proof-of-stake protocol, signing blocks on *every* branch costs nothing and guarantees you a reward on whichever wins. If everyone does that, forks never resolve, and an attacker's branch gets free support. Slashing is the answer: signing on two conflicting branches is exactly the kind of contradiction that can be proved and punished.
+
+**Long-range attacks.** Slashing works only while the stake is still deposited. Once validators have withdrawn, their old keys control nothing at stake — but those keys could still sign an alternative history starting from long ago, when they held a majority. An attacker could buy such old keys cheaply and build a fake chain from years back that looks valid to a newcomer. In proof of work, a fake history would need all its work redone; in proof of stake, signatures are cheap.
+
+**Weak subjectivity.** The defence is to accept that a node joining the network, or one that has been offline for a long time, cannot pick the right chain from genesis by rules alone. It needs a recent **checkpoint** — a block hash it trusts, obtained from a friend, a block explorer, a client release or several independent sources — no older than the **weak subjectivity period**, the time it takes for enough validators to withdraw that old keys could form a supermajority (on Ethereum, weeks to months depending on the validator count). Within that window, nodes that stay online make every decision objectively. Proof-of-work advocates count this as a genuine weakening of trust assumptions; proof-of-stake advocates answer that users already trust the source of their software, and that proof of work has its own social layer, as the 2010 and 2013 Bitcoin incidents showed.
+
+</Section>
+
+<Section id="bft" kind="human" title="BFT consensus, recalled">
+
+[Replication and consensus](/en/cs/replication-and-consensus/) taught Raft and Paxos, which tolerate crashes. Byzantine fault-tolerant protocols tolerate $f$ arbitrary faults among $n \ge 3f + 1$ participants — with stake, among weights where the faulty share is below a third. They all rest on one counting argument.
+
+<Theorem name="Quorum intersection">
+
+If every decision requires votes from validators holding at least two-thirds of the stake, then any two decisions share validators holding more than one-third of the stake. Consequently, if less than one-third of the stake is Byzantine, any two quorums share at least one honest validator.
+
+</Theorem>
+
+<Proof>
+
+Let the total stake be 1, and let two quorums $Q_1$ and $Q_2$ each hold at least $2/3$. Then $\mathrm{stake}(Q_1 \cap Q_2) \ge \mathrm{stake}(Q_1) + \mathrm{stake}(Q_2) - \mathrm{stake}(Q_1 \cup Q_2) \ge 2/3 + 2/3 - 1 = 1/3$. With exact two-thirds quorums the overlap can be exactly one-third, so protocols require strictly more than two-thirds, or Byzantine stake strictly less than one-third; then the overlap exceeds the Byzantine stake and contains an honest validator. An honest validator never votes for two conflicting decisions, so two conflicting decisions cannot both gather quorums.
+
+</Proof>
+
+Three protocols to know:
+
+- **PBFT** (Castro and Liskov, 1999) made BFT practical: a leader proposes, replicas exchange *prepare* and then *commit* messages, and a value is decided once a replica sees $2f+1$ commits. A **view change** replaces a faulty leader. All-to-all messages cost $O(n^2)$ per decision, which limits it to tens of replicas.
+- **Tendermint**, now maintained as **CometBFT**, adapted this to blockchains in 2016–2018: rounds of propose, *prevote* and *precommit*, with validators **locking** on a block once they see two-thirds of prevotes for it. A block is final as soon as it is committed, and the Cosmos ecosystem's chains run it. It chooses safety over liveness: if more than a third of the stake is offline, the chain halts rather than risk conflicting decisions.
+- **HotStuff** (Yin, Malkhi, Reiter, Gueta and Abraham, 2018–2019) makes leader replacement cheap and message complexity linear, by having the leader collect votes into compact certificates and by pipelining phases across consecutive blocks. Its descendants run Aptos and other chains.
+
+In all three, safety holds in an asynchronous network and liveness needs periods of good behaviour, the same split as Raft and Paxos.
+
+</Section>
+
+<Section id="gasper" kind="definitions" title="Gasper: LMD-GHOST plus Casper FFG">
+
+Classical BFT needs every validator to vote on every block, and Ethereum has hundreds of thousands of validators. Its consensus, **Gasper**, therefore separates two jobs.
+
+**Fork choice: LMD-GHOST.** To decide which block is the head right now, a node starts from the latest justified checkpoint and walks down the block tree. At each fork it moves into the child whose subtree carries the most stake, counting only each validator's **latest message** (LMD); GHOST stands for *greedy heaviest-observed subtree*. Like Nakamoto's rule, this keeps the chain growing even when finality stalls, and reorganisations near the tip are possible.
+
+**Finality: Casper FFG.** The first block of each epoch is a **checkpoint**. Every attestation also contains a vote from a *source* checkpoint to a later *target* checkpoint.
+
+<Definition term="Justification and finalization">
+
+A **supermajority link** $A \to B$ is a set of votes from source $A$ to target $B$ by validators holding at least two-thirds of the stake. The genesis checkpoint is **justified**. A checkpoint $B$ is justified if there is a supermajority link $A \to B$ from a justified checkpoint $A$ that is an ancestor of $B$. A justified checkpoint $A$ is **finalized** if there is a supermajority link $A \to B$ in which $B$ is its child checkpoint in the very next epoch.
+
+</Definition>
+
+<Definition term="Slashing conditions">
+
+A validator must never sign two distinct votes $(s_1 \to t_1)$ and $(s_2 \to t_2)$ such that either
+1. $\mathrm{epoch}(t_1) = \mathrm{epoch}(t_2)$ — a **double vote**; or
+2. $\mathrm{epoch}(s_1) < \mathrm{epoch}(s_2) < \mathrm{epoch}(t_2) < \mathrm{epoch}(t_1)$ — a **surround vote**.
+
+</Definition>
+
+<Theorem name="Accountable safety (Buterin and Griffith, 2017)">
+
+If two conflicting checkpoints (neither an ancestor of the other) are both finalized, then validators holding at least one-third of the stake have violated a slashing condition.
+
+</Theorem>
+
+<Proof>
+
+(Sketch.) Finalizing a checkpoint takes two supermajority links. If the conflicting finalized checkpoints are in the same epoch, the two links that justified them are votes for targets of the same epoch, and by quorum intersection validators with at least one-third of the stake signed both: a double vote. If they are in different epochs, follow the chain of supermajority links that justified the later one back towards genesis; at some point one link must jump over the earlier checkpoint's finalizing link, $A \to A'$ with consecutive epochs, either landing in the same epoch as one of its ends (a double vote) or surrounding it (a surround vote). Again quorum intersection gives at least one-third of the stake.
+
+</Proof>
+
+This is **economic finality**: a finalized checkpoint can be reverted only if at least a third of all stake is provably destroyed. Under normal conditions a checkpoint is justified one epoch after it appears and finalized one epoch later, so an Ethereum block is final after about two epochs, roughly 13 minutes.
+
+<Figure caption="Casper FFG in normal operation. Each epoch's first block is a checkpoint. A supermajority link (votes from validators holding at least two-thirds of the stake) from a justified checkpoint justifies its target, and when the target is the very next checkpoint, the source becomes finalized. Here checkpoints of epochs 0 to 2 are finalized, epoch 3 is justified, and epoch 4 is still collecting votes.">
+<svg viewBox="0 0 560 190" role="img" aria-label="Five checkpoints in a row, labelled epoch 0 to epoch 4, joined by a line of blocks. Curved arrows labelled two-thirds link each checkpoint to the next, from epoch 0 to epoch 3. Checkpoints for epochs 0, 1 and 2 are filled and labelled finalized; epoch 3 is outlined with a thick border and labelled justified; epoch 4 is dashed and labelled pending.">
+  <defs>
+    <marker id="pos-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <line x1="40" y1="120" x2="520" y2="120" stroke="currentColor" strokeWidth="1.2" />
+  <g fill="currentColor" fillOpacity="0.5">
+    <circle cx="65" cy="120" r="3" /><circle cx="90" cy="120" r="3" /><circle cx="115" cy="120" r="3" />
+    <circle cx="175" cy="120" r="3" /><circle cx="200" cy="120" r="3" /><circle cx="225" cy="120" r="3" />
+    <circle cx="285" cy="120" r="3" /><circle cx="310" cy="120" r="3" /><circle cx="335" cy="120" r="3" />
+    <circle cx="395" cy="120" r="3" /><circle cx="420" cy="120" r="3" /><circle cx="445" cy="120" r="3" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5">
+    <rect x="25" y="105" width="30" height="30" rx="4" fill="currentColor" fillOpacity="0.35" />
+    <rect x="135" y="105" width="30" height="30" rx="4" fill="currentColor" fillOpacity="0.35" />
+    <rect x="245" y="105" width="30" height="30" rx="4" fill="currentColor" fillOpacity="0.35" />
+    <rect x="355" y="105" width="30" height="30" rx="4" fill="none" strokeWidth="3" />
+    <rect x="465" y="105" width="30" height="30" rx="4" fill="none" strokeDasharray="4 3" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#pos-arrow)">
+    <path d="M 40 103 Q 95 50 148 103" />
+    <path d="M 150 103 Q 205 50 258 103" />
+    <path d="M 260 103 Q 315 50 368 103" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="95" y="62">≥ 2/3</text>
+    <text x="205" y="62">≥ 2/3</text>
+    <text x="315" y="62">≥ 2/3</text>
+    <text x="40" y="155">epoch 0</text>
+    <text x="150" y="155">epoch 1</text>
+    <text x="260" y="155">epoch 2</text>
+    <text x="370" y="155">epoch 3</text>
+    <text x="480" y="155">epoch 4</text>
+    <text x="40" y="175" fontSize="11">finalized</text>
+    <text x="150" y="175" fontSize="11">finalized</text>
+    <text x="260" y="175" fontSize="11">finalized</text>
+    <text x="370" y="175" fontSize="11">justified</text>
+    <text x="480" y="175" fontSize="11">pending</text>
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="simulation" kind="computation" title="Simulating finality and a slashable double vote">
+
+The program below implements the definitions above for a dozen validators with equal stakes. Everyone first agrees on two epochs, then the network splits into two halves that see different blocks in epochs 3 and 4. In the first scenario a third of the validators are Byzantine and vote on *both* sides; in the second, a quarter are.
+
+```python run
+from fractions import Fraction
+
+class CasperFFG:
+    """A toy of Casper FFG: stake-weighted votes between checkpoints, justification, finality, slashing."""
+    def __init__(self, stakes):
+        self.stakes, self.total = stakes, sum(stakes.values())
+        self.parent, self.epoch = {"G": None}, {"G": 0}      # checkpoint tree; G is genesis
+        self.justified, self.finalized = {"G"}, {"G"}
+        self.votes = {v: [] for v in stakes}                 # every vote each validator has signed
+        self.link_voters = {}                                # (source, target) -> set of validators
+        self.slashable = set()
+
+    def checkpoint(self, name, parent):
+        self.parent[name], self.epoch[name] = parent, self.epoch[parent] + 1
+
+    def is_ancestor(self, a, b):
+        while b is not None and b != a:
+            b = self.parent[b]
+        return b == a
+
+    def vote(self, v, source, target):
+        s, t = self.epoch[source], self.epoch[target]
+        for (src2, tgt2) in self.votes[v]:
+            s2, t2 = self.epoch[src2], self.epoch[tgt2]
+            if (t == t2 and target != tgt2) or s < s2 < t2 < t or s2 < s < t < t2:
+                self.slashable.add(v)                        # double vote or surround vote
+        self.votes[v].append((source, target))
+        if source not in self.justified or not self.is_ancestor(source, target):
+            return                                           # only links from a justified ancestor count
+        voters = self.link_voters.setdefault((source, target), set())
+        voters.add(v)
+        if 3 * sum(self.stakes[x] for x in voters) >= 2 * self.total:
+            self.justified.add(target)                       # a supermajority link justifies the target
+            if t == s + 1:
+                self.finalized.add(source)                   # ... and finalizes a source one epoch back
+
+    def report(self, label):
+        final = sorted(self.finalized, key=lambda c: (self.epoch[c], c))
+        conflicts = [(a, b) for a in final for b in final if a < b
+                     and not self.is_ancestor(a, b) and not self.is_ancestor(b, a)]
+        slashed = Fraction(sum(self.stakes[v] for v in self.slashable), self.total)
+        print(f"{label}\n  finalized: {final}\n  conflicting finalized pairs: {conflicts}")
+        print(f"  slashable: {sorted(self.slashable)} = {float(slashed):.0%} of stake")
+
+def run(label, honest_b, honest_c, byzantine):
+    stakes = {v: 32 for v in honest_b + honest_c + byzantine}
+    ffg = CasperFFG(stakes)
+    for name, parent in [("A1", "G"), ("A2", "A1"), ("B3", "A2"), ("B4", "B3"), ("C3", "A2"), ("C4", "C3")]:
+        ffg.checkpoint(name, parent)
+    for src, tgt in [("G", "A1"), ("A1", "A2")]:             # epochs 1-2: everyone sees one chain
+        for v in stakes:
+            ffg.vote(v, src, tgt)
+    for b_link, c_link in [(("A2", "B3"), ("A2", "C3")), (("B3", "B4"), ("C3", "C4"))]:
+        for v in honest_b + byzantine:                       # epochs 3-4: the network splits, and
+            ffg.vote(v, *b_link)                             # Byzantine validators vote on both sides
+        for v in honest_c + byzantine:
+            ffg.vote(v, *c_link)
+    ffg.report(label)
+
+names = ["Abebe", "Bich", "Carlos", "Divya", "Elif", "Farid", "Grace", "Hiroshi", "Ines", "Jomo",
+         "Kalani", "Lucia"]
+run("Scenario 1: 4 of 12 validators (33%) equivocate", names[0:4], names[4:8], names[8:12])
+run("Scenario 2: 3 of 12 validators (25%) equivocate", names[0:5], names[5:9], names[9:12])
+```
+
+In the first scenario, each side gathers exactly two-thirds of the stake (its four honest validators plus the four Byzantine ones), so the conflicting checkpoints B3 and C3 are **both finalized**: safety has failed. But exactly as the theorem promises, the four validators who caused it have signed double votes, and their third of the stake is provably slashable — the evidence is the pair of signed votes itself. In the second scenario the Byzantine quarter cannot lift both sides to two-thirds: the side with five honest validators finalizes B3, the other side finalizes nothing, and the equivocators are still caught.
+
+<Narrator who="chloe">
+
+Notice what the theorem does and does not promise. It does not say conflicting finality is impossible; with a third of the stake an attacker can produce it, as scenario 1 shows. It says the attack cannot be *anonymous* or *cheap*: the protocol can point at the culprits and destroy their deposits. Proof of work has nothing like this. A 51% attacker's hardware remains its own after the attack.
+
+</Narrator>
+
+What if more than a third of validators simply go **offline**, for instance because a widely used client crashes? Then no checkpoint can be justified, and finality stops, although LMD-GHOST keeps blocks coming. Ethereum restores finality with the **inactivity leak**: while finality is stalled, validators that fail to vote lose stake at a rate that grows every epoch, until those still online again hold two-thirds. Here is a simplified version using the constants in Ethereum's specification:
+
+```python run
+# A simplified inactivity leak, with the constants of Ethereum's consensus specification
+# (Bellatrix onwards). Real balances move in steps of 1 ETH of "effective balance"; we ignore that.
+INACTIVITY_SCORE_BIAS = 4
+INACTIVITY_PENALTY_QUOTIENT = 2**24
+EPOCH_MINUTES = 6.4
+
+def epochs_to_regain_finality(offline_share):
+    online, offline, score, epoch = 1.0 - offline_share, offline_share, 0, 0
+    while 3 * online < 2 * (online + offline):     # finality needs 2/3 of the *remaining* stake
+        epoch += 1
+        score += INACTIVITY_SCORE_BIAS             # each missed epoch raises the inactivity score
+        offline -= offline * score / (INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT)
+    return epoch, offline / offline_share
+
+print("offline share   epochs   days   offline validators keep")
+for share in [0.34, 0.40, 0.50, 0.60]:
+    epochs, kept = epochs_to_regain_finality(share)
+    print(f"{share:12.0%} {epochs:8} {epochs * EPOCH_MINUTES / 60 / 24:6.1f} {kept:16.0%}")
+```
+
+If 40% of the stake goes offline, the online validators regain a two-thirds majority after about two weeks, by which time the offline ones have lost a quarter of their stake; at 50% it takes about three weeks. The leak is also what decides a lasting network partition: each side would leak the other's validators and eventually finalize on its own, so an extended split can end in conflicting finality *without* anyone being slashable. That is the price of keeping the chain live, and it is why a partition lasting weeks would need people, not just code, to resolve.
+
+</Section>
+
+<Section id="finality" kind="human" title="Probabilistic and economic finality in practice">
+
+The two families now give different guarantees.
+
+- **Probabilistic finality** (proof of work, and longest-chain proof of stake such as Cardano's Ouroboros): the probability of reversal falls exponentially with depth but never reaches zero, and it depends on the attacker's share and on network delays.
+- **BFT finality** (Tendermint/CometBFT, Ethereum's Casper FFG, Algorand, Tezos's Tenderbake and others): once a block is final, it stays final unless at least a third of the stake misbehaves. Where equivocation is slashable, as on Ethereum and Cosmos chains, the culprits are identified and lose their deposits: **economic finality**.
+
+<Narrator who="margaret">
+
+Put a size on Ethereum's guarantee. With roughly 30 to 35 million ETH staked during 2024 and 2025, reverting a finalized block would require validators holding more than 10 million ETH to sign slashable votes, and the correlation penalty would destroy all of it. A proof-of-work attacker, by contrast, risks only the rewards it gives up and the value of hardware it may be able to reuse.
+
+</Narrator>
+
+Finality has failed in practice, if briefly. In May 2023 Ethereum's chain twice stopped finalizing, for about 25 minutes and then about an hour, because bugs in two consensus clients made them fall behind under load; blocks kept coming, and finality resumed without intervention. The episode showed the value of **client diversity**: Ethereum has several independent consensus clients (Lighthouse, Prysm, Teku, Nimbus, Lodestar, Grandine) and execution clients (Geth, Nethermind, Besu, Erigon, Reth), and a bug in a client used by more than two-thirds of the stake could finalize an invalid chain. Other proof-of-stake chains have had longer outages: Solana halted several times between 2021 and 2024, and its validators had to coordinate restarts.
+
+</Section>
+
+<Section id="concentration" kind="human" title="Liquid staking, concentration and open problems">
+
+Running a validator requires capital, skill and constant uptime, so most stake is delegated. **Staking services** run by exchanges (such as Coinbase, Binance and Kraken) and **liquid staking protocols** — Lido is the largest, Rocket Pool a smaller one with a permissionless set of operators — take deposits and issue a token representing the staked ether, which holders can trade or use elsewhere. Lido has at times held close to a third of all staked ether, which alarmed researchers precisely because of the one-third threshold: a single protocol's governance, or a small set of its operators, approaching the stake needed to stop finality. **Restaking** protocols such as EigenLayer let the same stake back additional services, with extra slashing conditions, which creates new links through which one failure could spread to others.
+
+Concentration also appears in block building. Since the Merge, most Ethereum blocks are built by a few specialised **builders** and passed to proposers through **relays** (the MEV-Boost system, which <LessonLink slug="contract-security">Contract security and MEV</LessonLink> covers). After the United States sanctioned the Tornado Cash contracts in August 2022, some relays filtered sanctioned transactions, raising concerns about censorship at the protocol level; those sanctions were lifted in March 2025, but the structural question remains.
+
+Research and engineering directions as of 2026, in order of maturity:
+
+- **Censorship resistance**: proposals to enshrine the proposer–builder split in the protocol ([EIP-7732](https://eips.ethereum.org/EIPS/eip-7732), ePBS), chosen in 2025 as a headline change for the upgrade after Fusaka, and to let many validators force transactions into blocks through inclusion lists ([EIP-7805](https://eips.ethereum.org/EIPS/eip-7805), FOCIL).
+- **Faster finality**: **single-slot finality**, in which each block is finalized within its own slot rather than after two epochs. The obstacle is aggregating signatures from so many validators in seconds; proposals include rotating committees ("Orbit") and three-slot designs. A broader redesign of Ethereum's consensus layer, proposed in late 2024 and since developed as "lean consensus", aims at faster finality together with post-quantum, hash-based signatures. Other chains are moving too: Solana's Alpenglow proposal (2025) replaces its voting protocol with one targeting finality in a fraction of a second.
+- **Theory**: how proof of stake behaves under long network partitions, what incentives validators really face once MEV is included, and how to keep stake decentralised, are all active research questions.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Proof of stake means the richest decide everything."** Voting power is proportional to stake, just as in proof of work it is proportional to hardware and electricity that money buys. The real differences are elsewhere: stake can be slashed, and stake held by custodians and liquid staking protocols concentrates power in a few operators, which is a genuine concern.
+
+</Misconception>
+
+<Misconception>
+
+**"Finalized means irreversible, full stop."** Finalized means reversible only if at least a third of the stake signs slashable messages, or if a partition lasts long enough for the inactivity leak to finalize both sides, or if the community deliberately coordinates a fork. It is a strong economic guarantee, not a mathematical certainty.
+
+</Misconception>
+
+<Misconception>
+
+**"Slashing is how validators get punished for being offline."** Being offline costs small penalties (and, during an inactivity leak, larger ones). Slashing is reserved for provable equivocation, signing two contradictory messages, and most slashings so far were caused by operators running the same keys on two machines as a misguided backup.
+
+</Misconception>
+
+<Misconception>
+
+**"BFT protocols tolerate up to half of the participants being malicious."** Tolerating Byzantine faults with two-thirds quorums requires the faulty share to be below one-third. Half is the bound for *crash* faults with majority quorums, and for Nakamoto consensus in its simplest model.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

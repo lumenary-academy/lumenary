@@ -1,0 +1,455 @@
+---
+title: Smart-contract security
+subtitle: "Public code holding public money: reentrancy, overflow, broken access control, oracle manipulation, MEV, bridge hacks, and the tools and habits that defend against them."
+minutes: 80
+objectives:
+  - Explain why smart-contract bugs are unusually costly and hard to fix
+  - Simulate a reentrancy attack, and prevent it with checks-effects-interactions and reentrancy guards
+  - Explain integer overflow before Solidity 0.8 and access-control failures, with real incidents
+  - Simulate a flash-loan oracle manipulation, and explain why time-weighted and aggregated oracles resist it
+  - Explain front-running, MEV and proposer–builder separation
+  - Describe bridge hacks as a category, the main defensive tools (audits, fuzzing, formal verification), and how users can protect themselves from phishing and wallet drainers
+prerequisites: [signatures-and-keys, proof-of-stake-and-finality, bitcoin-transactions, smart-contracts]
+narrators: [chloe, margaret, gideon]
+related: [math.comp.formal-methods, math.applied.cryptography, math.applied.optimisation]
+references:
+  - title: "Flash Boys 2.0: Frontrunning, Transaction Reordering, and Consensus Instability in Decentralized Exchanges"
+    author: Philip Daian et al.
+    year: 2019
+    url: https://arxiv.org/abs/1904.05234
+    note: The paper that named miner (now maximal) extractable value.
+  - title: "Solidity documentation: Security Considerations"
+    url: https://docs.soliditylang.org/en/latest/security-considerations.html
+  - title: "Solidity 0.8.0 release announcement"
+    url: https://soliditylang.org/blog/2020/12/16/solidity-v0.8.0-release-announcement/
+    note: Checked arithmetic by default, and the `unchecked` block.
+  - title: "Ethereum.org: Maximal extractable value (MEV)"
+    url: https://ethereum.org/en/developers/docs/mev/
+  - title: "Flashbots documentation"
+    url: https://docs.flashbots.net/
+    note: MEV-Boost, relays and proposer–builder separation, from the organisation that built them.
+  - title: "Smart Contract Weakness Classification (SWC) Registry"
+    url: https://swcregistry.io/
+    note: A catalogue of weakness types with examples; no longer actively maintained, but still a useful map.
+  - title: "Echidna: a smart-contract fuzzer"
+    author: Trail of Bits
+    url: https://github.com/crytic/echidna
+  - title: "Slither: a static analyzer for Solidity"
+    author: Trail of Bits
+    url: https://github.com/crytic/slither
+  - title: "Foundry book: fuzz and invariant testing"
+    url: https://book.getfoundry.sh/
+  - title: "Rekt"
+    url: https://rekt.news/
+    note: A running record of exploits with post-mortems; read with the projects' own disclosures.
+  - title: "Revoke.cash"
+    url: https://revoke.cash/
+    note: A tool for reviewing and revoking token approvals you have granted.
+---
+
+<Section id="motivation" kind="motivation" title="Bugs with a price tag">
+
+In most software, a bug is an inconvenience followed by a patch. In a smart contract, a bug can be a withdrawal button for anyone who finds it first. Four properties combine to make contract security unusually unforgiving:
+
+- **The code is public.** Every deployed contract's bytecode can be read by anyone, and most projects publish their source. Attackers audit for free.
+- **The money is in the code.** A contract does not protect an account at a bank; it *is* the account. Whoever satisfies its conditions gets the funds.
+- **Execution is final.** There is no administrator to reverse a transfer, no chargeback, and usually no way to patch the contract after deployment (see <LessonLink slug="smart-contracts">Ethereum and smart contracts</LessonLink>). Stolen funds can be moved across chains within minutes.
+- **Contracts compose.** Contracts call each other freely, so a contract's safety depends on the behaviour of code its authors never saw, written later by strangers, some of them hostile.
+
+The industry's losses are large: hacks, exploits and scams have taken billions of US dollars from users every year since 2020, by the estimates of several blockchain-analysis firms. This lesson goes through the main classes of vulnerability, each with a real incident and, where it helps, a simulation in Python, and ends with the defences used by professionals and the habits that protect ordinary users.
+
+</Section>
+
+<Section id="reentrancy" kind="computation" title="Reentrancy: The DAO, 2016">
+
+In April 2016, a contract called **The DAO** raised about 12 million ether from thousands of participants to run as an investor-directed venture fund. On 17 June 2016 an attacker began draining it, and about 3.6 million ether, roughly a third of its funds, was moved into a contract the attacker controlled. The flaw was in its withdrawal code: it sent ether to the caller *before* updating the caller's balance. Sending ether to a contract runs that contract's code, and the attacker's code simply called the withdrawal function again, and again, each time finding its balance still untouched.
+
+The Ethereum community's response was itself historic. After weeks of debate, a hard fork on 20 July 2016 moved the drained funds to a contract from which the original participants could reclaim them. Those who rejected the intervention, arguing that the chain's history should not be rewritten, kept running the unchanged chain, which continues as **Ethereum Classic**.
+
+<Figure caption="Reentrancy. The vault sends ether before updating its books; the payment runs the attacker's code, which calls withdraw again while the books still show a balance. Each nested call pays out again; the book-keeping lines run only as the calls unwind.">
+<svg viewBox="0 0 540 250" role="img" aria-label="A sequence diagram with two lifelines, Vault on the left and Attacker on the right. The attacker calls withdraw. The vault checks the balance, 1 ether, and sends 1 ether, which runs the attacker's receive function. Inside it the attacker calls withdraw again; the vault checks the balance, still 1, and sends again; this repeats. Only at the bottom, as the calls return, does the vault set the attacker's balance to zero, several times over, too late.">
+  <defs>
+    <marker id="cs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="90" y="8" width="90" height="26" rx="4" />
+    <rect x="360" y="8" width="90" height="26" rx="4" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="3 4">
+    <path d="M 135 34 L 135 245" />
+    <path d="M 405 34 L 405 245" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="135" y="26">Vault</text>
+    <text x="405" y="26">Attacker</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#cs-arrow)">
+    <path d="M 403 52 L 137 52" />
+    <path d="M 137 82 L 403 82" />
+    <path d="M 403 106 L 137 106" />
+    <path d="M 137 136 L 403 136" />
+    <path d="M 403 160 L 137 160" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="270" y="47">withdraw()</text>
+    <text x="270" y="77">check: balance 1 · send 1 ether → runs receive()</text>
+    <text x="270" y="101">withdraw() again, from inside receive()</text>
+    <text x="270" y="131">check: balance still 1 · send 1 ether → receive()</text>
+    <text x="270" y="155">withdraw() again …</text>
+    <text x="270" y="185">… until the vault is empty</text>
+  </g>
+  <g fill="var(--gold-soft)" fillOpacity="0.6" stroke="currentColor" strokeWidth="1">
+    <rect x="20" y="200" width="230" height="40" rx="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="135" y="217">calls unwind: balance = 0, balance = 0, …</text>
+    <text x="135" y="232">the effect arrives after the money has gone</text>
+  </g>
+</svg>
+</Figure>
+
+The simulation below models the essentials. `Chain.send` moves ether and then runs the recipient's `receive` method, exactly as a Solidity `call` with value runs the recipient's code. Three savers deposit 10 ether each; the attacker deposits 1 and withdraws.
+
+```python run
+class Revert(Exception):
+    pass
+
+class Chain:
+    """Ether balances, and calls that run the recipient's code, as an EVM `call` with value does."""
+    def __init__(self):
+        self.ether = {}
+
+    def send(self, frm, to, amount):
+        if self.ether[frm.name] < amount:
+            raise Revert("not enough ether")
+        self.ether[frm.name] -= amount
+        self.ether[to.name] = self.ether.get(to.name, 0) + amount
+        to.receive(frm, amount)                  # the recipient's code runs *now*, mid-withdrawal
+
+class Account:
+    def __init__(self, chain, name, ether=0):
+        self.chain, self.name = chain, name
+        chain.ether[name] = ether
+    def receive(self, frm, amount):
+        pass                                     # an ordinary wallet does nothing
+
+class VulnerableVault(Account):
+    def __init__(self, chain):
+        super().__init__(chain, "vault")
+        self.deposits = {}
+    def deposit(self, who, amount):
+        self.chain.send(who, self, amount)
+        self.deposits[who.name] = self.deposits.get(who.name, 0) + amount
+    def withdraw(self, who):
+        amount = self.deposits.get(who.name, 0)
+        if amount == 0:
+            raise Revert("nothing to withdraw")  # check
+        self.chain.send(self, who, amount)       # interaction ...
+        self.deposits[who.name] = 0              # ... and only then the effect
+
+class SafeVault(VulnerableVault):
+    def withdraw(self, who):
+        amount = self.deposits.get(who.name, 0)
+        if amount == 0:
+            raise Revert("nothing to withdraw")  # checks
+        self.deposits[who.name] = 0              # effects
+        self.chain.send(self, who, amount)       # interactions
+
+class Attacker(Account):
+    def __init__(self, chain, vault):
+        super().__init__(chain, "attacker", ether=1)
+        self.vault, self.reentries = vault, 0
+    def attack(self):
+        self.vault.deposit(self, 1)
+        self.vault.withdraw(self)
+    def receive(self, frm, amount):
+        if frm is self.vault and self.chain.ether["vault"] >= amount:
+            self.reentries += 1
+            try:
+                self.vault.withdraw(self)        # re-enter before the vault updates its books
+            except Revert as err:
+                print(f"   re-entry {self.reentries} refused: {err}")
+
+for Vault in (VulnerableVault, SafeVault):
+    chain = Chain()
+    vault = Vault(chain)
+    for name in ["Ana", "Bilal", "Chidi"]:
+        vault.deposit(Account(chain, name, ether=10), 10)
+    thief = Attacker(chain, vault)
+    print(f"{Vault.__name__}: vault holds {chain.ether['vault']} ether")
+    thief.attack()
+    print(f"   after the attack: vault {chain.ether['vault']}, attacker {chain.ether['attacker']} "
+          f"(started with 1), re-entries {thief.reentries}, books say {vault.deposits}")
+```
+
+Against the vulnerable vault, the attacker re-enters 30 times and leaves with 31 ether, everything the vault held. The vault's books still say that Ana, Bilal and Chidi have 10 ether each; it is insolvent, and nobody can withdraw. The safe vault differs in one line moved up by one position. Its first re-entry finds the balance already zero and is refused.
+
+<Definition term="checks-effects-interactions">
+
+The **checks-effects-interactions** pattern orders every function in three phases: first **check** all conditions (who is calling, balances, state); then apply all **effects** to the contract's own state; only then make **interactions**, calls to other contracts or transfers of ether. When control leaves the contract, its state is already consistent.
+
+</Definition>
+
+<Narrator who="chloe">
+
+The underlying idea is an invariant: the vault should always hold at least the sum of its recorded deposits. A function may break an invariant temporarily, but an external call hands control to someone else, who will see the contract in whatever state it is in. So the rule is: restore every invariant *before* any external call, because from the outside, every external call is a moment when the contract is open to the world.
+
+</Narrator>
+
+The second defence is a **reentrancy guard**: a storage flag set on entry and cleared on exit, so that any nested call into a guarded function reverts. Widely used libraries provide one (OpenZeppelin's `ReentrancyGuard`), and since 2024 the EVM's cheaper transient storage has made such locks less costly. Serious projects use both: correct ordering, and a guard as a backstop.
+
+<Narrator who="gideon">
+
+Neither defence is complete on its own. Reentrancy can cross functions (re-enter `transfer` while `withdraw` is mid-way) or even contracts that share state, and a "read-only" reentrancy can make another protocol read a price from a contract whose books are half-updated. And guards are code too: in July 2023 a bug in some versions of the Vyper compiler made its built-in reentrancy lock ineffective, and several pools using the affected versions were drained.
+
+</Narrator>
+
+</Section>
+
+<Section id="overflow-access" kind="examples" title="Overflow and access control">
+
+### Integer overflow before Solidity 0.8
+
+EVM arithmetic works modulo $2^{256}$. Until version 0.8.0 (December 2020), Solidity exposed that directly: `uint256` addition and multiplication **wrapped around** silently, and careful code used a library called `SafeMath` that checked every operation. Since 0.8.0, overflow reverts by default, and programmers must write `unchecked { … }` to get wrapping arithmetic. The best-known overflow exploit came in April 2018, in a token whose batch-transfer function computed the total to deduct as (number of receivers) × (value). An attacker chose a value so large that the product wrapped to zero.
+
+```python run
+WORD = 2**256
+
+def mul_unchecked(a, b):           # Solidity before 0.8 (or inside `unchecked { }`): wrap modulo 2**256
+    return a * b % WORD
+
+def mul_checked(a, b):             # Solidity 0.8 and later: revert on overflow
+    if a * b >= WORD:
+        raise OverflowError("arithmetic overflow: the call reverts")
+    return a * b
+
+def batch_transfer(balances, sender, receivers, value, mul):
+    """The shape of the 2018 'batchOverflow' bug: the total is computed, checked, then paid out."""
+    total = mul(len(receivers), value)
+    if balances.get(sender, 0) < total:
+        raise ValueError("insufficient balance")
+    balances[sender] = balances.get(sender, 0) - total
+    for r in receivers:
+        balances[r] = balances.get(r, 0) + value
+
+value = 2**255                     # chosen so that 2 * value is exactly 2**256
+for name, mul in [("unchecked", mul_unchecked), ("checked", mul_checked)]:
+    balances = {"attacker": 0}
+    try:
+        batch_transfer(balances, "attacker", ["sock1", "sock2"], value, mul)
+        print(f"{name:9}: total charged = {mul(2, value)}; sock1 now holds {balances['sock1']:.3e} tokens")
+    except (OverflowError, ValueError) as err:
+        print(f"{name:9}: {err}")
+
+print("uint8 examples:", (250 + 10) % 256, (0 - 1) % 256, (16 * 16) % 256)
+```
+
+With wrapping arithmetic, an account holding nothing passes the balance check (the "total" is 0) and credits two accomplice accounts with about $5.8 \times 10^{76}$ tokens each. In the real incident, exchanges suspended deposits of many tokens while they checked their contracts for the same pattern. Checked arithmetic turns the same call into a revert.
+
+### Access control
+
+Many of the largest losses involved no clever mathematics at all: a function that should have been restricted was callable by anyone. In July 2017, the widely used Parity multi-signature wallet relied on a shared library contract, reached through `DELEGATECALL`; its initialisation function, which sets the wallet's owners, could be called again by anyone through the wallet, and an attacker made themselves owner of three wallets and took about 150,000 ether. In November 2017, after a fix, a user called the initialisation function *on the library contract itself*, became its owner, and invoked its self-destruct function. Every wallet that relied on the library was left with no code to delegate to, and over 500,000 ether was frozen, permanently.
+
+The patterns repeat: an `initialize` function in an upgradeable contract that anyone can call first; a privileged function missing its `onlyOwner` check; authorisation by `tx.origin` (the transaction's original signer) instead of `msg.sender`, which lets any contract the owner interacts with act in the owner's name; and administrator keys held on a single laptop. Every privileged function deserves a written answer to the question: *who can call this, and what is the worst they could do?*
+
+</Section>
+
+<Section id="oracles" kind="computation" title="Oracle manipulation and flash loans">
+
+A **flash loan** is a loan that must be repaid within the same transaction; if it is not, the whole transaction reverts as if the loan never happened. Because the lender cannot lose, flash loans need no collateral, and for a small fee anyone can briefly command millions. That is useful for honest arbitrage and refinancing, and it removes the attacker's need for capital: an attack that requires 4 million US dollars for twelve seconds is open to anyone.
+
+The classic target is a lending protocol whose **oracle** reads the price of a token straight from one on-chain exchange pool. In February 2020 the bZx protocol suffered two attacks of this shape; in October 2022 an attacker on Mango Markets, a Solana exchange, pushed up the price of a thinly traded token and borrowed against the inflated value, in a case that later went to court in the United States. The simulation uses a constant-product pool, the exchange design that <LessonLink slug="applications-limits-and-regulation">Applications, limits and regulation</LessonLink> builds properly; here all we need is that buying a token from the pool raises its price.
+
+```python run
+class Pool:
+    """A constant-product exchange pool (x * y = k) for TOK and USD, with a 0.3 % fee on input."""
+    def __init__(self, tok, usd):
+        self.tok, self.usd = tok, usd
+    def spot_price(self):                       # USD per TOK, read straight from the reserves
+        return self.usd / self.tok
+    def buy_tok(self, usd_in):
+        out = self.tok * usd_in * 0.997 / (self.usd + usd_in * 0.997)
+        self.usd, self.tok = self.usd + usd_in, self.tok - out
+        return out
+    def sell_tok(self, tok_in):
+        out = self.usd * tok_in * 0.997 / (self.tok + tok_in * 0.997)
+        self.tok, self.usd = self.tok + tok_in, self.usd - out
+        return out
+
+class Lender:
+    """Lends USD against TOK collateral, up to 50 % of the collateral's value."""
+    def __init__(self, oracle):
+        self.oracle = oracle
+    def max_borrow(self, tok_collateral):
+        return 0.5 * tok_collateral * self.oracle()
+
+pool = Pool(tok=100_000, usd=1_000_000)          # fair price: 10 USD per TOK
+fair = pool.spot_price()
+naive = Lender(oracle=pool.spot_price)           # trusts the pool's current price
+twap = Lender(oracle=lambda: fair)               # a time-weighted average of earlier blocks does not move
+
+collateral = 10_000                              # TOK the attacker already owns: worth 100,000 USD
+print(f"honest limit: {naive.max_borrow(collateral):,.0f} USD")
+
+# One transaction: flash-borrow, pump, borrow, dump, repay.
+loan = 4_000_000
+bought = pool.buy_tok(loan)
+print(f"after buying {bought:,.0f} TOK the pool says 1 TOK = {pool.spot_price():,.2f} USD")
+borrowed = naive.max_borrow(collateral)
+print(f"naive lender lends {borrowed:,.0f} USD; a TWAP lender would lend {twap.max_borrow(collateral):,.0f}")
+back = pool.sell_tok(bought)
+fee = 0.0009 * loan                               # a typical flash-loan fee of 0.09 %
+profit = borrowed + back - loan - fee - collateral * fair
+print(f"sold back for {back:,.0f} USD; repaid {loan + fee:,.0f}; price now {pool.spot_price():,.2f}")
+print(f"attacker's profit after abandoning the collateral: {profit:,.0f} USD")
+print(f"lender's bad debt: {borrowed - collateral * fair:,.0f} USD")
+```
+
+<Narrator who="margaret">
+
+Follow the money in the output. Spending 4 million USD in a pool holding 1 million moves the price from 10 to about 249, a factor of 25, and the lender then values 100,000 USD of collateral at about 2.5 million. Selling back costs the attacker only the pool's fees and the flash-loan fee, about 8,400 USD in all, so the attack nets about 1.14 million. The lender is left holding a loan of about 1.25 million backed by tokens worth 100,000: 1.15 million of bad debt.
+
+</Narrator>
+
+The fixes all make the oracle harder to move than the money at stake. A **time-weighted average price** (TWAP) averages the pool's price over many past blocks, so a price that exists only inside one transaction does not affect it at all, and holding a false price for many blocks costs real money while arbitrageurs trade against it. **Aggregated oracle networks** combine prices from many exchanges and publishers. Lenders also cap how much they will lend against thinly traded collateral. None of this is perfect: TWAPs lag real crashes, and an attacker with enough capital can still move a small market for a while.
+
+</Section>
+
+<Section id="mev" kind="human" title="Front-running, MEV and proposer–builder separation">
+
+Transactions wait in public mempools before they are included, and whoever builds a block chooses their order. If you can see a large purchase coming, you can buy first and sell straight after it at the higher price it causes. This **sandwich attack** is front-running, the practice banned in traditional markets for brokers trading ahead of their clients, performed by software. More generally, **maximal extractable value** (MEV) is the profit that can be made by including, excluding or reordering transactions: arbitrage between exchanges, liquidating undercollateralised loans first, and sandwiching. The term comes from Daian and co-authors' paper [Flash Boys 2.0](https://arxiv.org/abs/1904.05234) (2019), originally as *miner* extractable value.
+
+Some MEV is benign or even useful (arbitrage keeps prices consistent; prompt liquidations keep lenders solvent); sandwiching is a pure transfer from users. MEV also threatens consensus: if a past block contains enough extractable value, a block producer might be tempted to re-mine or re-propose it.
+
+On Ethereum the response has been to organise the market rather than wish it away. Under **proposer–builder separation** (PBS), specialised **builders** assemble the most profitable blocks they can from public transactions and private "bundles" sent by **searchers**, and bid for the right to have their block proposed; the validator chosen to propose simply signs the header of the highest bid. Since the Merge in 2022 this has run outside the protocol, through software called MEV-Boost (from the research organisation [Flashbots](https://docs.flashbots.net/)) and trusted intermediaries called **relays**, and a large majority of Ethereum blocks are built this way.
+
+<Figure caption="Proposer–builder separation as it runs on Ethereum in 2026, outside the protocol. Order flow reaches builders through the public mempool or private channels; builders compete to construct blocks; relays carry their bids to the proposer, who commits to the best header without seeing the block's contents first.">
+<svg viewBox="0 0 540 150" role="img" aria-label="Five boxes from left to right connected by arrows: users and wallets, searchers who send bundles, builders who assemble full blocks, relays that hold the block and forward the bid, and the proposer, a validator who signs the header of the highest bid. Under the first arrow is the label public mempool or private order flow.">
+  <defs>
+    <marker id="cs-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="5" y="40" width="90" height="56" rx="4" />
+    <rect x="115" y="40" width="90" height="56" rx="4" />
+    <rect x="225" y="40" width="90" height="56" rx="4" />
+    <rect x="335" y="40" width="90" height="56" rx="4" />
+    <rect x="445" y="40" width="90" height="56" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" fillOpacity="0.5">
+    <rect x="225" y="40" width="90" height="56" rx="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="50" y="64">users,</text>
+    <text x="50" y="80">wallets</text>
+    <text x="160" y="64">searchers</text>
+    <text x="160" y="80" fontSize="10">bundles</text>
+    <text x="270" y="64">builders</text>
+    <text x="270" y="80" fontSize="10">full blocks + bids</text>
+    <text x="380" y="64">relays</text>
+    <text x="380" y="80" fontSize="10">hold block, pass bid</text>
+    <text x="490" y="64">proposer</text>
+    <text x="490" y="80" fontSize="10">signs best header</text>
+    <text x="105" y="125" fontSize="10">public mempool or private order flow</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#cs-arrow2)">
+    <path d="M 95 68 L 113 68" />
+    <path d="M 205 68 L 223 68" />
+    <path d="M 315 68 L 333 68" />
+    <path d="M 425 68 L 443 68" />
+    <path d="M 60 96 Q 150 140 250 98" />
+  </g>
+</svg>
+</Figure>
+
+PBS lets ordinary validators earn MEV without running sophisticated software, which protects decentralisation among validators, but it concentrates block building in a few builders and puts trust in relays. In late 2022, when some relays filtered transactions involving addresses under US sanctions, the share of blocks built that way raised concerns about **censorship**. Proposals to build PBS into the protocol itself (enshrined PBS) and to let validators force the inclusion of pending transactions (inclusion lists) have been under active development in 2025 and 2026. For users, practical defences are a tight **slippage limit** on every swap, private transaction submission services that keep a transaction out of the public mempool, and exchanges that settle orders in batches at a uniform price. MEV exists on every chain where someone orders transactions, Solana and the rollups of the next lesson included.
+
+</Section>
+
+<Section id="bridges" kind="human" title="Bridges: the biggest targets">
+
+A **bridge** moves assets between chains. Typically it locks tokens in a contract on chain A and mints a "wrapped" representation on chain B, releasing the originals when the wrapped tokens are burned. The bridge must somehow be convinced, on each chain, of what happened on the other, and that verification is the weak point. A bridge's locked funds are a single, enormous prize, and in 2022 bridges suffered several of the largest thefts in the field's history:
+
+- **Ronin** (March 2022), the bridge for the game Axie Infinity, accepted withdrawals signed by 5 of 9 validators. Attackers obtained five keys, four held by one company and one through an old, forgotten permission, and withdrew about 173,600 ether and 25.5 million USDC. The theft went unnoticed for six days. The FBI attributed it to the Lazarus Group, linked to North Korea.
+- **Wormhole** (February 2022): a flaw in how the bridge's Solana program verified guardian signatures let an attacker mint 120,000 wrapped ether on Solana with nothing locked behind them. The company backing the project replaced the funds.
+- **Nomad** (August 2022): a routine upgrade initialised a trusted value to zero, which made the contract accept any message as proven. Once the first attacker's transaction was public, hundreds of addresses copied it with their own addresses substituted, and nearly all the bridge's funds, about 190 million US dollars, were taken in a free-for-all.
+
+The pattern: bridges concentrate value, and their security is that of their weakest component, whether a small set of keys, one verification routine, or an upgrade. Designs that verify the other chain's consensus directly (light-client bridges) or with validity proofs (the subject of <LessonLink slug="zkvms-and-coprocessors">zkVMs and coprocessors</LessonLink>) aim to replace trusted signers with verification. <LessonLink slug="rollups-and-scaling">The next lesson</LessonLink> returns to bridges in the context of rollups.
+
+</Section>
+
+<Section id="defences" kind="human" title="Defences: audits, fuzzing and formal verification">
+
+No single technique finds every bug, so professionals layer them.
+
+- **Reviews and audits.** Independent security firms read the code against its specification, and "contest" platforms pay many reviewers for findings. An audit is a snapshot of one version by people with limited time; it lowers risk, it does not certify safety, and many exploited contracts had been audited.
+- **Static analysis.** Tools such as [Slither](https://github.com/crytic/slither) flag known dangerous patterns (an external call before a state update, a missing access check) in seconds, on every commit.
+- **Fuzzing and invariant testing.** Instead of hand-written test cases, state *properties* that must always hold ("the vault's ether is at least the sum of deposits", "total supply equals the sum of balances") and let a tool generate thousands of random call sequences trying to break them. [Echidna](https://github.com/crytic/echidna) and the fuzz and invariant tests of [Foundry](https://book.getfoundry.sh/) are widely used; the Python simulations in this lesson are the same idea in miniature.
+- **Formal verification.** Prove, with machine-checked mathematics, that the code satisfies a specification for *all* inputs. Approaches range from the SMT-based checker built into the Solidity compiler and commercial provers to complete formal semantics of the EVM in frameworks such as K. Formal verification is powerful and expensive, and it proves only what the specification says: a contract proven to match a wrong specification is wrong (compare <TopicLink id="math.comp.formal-methods">formal methods</TopicLink>).
+- **Operational security.** Multi-signature control of privileged keys, timelocks, monitoring with automatic pausing, bug bounties that reward disclosure, and rehearsed incident response. Many of the largest losses were failures here, not in the contract logic.
+
+</Section>
+
+<Section id="users" kind="human" title="Phishing, wallet drainers, and what users can do">
+
+For ordinary users, the commonest danger is not a bug in a famous protocol but being tricked into signing something. A wallet signature can authorise far more than a single payment:
+
+- **Approval phishing.** A fake site asks you to "connect" and then to approve a token allowance, often unlimited, for the attacker's contract, which drains the tokens later, sometimes months later.
+- **Signature phishing.** Some approvals can be granted by an off-chain signed message (for example ERC-2612 "permit" signatures) rather than a transaction, so no gas is paid and the wallet's warning may be less obvious.
+- **Address poisoning.** The attacker sends a worthless transfer from an address whose first and last characters match one you use, hoping you will later copy the wrong address from your history.
+- **Drainer kits.** Criminal groups rent out ready-made phishing sites and contracts to affiliates for a share of the proceeds, so the same tricks appear on thousands of fake airdrop and "claim" pages.
+- **Compromised interfaces.** In February 2025, attackers who had compromised a developer's machine at a widely used multisig wallet service altered its web interface, and the exchange Bybit's signers approved what looked like a routine transfer but in fact handed control of a cold wallet to the attackers; about 1.5 billion US dollars in ether and tokens was taken. The FBI attributed the theft to North Korean actors. Even professionals signing with hardware wallets were deceived, because the device displayed data they could not interpret.
+
+<Narrator who="gideon">
+
+The precise condition for safety is that what you *see* matches what you *sign*. A hardware wallet protects the key, not your judgement: if it shows an opaque hash or unreadable calldata, approving it is approving whatever those bytes mean, which is why "blind signing" should be treated as an emergency, not a routine.
+
+</Narrator>
+
+What helps, in rough order of importance:
+
+1. **Never share your seed phrase or private key**, with anyone, for any reason. No legitimate support desk, airdrop or "wallet validation" ever needs it.
+2. **Type or bookmark** the addresses of services you use; do not follow links from messages, advertisements or search results. Be suspicious of urgency and of anyone who contacts you first.
+3. **Read what you sign.** Prefer wallets that decode and simulate transactions and show the resulting balance changes; refuse requests you cannot read.
+4. **Limit and revoke approvals.** Approve only the amount you need, and periodically review and revoke old allowances with a tool such as [Revoke.cash](https://revoke.cash/) or your block explorer's approval checker.
+5. **Separate wallets.** Keep long-term holdings in a hardware wallet used for nothing else, and use a separate wallet with small balances for trying new applications.
+6. **Check whole addresses**, not just the first and last few characters.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The contract was audited, so it is safe."** An audit reviews one version of the code, for a limited time, against the auditors' understanding of the intended behaviour. Deployments, upgrades, integrations and keys fall outside it. Treat audits as one layer among several.
+
+</Misconception>
+
+<Misconception>
+
+**"Solidity 0.8 fixed overflow, so arithmetic bugs are gone."** It made overflow revert by default. Code inside `unchecked` blocks still wraps, precision loss from integer division and rounding in the wrong direction remain common, and a revert at the wrong moment can itself lock funds.
+
+</Misconception>
+
+<Misconception>
+
+**"A flash-loan attack is a bug in flash loans."** Flash loans only supply capital. The bug is in the victim contract, typically an oracle that can be moved within one transaction or a governance vote that counts tokens held for a single block.
+
+</Misconception>
+
+<Misconception>
+
+**"Code is law, so an exploit is just a clever use of the rules."** Taking funds by exploiting a bug has led to criminal charges in several countries; how far "the code allowed it" matters is still being argued in courts, with differing outcomes so far. Whatever one's view of the slogan, the people who lose money are real.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

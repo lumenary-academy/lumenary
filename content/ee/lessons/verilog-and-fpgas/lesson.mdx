@@ -1,0 +1,625 @@
+---
+title: Verilog and FPGAs
+subtitle: Describing hardware instead of programming it, the bug every Verilog designer meets once, and the chips that become whatever circuit you describe.
+minutes: 80
+objectives:
+  - Explain how a hardware description differs from a program, and read modules, ports, continuous assignments and always blocks
+  - Use blocking and non-blocking assignments correctly, and recognise the classic bug when they are mixed up
+  - Distinguish what simulates from what synthesises, and avoid accidental latches
+  - Write self-checking testbenches with reference models, and know where SystemVerilog, VHDL and newer languages fit
+  - Describe an FPGA's architecture (LUTs, flip-flops, carry chains, block RAM, DSP slices, routing) and compute a LUT's configuration
+  - Outline the flow from Verilog to a bitstream with vendor and open-source tools
+  - Design and verify a UART transmitter, including its baud-rate divisor
+prerequisites: [sequential-logic-and-state-machines]
+related: [math.comp.formal-methods]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "IEEE 1800: SystemVerilog unified hardware design, specification and verification language"
+    author: IEEE Standards Association
+    url: https://standards.ieee.org/
+    note: The standard that now defines Verilog and SystemVerilog; search the IEEE site for 1800. VHDL is IEEE 1076.
+  - title: Yosys Open SYnthesis Suite
+    url: https://github.com/YosysHQ/yosys
+    note: Open-source synthesis for FPGAs and ASICs.
+  - title: nextpnr
+    url: https://github.com/YosysHQ/nextpnr
+    note: Open-source, timing-driven place and route for several FPGA families.
+  - title: Project IceStorm
+    url: https://github.com/YosysHQ/icestorm
+    note: The documented bitstream format and tools for Lattice iCE40 FPGAs that started the open-source FPGA flow.
+  - title: Verilator
+    url: https://www.veripool.org/verilator/
+    note: A fast open-source simulator and linter that compiles Verilog to C++.
+  - title: cocotb
+    url: https://www.cocotb.org/
+    note: Write hardware testbenches in Python.
+  - title: Icarus Verilog
+    url: https://steveicarus.github.io/iverilog/
+    note: The simulator that runs this lesson's checks.
+---
+
+<Section id="motivation" kind="motivation" title="Describing hardware, not programming it">
+
+The previous lessons used Verilog to check small circuits. This lesson takes the language seriously, and then the chips it most often targets. Start with the mental shift that every software developer has to make.
+
+A program is a list of instructions executed one after another by a processor. A **hardware description** is a list of *things that exist at the same time*: wires, gates, flip-flops, all working in parallel, all the time. When you write `assign y = a & b;` you are not computing `a & b` once; you are placing an AND gate that will compute it forever. A Verilog `for` loop does not run over time; it is unrolled into copies of hardware side by side. A design with two `always` blocks is not two threads taking turns; it is two circuits switching at the same clock edge.
+
+Hardware description languages have a second personality, though: they are also **simulation languages**, with variables, loops, delays, file input and printing, so that the same language can describe a circuit *and* the testbench that exercises it. Knowing which personality you are using at any line is most of the skill. The rest of this lesson covers the language, the classic trap, simulation versus synthesis, testbenches, the architecture of an FPGA and how designs reach one, and ends with a complete, verified UART transmitter.
+
+</Section>
+
+<Section id="language" kind="definitions" title="Modules, ports and signals">
+
+The unit of a Verilog design is the **module**, a box with ports, like a chip with pins.
+
+```verilog
+module counter #(parameter int WIDTH = 8) (   // a parameter: set per instance
+  input  logic             clk, rst_n, enable,
+  output logic [WIDTH-1:0] count              // a vector: bits WIDTH-1 down to 0
+);
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n)      count <= '0;               // '0 fills every bit with 0
+    else if (enable) count <= count + 1'b1;
+endmodule
+
+// Elsewhere: an instance named u_ticks, with WIDTH overridden and ports connected by name.
+counter #(.WIDTH(26)) u_ticks (.clk(clk), .rst_n(rst_n), .enable(1'b1), .count(ticks));
+```
+
+The pieces you need to read most code:
+
+- **Values** have four states: `0`, `1`, `x` (unknown) and `z` (undriven), as you saw in <LessonLink slug="logic-gates-and-boolean-algebra">Logic gates and Boolean algebra</LessonLink>.
+- **Literals** carry a width and a base: `8'hFF` is eight bits of hexadecimal FF, `4'b1010` four binary bits, `1'b1` a single 1. An unsized number such as `5` is 32 bits wide, a frequent source of surprises.
+- **Signals.** Classic Verilog has `wire` (driven continuously, by an `assign` or a port) and `reg` (assigned in a procedural block, which does *not* necessarily mean a register). SystemVerilog's `logic` can be used for either, and modern code mostly uses it.
+- **Continuous assignment**: `assign y = s ? a : b;` describes combinational logic, here a 2:1 multiplexer.
+- **Procedural blocks**: `always_comb` (combinational logic), `always_ff @(posedge clk)` (flip-flops) and `always_latch`, SystemVerilog's intent-revealing versions of the classic `always @(...)`. Inside them you can use `if`, `case` and loops, which describe multiplexers and replicated logic.
+- **Hierarchy**: a module instantiates others, as the counter instance shows, so a processor is a tree of modules down to adders and registers.
+- **Generate** blocks and parameters replicate or configure hardware at elaboration time: a `for` inside `generate` places $n$ copies of a cell.
+
+</Section>
+
+<Section id="blocking" kind="examples" title="Blocking and non-blocking assignment">
+
+Verilog has two assignment operators, and choosing between them is the first real hurdle.
+
+- A **blocking** assignment `a = b;` updates `a` immediately; the next statement sees the new value. It behaves like an assignment in Python.
+- A **non-blocking** assignment `a <= b;` evaluates `b` now but *schedules* the update of `a` for the end of the current time step, after every block triggered at this instant has read its inputs.
+
+Non-blocking assignment exists to model flip-flops. At a clock edge, every flip-flop in a chip samples its input *before* any of them changes; with `<=`, every `always_ff` block reads old values and all updates land together, whatever order the simulator runs the blocks in. The check below writes the same three-stage shift register both ways and feeds both the same bit pattern.
+
+```verilog check
+// The same three-stage shift register written twice: with blocking (=) and non-blocking (<=) assignments.
+module shift_blocking (input logic clk, d, output logic q);
+  logic s1, s2;
+  always @(posedge clk) begin
+    s1 = d;            // s1 changes immediately ...
+    s2 = s1;           // ... so s2 receives the NEW s1, which is d ...
+    q  = s2;           // ... and so does q: three statements, one flip-flop's worth of delay
+  end
+endmodule
+
+module shift_nonblocking (input logic clk, d, output logic q);
+  logic s1, s2;
+  always @(posedge clk) begin
+    s1 <= d;           // every right-hand side is read first, with its OLD value,
+    s2 <= s1;          // and all the left-hand sides update together afterwards,
+    q  <= s2;          // exactly like three flip-flops sharing a clock
+  end
+endmodule
+
+module tb;
+  logic clk = 0, d = 0;
+  wire  q_b, q_nb;
+  shift_blocking    u1 (.clk(clk), .d(d), .q(q_b));
+  shift_nonblocking u2 (.clk(clk), .d(d), .q(q_nb));
+  always #5 clk = ~clk;
+
+  logic [11:0] pattern = 12'b1011_0010_0000;   // sent most significant bit first
+  string in_s = "", b_s = "", nb_s = "";
+
+  initial begin
+    for (int i = 11; i >= 0; i--) begin
+      d = pattern[i];
+      @(posedge clk); #1;                        // let the edge happen, then look
+      in_s = {in_s, $sformatf("%b", d)};
+      b_s  = {b_s,  $sformatf("%b", q_b)};
+      nb_s = {nb_s, $sformatf("%b", q_nb)};
+    end
+    $display("d at each clock edge:  %s", in_s);
+    $display("q, blocking (=):       %s", b_s);
+    $display("q, non-blocking (<=):  %s", nb_s);
+    if (b_s  != "101100100000") $fatal(1, "expected the blocking version to delay by one cycle");
+    if (nb_s != "xx1011001000") $fatal(1, "expected the non-blocking version to delay by three cycles");
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+d at each clock edge:  101100100000
+q, blocking (=):       101100100000
+q, non-blocking (<=):  xx1011001000
+```
+
+The non-blocking version delays the pattern by three cycles, as three flip-flops should (its first two outputs are `x`, the unknown initial contents of the register). The blocking version passes each bit straight through to `q` in the same edge: `s1 = d` changes `s1` at once, so `s2 = s1` copies the new value, and so does `q`. Synthesis tools read the blocking version the same way and build a single flip-flop, so here simulation and hardware agree; the bug is that the description does not say what the designer meant.
+
+A nastier form of the bug appears with two blocks. If one `always @(posedge clk)` block does `a = b;` and another does `b = a;`, the result depends on which block the simulator happens to run first, which the language standard leaves unspecified: both variables end up holding the old `b`, or both the old `a`, and neither order swaps them. The hardware, meanwhile, is two flip-flops that swap their contents at every edge. That is a **simulation–synthesis mismatch**, the most expensive kind of bug, because the tests pass and the chip fails. Two rules, written down by Clifford Cummings in a well-known conference paper and followed in essentially every style guide since, prevent all of this:
+
+1. In clocked blocks (`always_ff`), use only non-blocking `<=`.
+2. In combinational blocks (`always_comb`), use only blocking `=`.
+
+<Narrator who="gideon">
+
+The rules assume that every signal is assigned in exactly one block. Assigning the same variable from two `always_ff` blocks is a different error: in hardware it would be two flip-flops fighting over one wire, and SystemVerilog's `always_ff` lets tools reject it, one of several reasons to prefer it to plain `always`.
+
+</Narrator>
+
+</Section>
+
+<Section id="synthesis" kind="definitions" title="Simulation versus synthesis">
+
+A **simulator** (Icarus Verilog, Verilator, and commercial tools from Siemens, Synopsys, Cadence and others) executes the description as an event-driven program over simulated time. A **synthesis tool** reads it and builds hardware. Only a subset of the language synthesises:
+
+| Construct | Simulation | Synthesis |
+| --- | --- | --- |
+| `assign`, `always_comb`, `always_ff`, `if`, `case`, operators | yes | yes: logic and flip-flops |
+| `for` loops with constant bounds | yes | yes: unrolled into copies |
+| delays such as `#5` | waits 5 time units | ignored: real delays come from the gates |
+| `initial` blocks | run once at time 0 | ignored, except as power-up values on many FPGAs |
+| `$display`, `$fatal`, file I/O | yes | ignored |
+| `while` loops waiting on time or events | yes | no |
+| `real` numbers | yes | no (fixed-point integers instead) |
+
+The commonest synthesis surprise is the **inferred latch**. In this combinational block, `y` is not assigned when `sel` is 3:
+
+```verilog
+always_comb begin
+  case (sel)
+    2'd0: y = a;
+    2'd1: y = b;
+    2'd2: y = c;
+  endcase            // no default: when sel == 3, y must keep its old value, so a latch is inferred
+end
+```
+
+To "keep its old value", the hardware needs memory, so the tool infers a latch, which is almost never what was meant. Assign a default at the top of every combinational block (`y = '0;`) or give every `case` a `default`. Linters such as Verilator (`verilator --lint-only`) and the synthesis log warn about inferred latches; read the warnings.
+
+</Section>
+
+<Section id="testbenches" kind="human" title="Testbenches, and the other languages">
+
+Verification takes more engineering time than design on most chip projects, and it starts with the **self-checking testbench**, which you have now seen four times: generate stimulus, compute the expected response independently, compare, and stop loudly on the first mismatch. A testbench that only prints waveforms for a human to inspect is not a test; nobody will inspect them on the hundredth run.
+
+Good testbenches add **constrained-random stimulus** (millions of random but legal inputs, as the ALU testbench did with `$random`), **reference models** written in a different style or language from the design, **coverage** (did the tests actually reach every state and corner?), and **assertions**, properties checked continuously, such as the crossing's "never green and walk". SystemVerilog Assertions express these compactly, for example `assert property (@(posedge clk) !(car_green && walk));`. Large teams build testbenches with the **UVM** (Universal Verification Methodology, IEEE 1800.2), a SystemVerilog class library; many smaller teams and open-source projects write them in Python with [cocotb](https://www.cocotb.org/). **Formal verification** proves assertions for all inputs rather than sampling them.
+
+You will meet other hardware languages:
+
+- **SystemVerilog** (IEEE 1800, latest revision 2023) is the successor that absorbed Verilog (IEEE 1364) in 2009: it adds `logic`, `always_ff`, enums, structs, interfaces, and a large verification language. This course's checks use a little of it.
+- **VHDL** (IEEE 1076) grew from a US Department of Defense programme in the 1980s; it is strongly typed and verbose, and widely used in Europe, in aerospace and defence, and in FPGA work. The flip-flop above reads `if rising_edge(clk) then q <= d; end if;` inside a `process`.
+- **Embedded languages** generate Verilog from a general-purpose language: Chisel (in Scala, from UC Berkeley, used for many RISC-V cores), SpinalHDL (Scala), and Amaranth (Python). **High-level synthesis** tools compile C++ or similar into hardware, popular for signal processing and accelerators.
+
+</Section>
+
+<Section id="fpga" kind="definitions" title="Inside an FPGA">
+
+A **field-programmable gate array** is a chip full of generic logic and programmable wiring that can be configured, in milliseconds, to become almost any digital circuit. An ASIC (a custom chip) is faster, smaller and far more power-efficient for the same function, but costs millions to design and months to make; an FPGA is bought off the shelf and reconfigured as often as you like. FPGAs are used for prototyping ASICs, for low-volume products, wherever the hardware must change after shipping (telecommunications, networking, test equipment, satellites), and where latency must be measured in nanoseconds.
+
+The basic element is the **look-up table** (LUT). A $k$-input LUT is a tiny memory of $2^k$ bits plus a multiplexer: the $k$ inputs form an address, and the stored bit at that address is the output. Fill the memory with a function's truth table and the LUT computes that function, *any* function of $k$ inputs, with the same delay. This is Shannon expansion in silicon, as promised in <LessonLink slug="combinational-logic">Combinational logic</LessonLink>.
+
+<Figure caption="A logic element: a 4-input look-up table whose 16 configuration bits (here, the truth table of 4-input parity) are selected by the inputs a to d, followed by a flip-flop that can be used or bypassed. One configuration bit chooses registered or combinational output.">
+<svg viewBox="0 0 440 200" role="img" aria-label="On the left, a column of 16 configuration memory cells holding 0 and 1 values. They feed a 16-to-1 multiplexer drawn as a trapezoid, whose four select lines come up from inputs a, b, c and d at the bottom. The multiplexer's output goes both to a D flip-flop with a clock input and, by a bypass path, to a 2-to-1 multiplexer. That multiplexer, controlled by a configuration bit, chooses the registered or unregistered signal as the element's output to the routing.">
+  <defs>
+    <marker id="vf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.7" stroke="currentColor" strokeWidth="1">
+    <rect x="40" y="25" width="30" height="128" />
+  </g>
+  <g stroke="currentColor" strokeWidth="0.6">
+    <line x1="40" y1="33" x2="70" y2="33" /><line x1="40" y1="41" x2="70" y2="41" />
+    <line x1="40" y1="49" x2="70" y2="49" /><line x1="40" y1="57" x2="70" y2="57" />
+    <line x1="40" y1="65" x2="70" y2="65" /><line x1="40" y1="73" x2="70" y2="73" />
+    <line x1="40" y1="81" x2="70" y2="81" /><line x1="40" y1="89" x2="70" y2="89" />
+    <line x1="40" y1="97" x2="70" y2="97" /><line x1="40" y1="105" x2="70" y2="105" />
+    <line x1="40" y1="113" x2="70" y2="113" /><line x1="40" y1="121" x2="70" y2="121" />
+    <line x1="40" y1="129" x2="70" y2="129" /><line x1="40" y1="137" x2="70" y2="137" />
+    <line x1="40" y1="145" x2="70" y2="145" />
+  </g>
+  <g fill="currentColor" fontFamily="monospace" fontSize="7" textAnchor="middle">
+    <text x="55" y="31">0</text><text x="55" y="39">1</text><text x="55" y="47">1</text><text x="55" y="55">0</text>
+    <text x="55" y="63">1</text><text x="55" y="71">0</text><text x="55" y="79">0</text><text x="55" y="87">1</text>
+    <text x="55" y="95">1</text><text x="55" y="103">0</text><text x="55" y="111">0</text><text x="55" y="119">1</text>
+    <text x="55" y="127">0</text><text x="55" y="135">1</text><text x="55" y="143">1</text><text x="55" y="151">0</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <path d="M 100 25 L 150 55 L 150 125 L 100 155 Z" />
+    <rect x="215" y="70" width="50" height="45" rx="3" />
+    <path d="M 233 115 L 240 106 L 247 115" />
+    <path d="M 310 70 L 335 82 L 335 128 L 310 140 Z" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.1">
+    <path d="M 70 45 H 100 M 70 70 H 100 M 70 95 H 100 M 70 120 H 100 M 70 140 H 100" />
+    <path d="M 110 186 V 149 M 120 186 V 143 M 130 186 V 137 M 140 186 V 131" />
+    <path d="M 150 90 H 213" />
+    <path d="M 180 90 V 160 H 300 V 128 H 308" />
+    <path d="M 265 90 H 308" />
+    <path d="M 240 140 V 117" />
+    <path d="M 322 56 V 75" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.1" markerEnd="url(#vf-arrow)">
+    <path d="M 335 105 H 425" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="180" cy="90" r="2.5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="55" y="16">16 config bits</text>
+    <text x="125" y="93">16:1</text>
+    <text x="110" y="197">a</text><text x="120" y="197">b</text><text x="130" y="197">c</text><text x="140" y="197">d</text>
+    <text x="240" y="64">flip-flop</text>
+    <text x="226" y="94">D</text>
+    <text x="256" y="94">Q</text>
+    <text x="240" y="152">clk</text>
+    <text x="322" y="50">config bit</text>
+    <text x="242" y="172">bypass</text>
+    <text x="385" y="98">to routing</text>
+  </g>
+</svg>
+</Figure>
+
+The bits in the figure are the truth table of 4-input parity, read from address 0 at the top. That stored word is what vendor tools call the LUT's **INIT** value. The program computes it for several functions, and shows that a function of five inputs fits in two 4-input LUTs and a multiplexer.
+
+```python run
+from itertools import product
+
+def lut_init(f, k):
+    """The 2**k configuration bits of a k-input LUT computing f: bit i holds f at address i,
+    where address i lists the inputs in order, first input most significant."""
+    init = 0
+    for address, inputs in enumerate(product((0, 1), repeat=k)):
+        init |= f(*inputs) << address
+    return init
+
+def lut_read(init, *inputs):
+    """What the hardware does: use the inputs as an address into the stored bits."""
+    address = int("".join(map(str, inputs)), 2)
+    return (init >> address) & 1
+
+functions = {
+    "AND of 4 inputs": lambda a, b, c, d: a & b & c & d,
+    "XOR of 4 inputs (parity)": lambda a, b, c, d: a ^ b ^ c ^ d,
+    "majority of a, b, c (d unused)": lambda a, b, c, d: (a & b) | (a & c) | (b & c),
+    "segment e = CD' + B'D'": lambda a, b, c, d: (c & (1 - d)) | ((1 - b) & (1 - d)),
+}
+for name, f in functions.items():
+    init = lut_init(f, 4)
+    assert all(lut_read(init, *x) == f(*x) for x in product((0, 1), repeat=4))
+    print(f"{name:32} INIT = 16'h{init:04X}")
+
+# Any function of 5 inputs from two 4-input LUTs and a 2:1 mux (Shannon expansion on the 5th input).
+f5 = lambda a, b, c, d, e: (a + b + c + d + e) >= 3           # 5-input majority
+low, high = lut_init(lambda *x: f5(*x, 0), 4), lut_init(lambda *x: f5(*x, 1), 4)
+ok = all((lut_read(high, *x[:4]) if x[4] else lut_read(low, *x[:4])) == f5(*x)
+         for x in product((0, 1), repeat=5))
+print(f"5-input majority: LUT for e=0 holds 16'h{low:04X}, for e=1 16'h{high:04X}; mux output correct: {ok}")
+print("configuration bits in one 6-input LUT:", 2**6, "  functions it can compute:", f"2**64 = {2**64:,}")
+```
+
+A LUT doesn't care which function it holds: four-input AND and four-input parity cost exactly the same. That changes the economics of logic minimisation. On an FPGA the question is not "how many gates?" but "how many LUTs, and how many LUT levels on the critical path?", and synthesis tools map logic into $k$-input pieces to minimise those.
+
+Around the LUTs, a modern FPGA contains:
+
+- **Flip-flops**, one or two per LUT, so registers are nearly free.
+- **Carry chains**: dedicated fast logic for addition running through columns of logic blocks, which is why a simple ripple-carry adder is fast on an FPGA.
+- **Block RAM**: thousands of memory blocks of tens of kilobits each (36 Kb in AMD's families, 20 Kb in Altera's), with two ports, for buffers, FIFOs and lookup tables.
+- **DSP slices**: hard multiply–accumulate units (AMD's take a 27 × 18 multiplication and a 48-bit accumulator) for filters and, increasingly, neural-network inference.
+- **Programmable routing**: wires of several lengths joined by programmable switches. Routing usually takes most of the chip's area and, on a busy design, most of the delay.
+- **I/O blocks** supporting many voltage standards, high-speed serial transceivers, **clock-management** circuits (PLLs) that synthesise clock frequencies, and in many devices hard processor cores and memory controllers.
+
+Logic is grouped into blocks: each of AMD's configurable logic blocks in recent families holds eight 6-input LUTs and sixteen flip-flops; Altera's adaptive logic modules hold a fracturable LUT that can implement one 6-input function or two smaller ones; Lattice's iCE40 and ECP5 families use 4-input LUTs. Most FPGAs keep their configuration in SRAM cells, so they forget it at power-off and reload it from a flash chip at power-up; a few families (from Microchip and some of Lattice's) use non-volatile cells instead.
+
+<Figure caption="A simplified FPGA floorplan: columns of configurable logic blocks (CLB), interleaved with columns of block RAM and DSP slices, all joined by programmable routing channels (dashed), with I/O blocks around the edge.">
+<svg viewBox="0 0 400 240" role="img" aria-label="A rectangle representing an FPGA die, its border lined with small I/O pads. Inside, a grid of small square logic blocks labelled CLB, with one column of tall block-RAM blocks and one column of tall DSP blocks among them. Dashed lines between the blocks represent routing channels.">
+  <rect x="5" y="5" width="390" height="205" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="currentColor">
+    <rect x="30" y="7" width="8" height="5" /><rect x="70" y="7" width="8" height="5" /><rect x="110" y="7" width="8" height="5" />
+    <rect x="150" y="7" width="8" height="5" /><rect x="190" y="7" width="8" height="5" /><rect x="230" y="7" width="8" height="5" />
+    <rect x="270" y="7" width="8" height="5" /><rect x="310" y="7" width="8" height="5" /><rect x="350" y="7" width="8" height="5" />
+    <rect x="30" y="203" width="8" height="5" /><rect x="70" y="203" width="8" height="5" /><rect x="110" y="203" width="8" height="5" />
+    <rect x="150" y="203" width="8" height="5" /><rect x="190" y="203" width="8" height="5" /><rect x="230" y="203" width="8" height="5" />
+    <rect x="270" y="203" width="8" height="5" /><rect x="310" y="203" width="8" height="5" /><rect x="350" y="203" width="8" height="5" />
+  </g>
+  <g stroke="currentColor" strokeWidth="0.7" strokeDasharray="3 3">
+    <line x1="20" y1="65" x2="380" y2="65" /><line x1="20" y1="105" x2="380" y2="105" /><line x1="20" y1="145" x2="380" y2="145" />
+    <line x1="65" y1="22" x2="65" y2="190" /><line x1="105" y1="22" x2="105" y2="190" /><line x1="145" y1="22" x2="145" y2="190" />
+    <line x1="185" y1="22" x2="185" y2="190" /><line x1="225" y1="22" x2="225" y2="190" /><line x1="265" y1="22" x2="265" y2="190" />
+    <line x1="305" y1="22" x2="305" y2="190" /><line x1="345" y1="22" x2="345" y2="190" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1">
+    <rect x="110" y="30" width="30" height="70" /><rect x="110" y="110" width="30" height="70" />
+  </g>
+  <g fill="var(--compute-soft)" stroke="currentColor" strokeWidth="1">
+    <rect x="230" y="30" width="30" height="70" /><rect x="230" y="110" width="30" height="70" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="30" y="30" width="30" height="30" /><rect x="70" y="30" width="30" height="30" />
+    <rect x="150" y="30" width="30" height="30" /><rect x="190" y="30" width="30" height="30" />
+    <rect x="270" y="30" width="30" height="30" /><rect x="310" y="30" width="30" height="30" /><rect x="350" y="30" width="30" height="30" />
+    <rect x="30" y="70" width="30" height="30" /><rect x="70" y="70" width="30" height="30" />
+    <rect x="150" y="70" width="30" height="30" /><rect x="190" y="70" width="30" height="30" />
+    <rect x="270" y="70" width="30" height="30" /><rect x="310" y="70" width="30" height="30" /><rect x="350" y="70" width="30" height="30" />
+    <rect x="30" y="110" width="30" height="30" /><rect x="70" y="110" width="30" height="30" />
+    <rect x="150" y="110" width="30" height="30" /><rect x="190" y="110" width="30" height="30" />
+    <rect x="270" y="110" width="30" height="30" /><rect x="310" y="110" width="30" height="30" /><rect x="350" y="110" width="30" height="30" />
+    <rect x="30" y="150" width="30" height="30" /><rect x="70" y="150" width="30" height="30" />
+    <rect x="150" y="150" width="30" height="30" /><rect x="190" y="150" width="30" height="30" />
+    <rect x="270" y="150" width="30" height="30" /><rect x="310" y="150" width="30" height="30" /><rect x="350" y="150" width="30" height="30" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="8" textAnchor="middle">
+    <text x="45" y="48">CLB</text><text x="85" y="48">CLB</text><text x="165" y="48">CLB</text><text x="205" y="48">CLB</text>
+    <text x="285" y="48">CLB</text><text x="325" y="48">CLB</text><text x="365" y="48">CLB</text>
+    <text x="125" y="68">BRAM</text><text x="125" y="148">BRAM</text>
+    <text x="245" y="68">DSP</text><text x="245" y="148">DSP</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="200" y="230">CLB: LUTs, flip-flops, carry · BRAM: block memory · DSP: multiply–accumulate</text>
+  </g>
+</svg>
+</Figure>
+
+<Narrator who="chloe">
+
+Why is the 6-input LUT the industry's favourite size? A $k$-input LUT can hold any of $2^{2^k}$ functions, but its area grows as $2^k$ while most logic needs only a few inputs at a time. Studies of real designs in the 1990s and 2000s found that 4 to 6 inputs minimised area times delay, and the industry settled on 6-input LUTs that can split into two smaller ones when the logic is narrow.
+
+</Narrator>
+
+</Section>
+
+<Section id="toolchains" kind="human" title="From Verilog to a bitstream">
+
+Turning a description into a configured FPGA takes five steps, whichever tools you use.
+
+1. **Synthesis**: parse the HDL, infer registers, memories and arithmetic, optimise the logic, and map it onto the device's primitives (LUTs, flip-flops, carry chains, block RAM, DSP slices).
+2. **Placement**: choose a physical site on the chip for every primitive, keeping connected logic close together.
+3. **Routing**: choose the programmable wires and switches for every connection.
+4. **Timing analysis**: compute every path's delay with the real placement and routing, and report whether the design meets the clock constraints. <LessonLink slug="timing-and-clocking">Timing and clocking</LessonLink> covers what this computes.
+5. **Bitstream generation**: write the configuration file, which is loaded into the FPGA over USB or JTAG, or stored in the board's flash.
+
+Each vendor provides an integrated tool for its own chips: **AMD Vivado** (with Vitis for embedded software and high-level synthesis) for the FPGAs AMD acquired with Xilinx in 2022; **Quartus Prime** for **Altera**'s, a company that was part of Intel from 2015 and has operated independently again since 2025; **Lattice Radiant** and **Diamond**; **Microchip Libero SoC**; and the tools of newer makers such as **Gowin** (China) and **Efinix**. Licences for small and mid-sized devices are typically free.
+
+There is also a fully **open-source flow**, built on reverse-engineered and documented bitstream formats: [Yosys](https://github.com/YosysHQ/yosys) for synthesis, [nextpnr](https://github.com/YosysHQ/nextpnr) for place and route, and per-family bitstream projects (IceStorm for Lattice iCE40, Trellis for ECP5, Apicula for Gowin, and work by the F4PGA project for some AMD parts). For an iCE40 board the whole flow is a few commands (not run here, because they need the board):
+
+```bash
+yosys -p "synth_ice40 -top top -json top.json" top.v uart_tx.v
+nextpnr-ice40 --up5k --package sg48 --json top.json --pcf board.pcf --asc top.asc --freq 12
+icepack top.asc top.bin          # write the bitstream
+iceprog top.bin                  # load it over USB
+```
+
+Every flow also needs **constraints**: which signal goes to which physical pin, at what voltage standard, and what clock frequency to meet. Each family has its own format. A Lattice `.pcf` file and an AMD `.xdc` file look like this (the pin names are examples; take yours from the board's documentation):
+
+```text
+# board.pcf (iCE40)
+set_io clk   35
+set_io uart_tx 9
+set_io led   39
+
+# board.xdc (AMD Vivado)
+set_property PACKAGE_PIN W5      [get_ports clk]
+set_property IOSTANDARD LVCMOS33 [get_ports clk]
+create_clock -period 10.000 -name sys_clk [get_ports clk]
+```
+
+The `IOSTANDARD LVCMOS33` line is where the voltage levels of the first lesson of this level reappear: the FPGA's I/O bank must match what is on the other side of the pin. FPGA development boards powered from USB are a safe way to learn: they run at 5 V and below and draw well under an ampere, so mistakes cost a resent bitstream, not a burn.
+
+<Narrator who="margaret">
+
+How long does each step take? For the UART below, seconds. For a large design on a big FPGA, synthesis plus place and route can take hours, which is why teams simulate first and build second: an Icarus run of the UART testbench takes a fraction of a second, and Verilator, which compiles the design to C++, often runs large designs one or two orders of magnitude faster than event-driven simulators.
+
+</Narrator>
+
+</Section>
+
+<Section id="uart" kind="computation" title="A UART transmitter">
+
+A **UART** (universal asynchronous receiver–transmitter) sends bytes over a single wire with no shared clock. Both ends agree on a **baud rate** (bits per second), such as 115,200. The line idles at 1. A frame is a **start bit** (0), the eight data bits *least significant first*, and a **stop bit** (1). The falling edge of the start bit tells the receiver when to start its timer; it then samples each bit in the middle. The protocol and its relatives are the subject of <LessonLink slug="buses-and-interfaces">Buses and interfaces</LessonLink>, which builds the matching receiver in Verilog; here we build the transmitter.
+
+<Figure caption="One UART frame carrying the byte 0x4C (the letter L, binary 0100 1100), sent least significant bit first: start bit 0, data 0 0 1 1 0 0 1 0, stop bit 1. The receiver samples in the middle of each bit time.">
+<svg viewBox="0 0 360 110" role="img" aria-label="A digital waveform. The line idles high, drops low for the start bit, then carries the data bits 0, 0, 1, 1, 0, 0, 1, 0, labelled D0 to D7, then returns high for the stop bit and idle.">
+  <g stroke="currentColor" strokeWidth="0.6" strokeDasharray="2 3">
+    <line x1="56" y1="30" x2="56" y2="78" /><line x1="82" y1="30" x2="82" y2="78" /><line x1="108" y1="30" x2="108" y2="78" />
+    <line x1="134" y1="30" x2="134" y2="78" /><line x1="160" y1="30" x2="160" y2="78" /><line x1="186" y1="30" x2="186" y2="78" />
+    <line x1="212" y1="30" x2="212" y2="78" /><line x1="238" y1="30" x2="238" y2="78" /><line x1="264" y1="30" x2="264" y2="78" />
+    <line x1="290" y1="30" x2="290" y2="78" /><line x1="316" y1="30" x2="316" y2="78" />
+  </g>
+  <path d="M 30 40 H 56 V 70 H 134 V 40 H 186 V 70 H 238 V 40 H 264 V 70 H 290 V 40 H 342" fill="none" stroke="currentColor" strokeWidth="1.8" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="69" y="30">0</text><text x="95" y="30">0</text><text x="121" y="30">0</text><text x="147" y="30">1</text>
+    <text x="173" y="30">1</text><text x="199" y="30">0</text><text x="225" y="30">0</text><text x="251" y="30">1</text>
+    <text x="277" y="30">0</text><text x="303" y="30">1</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="43" y="92">idle</text><text x="69" y="92">start</text><text x="95" y="92">D0</text><text x="121" y="92">D1</text>
+    <text x="147" y="92">D2</text><text x="173" y="92">D3</text><text x="199" y="92">D4</text><text x="225" y="92">D5</text>
+    <text x="251" y="92">D6</text><text x="277" y="92">D7</text><text x="303" y="92">stop</text><text x="329" y="92">idle</text>
+  </g>
+</svg>
+</Figure>
+
+The transmitter needs to hold each bit for exactly one bit time, which it measures in clock cycles: **cycles per bit** = clock frequency ÷ baud rate, rounded to a whole number. Rounding introduces an error, which matters because the receiver's own clock is also imperfect.
+
+```python run
+# Clock cycles per bit for a UART: the nearest whole number to f_clk / baud.
+clocks = [12e6, 16e6, 50e6, 100e6]
+bauds = [9600, 115200, 921600]
+
+print("clock     baud     divisor  actual baud   error")
+for f in clocks:
+    for baud in bauds:
+        div = round(f / baud)
+        actual = f / div
+        error = 100 * (actual - baud) / baud
+        print(f"{f / 1e6:5.0f} MHz {baud:7}  {div:7}  {actual:11.1f}  {error:+6.2f} %")
+
+# The receiver samples each bit in its middle. By the middle of the stop bit (9.5 bit
+# times after the start edge) the accumulated timing error must stay under half a bit.
+print(f"\ntotal mismatch the frame can absorb: {100 * 0.5 / 9.5:.1f} % (shared by transmitter and receiver)")
+```
+
+Most combinations are well within budget, but 921,600 baud from a 16 MHz clock is off by 2.1%, which uses up most of the 5.3% the frame can absorb before the receiver has allowed for its own clock error. That is why microcontroller datasheets tabulate baud-rate errors, and why some boards use oddly specific crystals such as 14.7456 MHz, which divide exactly into the standard rates.
+
+The design is a Moore state machine with four states (IDLE, START, DATA, STOP), a counter that counts the cycles within each bit, and a shift register that presents the data bits one at a time. The testbench contains a **receiver model**, written independently in the testbench style, that waits for a start edge, samples each bit in its middle, checks the start and stop bits, and rebuilds the bytes; it sends a whole string and requires every character to come back. `.*` connects every port of the instance to the signal of the same name, a SystemVerilog shorthand.
+
+```verilog check
+// A UART transmitter, 8 data bits, no parity, 1 stop bit ("8N1"), and a testbench whose
+// receiver model decodes the serial line independently and checks every byte.
+module uart_tx #(parameter int CLKS_PER_BIT = 434) (   // 50 MHz / 115200 baud = 434
+  input  logic       clk, rst_n,
+  input  logic       start,          // one-cycle pulse: send data
+  input  logic [7:0] data,
+  output logic       tx,             // the serial line: idle high
+  output logic       busy
+);
+  typedef enum logic [1:0] {IDLE, START, DATA, STOP} state_t;
+  state_t                          state;
+  logic [$clog2(CLKS_PER_BIT)-1:0] clk_count;   // clock cycles within the current bit
+  logic [2:0]                      bit_index;   // which data bit is on the line
+  logic [7:0]                      shifter;     // the byte, shifted out least significant bit first
+  logic                            bit_done;
+  assign bit_done = (clk_count == CLKS_PER_BIT - 1);
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state <= IDLE; tx <= 1'b1; busy <= 1'b0;
+      clk_count <= '0; bit_index <= '0; shifter <= '0;
+    end else begin
+      clk_count <= (state == IDLE || bit_done) ? '0 : clk_count + 1'b1;
+      case (state)
+        IDLE: begin
+          tx <= 1'b1;
+          if (start) begin
+            shifter <= data;
+            busy    <= 1'b1;
+            state   <= START;
+          end
+        end
+        START: begin
+          tx <= 1'b0;                              // the start bit
+          if (bit_done) begin bit_index <= '0; state <= DATA; end
+        end
+        DATA: begin
+          tx <= shifter[0];
+          if (bit_done) begin
+            shifter <= shifter >> 1;
+            if (bit_index == 3'd7) state <= STOP;
+            else                   bit_index <= bit_index + 1'b1;
+          end
+        end
+        STOP: begin
+          tx <= 1'b1;                              // the stop bit
+          if (bit_done) begin busy <= 1'b0; state <= IDLE; end
+        end
+      endcase
+    end
+  end
+endmodule
+
+module tb;
+  localparam int CPB = 8;                          // 8 clocks per bit keeps the simulation short
+  logic clk = 0, rst_n = 0, start = 0;
+  logic [7:0] data;
+  wire  tx, busy;
+  uart_tx #(.CLKS_PER_BIT(CPB)) dut (.*);
+  always #5 clk = ~clk;
+
+  string message = "Lumenary", received = "";
+
+  // Receiver model: find the falling edge of a start bit, then sample in the middle of every bit.
+  initial begin : receiver
+    logic [7:0] byte_in;
+    string      levels;
+    forever begin
+      @(negedge tx);
+      repeat (CPB / 2) @(posedge clk);
+      if (tx !== 1'b0) $fatal(1, "start bit too short");
+      levels = "0";
+      for (int i = 0; i < 8; i++) begin
+        repeat (CPB) @(posedge clk);
+        byte_in[i] = tx;                           // least significant bit first
+        levels = {levels, $sformatf(" %b", tx)};
+      end
+      repeat (CPB) @(posedge clk);
+      if (tx !== 1'b1) $fatal(1, "missing stop bit");
+      levels = {levels, " 1"};
+      if (received.len() < 2)
+        $display("received 0x%h '%s'   line: %s", byte_in, byte_in, levels);
+      received = {received, string'(byte_in)};
+    end
+  end
+
+  initial begin
+    repeat (3) @(posedge clk);
+    rst_n = 1;
+    for (int i = 0; i < message.len(); i++) begin
+      @(posedge clk);
+      data <= message[i]; start <= 1;            // <= : change inputs just after the edge,
+      @(posedge clk);                              //      so the design samples them cleanly
+      start <= 0;
+      @(negedge busy);                             // wait until the frame is finished
+    end
+    repeat (2 * CPB) @(posedge clk);
+    $display("sent \"%s\", received \"%s\", %0d clock cycles", message, received, $time / 10);
+    if (received != message) $fatal(1, "mismatch");
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+received 0x4c 'L'   line: 0 0 0 1 1 0 0 1 0 1
+received 0x75 'u'   line: 0 1 0 1 0 1 1 1 0 1
+sent "Lumenary", received "Lumenary", 674 clock cycles
+```
+
+The line levels for `L` match the frame in the figure. Two details deserve notice. The output `tx` is set inside the clocked block, so it comes straight from a flip-flop: a serial line that leaves the chip must never glitch, and a registered output cannot. And the testbench changes the design's inputs with `<=` just after a clock edge, so that the design always samples them cleanly at the next edge; testbenches that use `=` at the same instant as the clock can race with the design they are testing.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Verilog runs on the FPGA."** Nothing runs; the FPGA is configured to *be* the described circuit. There is no program counter, no sequence of statements in time, only gates and flip-flops switching in parallel.
+
+</Misconception>
+
+<Misconception>
+
+**"A `for` loop takes one clock cycle per iteration."** In synthesisable code a loop is unrolled into parallel copies of hardware, all computing in the same cycle. To spread work over cycles, write a state machine or a counter.
+
+</Misconception>
+
+<Misconception>
+
+**"`=` and `<=` are a matter of style."** They have different semantics. Blocking assignment in a clocked block can turn a shift register into a wire, and blocking assignments in two clocked blocks make simulation order-dependent.
+
+</Misconception>
+
+<Misconception>
+
+**"If it simulates, it will work on the board."** Simulation without delays assumes every path settles within a clock period, and ignores clock-domain crossings, unconstrained pins and wrong I/O standards. Static timing analysis and the constraint files are part of the design, not paperwork.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

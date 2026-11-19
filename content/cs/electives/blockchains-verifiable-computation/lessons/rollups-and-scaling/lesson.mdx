@@ -1,0 +1,356 @@
+---
+title: "Scaling: rollups and data availability"
+subtitle: Why a base layer is slow on purpose, how rollups move execution off it while keeping its security, and why publishing data turns out to be the hard part.
+minutes: 80
+objectives:
+  - Explain why a base layer's throughput is limited, and treat the scalability trilemma as a heuristic
+  - Compare payment channels, sidechains and rollups by where execution, data and security live
+  - Simulate an optimistic rollup's bisection fraud-proof game, and explain challenge windows
+  - Explain data availability, EIP-4844 blobs and the danksharding roadmap
+  - Show with erasure coding and a simulation why sampling a few random chunks detects withheld data
+  - Assess sequencers, forced inclusion, rollup maturity stages and bridge risk as of 2026
+prerequisites: [hashes-and-merkle-trees, proof-of-stake-and-finality, bitcoin-transactions, smart-contracts, contract-security]
+narrators: [chloe, margaret, gideon]
+related: [math.algebra.polynomials, math.algebra.fields-galois, math.prob.probability-theory, math.applied.information-theory]
+references:
+  - title: "An Incomplete Guide to Rollups"
+    author: Vitalik Buterin
+    year: 2021
+    url: https://vitalik.eth.limo/general/2021/01/05/rollup.html
+  - title: "EIP-4844: Shard Blob Transactions"
+    url: https://eips.ethereum.org/EIPS/eip-4844
+  - title: "EIP-7594: PeerDAS – Peer Data Availability Sampling"
+    url: https://eips.ethereum.org/EIPS/eip-7594
+  - title: "Ethereum.org: Danksharding"
+    url: https://ethereum.org/en/roadmap/danksharding/
+  - title: "Fraud and Data Availability Proofs: Maximising Light Client Security and Scaling Blockchains with Dishonest Majorities"
+    author: Mustafa Al-Bassam, Alberto Sonnino and Vitalik Buterin
+    year: 2018
+    url: https://arxiv.org/abs/1809.09044
+    note: The paper behind data availability sampling with erasure codes.
+  - title: "ETHBEAT (formerly L2BEAT): the Stages framework"
+    url: https://ethbeat.org/stages
+    note: Independent assessments of how far each rollup's security depends on its operators; the live pages change often.
+  - title: "Arbitrum documentation: inside Arbitrum Nitro"
+    url: https://docs.arbitrum.io/
+  - title: "OP Stack documentation"
+    url: https://docs.optimism.io/
+  - title: "Celestia documentation: data availability"
+    url: https://docs.celestia.org/
+---
+
+<Section id="motivation" kind="motivation" title="Slow on purpose">
+
+Bitcoin settles a handful of payments per second, and Ethereum's base layer a few dozen. A single database server does thousands. This is not because blockchain engineers cannot write fast code. It is because a public blockchain's security rests on many independent people being able to **check everything**: every full node downloads every block, re-executes every transaction and keeps the resulting state. If blocks were made a hundred times bigger, verifying the chain would need data-centre hardware, fewer people would run nodes, and the system would drift back towards trusting a few operators, the very thing it was built to avoid.
+
+So scaling a blockchain is not mainly about speed. It is about this question: *how can a chain process far more transactions than every node can afford to re-execute, without asking anyone to trust the people who do execute them?* This lesson follows the answers in order of how much they keep of the base layer's security: payment channels, sidechains, and rollups, both optimistic and validity-based. Along the way it reaches the surprising conclusion of the last decade of research: the hard resource is not computation, which proofs can compress, but **data**, which must be published so that anyone can check, and which leads to erasure codes and random sampling.
+
+</Section>
+
+<Section id="limits" kind="intuition" title="Why every node re-executing is the bottleneck">
+
+A full node's work per block is roughly: download the block, verify signatures, execute the transactions, update the state, and pass the block on. Each of these scales with the block's contents, and the slowest node that the community wants to support sets the limit.
+
+<Narrator who="margaret">
+
+Ethereum's base layer, for illustration: with a 36 million gas limit per 12-second slot (the limit for part of 2025, since raised), and a plain ether transfer costing 21,000 gas, the chain could carry at most $36{,}000{,}000 / 21{,}000 / 12 \approx 142$ transfers per second, and real transactions, which call contracts, use several times more gas. Bitcoin's estimate in <LessonLink slug="bitcoin-transactions">Bitcoin's transactions</LessonLink> came to 5 to 10 per second. Either way, the planet's payments do not fit.
+
+</Narrator>
+
+The **scalability trilemma**, popularised by Vitalik Buterin, says a blockchain can easily get two of *decentralisation* (ordinary people can verify it), *security* (it resists attackers controlling a large share of resources) and *scalability* (it processes far more than one node could), but not all three. Treat it as a **heuristic**, not a theorem. Its three terms have no precise definitions, so nothing has been proved about them, and the techniques of this lesson are exactly attempts to escape it: if nodes can check a block's correctness with a short proof, and its availability with a few random samples, they need not re-execute or download everything. Whether those techniques "solve" the trilemma depends on how you define its terms, which is a good reason to distrust anyone who claims a chain has beaten it.
+
+</Section>
+
+<Section id="families" kind="definitions" title="Channels, sidechains and rollups">
+
+Three families of designs move work off the base layer (layer 1, or **L1**). They differ in where transactions are executed, where their data is published, and what you must trust.
+
+<Definition term="payment channel">
+
+A **payment channel** (recalled from <LessonLink slug="bitcoin-transactions">Bitcoin's transactions</LessonLink>) locks funds on L1 and lets a fixed set of participants update their split off-chain, settling on L1 only to open, close or resolve a dispute. Security is inherited from L1 as long as participants (or their watchtowers) watch it, but channels suit repeated payments between known parties, not general applications with shared state.
+
+</Definition>
+
+<Definition term="sidechain">
+
+A **sidechain** is a separate blockchain with its own consensus and validators, connected to L1 by a bridge. Its security is its own: if its validators collude, they can steal whatever is bridged to it. Examples include federated or merge-mined sidechains for Bitcoin, such as Liquid and Rootstock, and proof-of-stake chains connected to Ethereum, such as Polygon PoS and Gnosis Chain.
+
+</Definition>
+
+<Definition term="rollup">
+
+A **rollup** executes transactions off L1 but publishes them, compressed, *to* L1, together with a commitment to the resulting state (a state root). A contract on L1 holds the bridged funds and accepts a new state root only if it is shown to be correct: by surviving a challenge period in which anyone may submit a **fraud proof** (an **optimistic rollup**), or by an accompanying **validity proof** that checks the execution cryptographically (a **validity rollup**, often called a zk-rollup).
+
+</Definition>
+
+The difference that matters is the last sentence of each definition. A sidechain asks you to trust its validators. A rollup asks only that the L1 is secure, that the data is published, and, for optimistic rollups, that at least one honest party is watching and will challenge a false state root in time.
+
+<Figure caption="A rollup. A sequencer orders users' transactions and executes them off-chain; it posts the transaction data and a new state root to contracts on L1. The state root becomes final after a fraud-proof window or with a validity proof. Users who are ignored by the sequencer can push transactions through an inbox on L1.">
+<svg viewBox="0 0 540 260" role="img" aria-label="Top half, labelled layer 2: users send transactions to a sequencer, which executes them and produces batches. Bottom half, labelled layer 1: a rollup contract holding bridged funds and state roots, and a data area for blobs. Arrows from the sequencer go down to the data area labelled transaction data and to the rollup contract labelled new state root. A side box says the root is final after a challenge window with fraud proofs, or with a validity proof. A dashed arrow from users goes directly down to an L1 inbox labelled forced inclusion, which the sequencer must read.">
+  <defs>
+    <marker id="ru-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="2 4">
+    <path d="M 5 125 L 535 125" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="start">
+    <text x="8" y="16">layer 2 (off-chain)</text>
+    <text x="8" y="142">layer 1</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="40" width="90" height="44" rx="4" />
+    <rect x="190" y="35" width="140" height="54" rx="6" />
+    <rect x="20" y="170" width="110" height="44" rx="4" />
+    <rect x="190" y="160" width="140" height="64" rx="6" />
+    <rect x="390" y="160" width="140" height="64" rx="6" />
+    <rect x="390" y="35" width="140" height="54" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" fillOpacity="0.5">
+    <rect x="190" y="160" width="140" height="64" rx="6" />
+  </g>
+  <g fill="var(--gold-soft)" fillOpacity="0.5">
+    <rect x="390" y="160" width="140" height="64" rx="6" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="65" y="66">users</text>
+    <text x="260" y="58">sequencer</text>
+    <text x="260" y="75" fontSize="10">orders and executes</text>
+    <text x="75" y="190">inbox</text>
+    <text x="75" y="205" fontSize="10">forced inclusion</text>
+    <text x="260" y="182">rollup contract</text>
+    <text x="260" y="198" fontSize="10">bridged funds</text>
+    <text x="260" y="213" fontSize="10">state roots</text>
+    <text x="460" y="182">data (blobs)</text>
+    <text x="460" y="198" fontSize="10">compressed transactions,</text>
+    <text x="460" y="213" fontSize="10">kept about 18 days</text>
+    <text x="460" y="55" fontSize="10">root final after a</text>
+    <text x="460" y="69" fontSize="10">fraud-proof window,</text>
+    <text x="460" y="83" fontSize="10">or with a validity proof</text>
+    <text x="295" y="140" fontSize="10">new state root</text>
+    <text x="400" y="118" fontSize="10">transaction data</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#ru-arrow)">
+    <path d="M 110 62 L 188 62" />
+    <path d="M 260 89 L 260 158" />
+    <path d="M 320 89 L 430 158" />
+    <path d="M 132 192 L 188 192" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" markerEnd="url(#ru-arrow)">
+    <path d="M 60 84 L 60 168" />
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="optimistic" kind="computation" title="Optimistic rollups and the bisection game">
+
+An optimistic rollup's operator posts a state root and a bond, and the root is assumed correct unless someone proves otherwise within a **challenge window**, about seven days on the largest rollups. A naive fraud proof would make L1 re-execute the whole disputed batch, which might be far more than L1 can afford. Instead, the two parties play a **bisection game**. They agree on the state before the batch and disagree on the state after it. The asserter posts the claimed state at the midpoint; if the challenger agrees with it, the dispute must lie in the second half, otherwise in the first. After about $\log_2 N$ rounds they have narrowed $N$ steps to a single step on which they agree beforehand and disagree afterwards, and L1 executes just that one step to see who is right.
+
+```python run
+import hashlib
+
+def step(state, i):
+    """One step of a 'rollup VM': here, a hash chain stands in for executing transaction i."""
+    return hashlib.sha256(state + i.to_bytes(4, "big")).digest()
+
+def trace(n, cheat_at=None):
+    states = [b"genesis"]
+    for i in range(n):
+        s = step(states[-1], i)
+        if i == cheat_at:
+            s = hashlib.sha256(b"I credit myself 1000 ETH").digest()   # one wrong step
+        states.append(s)
+    return states
+
+N = 100_000
+honest = trace(N)
+claimed = trace(N, cheat_at=61_803)          # the asserter's claimed execution
+print("final states agree?", honest[-1] == claimed[-1])
+
+# The challenge: both agree on state 0 and disagree on state N. Bisect.
+lo, hi, rounds = 0, N, 0
+while hi - lo > 1:
+    mid = (lo + hi) // 2
+    rounds += 1                              # the asserter posts claimed[mid]; the challenger compares
+    if claimed[mid] == honest[mid]:
+        lo = mid
+    else:
+        hi = mid
+print(f"after {rounds} rounds: agree on state {lo}, disagree on state {hi}")
+
+# The base layer now executes ONE step from the agreed state and compares.
+correct = step(claimed[lo], lo)
+print("one-step check on L1: the asserter's state is", "valid" if correct == claimed[hi] else "FRAUDULENT")
+print(f"L1 re-executed 1 step instead of {N:,}; the dispute took {rounds} rounds (ceil(log2 N) = {(N - 1).bit_length()})")
+```
+
+Seventeen rounds isolate the single corrupted step among 100,000, and the base layer's entire contribution is to execute that one step. In production, a "step" is one instruction of a virtual machine (Arbitrum uses WebAssembly, the OP Stack a MIPS-like machine), and the hard engineering is making that one-step execution on L1 faithful to the off-chain machine.
+
+<Theorem name="Bisection finds a disputed step">
+
+Let $c_0, \ldots, c_N$ be the asserter's claimed states and $h_0, \ldots, h_N$ the challenger's, with $c_0 = h_0$ and $c_N \neq h_N$. Bisection maintains the invariant $c_{lo} = h_{lo}$ and $c_{hi} \neq h_{hi}$, and ends after $\lceil \log_2 N \rceil$ rounds with $hi = lo + 1$.
+
+</Theorem>
+
+<Proof>
+
+Initially $lo = 0$ and $hi = N$, so the invariant holds. In each round, if $c_{mid} = h_{mid}$ the algorithm sets $lo = mid$, and otherwise $hi = mid$; either way the invariant is preserved. The interval length $hi - lo$ goes from $L$ to at most $\lceil L/2 \rceil$, so after $r$ rounds it is at most $\lceil N / 2^r \rceil$, which reaches 1 when $r = \lceil \log_2 N \rceil$. At that point the two parties agree on state $lo$ and disagree on state $lo + 1$, so exactly one execution step is in dispute, and if the challenger is honest, $h_{lo+1} = \text{step}(h_{lo}) = \text{step}(c_{lo})$, which L1 can check.
+
+</Proof>
+
+<Narrator who="gideon">
+
+The proof assumes the challenger exists and gets its moves on chain in time. That is the real security assumption of an optimistic rollup: **one honest, live, uncensored watcher**. The seven-day window is sized for that, allowing for a challenger who must react to an attack, and for an attacker who might try to censor or delay the challenger's transactions on L1. It is also why withdrawals from an optimistic rollup to L1 take about a week, unless a third party advances the funds for a fee.
+
+</Narrator>
+
+Fraud proofs that anyone can submit took years to ship: permissionless fault proofs went live on OP Mainnet in 2024 and on Arbitrum One (with a protocol called BoLD) in 2025. Before that, only allow-listed parties could challenge, which is a much weaker guarantee.
+
+### Validity rollups
+
+A **validity rollup** posts, with each new state root, a succinct proof that executing the batch from the old root gives the new one. L1 verifies the proof in a fixed, small amount of computation, so there is no challenge window: once the proof is verified, the state is final, and withdrawals can complete within hours or less. The price is proving cost and engineering complexity: generating proofs for general-purpose computation, such as the EVM, was impractical only a few years ago and now runs on clusters of GPUs. Several validity rollups run in production in 2026, among them Starknet, zkSync Era, Scroll and Linea, and some optimistic rollups have begun adding validity proofs. How such proofs work, from interactive proofs to SNARKs, STARKs and zkVMs, is the subject of the next level, starting with <LessonLink slug="interactive-proofs-and-sumcheck">Interactive proofs and sumcheck</LessonLink>.
+
+</Section>
+
+<Section id="data-availability" kind="human" title="Data availability: the real bottleneck">
+
+Why must a rollup publish its transaction data on L1 at all, if a proof can show the state root is correct? Because correctness is not enough. Suppose the operator posts a valid state root but withholds the transactions behind it. Then:
+
+- in an optimistic rollup, nobody can compute the true state, so nobody can build a fraud proof;
+- in a validity rollup, the state is correct, but nobody else knows it: users cannot prove what they own in order to withdraw, and no one else can take over if the operator disappears.
+
+**Data availability** is the guarantee that the data behind a block was published and could be downloaded by anyone who wanted it. Earlier off-chain designs (Plasma, around 2017) failed largely on this point: they needed users to exit in a hurry whenever an operator withheld data. Designs that keep data off L1 to save cost, with a committee promising to store it (a **validium**) or with a separate data-availability network, trade this guarantee for lower fees and should be labelled as such.
+
+Publishing data on L1 used to be expensive, because rollups had to put it in calldata, which every node keeps forever. **EIP-4844**, activated with Ethereum's Dencun upgrade on 13 March 2024, introduced **blobs**: 4,096 field elements of 32 bytes each (128 KiB) attached to a block, with their own fee market, committed to with KZG polynomial commitments, and deleted by nodes after about 18 days. A rollup only needs its data to be available long enough for anyone who cares to download it and for disputes to finish; permanent storage is somebody else's job. Rollup fees fell sharply after Dencun.
+
+The roadmap from there is called **danksharding**: make blobs far more plentiful *without* asking every node to download all of them. The Pectra upgrade (May 2025) raised the target from 3 to 6 blobs per block and the maximum from 6 to 9. The Fusaka upgrade (3 December 2025) introduced **PeerDAS** ([EIP-7594](https://eips.ethereum.org/EIPS/eip-7594)), in which each node stores only some columns of the erasure-coded blob data and samples others, and two follow-up "blob-parameter-only" forks raised the target and maximum to 14 and 21 blobs per block by January 2026. Full danksharding, with two-dimensional erasure coding and sampling by light clients, remains a research and engineering goal.
+
+</Section>
+
+<Section id="sampling" kind="computation" title="Erasure coding and data availability sampling">
+
+How can a node be confident that a large block is available without downloading it? Random sampling alone does not work on raw data: an attacker withholding a single chunk escapes almost every sample. The trick, from [Al-Bassam, Sonnino and Buterin (2018)](https://arxiv.org/abs/1809.09044), is to **erasure-code** the data first. Treat $k$ chunks as values of a polynomial of degree less than $k$ over a finite field, and publish its values at $2k$ points. Any $k$ of the $2k$ chunks determine the polynomial (see <TopicLink id="math.algebra.polynomials">polynomials</TopicLink> and <TopicLink id="math.algebra.fields-galois">fields</TopicLink>), hence all the data. This is a **Reed–Solomon code**.
+
+```python run
+P = 65537                                    # a small prime field; Ethereum uses a 255-bit one
+
+def lagrange_eval(points, x):
+    """Evaluate at x the unique polynomial of degree < len(points) through the given (xi, yi)."""
+    total = 0
+    for i, (xi, yi) in enumerate(points):
+        num = den = 1
+        for j, (xj, _) in enumerate(points):
+            if j != i:
+                num = num * (x - xj) % P
+                den = den * (xi - xj) % P
+        total = (total + yi * num * pow(den, P - 2, P)) % P
+    return total
+
+data = [ord(c) for c in "BLOBDATA"]          # k = 8 original chunks
+k = len(data)
+original = list(enumerate(data))             # chunk i is the polynomial's value at x = i
+extended = [(x, lagrange_eval(original, x)) for x in range(2 * k)]   # 2k chunks: rate 1/2
+print("extended chunks:", [y for _, y in extended])
+
+import random
+rng = random.Random(4844)
+for available in (8, 7):
+    kept = sorted(rng.sample(extended, available))
+    guess = [lagrange_eval(kept, x) for x in range(k)]
+    ok = guess == data
+    print(f"from {available} of {2 * k} chunks at x = {[x for x, _ in kept]}: "
+          f"{'recovered ' + repr(''.join(map(chr, guess))) if ok else 'cannot recover (got garbage)'}")
+```
+
+The first eight extended chunks are the original bytes (the code is *systematic*), and the other eight are redundancy. Any eight chunks recover `BLOBDATA`; seven do not, because 65,537 different polynomials of degree less than 8 pass through any seven points, one for each possible value at an eighth.
+
+Now the attacker's position is much worse. To make the data unrecoverable, it must withhold at least $k + 1$ of the $2k$ chunks, **more than half**. So every random sample a node takes has a better than even chance of hitting a missing chunk, and a node that takes $s$ samples and finds them all present is fooled with probability below $(1/2)^s$.
+
+```python run
+import random
+from math import comb
+
+n, k = 256, 128                    # 128 chunks of data, extended to 256: any 128 suffice
+withheld = k + 1                   # the least an attacker must hide to make the data unrecoverable
+rng = random.Random(4844)
+
+def p_fooled(s):
+    """Exact chance that s distinct random samples all land on available chunks."""
+    return comb(n - withheld, s) / comb(n, s)
+
+print(" samples   exact P(fooled)   simulated   bound (1/2)^s")
+for s in (1, 5, 10, 20, 30):
+    trials = 40_000
+    hidden = set(range(withheld))
+    fooled = sum(not hidden.intersection(rng.sample(range(n), s)) for _ in range(trials))
+    print(f"{s:8} {p_fooled(s):17.3e} {fooled / trials:11.5f} {0.5 ** s:14.3e}")
+
+s = next(s for s in range(1, n) if p_fooled(s) < 1e-9)
+print(f"samples needed for one client to be fooled with probability below 1e-9: {s}")
+print(f"samples that the simple bound (1/2)^s < 1e-9 asks for: {next(s for s in range(1, 99) if 0.5 ** s < 1e-9)}")
+```
+
+<Narrator who="chloe">
+
+Here is the key idea in one sentence: erasure coding turns "is *every* chunk available?", which needs everything, into "is *more than half* available?", which a few random samples answer. The exact probability, a ratio of binomial coefficients, is even smaller than $(1/2)^s$ because sampling is without replacement, which is why 28 samples suffice here for a one-in-a-billion guarantee.
+
+</Narrator>
+
+Two practical points complete the picture. First, the code must be *correct*: a malicious producer could publish chunks that are not evaluations of one low-degree polynomial. Ethereum prevents this with KZG polynomial commitments, against which every chunk can be checked (they are explained in <LessonLink slug="snarks-and-polynomial-commitments">SNARKs and polynomial commitments</LessonLink>). Second, sampling clients must collectively be able to reconstruct the block, and must not be fooled one at a time by a producer who answers only the first few queries. Many clients sampling independently handle both, and in full danksharding a two-dimensional code lets data be reconstructed row by row and column by column. Separate data-availability networks, such as Celestia, offer sampling-based guarantees to rollups that do not post data to Ethereum.
+
+</Section>
+
+<Section id="sequencers" kind="human" title="Sequencers, forced inclusion and maturity, as of 2026">
+
+A rollup's **sequencer** orders transactions and posts batches. In 2026, most rollups still run a **single, centralised sequencer** operated by the team behind them. That makes them fast and simple, and gives the sequencer power: it can delay or refuse your transactions, and it captures MEV (<LessonLink slug="contract-security">Smart-contract security</LessonLink>). It cannot, by itself, steal funds or forge a state transition, provided the proof system works. Censorship is handled by **forced inclusion**: a user can submit a transaction to an inbox contract on L1, and the rollup's rules oblige the sequencer to include it after a delay (typically hours); if it does not, users can eventually post the next batch themselves. Projects are experimenting with shared sequencers and with **based rollups**, whose ordering is done by L1's own proposers.
+
+What protects users in practice also depends on who can **upgrade** the rollup's contracts. If a team's multisig can replace the bridge contract instantly, the proof system is only advice. The independent research group L2BEAT, renamed ETHBEAT in 2026, assesses this with its [Stages framework](https://ethbeat.org/stages):
+
+- **Stage 0**: the system calls itself a rollup and posts its data and state roots to L1, but its operators still control it in practice.
+- **Stage 1**: a working proof system protects users, and outside a security council (which needs a large supermajority to act) no one can push invalid withdrawals or block them indefinitely; users get at least seven days to exit before other upgrades take effect.
+- **Stage 2**: the proof system is permissionless, users get at least 30 days to exit unwanted upgrades, and the security council can intervene only on bugs detectable on chain.
+
+As of 2026 most rollups are assessed at Stage 0 or Stage 1, with only a few at Stage 2. The assessments change as projects ship, so check the live pages rather than any textbook, including this one.
+
+### Bridges and their risks
+
+Every rollup's **canonical bridge** (its L1 contract) inherits the rollup's security: slow on the way out of an optimistic rollup, but trust-minimised. Users often prefer faster **third-party bridges**, which move value between chains using their own validators, committees or liquidity pools. These are exactly the systems whose failures headlined <LessonLink slug="contract-security">the previous lesson</LessonLink>. Before bridging, ask: who can sign or prove the messages this bridge accepts? Who can upgrade it? How much value is locked in it? A wrapped token is a claim on a bridge, and is worth exactly what that bridge's weakest key or contract is worth.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Layer 2s are as secure as Ethereum."** A rollup at Stage 2, with its data on Ethereum, comes close; a rollup at Stage 0, or one keeping its data elsewhere, depends on its operators. "Layer 2" is a marketing term as often as a technical one. Ask where the data goes, who can prove fraud, and who can upgrade the contracts.
+
+</Misconception>
+
+<Misconception>
+
+**"Validity proofs make data availability unnecessary."** A proof shows that the new state is correct, not that anyone else knows what it is. Without the data, users cannot construct proofs of their own balances to withdraw, and nobody can take over from a failed operator.
+
+</Misconception>
+
+<Misconception>
+
+**"Blobs are permanent storage."** Nodes delete blob data after about 18 days. The protocol guarantees it was *published*, so anyone who needed it could download it; archives, indexers and the rollups themselves keep history.
+
+</Misconception>
+
+<Misconception>
+
+**"The trilemma proves a chain cannot be fast and decentralised."** It is an informal heuristic, not a theorem, and it says nothing about techniques that let nodes verify without re-executing. It is useful as a checklist of what a scaling claim might be quietly giving up.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
