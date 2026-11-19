@@ -1,0 +1,424 @@
+---
+title: Parallel computing and a simulation project
+subtitle: Tasks, threads and processes in Julia, how to share data between them safely, and a complete heat-diffusion simulation that brings the whole course together.
+minutes: 75
+objectives:
+  - Distinguish tasks, threads and processes, and start Julia with the number of threads you want
+  - Spawn tasks, fetch their results and pass values through channels
+  - Recognise a data race and avoid it with atomics, locks or per-task results
+  - Explain how Distributed, MPI and GPU packages extend parallelism beyond one machine's threads
+  - Build, run and test a complete multithreaded simulation in idiomatic Julia
+prerequisites: [metaprogramming-and-macros]
+related: [math.analysis.ordinary-differential-equations, math.comp.numerical-methods]
+references:
+  - title: Julia manual, Multi-Threading
+    url: https://docs.julialang.org/en/v1/manual/multi-threading/
+    note: Starting Julia with threads, the interactive thread pool, @spawn, @threads, atomics and data races.
+  - title: Julia manual, Asynchronous Programming
+    url: https://docs.julialang.org/en/v1/manual/asynchronous-programming/
+    note: Tasks, channels and how the scheduler runs them.
+  - title: Julia manual, Multi-processing and Distributed Computing
+    url: https://docs.julialang.org/en/v1/manual/distributed-computing/
+    note: Worker processes, remote calls, pmap and @distributed.
+  - title: JuliaGPU
+    url: https://juliagpu.org/
+    note: The organisation behind CUDA.jl, AMDGPU.jl, Metal.jl, oneAPI.jl and KernelAbstractions.jl.
+  - title: SciML documentation
+    url: https://docs.sciml.ai/
+    note: The scientific machine learning and differential equations ecosystem, a natural next step after this project.
+---
+
+<Section id="motivation" kind="motivation" title="One machine, many cores">
+
+Your laptop almost certainly has between four and twenty processor cores, and a single Julia session uses one of them unless you ask for more. Scientific workloads are often embarrassingly parallel (a thousand independent simulation runs, a grid whose cells can be updated independently) and leaving the other cores idle wastes most of the machine.
+
+Julia offers three levels of parallelism, and choosing the right one is most of the skill:
+
+| Level | What runs in parallel | Shares memory? | Typical use |
+| --- | --- | --- | --- |
+| **Tasks** | lightweight units of work scheduled by Julia | yes | overlapping waiting (files, network) and structuring concurrent work |
+| **Threads** | tasks running at the same time on several cores | yes | speeding up loops and independent computations on one machine |
+| **Processes** | separate Julia programs that exchange messages | no | many machines, a cluster, or isolation between workers |
+
+On top of these sit **GPUs**, where thousands of simple arithmetic units run the same operation on different data. This final lesson covers the first two in working code, describes the others, and then builds a complete, tested, multithreaded simulation.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Tasks and threads">
+
+<Definition term="Task, thread">
+
+A **task** (also called a coroutine or green thread) is a function call that can be suspended and resumed. Creating one is cheap: thousands are fine. A **thread** is an operating-system thread on which Julia's scheduler runs tasks. With several threads, several tasks run truly simultaneously, each on its own core.
+
+</Definition>
+
+Julia starts with one thread for your code unless you ask otherwise. Choose the number when starting Julia:
+
+```bash
+julia -t 4 script.jl          # four threads
+julia -t auto script.jl       # one per available core
+JULIA_NUM_THREADS=8 julia     # or by environment variable
+```
+
+Since Julia 1.12 there is also, by default, one **interactive** thread, a separate pool kept free so that the REPL and other latency-sensitive tasks stay responsive while the default threads are busy; `Threads.nthreads()` counts only the default pool.
+
+```julia check
+# Tasks: lightweight units of work that the scheduler runs, on one thread or many.
+using Base.Threads
+
+println("threads in the default pool: ", nthreads())
+
+# Spawn tasks, then fetch their results. The answers are the same with 1 thread or 16.
+function count_primes(range)
+    count = 0
+    for n in range
+        n < 2 && continue
+        isprime = true
+        for d in 2:isqrt(n)
+            if n % d == 0
+                isprime = false
+                break
+            end
+        end
+        count += isprime
+    end
+    return count
+end
+
+chunks = [1:250_000, 250_001:500_000, 500_001:750_000, 750_001:1_000_000]
+tasks = [Threads.@spawn count_primes(c) for c in chunks]   # start all four
+counts = fetch.(tasks)                                     # wait for each and collect
+println("primes per quarter: ", counts, ", total ", sum(counts))
+
+# Channels pass values between tasks: here a producer and a consumer.
+readings = Channel{Float64}(10)              # a buffer of up to 10 values
+producer = Threads.@spawn begin
+    for hour in 0:5
+        put!(readings, 18.0 + 4 * sin(hour * π / 6))
+    end
+    close(readings)                          # tells the consumer no more are coming
+end
+total, n = 0.0, 0
+for r in readings                            # iterating a channel takes values until it is closed
+    global total += r
+    global n += 1
+end
+wait(producer)
+println("received ", n, " readings, mean ", round(total / n; digits = 2), " °C")
+```
+
+It prints, when run with the default single thread:
+
+```text
+threads in the default pool: 1
+primes per quarter: [22044, 19494, 18700, 18260], total 78498
+received 6 readings, mean 20.49 °C
+```
+
+`Threads.@spawn expr` creates a task that runs `expr`, possibly on another thread, and returns immediately; `fetch(task)` waits for it to finish and returns its value. Spawning four tasks and then fetching all four is the basic pattern of parallel Julia. Because each task's result is collected in order, the program prints the same prime counts with 1 thread or 16; when this program was run with `-t 4`, its output was identical apart from the first line, which reported 4 threads. (The counts also confirm a classic fact: there are 78 498 primes below one million.)
+
+A **`Channel`** is a thread-safe queue for passing values between tasks. The producer `put!`s readings and finally `close`s the channel; the consumer simply iterates over it, and the loop ends when the channel is closed and empty. Channels are the natural tool for pipelines in which one stage produces work for another.
+
+</Section>
+
+<Section id="data-races" kind="computation" title="Data races, and three ways to avoid them">
+
+Tasks on different threads share memory, and that is both the power and the danger. Here is an innocent-looking function that counts the positive numbers in a vector with `Threads.@threads`, which splits a loop's iterations among the threads:
+
+```julia
+function racy_count(data)
+    n = Ref(0)
+    @threads for x in data
+        x > 0 && (n[] += 1)       # a data race: many threads read, add and write n[] at once
+    end
+    return n[]
+end
+```
+
+Run with four threads on a vector containing 500 000 positive numbers, three calls printed:
+
+```text
+threads = 4, attempt 1: counted 187559 (correct: 500000)
+threads = 4, attempt 2: counted 294439 (correct: 500000)
+threads = 4, attempt 3: counted 245143 (correct: 500000)
+```
+
+Wrong, and wrong differently every time. `n[] += 1` is three steps (read, add, write), and when two threads interleave them, one increment overwrites the other. This is a **data race**, and in Julia, as in C and Rust's unsafe code, a race is a bug whose results are undefined. With a single thread it never shows up, which is what makes it treacherous: your tests pass on your laptop and fail on the cluster. The correct versions:
+
+```julia check
+# Sharing data between threads safely: three correct ways to count in parallel.
+using Base.Threads
+
+data = [isodd(k) ? k : -k for k in 1:1_000_000]
+
+# 1. Atomic counter: every increment is indivisible
+positives = Threads.Atomic{Int}(0)
+@threads for x in data
+    x > 0 && atomic_add!(positives, 1)
+end
+println("atomic:       ", positives[])
+
+# 2. A lock around the shared update (simple, but threads wait for each other)
+lk = ReentrantLock()
+count_locked = Ref(0)
+@threads for x in data
+    if x > 0
+        @lock lk count_locked[] += 1
+    end
+end
+println("lock:         ", count_locked[])
+
+# 3. Best: give each task its own chunk and combine the results at the end
+chunks = Iterators.partition(data, length(data) ÷ 8)
+partial = [Threads.@spawn count(>(0), c) for c in chunks]
+println("per-chunk:    ", sum(fetch.(partial)))
+
+# Random numbers: each task has its own generator, seeded from its parent,
+# so a seeded program gives the same results however tasks are scheduled.
+using Random
+Random.seed!(2026)
+function estimate_pi(samples)
+    hits = 0
+    for _ in 1:samples
+        hits += rand()^2 + rand()^2 <= 1
+    end
+    return 4 * hits / samples
+end
+runs = [Threads.@spawn estimate_pi(100_000) for _ in 1:4]
+println("π estimates: ", fetch.(runs))
+```
+
+It prints:
+
+```text
+atomic:       500000
+lock:         500000
+per-chunk:    500000
+π estimates: [3.14076, 3.14628, 3.1428, 3.14556]
+```
+
+1. **Atomics.** `Threads.Atomic{Int}` and `atomic_add!` make each increment indivisible. This is correct but slow when many threads hammer one counter.
+2. **Locks.** `@lock lk expr` lets only one task at a time run `expr`. Also correct, and the most general tool, but threads queue up for the lock.
+3. **Per-task results.** Give each task its own chunk and its own local count, then combine the results at the end. There is no shared mutable state, so there is nothing to protect, and it is usually the fastest. Prefer this design whenever you can.
+
+The last part shows a detail that makes parallel Julia pleasant for science. Each task has its own random-number generator, seeded deterministically from its parent when it is spawned. After `Random.seed!(2026)`, the four Monte Carlo estimates of π are the same however the tasks are scheduled and however many threads there are: this program printed the same four numbers with one thread and with four.
+
+</Section>
+
+<Section id="human" kind="human" title="Beyond one machine: processes, MPI and GPUs">
+
+**Distributed.** The `Distributed` standard library starts extra Julia **processes**, on the same machine or across a cluster, and lets you call functions on them. Processes do not share memory, so there are no data races, but data must be sent between them, which costs time. This sketch was run on our test machine:
+
+```julia
+using Distributed
+addprocs(2)                                   # start two worker processes on this machine
+@everywhere function collatz_steps(n)
+    steps = 0
+    while n != 1
+        n = iseven(n) ? n ÷ 2 : 3n + 1
+        steps += 1
+    end
+    return steps
+end
+println("workers: ", workers())
+longest = pmap(r -> maximum(collatz_steps, r), [1:250_000, 250_001:500_000, 500_001:750_000, 750_001:1_000_000])
+println("longest Collatz journey in each quarter of 1..10^6: ", longest)
+```
+
+```text
+workers: [2, 3]
+longest Collatz journey in each quarter of 1..10^6: [442, 448, 508, 524]
+```
+
+`@everywhere` defines the function on every process, and `pmap` hands out the work and gathers the results. On a cluster, `addprocs` takes a list of machines, or a cluster-manager package starts workers through a scheduler such as Slurm.
+
+**MPI.** On supercomputers, the standard for distributed-memory programs is MPI, and **MPI.jl** gives Julia full access to it, so Julia programs run alongside C and Fortran codes on the largest machines. Each process runs the same program and exchanges messages explicitly; Lumenary's [Fortran course](/en/cs/languages/fortran/) describes MPI from the side of the language where it is most used.
+
+**GPUs.** **CUDA.jl** (NVIDIA), **AMDGPU.jl**, **Metal.jl** (Apple) and **oneAPI.jl** (Intel) let you move arrays to a GPU and work on them with ordinary broadcasting and array functions, or write your own GPU kernels in Julia. **KernelAbstractions.jl** lets one kernel run on any of them, or on CPU threads. This is multiple dispatch once more: `x .+ 1` on a `CuArray` dispatches to code that runs on the GPU.
+
+**Choosing.** Start with a fast serial version (lesson 6), measure, and parallelise the outermost independent loop with tasks or `@threads`. Reach for processes when you need more than one machine, and for GPUs when the work is large, regular arithmetic on arrays.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Project: heat spreading through a plate">
+
+To finish, here is a complete program in the style of a small Julia package: a simulation of heat diffusing through a thin aluminium plate. A hot spot is placed on a cool plate, and we watch it spread.
+
+**The physics.** The temperature $u(x, y, t)$ obeys the heat equation $\partial u / \partial t = \alpha \left(\partial^2 u / \partial x^2 + \partial^2 u / \partial y^2\right)$, where $\alpha$ is the material's thermal diffusivity (about $9.7 \times 10^{-5}$ m²/s for aluminium). On a grid with spacing $\Delta x$, the **explicit finite-difference method** advances each cell by
+
+$$
+u_{i,j} \leftarrow u_{i,j} + r\,(u_{i-1,j} + u_{i+1,j} + u_{i,j-1} + u_{i,j+1} - 4u_{i,j}), \qquad r = \frac{\alpha\,\Delta t}{\Delta x^2},
+$$
+
+so each cell moves towards the average of its four neighbours. The method is stable only when $r \le \tfrac14$, that is $\Delta t \le \Delta x^2 / (4\alpha)$; with larger steps, rounding errors grow exponentially and the numbers explode. At the edges we need a rule for the missing neighbours: a **fixed** edge is held at a constant temperature, and an **insulated** edge lets no heat through.
+
+```julia check
+# Project: heat spreading through a metal plate, by the explicit finite-difference method.
+module HeatPlate
+
+export Fixed, Insulated, Plate, simulate!, stable_dt, total_heat, show_plate
+
+abstract type Boundary end
+
+"Edges held at a constant temperature, as if clamped to a large block."
+struct Fixed{T<:AbstractFloat} <: Boundary
+    temperature::T
+end
+
+"Edges through which no heat flows."
+struct Insulated <: Boundary end
+
+"A rectangular plate: temperatures on a square grid, diffusivity α (m²/s), spacing dx (m)."
+struct Plate{T<:AbstractFloat, B<:Boundary}
+    u::Matrix{T}
+    α::T
+    dx::T
+    boundary::B
+end
+
+"The largest time step for which the explicit scheme is stable."
+stable_dt(p::Plate) = p.dx^2 / (4 * p.α)
+
+total_heat(p::Plate) = sum(p.u)
+
+# The temperature just outside the grid depends on the boundary: chosen by dispatch.
+outside(b::Fixed, inside) = b.temperature
+outside(::Insulated, inside) = inside          # mirror the edge: zero heat flow
+
+@inline function at(u, b, i, j, i0, j0)
+    checkbounds(Bool, u, i, j) ? u[i, j] : outside(b, u[i0, j0])
+end
+
+function step!(new::Matrix{T}, u::Matrix{T}, b::Boundary, r::T) where {T}
+    m, n = size(u)
+    Threads.@threads for j in 1:n          # columns in parallel; rows in the inner loop
+        for i in 1:m
+            neighbours = at(u, b, i - 1, j, i, j) + at(u, b, i + 1, j, i, j) +
+                         at(u, b, i, j - 1, i, j) + at(u, b, i, j + 1, i, j)
+            new[i, j] = u[i, j] + r * (neighbours - 4 * u[i, j])
+        end
+    end
+    return new
+end
+
+"Advance the plate by `steps` time steps of length `dt`, in place."
+function simulate!(p::Plate{T}, dt::Real, steps::Integer) where {T}
+    dt <= stable_dt(p) || throw(ArgumentError("dt = $dt is unstable; use at most $(stable_dt(p))"))
+    r = T(p.α * dt / p.dx^2)
+    u, spare = p.u, similar(p.u)
+    for _ in 1:steps
+        step!(spare, u, p.boundary, r)
+        u, spare = spare, u                # swap buffers instead of allocating
+    end
+    u === p.u || copyto!(p.u, u)
+    return p
+end
+
+"Draw the plate as text, from cool (space) to hot (@)."
+function show_plate(io::IO, p::Plate; shades = " .:-=+*#%@")
+    lo, hi = extrema(p.u)
+    k = length(shades)
+    for i in axes(p.u, 1)
+        for j in axes(p.u, 2)
+            level = hi > lo ? round(Int, (p.u[i, j] - lo) / (hi - lo) * (k - 1)) + 1 : 1
+            print(io, shades[level])
+        end
+        println(io)
+    end
+end
+
+end # module HeatPlate
+
+using .HeatPlate, Printf, Test
+
+# An aluminium plate, 10 cm × 20 cm on a 5 mm grid, at 20 °C, with a 100 °C hot spot.
+function make_plate(boundary)
+    u = fill(20.0, 20, 40)
+    u[6:9, 8:11] .= 100.0
+    return Plate(u, 9.7e-5, 0.005, boundary)
+end
+
+plate = make_plate(Fixed(20.0))
+dt = 0.05                                   # seconds; the stable limit is printed below
+@printf("stable time step: %.4f s, using %.2f s\n", stable_dt(plate), dt)
+for (seconds, steps) in ((0, 0), (2.5, 50), (5.0, 50), (10.0, 100))
+    simulate!(plate, dt, steps)
+    @printf("t = %4.1f s   hottest %6.2f °C   mean %6.3f °C\n", seconds, maximum(plate.u), sum(plate.u) / length(plate.u))
+end
+show_plate(stdout, plate)
+
+@testset "HeatPlate" begin
+    insulated = make_plate(Insulated())
+    before = total_heat(insulated)
+    simulate!(insulated, dt, 200)
+    @test total_heat(insulated) ≈ before                 # no heat escapes
+    @test maximum(insulated.u) < 100.0                    # the hot spot spreads out
+    @test minimum(insulated.u) >= 20.0                    # nothing gets colder than the start
+    @test_throws ArgumentError simulate!(make_plate(Fixed(20.0)), 1.0, 1)   # too large a step
+    uniform = Plate(fill(37.0, 5, 5), 1e-4, 0.01, Fixed(37.0))
+    @test simulate!(uniform, 0.1, 10).u ≈ fill(37.0, 5, 5)     # equilibrium stays put
+end
+```
+
+It printed (the time in the test summary will differ on your machine):
+
+```text
+stable time step: 0.0644 s, using 0.05 s
+t =  0.0 s   hottest 100.00 °C   mean 21.600 °C
+t =  2.5 s   hottest  29.64 °C   mean 21.381 °C
+t =  5.0 s   hottest  24.74 °C   mean 21.010 °C
+t = 10.0 s   hottest  21.88 °C   mean 20.541 °C
+  .....................                 
+ ..:::---------:::::......              
+..::--==========---:::......            
+.::-==++++*+++++==---:::.....           
+.:-==+***###***+++==--:::.....          
+.:-=+**###%####**++==--::.....          
+.:=+**#%%%%%%%##**+==--:::....          
+.-=+*##%%@@@%%%##*++==--::.....         
+.-=+*#%%@@@@@%%##*++==--::.....         
+.-=+*#%%@@@@@%%##**+==--::.....         
+.-=+*#%%@@@@@%%##*++==--::.....         
+.:=+*##%%%%%%%##**++=--:::....          
+.:-=+*##%%%%%###*++==--:::....          
+.:-=+**#######**++==---::.....          
+.:-==+*********++==---:::....           
+.::-==++++*+++++==---:::.....           
+..:---====+=====---::::.....            
+...::------------::::......             
+ ...::::::::::::::.......               
+  ...................                   
+Test Summary: | Pass  Total  Time
+HeatPlate     |    5      5  0.8s
+```
+
+Every idea of the course is in this program:
+
+- **A module** (lesson 7) with an `export` list and docstrings, which is exactly what `src/HeatPlate.jl` would contain in a real package; the `@testset` at the end would move to `test/runtests.jl`.
+- **Parametric types** (lesson 5): `Plate{T, B}` stores its boundary type `B` as a parameter, so the compiler knows which boundary rule applies and generates code specialised for it. The fields are concrete once `T` and `B` are known.
+- **Multiple dispatch** (lesson 3): the boundary condition is chosen by two one-line methods of `outside`. Adding a third kind of edge, say one that loses heat to the air at a given rate, means adding a type and a method, without touching `step!`.
+- **Performance** (lesson 6): the step function is type-stable, the inner loop runs down columns in memory order, and two buffers are swapped instead of allocating a new grid each step.
+- **Threads** (this lesson): `Threads.@threads` splits the columns among threads. Each cell's new value depends only on the old grid, and each thread writes only its own columns, so there is no data race, and the output is identical with any number of threads, which we checked by running it with `-t 4`.
+- **Errors and tests** (lesson 7): `simulate!` throws an `ArgumentError` for an unstable time step instead of silently producing nonsense, and the tests check physics, not just code: with insulated edges the total heat is conserved, the maximum falls, nothing cools below the starting temperature, and a plate already at equilibrium stays there.
+
+Read the output as a physicist would. The hot spot's peak falls from 100 °C to under 22 °C in ten seconds as heat spreads, and the mean temperature slowly drops as heat leaves through the fixed 20 °C edges. The text picture shows the warm region as a smooth blob that has grown well beyond the original 4 × 4 square. Its shading is relative, from the coolest cell (a space) to the hottest (`@`), so it exaggerates differences that by now are less than two degrees.
+
+### Where to go next
+
+Ideas for extending the project, roughly in order of difficulty: add a boundary type that loses heat to the surroundings; make the time step adapt to the stability limit automatically; plot snapshots with Plots.jl or animate them with Makie.jl; compare the explicit method with an implicit one that is stable for any step size, which requires solving a sparse linear system each step (the `SparseArrays` standard library and `\` from lesson 4 will do it); and finally, express the problem in DifferentialEquations.jl and let its solvers choose the time steps for you.
+
+Beyond this course, the official [Julia documentation](https://docs.julialang.org/) is excellent and worth reading front to back, the [Julia Discourse](https://discourse.julialang.org/) forum is friendly to beginners, and the talks from the annual JuliaCon conference, linked from [julialang.org](https://julialang.org/), show what people are building. The best next step, though, is a problem of your own.
+
+<Reflection title="Many hands">
+
+Parallel programs work when each worker does its own part faithfully and nobody tramples on anyone else's: the per-task design that avoids data races is, in miniature, a picture of good collaboration. It is a small echo of an old image, of one body with many members, each different and each needed, working together without confusion.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

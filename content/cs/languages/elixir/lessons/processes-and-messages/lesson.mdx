@@ -1,0 +1,370 @@
+---
+title: Processes, messages and links
+subtitle: The BEAM's lightweight processes, mailboxes and selective receive, keeping state in a loop, links and monitors, and Tasks for everyday concurrency.
+minutes: 60
+objectives:
+  - Start processes with `spawn`, send them messages with `send`, and wait for replies with `receive` and `after`
+  - Explain how a mailbox and selective receive work, and why unmatched messages are a hazard
+  - Keep state in a process with a recursive loop, and make a synchronous request with a reference
+  - Use links and trapped exits to propagate failure, and monitors to observe it
+  - Run concurrent work with `Task.async`, `Task.await_many` and `Task.async_stream`
+prerequisites: [control-flow-errors-testing]
+references:
+  - title: "Getting started: Processes"
+    url: https://hexdocs.pm/elixir/processes.html
+    note: The official chapter on spawn, send, receive, links and tasks.
+  - title: The Process module
+    url: https://hexdocs.pm/elixir/Process.html
+    note: Monitors, links, flags, registration and process information.
+  - title: The Task module
+    url: https://hexdocs.pm/elixir/Task.html
+    note: async/await, async_stream and their options, including timeouts and ordering.
+  - title: Erlang efficiency guide on processes
+    url: https://www.erlang.org/doc/system/eff_guide_processes.html
+    note: How much memory a process uses and how messages are copied.
+  - title: The Agent module
+    url: https://hexdocs.pm/elixir/Agent.html
+    note: A tiny wrapper around a process that holds state.
+---
+
+<Section id="motivation" kind="motivation" title="Concurrency without shared memory">
+
+In most mainstream languages, concurrency means threads that share memory. Two threads that update the same counter need a lock; forget the lock and the counter is occasionally wrong; take two locks in the wrong order and the program occasionally freezes. These bugs are notoriously hard to reproduce because they depend on timing.
+
+The BEAM avoids the whole category by **not sharing memory at all**. Its unit of concurrency is the **process**: a lightweight, isolated computation with its own memory and its own **mailbox**. Processes cannot read or write each other's data. The only way they interact is by **sending messages**, which are copied into the receiver's mailbox. A process handles its messages one at a time, so the data it owns is never touched by two computations at once. No locks, no data races.
+
+This lesson is the foundation of everything that makes Elixir distinctive: GenServers, supervisors, Phoenix's handling of thousands of simultaneous connections, LiveView's per-user state. You will use the raw primitives here so that the abstractions in <LessonLink slug="genserver-and-supervisors">the next lesson</LessonLink> hold no mysteries.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Processes, mailboxes and receive">
+
+<Definition term="Process">
+
+A **process** is a function running on the BEAM with its own heap, stack, garbage collector and mailbox, identified by a **PID**. It starts in microseconds with a couple of kilobytes of memory, is scheduled preemptively alongside every other process, and ends when its function returns or it crashes.
+
+</Definition>
+
+Three primitives do almost everything:
+
+- `spawn(fun)` starts a new process running `fun` and returns its PID immediately.
+- `send(pid, message)` puts `message` (any value) at the end of `pid`'s mailbox. It never blocks and always succeeds, even if the process has died.
+- `receive do ... end` takes the **first message in the mailbox that matches one of its patterns**, removes it and runs that clause. If no message matches, the process waits. An `after milliseconds -> ...` clause gives up after a timeout.
+
+That bold phrase hides the most important detail: **selective receive**. `receive` does not take the oldest message; it scans the mailbox from oldest to newest and takes the first one that *matches*. Messages that match no clause stay in the mailbox, in order, for a later `receive`. This makes it easy to wait for one specific reply while other messages pile up, which is powerful and occasionally dangerous.
+
+```elixir check
+parent = self()
+
+echo =
+  spawn(fn ->
+    receive do
+      {:ping, from} -> send(from, {:pong, self()})
+    end
+  end)
+
+send(echo, {:ping, parent})
+
+receive do
+  {:pong, ^echo} -> IO.puts("got pong from the process we started")
+after
+  1_000 -> IO.puts("no reply within a second")
+end
+
+receive do
+  :never_sent -> :ok
+after
+  50 -> IO.puts("timed out after 50 ms, as expected")
+end
+
+# Selective receive: messages wait in the mailbox until something matches them.
+send(self(), {:low, "tidy the desk"})
+send(self(), {:high, "the server is down"})
+send(self(), {:low, "answer email"})
+
+receive do
+  {:high, task} -> IO.puts("first: #{task}")
+end
+
+for _ <- 1..2 do
+  receive do
+    {:low, task} -> IO.puts("then: #{task}")
+  end
+end
+
+IO.inspect(Process.info(self(), :message_queue_len))
+```
+
+It prints:
+
+```text
+got pong from the process we started
+timed out after 50 ms, as expected
+first: the server is down
+then: tidy the desk
+then: answer email
+{:message_queue_len, 0}
+```
+
+The echo process waits for one message, replies to whoever sent it, and ends because its function returns. The pinned pattern `{:pong, ^echo}` accepts a pong only from the process we started. The urgent message was handled first even though it arrived second, because the first `receive` only matched `{:high, _}`; the two `{:low, _}` messages then came out in their original order. The final line confirms that the mailbox is empty.
+
+Two guarantees, and one non-guarantee, govern messages. Between **one sender and one receiver**, messages arrive in the order they were sent. Messages are **copied**, so the receiver gets its own immutable data. But there is **no ordering guarantee between different senders**, and no guarantee that a message is ever processed: if the receiver has died, `send` succeeds and the message silently disappears. That is why replies need timeouts and why you need links and monitors, below.
+
+</Section>
+
+<Section id="state" kind="examples" title="State lives in a loop">
+
+Processes are also how Elixir holds **state that changes over time**, despite immutable data. The trick is a recursive loop: the process waits for a message, computes a new state, and calls itself with it. The "current state" is just the argument of the latest call.
+
+```elixir check
+defmodule Account do
+  def start(balance), do: spawn(fn -> loop(balance) end)
+
+  # A synchronous request: send a unique reference and wait for a reply that carries it.
+  def call(pid, request) do
+    ref = make_ref()
+    send(pid, {request, self(), ref})
+
+    receive do
+      {^ref, reply} -> reply
+    after
+      1_000 -> {:error, :timeout}
+    end
+  end
+
+  def deposit(pid, amount), do: call(pid, {:deposit, amount})
+  def withdraw(pid, amount), do: call(pid, {:withdraw, amount})
+  def balance(pid), do: call(pid, :balance)
+
+  defp loop(balance) do
+    receive do
+      {{:deposit, amount}, from, ref} ->
+        send(from, {ref, :ok})
+        loop(balance + amount)
+
+      {{:withdraw, amount}, from, ref} when amount <= balance ->
+        send(from, {ref, :ok})
+        loop(balance - amount)
+
+      {{:withdraw, _amount}, from, ref} ->
+        send(from, {ref, {:error, :insufficient_funds}})
+        loop(balance)
+
+      {:balance, from, ref} ->
+        send(from, {ref, balance})
+        loop(balance)
+    end
+  end
+end
+
+account = Account.start(100)
+IO.inspect(Account.withdraw(account, 30))
+IO.inspect(Account.withdraw(account, 500))
+
+# A thousand processes deposit at the same time; no update is ever lost.
+parent = self()
+
+for _ <- 1..1_000 do
+  spawn(fn ->
+    :ok = Account.deposit(account, 1)
+    send(parent, :done)
+  end)
+end
+
+for _ <- 1..1_000, do: receive(do: (:done -> :ok))
+IO.inspect(Account.balance(account))
+```
+
+It prints:
+
+```text
+:ok
+{:error, :insufficient_funds}
+1070
+```
+
+Several patterns here recur throughout Elixir:
+
+- **The state is private.** No other process can see `balance` except by asking.
+- **Requests are serialised.** A thousand processes deposited "simultaneously", yet the final balance is exactly 70 + 1,000. The account handles one message at a time, so there is no read-modify-write race and no lock.
+- **References tag replies.** `make_ref()` returns a value unique within the running system. Sending it with the request and matching `{^ref, reply}` guarantees we take *our* reply and not some other message, which is selective receive used well.
+- **Synchronous calls on top of asynchronous messages.** `send` never waits; `call/2` makes a request-and-wait out of a send and a receive with a timeout. Each depositor waits for its `:ok` before reporting `:done`, so by the time we ask for the balance every deposit has been applied.
+
+This loop-with-a-receive is exactly what `GenServer` packages up, with more care for edge cases than our version has. For the simplest case, a process that only holds a value, the standard library offers `Agent`: `Agent.start_link(fn -> 0 end)`, `Agent.update(pid, &(&1 + 1))`, `Agent.get(pid, & &1)`.
+
+</Section>
+
+<Section id="links" kind="examples" title="Links, trapped exits and monitors">
+
+Isolation means one process's crash does not corrupt another. But someone needs to *know* about the crash. The BEAM provides two mechanisms.
+
+<Definition term="Link">
+
+A **link** is a bidirectional connection between two processes. When one exits with a reason other than `:normal`, an exit signal goes to the other, which also exits with the same reason, unless it is **trapping exits**, in which case the signal is converted into an ordinary message `{:EXIT, pid, reason}`.
+
+</Definition>
+
+<Definition term="Monitor">
+
+A **monitor** is a one-way observation. When the monitored process exits for any reason, the monitoring process receives `{:DOWN, ref, :process, pid, reason}`. The observer is never killed.
+
+</Definition>
+
+```elixir check
+# 1. A link without trapping: the crash spreads to the linked process.
+{manager, ref} =
+  spawn_monitor(fn ->
+    spawn_link(fn -> exit(:worker_failed) end)
+    Process.sleep(:infinity)
+  end)
+
+receive do
+  {:DOWN, ^ref, :process, ^manager, reason} ->
+    IO.puts("the manager died with its worker: #{inspect(reason)}")
+end
+
+# 2. Trapping exits turns exit signals into messages.
+Process.flag(:trap_exit, true)
+
+worker = spawn_link(fn -> exit(:disk_full) end)
+
+receive do
+  {:EXIT, ^worker, reason} -> IO.puts("trapped: worker exited with #{inspect(reason)}")
+end
+
+quiet = spawn_link(fn -> :finished end)
+
+receive do
+  {:EXIT, ^quiet, reason} -> IO.puts("a normal exit is reported too: #{inspect(reason)}")
+end
+
+Process.flag(:trap_exit, false)
+
+# 3. A monitor reports why a process ended, and never harms the observer.
+{pid, ref} = spawn_monitor(fn -> exit({:bad_input, "row 17"}) end)
+
+receive do
+  {:DOWN, ^ref, :process, ^pid, reason} -> IO.puts("monitor saw: #{inspect(reason)}")
+end
+
+IO.puts("and the observer is still alive")
+```
+
+It prints:
+
+```text
+the manager died with its worker: :worker_failed
+trapped: worker exited with :disk_full
+a normal exit is reported too: :normal
+monitor saw: {:bad_input, "row 17"}
+and the observer is still alive
+```
+
+An exit reason can be any term, and a tuple with details, like `{:bad_input, "row 17"}`, is common. When a process dies because of an *exception* rather than an explicit `exit`, the reason is `{exception, stacktrace}`, and Elixir's `Logger` also prints an error report naming the process and the exception. (We used `exit` in this example so that no log report, which carries a timestamp, appears in the output.)
+
+In the first experiment the manager did nothing wrong, yet it died, because it was linked to a worker that failed and it was not trapping exits. That is a feature: **linked processes live and die together**, so a group of processes that only make sense together cannot be left half-alive. We used `spawn_monitor` to watch the manager; it starts the process and monitors it in one atomic step, so there is no moment where the process could die unobserved.
+
+In the second, the main process traps exits, so the exit signals arrive as `{:EXIT, pid, reason}` messages it can react to. This is exactly what a **supervisor** does: it links to its children, traps exits, and when a child's exit message arrives, it decides whether and how to restart it. A normal exit (`:normal`) never kills a linked process, but a trapping process still hears about it.
+
+The third shows a monitor. Use **links** for processes that depend on each other's existence, and **monitors** when one process merely wants to know whether another is still there: a client waiting for a server's reply, or a cache that should forget a user whose session process has ended.
+
+</Section>
+
+<Section id="scheduler" kind="intuition" title="How the BEAM keeps everyone moving">
+
+A useful mental model helps explain why Elixir systems behave so predictably under load.
+
+When the BEAM starts, it creates one **scheduler** thread per CPU core (the `smp:20:20` in the banner from lesson 1). Each scheduler has a queue of processes ready to run. It picks one, lets it run for a budget of about four thousand **reductions** (roughly, function calls), then puts it back in the queue and picks the next. A process also gives up the scheduler whenever it waits in a `receive` with no matching message. Idle schedulers steal work from busy ones.
+
+This is **preemptive** scheduling, and it matters more than it might seem. In runtimes where tasks must yield voluntarily, one accidentally expensive computation, say a request that sorts a huge list, holds a thread hostage and every other request on it waits. On the BEAM that request uses its share and is paused, and the others continue. Latency stays even, which is why Phoenix applications can hold hundreds of thousands of idle WebSocket connections, each a process, while still answering the active ones quickly.
+
+Because each process has its **own heap**, garbage collection happens per process: a collector pauses only the process it is cleaning, typically for microseconds, and a process that dies simply has its whole heap reclaimed at once. Short-lived processes (one per request, one per task) often finish before they ever need a collection.
+
+Processes can also be found by **name** instead of PID. `Process.register(pid, :ledger)` lets any code `send(:ledger, msg)`, and OTP's `name:` options do the same. Names are atoms, so they suit a fixed set of long-lived services; for dynamic names (one process per user or per game room), Elixir provides `Registry`, which you will meet in the next lesson.
+
+Finally, the BEAM lets you look inside a running system. `Process.list()` returns every PID, `Process.info(pid)` reports a process's memory, mailbox length and current function, and `:observer.start()` opens a graphical dashboard of processes, memory and load (on machines with a desktop). Production teams rely on these tools, along with remote shells into running nodes, to diagnose problems without stopping anything.
+
+</Section>
+
+<Section id="tasks" kind="computation" title="Tasks: concurrency for everyday code">
+
+Most of the time you do not want a long-lived process; you want to run some work concurrently and collect the result. The `Task` module wraps the primitives above, links included, into a convenient API:
+
+```elixir check
+fetch = fn city ->
+  Process.sleep(100)
+  "forecast for #{city}"
+end
+
+tasks = for city <- ["Nairobi", "Quito", "Hanoi"], do: Task.async(fn -> fetch.(city) end)
+IO.inspect(Task.await_many(tasks))
+
+slow_square = fn n ->
+  Process.sleep(100)
+  n * n
+end
+
+{microseconds, squares} =
+  :timer.tc(fn ->
+    1..12
+    |> Task.async_stream(slow_square, max_concurrency: 12)
+    |> Enum.map(fn {:ok, square} -> square end)
+  end)
+
+IO.inspect(squares)
+IO.puts("12 jobs of 100 ms each finished in under half a second: #{microseconds < 500_000}")
+
+task = Task.async(fn -> Process.sleep(5_000) end)
+IO.inspect(Task.yield(task, 50) || Task.shutdown(task))
+```
+
+It prints:
+
+```text
+["forecast for Nairobi", "forecast for Quito", "forecast for Hanoi"]
+[1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144]
+12 jobs of 100 ms each finished in under half a second: true
+nil
+```
+
+`Task.async/1` starts a linked process and returns a handle; `Task.await/2` or `Task.await_many/2` waits for the results, in the order of the tasks, with a default timeout of five seconds. The three "forecasts" took about 100 ms in total, not 300.
+
+`Task.async_stream/3` is the workhorse for "do this to every element, concurrently". It is lazy like a `Stream`, runs at most `max_concurrency` tasks at once (the default is the number of schedulers, which suits CPU-bound work; for waiting on networks you raise it), returns results **in input order** as `{:ok, value}` tuples, and supports `timeout:` and `on_timeout: :kill_task`. Twelve 100-millisecond jobs finished in a fraction of the 1.2 seconds they would take one after another.
+
+The last two lines show how to give up politely: `Task.yield/2` waits up to 50 ms and returns `nil` if the task is not done, and `Task.shutdown/1` then stops it, returning `nil` because it never produced a result. In production code, tasks are usually started under a `Task.Supervisor`, so that a crashing task is reported and cleaned up without taking its caller down.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"`send` tells me the message was delivered."** `send` always returns the message, even when the target is dead. The only evidence of delivery is a reply, which is why requests carry a reference and a timeout.
+
+</Misconception>
+
+<Misconception>
+
+**"A process should catch-all its mailbox to stay tidy."** A receive with a catch-all `_ ->` clause can swallow messages meant for a later, more specific `receive`. The opposite mistake is worse in long-lived processes: never matching some message type, so the mailbox grows forever and every `receive` gets slower as it scans it. GenServer solves both by handling every message in a defined callback.
+
+</Misconception>
+
+<Misconception>
+
+**"More processes always means more speed."** Processes give you *concurrency* (many things in progress) cheaply; *parallel speed-up* is limited by the number of cores, and every message is copied. Use processes to model independent activities and to isolate failures, not to split a tiny computation into a thousand pieces.
+
+</Misconception>
+
+<Misconception>
+
+**"Linking is just a stronger monitor."** Links are bidirectional and, without trapping, lethal; monitors are one-way and harmless. Linking a short-lived helper to a long-lived server means a bug in the helper restarts the server. Choose deliberately.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

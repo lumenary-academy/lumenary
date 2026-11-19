@@ -1,0 +1,370 @@
+---
+title: Functions, guards and recursion
+subtitle: Function clauses and guards, if and case, recursion with accumulators instead of loops, and funs as values for higher-order programming.
+minutes: 55
+objectives:
+  - Write functions with several clauses and guards, and explain which expressions are allowed in a guard
+  - Choose between function clauses, case, if and maybe
+  - Replace loops with body or tail recursion, using accumulators, and judge which to use
+  - Create funs, including closures and references to named functions, and pass them to lists:map, filter and fold
+  - Process recursive data structures built from tuples
+prerequisites: [terms-and-pattern-matching]
+references:
+  - title: Functions
+    url: https://www.erlang.org/doc/system/ref_man_functions.html
+    note: The reference manual's chapter on clauses, guards and tail recursion.
+  - title: Expressions (including guard sequences)
+    url: https://www.erlang.org/doc/system/expressions.html
+    note: The exact list of expressions allowed in guards, and the semantics of if and case.
+  - title: The lists module
+    url: https://www.erlang.org/doc/apps/stdlib/lists.html
+    note: map, filter, foldl, foldr, sort and dozens more.
+  - title: Efficiency guide
+    url: https://www.erlang.org/doc/system/efficiency_guide.html
+    note: The official guide to writing fast Erlang, including its section on common performance myths.
+---
+
+<Section id="motivation" kind="motivation" title="Thinking in clauses">
+
+Erlang has no `for` loop, no `while` loop, and no statement that changes a variable. For programmers coming from other languages, that seems like a lot to give up. What you get instead is a style in which a function is written as a list of **cases**: "if the input looks like this, the answer is that; if it looks like this other thing, the answer is computed like so." Each case is a **clause**, chosen by pattern matching and refined by **guards**, and repetition is expressed by a function calling itself, **recursion**.
+
+This style turns out to be remarkably clear. Each clause can be read and checked on its own. The edge cases (the empty list, zero, the missing value) are not buried in the middle of a loop but stated up front as their own clauses. And because nothing is mutated, there is no question of what a variable holds at a given moment.
+
+This lesson covers clauses and guards, the `if` and `case` expressions, recursion with and without accumulators, and **funs**, functions as values, which let you write the common loops once and reuse them everywhere.
+
+</Section>
+
+<Section id="clauses" kind="definitions" title="Clauses and guards">
+
+A function definition is a sequence of clauses separated by semicolons and ended by a full stop. Each clause has a head with patterns, an optional guard introduced by `when`, an arrow and a body. Erlang tries the clauses in order and runs the first whose patterns match and whose guard is true. If none matches, the call fails with a `function_clause` error.
+
+<Definition term="Guard">
+
+A **guard** is a condition attached to a clause. It may contain only a restricted set of expressions: comparisons, arithmetic, type tests such as `is_integer/1` and `is_list/1`, and a few side-effect-free built-ins such as `length/1`, `tuple_size/1`, `map_size/1`, `is_map_key/2`, `element/2` and `abs/1`. Within a guard, a **comma means "and"** and a **semicolon means "or"**. If evaluating a guard raises an error, the guard is simply false.
+
+</Definition>
+
+Guards cannot call your own functions. That is deliberate: guards must be fast and must never have side effects, because the runtime may evaluate them many times while choosing a clause or a message.
+
+```erlang check
+#!/usr/bin/env escript
+-module(tickets).
+-export([main/1]).
+
+main(_) ->
+    Visitors = [{"Mariam", 7, weekday}, {"Joon", 34, weekend},
+                {"Grace", 71, weekday}, {"Tomás", 15, weekend}, {"Amani", 1, weekend}],
+    [io:format("~ts: ~ts~n", [Name, describe(price(Age, Day))])
+     || {Name, Age, Day} <- Visitors],
+    io:format("~p ~p~n", [category(9), category(42)]),
+    io:format("~p~n", [category(-3)]).
+
+%% Price in cents. Clauses are tried top to bottom.
+price(Age, _Day) when Age < 3 -> 0;
+price(Age, Day) when Age < 16; Age >= 65 -> half(price(30, Day));
+price(_Age, weekday) -> 12_00;
+price(_Age, weekend) -> 15_00.
+
+half(Cents) -> Cents div 2.
+
+describe(0) -> "free";
+describe(Cents) ->
+    io_lib:format("~b.~2..0b", [Cents div 100, Cents rem 100]).
+
+category(N) when is_integer(N, 0, 17) -> child;
+category(N) when is_integer(N), N >= 18 -> adult;
+category(_) -> invalid.
+```
+
+It prints:
+
+```text
+Mariam: 6.00
+Joon: 15.00
+Grace: 6.00
+Tomás: 7.50
+Amani: free
+child adult
+invalid
+```
+
+The pricing rules read almost like a fare table. Infants under three are free; then `when Age < 16; Age >= 65` uses a semicolon, so it means children *or* seniors, who pay half of an adult's price for that day; everyone else pays by day. The order of clauses is part of the logic: the infant clause must come before the half-price one, since a two-year-old is also under 16.
+
+`category/1` uses **`is_integer/3`**, a guard added in Erlang/OTP 29, which checks that a value is an integer within an inclusive range. Before OTP 29 you would write `is_integer(N), N >= 0, N =< 17`, with commas meaning "and"; you will see that form in most existing code. In the second clause, `is_integer(N), N >= 18` shows the comma form.
+
+The `-module(tickets).` and `-export([main/1]).` lines are optional in an escript, but they make it look like an ordinary module, and they let other code refer to it by name. We will use them whenever a script defines several functions.
+
+The `~2..0b` directive in `describe/1` prints an integer in a field of width 2 padded with `0`, so 750 cents becomes `7.50` rather than `7.5`. Money is kept in integer cents throughout, as it should be.
+
+**Which conditional to use?** Function clauses are the first choice when the decision depends on the arguments. `case` is for decisions about an intermediate value inside a body. Erlang also has **`if`**, which chooses between guard sequences:
+
+```erlang
+if
+    Temperature > 30 -> hot;
+    Temperature < 10 -> cold;
+    true -> mild
+end
+```
+
+Because `if` only accepts guard expressions (no function calls) and needs a final `true ->` catch-all to avoid an `if_clause` error, experienced Erlang programmers use it sparingly and usually prefer a `case` or a helper function with clauses.
+
+</Section>
+
+<Section id="recursion" kind="examples" title="Recursion and accumulators">
+
+To process a list, write one clause for the empty list and one for a list with a head and a tail. To count, compute or build anything, recurse on the tail.
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    io:format("~p~n", [len([a, b, c, d])]),
+    io:format("~p~n", [sum([4, 8, 15, 16, 23, 42])]),
+    io:format("~p~n", [sum_tail(lists:seq(1, 1000000), 0)]),
+    io:format("~p~n", [reverse([1, 2, 3], [])]),
+    io:format("~p~n", [digits(2026)]),
+    io:format("~p~n", [collatz_steps(27, 0)]).
+
+%% Body recursion: the work happens after the recursive call returns.
+len([]) -> 0;
+len([_ | T]) -> 1 + len(T).
+
+sum([]) -> 0;
+sum([H | T]) -> H + sum(T).
+
+%% Tail recursion: the recursive call is the last thing that happens.
+sum_tail([], Acc) -> Acc;
+sum_tail([H | T], Acc) -> sum_tail(T, Acc + H).
+
+reverse([], Acc) -> Acc;
+reverse([H | T], Acc) -> reverse(T, [H | Acc]).
+
+digits(N) when N < 10 -> [N];
+digits(N) -> digits(N div 10) ++ [N rem 10].
+
+collatz_steps(1, Steps) -> Steps;
+collatz_steps(N, Steps) when N rem 2 =:= 0 -> collatz_steps(N div 2, Steps + 1);
+collatz_steps(N, Steps) -> collatz_steps(3 * N + 1, Steps + 1).
+```
+
+It prints:
+
+```text
+4
+108
+500000500000
+[3,2,1]
+[2,0,2,6]
+111
+```
+
+`len/1` and `sum/1` are **body-recursive**: after the recursive call returns, there is still work to do (adding 1, adding the head). Each pending call needs a stack frame, so the stack grows with the length of the list.
+
+`sum_tail/2` is **tail-recursive**: the recursive call is the very last thing the clause does, and the running total travels in an extra argument, the **accumulator**. The BEAM turns a tail call into a jump, so the function runs in constant stack space, the functional equivalent of a loop. That is how it handles a million elements comfortably. `reverse/2` uses the same idea to build a list: each step moves one element from the input to the front of the accumulator, which reverses the order.
+
+`digits/1` recurses on a number rather than a list, and `collatz_steps/2` counts iterations of the Collatz process in its accumulator. Note that `digits/1` uses `++`, which copies its left-hand list; fine for the four digits of a year, but in a loop over long lists you would build in reverse and call `lists:reverse/1` once at the end.
+
+Which kind of recursion should you write? The official Efficiency Guide lists "tail-recursive functions are much faster than recursive functions" among its **myths**: on the modern BEAM, a body-recursive function that builds a list is often as fast as the tail-recursive version plus `lists:reverse/1`, and easier to read. The guide's advice, and the practice of experienced Erlang programmers, is to write the clearest version, and use tail recursion where it matters: in loops that run indefinitely (every server process is one) and over data that can be very large.
+
+</Section>
+
+<Section id="funs" kind="examples" title="Funs and higher-order functions">
+
+A **fun** is a function as a value. You can create one with `fun(Args) -> Body end`, store it in a variable, pass it to another function and call it like any other function. Funs can have several clauses and guards, and they **close over** the variables visible where they were created.
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    Double = fun(X) -> X * 2 end,
+    io:format("~p~n", [Double(21)]),
+    Classify = fun(0) -> zero;
+                  (N) when N < 0 -> negative;
+                  (_) -> positive
+               end,
+    io:format("~p~n", [lists:map(Classify, [-2, 0, 5])]),
+    MakeGreeter = fun(Greeting) -> fun(Name) -> Greeting ++ ", " ++ Name ++ "!" end end,
+    Hola = MakeGreeter("Hola"),
+    io:format("~ts~n", [Hola("Lucía")]),
+    io:format("~p~n", [lists:filter(fun is_even/1, lists:seq(1, 10))]),
+    io:format("~p~n", [lists:foldl(fun(X, Acc) -> X + Acc end, 0, [1, 2, 3, 4])]),
+    io:format("~p~n", [lists:foldr(fun(X, Acc) -> [X * X | Acc] end, [], [1, 2, 3])]),
+    Words = ["kiwi", "fig", "banana", "date"],
+    io:format("~p~n", [lists:sort(fun(A, B) -> length(A) =< length(B) end, Words)]),
+    Upper = fun string:uppercase/1,
+    io:format("~p~n", [lists:map(Upper, Words)]),
+    io:format("~p~n", [apply_twice(fun(X) -> X + 10 end, 1)]).
+
+is_even(N) -> N rem 2 =:= 0.
+
+apply_twice(F, X) -> F(F(X)).
+```
+
+It prints:
+
+```text
+42
+[negative,zero,positive]
+Hola, Lucía!
+[2,4,6,8,10]
+10
+[1,4,9]
+["fig","kiwi","date","banana"]
+["KIWI","FIG","BANANA","DATE"]
+21
+```
+
+`MakeGreeter` returns a fun that remembers `Greeting`, so `Hola` is a greeter specialised for Spanish. `fun is_even/1` refers to a local function and `fun string:uppercase/1` to a function in another module; both produce funs you can pass around.
+
+The `lists` module supplies the loops you would otherwise write by hand:
+
+- `lists:map(F, List)` applies `F` to each element;
+- `lists:filter(Pred, List)` keeps the elements for which `Pred` returns `true`;
+- `lists:foldl(F, Acc0, List)` walks from the left, calling `F(Element, Acc)` and passing the result on, so it can compute anything a loop with an accumulator can; `lists:foldr/3` walks from the right, which is convenient for building a list in its original order;
+- `lists:sort(Fun, List)` sorts with your own ordering, where `Fun(A, B)` returns `true` if `A` should come before (or tie with) `B`. Sorting is stable, which is why `"kiwi"` stays before `"date"`: both have four letters.
+
+Erlang also has **list comprehensions**, `[Expr || Pattern <- List, Filter]`, which you have already seen in passing; the next lesson covers them in depth.
+
+Funs are also how work is handed to other processes: `spawn(fun() -> ... end)` starts a process running a fun, and the fun carries its captured variables with it. When you only need a function for its side effects, such as printing each element, use `lists:foreach/2`, which returns `ok` instead of building a list of results you would throw away.
+
+</Section>
+
+<Section id="trees" kind="computation" title="Recursive data: a tree of tuples">
+
+Recursion fits recursive data just as naturally as it fits lists. Here is a binary search tree in which every node is a tuple `{node, Left, Key, Right}` and the empty tree is the atom `nil`. No classes, no pointers, just terms:
+
+```erlang check
+#!/usr/bin/env escript
+%% A binary search tree built from tuples: nil or {node, Left, Key, Right}.
+main(_) ->
+    Keys = [50, 30, 70, 20, 40, 60, 80, 30],
+    Tree = lists:foldl(fun insert/2, nil, Keys),
+    io:format("~p~n", [to_list(Tree)]),
+    io:format("count ~p, height ~p~n", [count(Tree), height(Tree)]),
+    io:format("~p ~p~n", [member(60, Tree), member(65, Tree)]),
+    io:format("~p~n", [Tree]).
+
+insert(Key, nil) -> {node, nil, Key, nil};
+insert(Key, {node, L, K, R}) when Key < K -> {node, insert(Key, L), K, R};
+insert(Key, {node, L, K, R}) when Key > K -> {node, L, K, insert(Key, R)};
+insert(_Key, Node) -> Node.
+
+member(_, nil) -> false;
+member(Key, {node, _, Key, _}) -> true;
+member(Key, {node, L, K, _}) when Key < K -> member(Key, L);
+member(Key, {node, _, _, R}) -> member(Key, R).
+
+to_list(nil) -> [];
+to_list({node, L, K, R}) -> to_list(L) ++ [K] ++ to_list(R).
+
+count(nil) -> 0;
+count({node, L, _, R}) -> count(L) + 1 + count(R).
+
+height(nil) -> 0;
+height({node, L, _, R}) -> 1 + max(height(L), height(R)).
+```
+
+It prints:
+
+```text
+[20,30,40,50,60,70,80]
+count 7, height 3
+true false
+{node,{node,{node,nil,20,nil},30,{node,nil,40,nil}},
+      50,
+      {node,{node,nil,60,nil},70,{node,nil,80,nil}}}
+```
+
+Every function follows the shape of the data: a clause for `nil` and a clause for a node, recursing into the subtrees. `insert/2` is written so that `lists:foldl/3` can call it directly with each key and the tree so far; the duplicate 30 falls through to the last clause and leaves the tree unchanged. Because data is immutable, `insert/2` does not modify the tree; it returns a new one that shares every untouched subtree with the old. Both versions remain valid, which makes it trivial to keep history or to let other processes go on reading an old version.
+
+The function that counts nodes is named `count/1` rather than `size/1` for a reason: `size/1` is a built-in function that is imported automatically into every module, and defining your own causes an "ambiguous call" warning. The compiler suggests the fix (`-compile({no_auto_import, [size/1]})`), but choosing another name is simpler.
+
+For real programs you would use OTP's balanced trees in the `gb_trees` and `gb_sets` modules, or maps, rather than this unbalanced one. Insert keys in sorted order here and the tree degenerates into a list.
+
+</Section>
+
+<Section id="maybe" kind="examples" title="Chaining fallible steps with maybe">
+
+Real functions often perform a chain of steps that can each fail: read a field, read another, parse it, check it. Written with nested `case` expressions, the happy path drifts to the right and the error handling is scattered. Since Erlang/OTP 27 the **`maybe`** expression is available without any special setting (it was introduced experimentally in OTP 25). Inside `maybe ... end`, each `Pattern ?= Expression` must match for evaluation to continue; the first value that does not match is passed to the `else` clauses, or returned as is if there is no `else`.
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    Inputs = [#{"name" => "Aiyana", "age" => "34"},
+              #{"age" => "40"},
+              #{"name" => "Sami", "age" => "twelve"},
+              #{"name" => "Leo", "age" => "11"}],
+    [io:format("~p~n", [register(Input)]) || Input <- Inputs].
+
+register(Params) ->
+    maybe
+        {ok, Name} ?= required(Params, "name"),
+        {ok, AgeText} ?= required(Params, "age"),
+        {ok, Age} ?= parse_age(AgeText),
+        {ok, #{name => Name, age => Age}}
+    else
+        {error, {missing, Field}} -> {error, Field ++ " is required"};
+        {error, not_a_number} -> {error, "age must be a whole number"};
+        {error, too_young} -> {error, "you must be 13 or older"}
+    end.
+
+required(Params, Field) ->
+    case maps:find(Field, Params) of
+        {ok, Value} when Value =/= "" -> {ok, Value};
+        _ -> {error, {missing, Field}}
+    end.
+
+parse_age(Text) ->
+    case string:to_integer(Text) of
+        {Age, ""} when Age >= 13 -> {ok, Age};
+        {Age, ""} when is_integer(Age) -> {error, too_young};
+        _ -> {error, not_a_number}
+    end.
+```
+
+It prints:
+
+```text
+{ok,#{name => "Aiyana",age => 34}}
+{error,"name is required"}
+{error,"age must be a whole number"}
+{error,"you must be 13 or older"}
+```
+
+The body of `maybe` tells the success story in four lines, and the `else` clauses translate each internal error into a message. Two design points make this work well. Each helper returns a **distinguishable** error, such as `{error, {missing, Field}}` naming the field, so the `else` clause knows what went wrong. And `string:to_integer/1` returns the number together with whatever text follows it, so matching `{Age, ""}` insists that nothing does: "34 years" is rejected. If an error value matches no `else` clause, `maybe` raises an `else_clause` error, which keeps unexpected failures loud.
+
+A few habits of experienced Erlang programmers are worth adopting from the start. Export only the functions that form the module's interface, and keep the rest private. Do not write clauses for inputs that should never happen: a `function_clause` error that names the function and shows the bad arguments is more useful than a vague `{error, invalid}` returned from a catch-all clause. And document what each exported function accepts and returns with a `-spec`, which tools such as Dialyzer can check, as the last lesson shows.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"I can call my own function in a guard."** Guards only allow a fixed set of built-in tests and operators. Compute the value first, in the body or in a `case`, and match on the result.
+
+</Misconception>
+
+<Misconception>
+
+**"The most specific clause wins."** The *first* matching clause wins. Put special cases before general ones; the compiler warns when a clause can never match because an earlier one covers it.
+
+</Misconception>
+
+<Misconception>
+
+**"In a guard, a comma means 'or'."** It is the other way round: `when A, B` means both; `when A; B` means either. The same punctuation rule holds everywhere: a semicolon separates alternatives.
+
+</Misconception>
+
+<Misconception>
+
+**"Tail recursion is always required."** It matters for unbounded loops and very large inputs. For ordinary list transformations, a clear body-recursive function or a call to `lists:map/2` is the idiomatic choice.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

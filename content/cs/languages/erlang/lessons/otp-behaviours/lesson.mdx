@@ -1,0 +1,399 @@
+---
+title: "OTP behaviours: gen_server, supervisor and application"
+subtitle: The generic parts of servers, supervisors and applications that OTP provides, the callbacks you write, and how they fit into a supervision tree.
+minutes: 65
+objectives:
+  - Explain what an OTP behaviour is and why it splits code into generic and specific parts
+  - Implement a gen_server with init, handle_call, handle_cast, handle_info and terminate
+  - Write a supervisor's flags and child specifications, and choose a restart strategy and intensity
+  - Describe what an OTP application is, write its resource file and callback module, and start and stop it
+  - Read a gen_server crash report, inspect a running server with the sys module, and model a state machine with gen_statem
+prerequisites: [errors-links-monitors]
+references:
+  - title: OTP Design Principles
+    url: https://www.erlang.org/doc/system/design_principles.html
+    note: The official overview of behaviours, supervision trees and applications.
+  - title: gen_server behaviour
+    url: https://www.erlang.org/doc/system/gen_server_concepts.html
+    note: The design principles chapter on generic servers, with a worked example.
+  - title: The gen_server module
+    url: https://www.erlang.org/doc/apps/stdlib/gen_server.html
+    note: Every callback, return value and option.
+  - title: The supervisor module
+    url: https://www.erlang.org/doc/apps/stdlib/supervisor.html
+    note: Supervisor flags, child specifications and the functions to manage children.
+  - title: Applications
+    url: https://www.erlang.org/doc/system/applications.html
+    note: Application resource files, callback modules and start types.
+  - title: The gen_statem module
+    url: https://www.erlang.org/doc/apps/stdlib/gen_statem.html
+    note: The behaviour for state machines, the other workhorse of OTP.
+---
+
+<Section id="motivation" kind="motivation" title="Write the specific part, reuse the rest">
+
+In the last two lessons you wrote a booking server and a supervisor by hand, and you saw how much they left out. A server needs calls that notice a dead server, a catch-all for unexpected messages, clean shutdown, a way to inspect its state while it runs, and hooks for upgrading its code. A supervisor needs restart limits over a time window, several strategies, ordered startup and shutdown, and reports of what it did. Every team that writes these by hand writes them slightly differently, and slightly wrong.
+
+OTP's answer is the **behaviour**: a module that implements the *generic* part of a pattern once, carefully, and calls a *callback module* that you write for the *specific* part. `gen_server` knows how to be a server; your callback module knows what your server does with each request. `supervisor` knows how to supervise; your callback says which children to start and how. `application` knows how to start and stop a component of a system; your callback says where its supervision tree begins.
+
+Behaviours make Erlang systems remarkably uniform. Open any well-written Erlang project and you find the same shapes: applications that start supervisors, supervisors that start gen_servers and state machines, each callback module small and focused. This lesson teaches the three behaviours you will use most, with complete running examples.
+
+</Section>
+
+<Section id="gen-server" kind="definitions" title="gen_server">
+
+<Definition term="gen_server">
+
+A **gen_server** is a process that holds state and handles requests through callbacks. Clients use `gen_server:call/2,3` for requests that need a reply (with a default timeout of 5 seconds) and `gen_server:cast/2` for requests that do not; any other message is delivered to `handle_info/2`.
+
+</Definition>
+
+| Callback | Called when | Usual return value |
+| --- | --- | --- |
+| `init(Args)` | the server starts, inside the new process | `{ok, State}` |
+| `handle_call(Request, From, State)` | a client calls | `{reply, Reply, NewState}` |
+| `handle_cast(Request, State)` | a client casts | `{noreply, NewState}` |
+| `handle_info(Message, State)` | any other message arrives | `{noreply, NewState}` |
+| `terminate(Reason, State)` | the server is stopping (not guaranteed in every case) | ignored |
+
+Any callback can also return `{stop, Reason, ...}`. Here is a small cache whose entries expire after a time-to-live:
+
+```erlang check
+#!/usr/bin/env escript
+-module(cache).
+-behaviour(gen_server).
+-export([main/1, start_link/0, put/3, get/1, size/0, stop/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-compile({no_auto_import, [get/1, put/2, size/1]}).
+
+%%% Client API
+
+start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% Store Value under Key for TtlMs milliseconds.
+put(Key, Value, TtlMs) -> gen_server:cast(?MODULE, {put, Key, Value, TtlMs}).
+get(Key) -> gen_server:call(?MODULE, {get, Key}).
+size() -> gen_server:call(?MODULE, size).
+stop() -> gen_server:stop(?MODULE).
+
+%%% Server callbacks
+
+init([]) -> {ok, #{}}.
+
+handle_call({get, Key}, _From, Entries) ->
+    case Entries of
+        #{Key := {Value, _Timer}} -> {reply, {ok, Value}, Entries};
+        #{} -> {reply, not_found, Entries}
+    end;
+handle_call(size, _From, Entries) ->
+    {reply, map_size(Entries), Entries}.
+
+handle_cast({put, Key, Value, TtlMs}, Entries) ->
+    case Entries of
+        #{Key := {_Old, OldTimer}} -> erlang:cancel_timer(OldTimer);
+        #{} -> ok
+    end,
+    Timer = erlang:send_after(TtlMs, self(), {expire, Key}),
+    {noreply, Entries#{Key => {Value, Timer}}}.
+
+handle_info({expire, Key}, Entries) ->
+    {noreply, maps:remove(Key, Entries)};
+handle_info(_Unexpected, Entries) ->
+    {noreply, Entries}.
+
+terminate(Reason, Entries) ->
+    io:format("cache stopping (~p) with ~p entries~n", [Reason, map_size(Entries)]).
+
+%%% Demo
+
+main(_) ->
+    {ok, _Pid} = start_link(),
+    put(<<"KE">>, <<"Kenya">>, 1000),
+    put(<<"PE">>, <<"Peru">>, 50),
+    io:format("~p~n", [get(<<"KE">>)]),
+    io:format("~p~n", [get(<<"PE">>)]),
+    io:format("entries: ~p~n", [size()]),
+    timer:sleep(200),
+    io:format("~p~n", [get(<<"PE">>)]),
+    io:format("entries: ~p~n", [size()]),
+    cache ! unexpected_message,
+    io:format("still alive: ~p~n", [is_process_alive(whereis(cache))]),
+    ok = stop().
+```
+
+It prints:
+
+```text
+{ok,<<"Kenya">>}
+{ok,<<"Peru">>}
+entries: 2
+not_found
+entries: 1
+still alive: true
+cache stopping (normal) with 1 entries
+```
+
+The module follows the standard layout: `-behaviour(gen_server)` lets the compiler check that the required callbacks exist; a **client API** of ordinary exported functions hides the message protocol; and the **callbacks** run inside the server process. `gen_server:start_link({local, cache}, ...)` starts the server, links it to the caller and registers it under the name `cache`, so the API functions do not need a pid.
+
+Follow a `get/1`. The client calls `gen_server:call(cache, {get, Key})`, which monitors the server, sends the request and waits, exactly like the `call/2` you wrote by hand in the last lesson. Inside the server, OTP calls `handle_call({get, Key}, From, Entries)`, and the `{reply, ...}` tuple sends the answer back and sets the next state. `put/3` uses `cast`, so the caller does not wait; the server stores the value and sets a timer with `erlang:send_after/3`, which later delivers `{expire, Key}` as a plain message to `handle_info/2`. The catch-all `handle_info(_Unexpected, ...)` clause keeps stray messages from piling up in the mailbox.
+
+The `-compile({no_auto_import, ...})` line is needed because the API functions are named `get/1`, `put/3` and `size/0`, and `get/1` and `size/1` are also built-in functions imported automatically into every module. It tells the compiler that calls to these names mean our functions.
+
+**Call or cast?** Prefer `call` unless losing the request would be fine. A call gives **back-pressure** (a client cannot send faster than the server answers) and tells the client whether the request succeeded. A cast returns at once, so a fast client can flood a slow server's mailbox, and the client never learns about failures. Use cast for genuinely fire-and-forget notifications.
+
+</Section>
+
+<Section id="supervisor" kind="definitions" title="supervisor">
+
+A supervisor's callback module has a single callback, `init/1`, which returns the **supervisor flags** and a list of **child specifications**:
+
+```erlang
+init(_Args) ->
+    SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
+    Children = [#{id => cache,
+                  start => {cache, start_link, []},
+                  restart => permanent,
+                  shutdown => 5000,
+                  type => worker}],
+    {ok, {SupFlags, Children}}.
+```
+
+The **strategy** decides what else to restart when a child dies:
+
+| Strategy | Restart... | Use when |
+| --- | --- | --- |
+| `one_for_one` | only the child that died | children are independent |
+| `one_for_all` | all children | children cannot work without each other |
+| `rest_for_one` | the child that died and those started after it | later children depend on earlier ones |
+| `simple_one_for_one` | (dynamically added children of one kind) | many identical workers started at run time |
+
+**Intensity and period** set the restart limit: if more than `intensity` restarts happen within `period` seconds, the supervisor gives up, terminates its children and exits, passing the problem to *its* supervisor. The defaults are 1 restart in 5 seconds.
+
+Each child specification gives a unique `id`; `start`, the `{Module, Function, Args}` to call (which must start a process, link it and return `{ok, Pid}`); `restart`, which is `permanent` (always restart), `transient` (restart only after an abnormal exit) or `temporary` (never restart); `shutdown`, how many milliseconds to wait for a polite exit before killing the child (or `infinity` for child supervisors); and `type`, `worker` or `supervisor`. Children start in list order and are shut down in reverse, so put dependencies first.
+
+Children can also be added while the system runs. `supervisor:start_child(Sup, ChildSpec)` adds one to an ordinary supervisor; with the `simple_one_for_one` strategy, the supervisor holds a single template specification and `supervisor:start_child(Sup, ExtraArgs)` starts another instance of it, which is how systems start one process per connection, per user session or per job. A supervisor can itself be a child of another supervisor (with `type => supervisor`), and that nesting is the **supervision tree**: an application's top supervisor at the root, subsystem supervisors below it, and workers at the leaves. Drawing that tree, and deciding which strategy each supervisor needs, is one of the first design steps of any Erlang system.
+
+</Section>
+
+<Section id="application" kind="examples" title="application, and everything together">
+
+An **application** is OTP's unit of deployment: a named component with a version, its modules, the other applications it depends on, and a callback module that starts its top supervisor. Erlang/OTP itself is a set of applications (`kernel`, `stdlib`, `ssl`, `mnesia` and dozens more), and so is every library you depend on. In a project, an application is described by a **resource file**, `src/counter_app.app.src`, which the build tool turns into `counter_app.app`:
+
+```erlang
+{application, counter_app,
+ [{description, "A supervised counter"},
+  {vsn, "1.0.0"},
+  {registered, [counter_sup, counter]},
+  {applications, [kernel, stdlib]},
+  {mod, {counter_app, []}},
+  {env, []}]}.
+```
+
+`applications` lists dependencies that must be started first, `mod` names the callback module, and `env` holds default configuration, read with `application:get_env/2`. An escript cannot ship a resource file, so the program below passes the same description to `application:load/1` directly. It also holds the application callback, the supervisor callback and the worker in one module, because an escript is a single module; `init/1` tells the supervisor and the worker apart by its argument. In a real project these would be three short files.
+
+```erlang check
+#!/usr/bin/env escript
+%% An application, its top supervisor and a worker, all in one module
+%% because an escript holds a single module. In a real project these
+%% would be three modules in three files.
+-module(counter_app).
+-behaviour(application).
+-export([main/1]).
+-export([start/2, stop/1]).                     % application callbacks
+-export([init/1, handle_call/3, handle_cast/2]). % supervisor and gen_server callbacks
+-export([start_counter/1, add/1, value/0]).
+
+%%% Application callbacks
+
+start(_StartType, _Args) ->
+    supervisor:start_link({local, counter_sup}, ?MODULE, supervisor).
+
+stop(_State) -> ok.
+
+%%% The worker's API
+
+start_counter(Initial) ->
+    gen_server:start_link({local, counter}, ?MODULE, {counter, Initial}, []).
+
+add(N) -> gen_server:cast(counter, {add, N}).
+value() -> gen_server:call(counter, value).
+
+%%% init/1 serves both behaviours, told apart by its argument.
+
+init(supervisor) ->
+    SupFlags = #{strategy => one_for_one, intensity => 2, period => 5},
+    Child = #{id => counter,
+              start => {?MODULE, start_counter, [100]},
+              restart => permanent,
+              shutdown => 1000,
+              type => worker},
+    {ok, {SupFlags, [Child]}};
+init({counter, Initial}) ->
+    {ok, Initial}.
+
+handle_call(value, _From, N) -> {reply, N, N}.
+
+handle_cast({add, N}, Total) when is_integer(N) -> {noreply, Total + N}.
+
+%%% Demo
+
+main(_) ->
+    logger:set_primary_config(level, none),
+    ok = application:load({application, counter_app,
+                           [{description, "A supervised counter"},
+                            {vsn, "1.0.0"},
+                            {modules, [?MODULE]},
+                            {registered, [counter_sup, counter]},
+                            {applications, [kernel, stdlib]},
+                            {mod, {?MODULE, []}}]}),
+    ok = application:start(counter_app),
+    io:format("running: ~p~n", [lists:keymember(counter_app, 1, application:which_applications())]),
+    add(5),
+    add(7),
+    io:format("value: ~p~n", [value()]),
+    First = whereis(counter),
+    add(not_a_number),
+    timer:sleep(100),
+    io:format("restarted with a new pid: ~p~n", [whereis(counter) =/= First]),
+    io:format("value after restart: ~p~n", [value()]),
+    io:format("~p~n", [supervisor:count_children(counter_sup)]),
+    ok = application:stop(counter_app),
+    io:format("counter after stop: ~p~n", [whereis(counter)]).
+```
+
+It prints:
+
+```text
+running: true
+value: 112
+restarted with a new pid: true
+value after restart: 100
+[{specs,1},{active,1},{supervisors,0},{workers,1}]
+counter after stop: undefined
+```
+
+`application:start/1` calls `start/2`, which starts the supervisor, which starts the counter with 100. Two casts bring it to 112. Then `add(not_a_number)` sends a cast that no `handle_cast` clause matches (the guard requires an integer), so the counter crashes with `function_clause`; the supervisor restarts it from its child specification, with a new pid and the initial value 100. Finally `application:stop/1` shuts the whole tree down in order, and the registered name disappears.
+
+The first line of `main/1` turns logging off so that the output above is predictable. With logging on, the crash produces reports like this one (from a run without that line, so the file line number is one lower than in the listing):
+
+```text
+=ERROR REPORT==== 19-Nov-2026::20:37:59.423861 ===
+** Generic server counter terminating 
+** Last message in was {'$gen_cast',{add,not_a_number}}
+** When Server state == 112
+** Reason for termination ==
+** {function_clause,[{counter_app,handle_cast,
+                                  [{add,not_a_number},112],
+                                  [{file,"main.erl"},{line,42}]},
+                     {gen_server,try_handle_cast,3,
+                                 [{file,"gen_server.erl"},{line,2460}]},
+                     {gen_server,handle_msg,3,
+                                 [{file,"gen_server.erl"},{line,2418}]},
+                     {proc_lib,init_p_do_apply,3,
+                               [{file,"proc_lib.erl"},{line,333}]}]}
+```
+
+followed by a crash report and a supervisor report. The error report alone tells you which server died, the **last message** it received, its **state** at the time, and the exact clause that failed with its arguments. Most production bugs in Erlang systems are found from reports like this, logged while the system carried on. (In the supervisor report that follows, the child's start arguments `[100]` are printed as `"d"`, because 100 is the character code of `d`: the list-as-string guess from earlier lessons appears even in OTP's own reports.)
+
+</Section>
+
+<Section id="practice" kind="human" title="Working with behaviours in practice">
+
+A few more parts of OTP round out the toolkit that professional Erlang developers use daily.
+
+**gen_statem** is the behaviour for state machines: a connection that is `connecting`, `authenticated` or `closed`; a door that is `locked` or `open`; a payment that is `pending`, `authorised` or `captured`. With `callback_mode() -> state_functions`, each state is a function named after it, receiving the event type, the event and the data, and returning the next state together with *actions* such as replies and timeouts. Here is a keypad door that locks itself again after a short time:
+
+```erlang check
+#!/usr/bin/env escript
+%% A door with a keypad: locked until the right code is entered,
+%% and locked again automatically 200 ms after it was opened.
+-module(door).
+-behaviour(gen_statem).
+-export([main/1]).
+-export([callback_mode/0, init/1, locked/3, open/3]).
+
+callback_mode() -> state_functions.
+
+init(Code) -> {ok, locked, #{code => Code, attempts => 0}}.
+
+locked({call, From}, {enter, Code}, #{code := Code} = Data) ->
+    {next_state, open, Data#{attempts := 0},
+     [{reply, From, opened}, {state_timeout, 200, relock}]};
+locked({call, From}, {enter, _Wrong}, #{attempts := N} = Data) ->
+    {keep_state, Data#{attempts := N + 1}, [{reply, From, {wrong_code, N + 1}}]};
+locked({call, From}, status, _Data) ->
+    {keep_state_and_data, [{reply, From, locked}]}.
+
+open(state_timeout, relock, Data) ->
+    {next_state, locked, Data};
+open({call, From}, {enter, _Code}, _Data) ->
+    {keep_state_and_data, [{reply, From, already_open}]};
+open({call, From}, status, _Data) ->
+    {keep_state_and_data, [{reply, From, open}]}.
+
+main(_) ->
+    {ok, Door} = gen_statem:start_link(?MODULE, "1234", []),
+    Enter = fun(Code) -> gen_statem:call(Door, {enter, Code}) end,
+    io:format("~p~n", [Enter("0000")]),
+    io:format("~p~n", [Enter("9999")]),
+    io:format("~p~n", [Enter("1234")]),
+    io:format("~p~n", [gen_statem:call(Door, status)]),
+    io:format("~p~n", [Enter("1234")]),
+    timer:sleep(300),
+    io:format("~p~n", [gen_statem:call(Door, status)]).
+```
+
+It prints:
+
+```text
+{wrong_code,1}
+{wrong_code,2}
+opened
+open
+already_open
+locked
+```
+
+Each state's function lists only the events that make sense in that state, so the code reads like the state diagram. The action `{state_timeout, 200, relock}` is cancelled automatically if the machine leaves the `open` state, a detail that is easy to get wrong with hand-managed timers in a gen_server. When you notice a gen_server whose every callback begins by checking which phase it is in, it probably wants to be a gen_statem.
+
+**The `sys` module** works on every process built on a behaviour, without any code from you. `sys:get_state(cache)` returns a running server's state; `sys:trace(cache, true)` prints every message it handles; `sys:suspend/1` and `sys:resume/1` pause and continue it. In a remote shell attached to a production node, these are invaluable.
+
+**Releases** bundle your applications, their dependencies and the runtime into a directory that starts with one command, configured by `sys.config` and `vm.args` files. rebar3 builds them, as the next lesson shows.
+
+Some design guidance experienced Erlang developers give: keep `init/1` fast, because the supervisor waits for it, and do slow setup by returning `{ok, State, {continue, Term}}` and finishing in `handle_continue/2`; keep state that must survive a crash outside the process (in a database, a file or an ETS table owned by a process higher in the tree); and do not funnel all traffic through one gen_server, since it handles one message at a time: spread load across processes, or let readers use ETS directly.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"terminate/2 always runs, so I can rely on it."** It runs when the server returns `{stop, ...}` or is stopped with `gen_server:stop`, and on supervisor shutdown only if the server traps exits. It does not run if the process is killed. Treat it as a courtesy, not a guarantee.
+
+</Misconception>
+
+<Misconception>
+
+**"A supervisor preserves my process's state across crashes."** It restarts the process from its child specification. The state is rebuilt by `init/1`; anything else is gone, and that is the point.
+
+</Misconception>
+
+<Misconception>
+
+**"Casts are better because they are asynchronous."** They remove back-pressure and error reporting. Default to `call`; cast only when you truly do not care about the outcome.
+
+</Misconception>
+
+<Misconception>
+
+**"I should raise the restart intensity until the crashes stop being reported."** Frequent restarts mean a restart is not fixing the problem. The limit exists so the failure escalates to a level that can do something different, or stops visibly.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

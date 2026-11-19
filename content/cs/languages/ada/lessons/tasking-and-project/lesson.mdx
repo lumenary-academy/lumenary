@@ -1,0 +1,549 @@
+---
+title: Tasks, protected objects and a project
+subtitle: Concurrency built into the language, from tasks and rendezvous to protected objects with barriers, then a complete concurrent program and where to go next.
+minutes: 65
+objectives:
+  - Declare task types and single tasks, and explain activation, masters and termination
+  - Pass data between tasks with rendezvous, and use select for alternatives, time-outs and termination
+  - Protect shared data with protected objects, and coordinate tasks with entry barriers
+  - Explain the Ravenscar and Jorvik profiles and why real-time systems restrict tasking
+  - Build a complete program from packages, contracts, a protected buffer and tasks, and lay it out as an Alire project
+prerequisites: [packages-and-generics, tagged-types, contracts-and-spark]
+references:
+  - title: "Ada Reference Manual, section 9: Tasks and synchronization"
+    url: https://ada-lang.io/docs/arm
+    note: Tasks, rendezvous, protected objects, select statements and delays.
+  - title: "learn.adacore.com: Introduction to Ada, tasking"
+    url: https://learn.adacore.com/courses/intro-to-ada/index.html
+    note: Tasks and protected objects with examples that run in the browser.
+  - title: "learn.adacore.com: Introduction to Embedded Systems Programming"
+    url: https://learn.adacore.com/courses/intro-to-embedded-sys-prog/index.html
+    note: Ada on small targets, including interrupts and the Ravenscar and Jorvik profiles.
+  - title: Alire documentation
+    url: https://alire.ada.dev/docs/
+    note: Creating, building, testing and publishing crates.
+  - title: Ada community forum
+    url: https://forum.ada-lang.io/
+    note: Where Ada programmers ask and answer questions and announce new crates.
+---
+
+<Section id="motivation" kind="motivation" title="Concurrency in the language">
+
+The systems Ada was designed for do many things at once. A flight computer samples sensors at fixed rates, runs control laws, talks to other computers and watches for faults, all with deadlines. In 1983 most languages left concurrency to the operating system or to a library. Ada made it part of the language: a **task** is declared like a package or a procedure, communicates through language constructs that the compiler checks, and has a lifetime that the language manages.
+
+Ada 95 added **protected objects**, a structured form of shared data with mutual exclusion and condition synchronisation built in. Together they give you something rare: concurrent code whose structure can be read from its declarations, and whose behaviour can be analysed. Subsets of Ada tasking, the **Ravenscar** and **Jorvik** profiles, are restricted enough that tools can calculate worst-case response times, which is why Ada and SPARK run on satellites and in train-control systems.
+
+This lesson teaches tasks, rendezvous and protected objects, then brings the whole course together in a project: a small concurrent program built from packages, enumerations, fixed-point types, contracts, a protected buffer and tasks.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Tasks, rendezvous and protected objects">
+
+<Definition term="Task">
+
+A task is a unit of code that runs concurrently with the rest of the program. A **task type** is a template from which you can declare many tasks, including arrays of them. A task is **activated** when the declarative part that declares it has been elaborated, and the unit containing that declaration, its **master**, cannot complete until all of its tasks have **terminated**.
+
+</Definition>
+
+<Definition term="Rendezvous">
+
+A task may declare **entries** that other tasks call. The called task executes an `accept` statement for the entry; caller and callee meet, the parameters are passed, the body of the `accept` runs while the caller waits, and then both carry on. It is synchronous, two-way communication.
+
+</Definition>
+
+<Definition term="Protected object">
+
+A protected object encapsulates data with operations that run under mutual exclusion. **Protected procedures** and **entries** have exclusive access; **protected functions** may only read, and may run concurrently with each other. An entry has a **barrier**, a Boolean condition: a caller whose barrier is false waits in a queue until the protected data changes and the barrier becomes true.
+
+</Definition>
+
+The master rule removes a whole category of bugs. In a thread library you must remember to join every thread; in Ada a block that declares tasks simply does not finish until they have. The rule also makes the results of finished tasks safe to read: a task's termination synchronises with its master, so everything the task wrote is visible afterwards.
+
+A task that serves several kinds of request uses a **selective accept**:
+
+```ada
+task body Logger is
+begin
+   loop
+      select
+         accept Write (Line : String) do
+            Put_Line (Line);
+         end Write;
+      or
+         accept Flush;
+      or
+         terminate;      -- end quietly when no one can call any more
+      end select;
+   end loop;
+end Logger;
+```
+
+and a caller that will not wait for ever uses a **timed entry call**:
+
+```ada
+select
+   Buffer.Put (R);
+or
+   delay 0.5;
+   Put_Line ("buffer full for half a second: reading dropped");
+end select;
+```
+
+`delay 0.5;` suspends a task for at least half a second, and `delay until T;` until an absolute time from `Ada.Real_Time`, which is how periodic tasks avoid drift. Ada 2022 also defines `parallel` blocks and loops for fine-grained parallelism; GNAT 14 does not implement them yet, so this course uses tasks.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Tasks at work">
+
+### Splitting work between tasks
+
+Counting primes is easy to divide. This first attempt gives each of four workers every fourth number:
+
+```ada check
+pragma Ada_2022;
+with Ada.Text_IO; use Ada.Text_IO;
+
+procedure Main is
+   Limit   : constant := 200_000;
+   Workers : constant := 4;
+   type Worker_Id is range 1 .. Workers;
+
+   function Is_Prime (N : Positive) return Boolean is
+      D : Positive := 2;
+   begin
+      if N < 2 then
+         return False;
+      end if;
+      while D * D <= N loop
+         if N mod D = 0 then
+            return False;
+         end if;
+         D := D + 1;
+      end loop;
+      return True;
+   end Is_Prime;
+
+   --  One result slot per worker: each task writes only its own slot.
+   Counts : array (Worker_Id) of Natural := [others => 0];
+
+   task type Prime_Counter is
+      entry Start (Id : Worker_Id);       -- a rendezvous to receive its number
+   end Prime_Counter;
+
+   task body Prime_Counter is
+      Me    : Worker_Id;
+      Found : Natural := 0;
+   begin
+      accept Start (Id : Worker_Id) do
+         Me := Id;
+      end Start;
+      --  Worker k checks the numbers k, k + 4, k + 8, ... up to Limit.
+      for N in 1 .. Limit loop
+         if N mod Workers = Integer (Me) mod Workers and then Is_Prime (N) then
+            Found := Found + 1;
+         end if;
+      end loop;
+      Counts (Me) := Found;
+   end Prime_Counter;
+
+begin
+   declare
+      Team : array (Worker_Id) of Prime_Counter;   -- four tasks start here
+   begin
+      for Id in Worker_Id loop
+         Team (Id).Start (Id);
+      end loop;
+   end;   -- the block cannot end until all four tasks have finished
+
+   for Id in Worker_Id loop
+      Put_Line ("worker" & Id'Image & " found" & Counts (Id)'Image);
+   end loop;
+   Put_Line ("primes up to" & Limit'Image & ":"
+             & Natural'Image (Counts'Reduce ("+", 0)));
+end Main;
+```
+
+It prints:
+
+```text
+worker 1 found 8977
+worker 2 found 1
+worker 3 found 9006
+worker 4 found 0
+primes up to 200000: 17984
+```
+
+The structure is typical. `Team` is an array of four tasks, activated when the `declare` block begins. Each waits at its `accept Start` until the main program calls `Team (Id).Start (Id)`, a rendezvous that hands it its number. The block's `end` waits for all four to finish, after which `Main` can safely read `Counts`. Each worker writes only its own element of `Counts`, so no two tasks ever touch the same data.
+
+The answer is right (there are 17 984 primes below 200 000), but look at the split: workers 2 and 4 received only even numbers and had almost nothing to do. A static division of work is only as good as your knowledge of the work. A better design lets idle workers ask for more.
+
+### A protected work queue
+
+```ada check
+pragma Ada_2022;
+with Ada.Text_IO; use Ada.Text_IO;
+
+procedure Main is
+   Limit      : constant := 200_000;
+   Chunk_Size : constant := 1_000;
+
+   function Is_Prime (N : Positive) return Boolean is
+      D : Positive := 2;
+   begin
+      if N < 2 then
+         return False;
+      end if;
+      while D * D <= N loop
+         if N mod D = 0 then
+            return False;
+         end if;
+         D := D + 1;
+      end loop;
+      return True;
+   end Is_Prime;
+
+   --  A protected object: its procedures and entries run one caller at a time.
+   protected Work is
+      procedure Next_Chunk (First : out Positive; Done : out Boolean);
+      procedure Add (Found : Natural);
+      function Total return Natural;          -- functions may run concurrently
+      function Chunks return Natural;
+   private
+      Next   : Positive := 1;
+      Count  : Natural  := 0;
+      Handed : Natural  := 0;
+   end Work;
+
+   protected body Work is
+      procedure Next_Chunk (First : out Positive; Done : out Boolean) is
+      begin
+         Done  := Next > Limit;
+         First := Next;
+         if not Done then
+            Next := Next + Chunk_Size;
+            Handed := Handed + 1;
+         end if;
+      end Next_Chunk;
+
+      procedure Add (Found : Natural) is
+      begin
+         Count := Count + Found;
+      end Add;
+
+      function Total return Natural is (Count);
+      function Chunks return Natural is (Handed);
+   end Work;
+
+   task type Worker;
+   task body Worker is
+      First : Positive;
+      Done  : Boolean;
+      Found : Natural;
+   begin
+      loop
+         Work.Next_Chunk (First, Done);
+         exit when Done;
+         Found := 0;
+         for N in First .. Integer'Min (First + Chunk_Size - 1, Limit) loop
+            if Is_Prime (N) then
+               Found := Found + 1;
+            end if;
+         end loop;
+         Work.Add (Found);
+      end loop;
+   end Worker;
+begin
+   declare
+      Team : array (1 .. 4) of Worker;   -- no entries: they start work at once
+   begin
+      null;
+   end;
+   Put_Line ("primes up to" & Limit'Image & ":" & Work.Total'Image);
+   Put_Line ("chunks handed out:" & Work.Chunks'Image);
+end Main;
+```
+
+It prints:
+
+```text
+primes up to 200000: 17984
+chunks handed out: 200
+```
+
+`Work` is a single protected object. `Next_Chunk` hands out the next block of 1 000 numbers, and because protected procedures run one at a time, no two workers can receive the same chunk. Each worker adds its count with `Add`, also exclusive, so no update is lost. A fast worker simply comes back for more chunks, so the load balances itself. Which worker counted which chunk differs from run to run, but the total cannot.
+
+Compare this with locks in other languages. There is no lock object to forget to release and no way to read `Count` without going through the protected object, because its data is in its private part. The compiler forbids protected functions from changing the data, so readers can safely run in parallel.
+
+### Real-time profiles
+
+General Ada tasking is very flexible, and flexibility is hard to analyse. The **Ravenscar profile**, defined in the standard since Ada 2005, restricts a program to a fixed set of tasks created at start-up, no rendezvous, protected objects with at most one entry and simple barriers, and no task termination. What remains can be scheduled with fixed priorities and analysed for worst-case timing, and its run-time system is small enough to certify. Ada 2022 standardised **Jorvik**, a slightly more relaxed profile. Embedded Ada toolchains, including those Alire installs for ARM and RISC-V boards, offer run-time libraries that implement these profiles.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Project: a concurrent weather aggregator">
+
+The project combines most of the course. Six feed tasks, one per weather station, each produce 24 hourly readings. A protected bounded buffer passes them to one aggregator task, which rejects implausible values and keeps per-station statistics. When all the tasks have finished, the main program prints a report. The sensors are simulated by a deterministic function, with a few deliberate glitches, so the output is the same on every run.
+
+```ada check
+pragma Ada_2022;
+pragma Assertion_Policy (Check);
+with Ada.Text_IO; use Ada.Text_IO;
+
+procedure Main is
+
+   ---------------------------------------------------------------------------
+   --  Readings: the data model.
+   ---------------------------------------------------------------------------
+   package Readings is
+      type Station is (Accra, Lima, Mumbai, Oslo, Perth, Tokyo);
+      type Hour is range 0 .. 23;
+      type Celsius is delta 0.1 digits 5;                -- exact tenths
+      subtype Plausible is Celsius range -90.0 .. 60.0;   -- what Earth allows
+
+      type Reading is record
+         From    : Station;
+         At_Hour : Hour;
+         Value   : Celsius;
+      end record;
+
+      --  A stand-in for real hardware: deterministic values, with a few glitches.
+      function Sample (S : Station; H : Hour) return Reading
+        with Post => Sample'Result.From = S and Sample'Result.At_Hour = H;
+   end Readings;
+
+   package body Readings is
+      Base : constant array (Station) of Celsius :=
+        [Accra => 27.0, Lima => 18.5, Mumbai => 29.0,
+         Oslo => -2.0, Perth => 21.0, Tokyo => 9.5];
+
+      function Sample (S : Station; H : Hour) return Reading is
+         --  Hours away from 14:00 on a 24-hour clock: 0 .. 12.
+         Distance : constant Natural :=
+           Natural'Min (abs (Integer (H) - 14), 24 - abs (Integer (H) - 14));
+         --  Warmest at 14:00, coolest at 02:00: 3 degrees either side of the base.
+         Offset : constant Celsius := Celsius (6 - Distance) / 2;
+      begin
+         if (Station'Pos (S) + Integer (H)) mod 17 = 0 then
+            return (S, H, 999.9);                          -- a sensor glitch
+         end if;
+         return (S, H, Base (S) + Offset);
+      end Sample;
+   end Readings;
+
+   use Readings;
+
+   ---------------------------------------------------------------------------
+   --  A bounded buffer between the producers and the consumer.
+   ---------------------------------------------------------------------------
+   type Slot_Index is mod 8;
+   type Slot_Array is array (Slot_Index) of Reading;
+
+   protected Buffer is
+      entry Put (R : Reading);
+      entry Get (R : out Reading);
+   private
+      Slots : Slot_Array;
+      Head, Tail : Slot_Index := 0;     -- modular: they wrap around
+      Count : Natural range 0 .. Slot_Array'Length := 0;
+   end Buffer;
+
+   protected body Buffer is
+      entry Put (R : Reading) when Count < Slot_Array'Length is
+      begin
+         Slots (Tail) := R;
+         Tail := Tail + 1;
+         Count := Count + 1;
+      end Put;
+
+      entry Get (R : out Reading) when Count > 0 is
+      begin
+         R := Slots (Head);
+         Head := Head + 1;
+         Count := Count - 1;
+      end Get;
+   end Buffer;
+
+   ---------------------------------------------------------------------------
+   --  Statistics, written only by the aggregator task.
+   ---------------------------------------------------------------------------
+   type Summary is record
+      Low, High : Celsius := 0.0;
+      Total     : Celsius := 0.0;
+      Count     : Natural := 0;
+   end record;
+
+   Stats    : array (Station) of Summary;
+   Rejected : Natural := 0;
+
+   procedure Record_Value (S : in out Summary; V : Plausible)
+     with Post => S.Count = S'Old.Count + 1
+   is
+   begin
+      if S.Count = 0 then
+         S.Low  := V;
+         S.High := V;
+      else
+         S.Low  := Celsius'Min (S.Low, V);
+         S.High := Celsius'Max (S.High, V);
+      end if;
+      S.Total := S.Total + V;
+      S.Count := S.Count + 1;
+   end Record_Value;
+
+   ---------------------------------------------------------------------------
+   --  The tasks.
+   ---------------------------------------------------------------------------
+   task type Feed is
+      entry Start (S : Station);
+   end Feed;
+
+   task body Feed is
+      Mine : Station;
+   begin
+      accept Start (S : Station) do
+         Mine := S;
+      end Start;
+      for H in Hour loop
+         Buffer.Put (Sample (Mine, H));
+      end loop;
+   end Feed;
+
+   task type Aggregator;
+   task body Aggregator is
+      Expected : constant Positive := Stats'Length * Integer (Hour'Last - Hour'First + 1);
+      R : Reading;
+   begin
+      for I in 1 .. Expected loop
+         Buffer.Get (R);
+         if R.Value in Plausible then
+            Record_Value (Stats (R.From), R.Value);
+         else
+            Rejected := Rejected + 1;
+         end if;
+      end loop;
+   end Aggregator;
+
+   function Column (Text : String; Width : Positive) return String is
+     ([1 .. Width - Text'Length => ' '] & Text)
+     with Pre => Text'Length <= Width;
+
+begin
+   declare
+      Feeds    : array (Station) of Feed;    -- six producers
+      Consumer : Aggregator;                 -- one consumer
+   begin
+      for S in Station loop
+         Feeds (S).Start (S);
+      end loop;
+   end;              -- waits here until all seven tasks have finished
+
+   Put_Line ("Station " & Column ("Low", 7) & Column ("High", 7)
+             & Column ("Mean", 7) & Column ("Readings", 10));
+   for S in Station loop
+      declare
+         Sum  : Summary renames Stats (S);
+         Mean : constant Celsius := Sum.Total / Sum.Count;
+      begin
+         Put_Line (S'Image & [1 .. 8 - S'Image'Length => ' ']
+                   & Column (Sum.Low'Image, 7) & Column (Sum.High'Image, 7)
+                   & Column (Mean'Image, 7) & Column (Sum.Count'Image, 10));
+      end;
+   end loop;
+   Put_Line ("Rejected glitches:" & Rejected'Image);
+end Main;
+```
+
+It prints:
+
+```text
+Station     Low   High   Mean  Readings
+ACCRA      24.0   30.0   27.0        22
+LIMA       15.5   21.5   18.4        23
+MUMBAI     26.0   32.0   28.8        23
+OSLO       -5.0    0.5   -2.1        23
+PERTH      18.0   24.0   20.8        23
+TOKYO       6.5   12.5    9.4        23
+Rejected glitches: 7
+```
+
+How each part reflects what you have learnt:
+
+- **Types model the domain** (Lesson 2). `Station` is an enumeration, so the report and the `Stats` array cover exactly six stations. `Celsius` is a decimal fixed-point type, so sums are exact. The subtype `Plausible` states what a real temperature can be, and the membership test `R.Value in Plausible` filters glitches, whose 999.9 is a legal `Celsius` but not a plausible one.
+- **A package hides the data source** (Lesson 5). `Readings` exposes `Sample` and keeps the station base temperatures in its body. Replacing the simulation with real sensor input would change only that body, and its postcondition documents that a sample always belongs to the station and hour requested.
+- **Contracts document and check** (Lesson 7). `Record_Value` accepts only `Plausible` values and promises to count exactly one more reading.
+- **The buffer is a classic protected object.** `Put` waits while the buffer is full and `Get` while it is empty; the barriers `Count < Slot_Array'Length` and `Count > 0` say so directly. The modular type `Slot_Index` makes the circular indices wrap around with no explicit `mod`. With eight slots and six producers, a feed that finds the buffer full is held in the entry queue until the aggregator makes room: flow control for free.
+- **Tasks have clear lifetimes.** The feeds receive their stations by rendezvous; the `declare` block is the master of all seven tasks, so the report is printed only after every reading has been processed. `Stats` and `Rejected` are written only by the aggregator, so they need no protection.
+
+The mean is computed by dividing a `Celsius` total by a count, which truncates toward zero: Oslo's true mean is about -2.13, and it prints as -2.1.
+
+### As an Alire project
+
+In a real project each package goes in its own files, and the program becomes an Alire crate:
+
+```text
+weather/
+  alire.toml            the manifest: name, version, dependencies
+  weather.gpr           the GNAT project file, with -gnat2022 -gnata -gnatwa
+  src/
+    readings.ads        the data model and Sample
+    readings.adb
+    buffers.ads         the protected buffer (a generic, in a larger system)
+    buffers.adb
+    statistics.ads      Summary and Record_Value
+    statistics.adb
+    weather.adb         the main procedure with the tasks
+  tests/                an AUnit test crate for Readings and Statistics
+```
+
+`alr build` builds it, `alr run` runs it, and `alr with aunit` in the test crate brings in the test framework. The natural next steps would be to make the buffer a generic package (any element type, any size), to add SPARK annotations to `Readings` and `Statistics` and prove them free of run-time errors, and to replace the simulated `Sample` with input from a file or a serial port, behind the same specification.
+
+</Section>
+
+<Section id="reading" kind="reading" title="Where to go next">
+
+You now know the core of Ada: strong types, subprograms and exceptions, records, arrays and strings, packages and generics, tagged types, contracts and tasking. Good next steps:
+
+- **Practise on a real project.** Port a small program you wrote in another language, and let the types and contracts find the assumptions it was making. [ada-lang.io](https://ada-lang.io/) lists projects that need contributors, and [Alire's catalogue](https://alire.ada.dev/) shows what libraries exist.
+- **Go deeper into the language** with the free courses at [learn.adacore.com](https://learn.adacore.com/): *Advanced Journey With Ada*, *Ada In Practice* and *What's New in Ada 2022*. John Barnes's *Programming in Ada* books are the classic thorough treatment.
+- **Learn SPARK properly** with *Introduction to SPARK* on learn.adacore.com and the [SPARK User's Guide](https://docs.adacore.com/spark2014-docs/html/ug/). Proving a small library free of run-time errors is the best way to understand what proof offers and costs.
+- **Try embedded Ada.** Alire can install cross-compilers for ARM and RISC-V microcontrollers, and *Introduction to Embedded Systems Programming* on learn.adacore.com covers what changes on bare metal.
+- **Keep the standard close.** The [Reference Manual](https://ada-lang.io/docs/arm) is precise and, with practice, readable; experienced Ada programmers consult it often.
+- **Join the community** on the [Ada forum](https://forum.ada-lang.io/), where questions from newcomers are welcome.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"Tasks are threads, so I must start and join them."** GNAT usually runs each task on an operating-system thread, but the language manages their lifetime: tasks start when their declarations are elaborated and their master waits for them. There is nothing to join and nothing to forget.
+
+</Misconception>
+
+<Misconception>
+
+**"Barriers are polled in a loop."** A barrier is re-evaluated when the protected object's state may have changed, at the end of a protected procedure or entry, and waiting callers are then serviced before any new caller gets in. Waiting tasks use no processor time.
+
+</Misconception>
+
+<Misconception>
+
+**"Two tasks may share an ordinary variable if they are careful."** Unsynchronised access to shared variables, where at least one task writes, is erroneous in Ada, just as data races are undefined in C. Share data through protected objects or rendezvous, or give each task its own data and read it only after the task terminates.
+
+</Misconception>
+
+<Misconception>
+
+**"A rendezvous is a message queue."** It is synchronous: the caller waits until the callee accepts the call and finishes the `accept` body. If you need to decouple producers and consumers, put a protected buffer between them, as the project does.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GNAT 14.
+
+<Exercises/>
+
+</Section>

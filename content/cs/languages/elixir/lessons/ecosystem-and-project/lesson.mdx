@@ -1,0 +1,423 @@
+---
+title: Mix, the ecosystem and a complete project
+subtitle: How professional Elixir projects are built, checked and shipped, what Phoenix and LiveView do, and a small supervised service with tests, written in idiomatic style.
+minutes: 70
+objectives:
+  - Read a mix.exs file, add dependencies from Hex with sensible version requirements, and explain mix.lock
+  - "Use the everyday tools of an Elixir team: the formatter, warnings as errors, tests, Credo, Dialyzer, ExDoc and releases"
+  - Describe what Phoenix, Ecto and LiveView are for and how LiveView uses processes
+  - Structure a small application as a pure functional core inside a supervised process
+  - Plan your next steps in the language and its community
+prerequisites: [genserver-and-supervisors]
+references:
+  - title: Introduction to Mix
+    url: https://hexdocs.pm/elixir/introduction-to-mix.html
+    note: The first chapter of the official Mix and OTP guide, which builds a complete distributed key-value store.
+  - title: mix release
+    url: https://hexdocs.pm/mix/Mix.Tasks.Release.html
+    note: Building self-contained releases for deployment, and runtime configuration.
+  - title: Library guidelines
+    url: https://hexdocs.pm/elixir/library-guidelines.html
+    note: The official advice on writing and publishing packages on Hex.
+  - title: Phoenix overview
+    url: https://hexdocs.pm/phoenix/overview.html
+    note: The official guides of the Phoenix web framework.
+  - title: Phoenix LiveView
+    url: https://hexdocs.pm/phoenix_live_view/welcome.html
+    note: Rich, real-time user interfaces with server-rendered HTML.
+  - title: Ecto
+    url: https://hexdocs.pm/ecto/
+    note: The database wrapper and query language used by most Elixir applications.
+  - title: Credo
+    url: https://hexdocs.pm/credo/
+    note: The community's static analysis tool for code consistency and readability.
+  - title: Elixir Forum
+    url: https://elixirforum.com/
+    note: Where the community, including the core team, discusses questions and libraries.
+  - title: Exercism Elixir track
+    url: https://exercism.org/tracks/elixir
+    note: Free practice exercises with optional mentoring.
+---
+
+<Section id="motivation" kind="motivation" title="From scripts to a service">
+
+Every program so far has been a single script. Real Elixir work happens in **Mix projects**: a directory with a known layout, dependencies pinned in a lock file, code split into one module per file, tests that run on every change, and a release that can be deployed to a server and started with one command. The language you have learned is the same; what changes is the scaffolding around it and the habits of the people who use it.
+
+This lesson has three parts. First, the anatomy of a Mix project and the tools that Elixir teams run every day. Second, a quick tour of the libraries you will meet in most production systems, above all Phoenix and its LiveView. Third, a complete small service that uses nearly everything in the course, structured the way an experienced Elixir developer would structure it, with tests.
+
+</Section>
+
+<Section id="mix" kind="definitions" title="Anatomy of a Mix project">
+
+`mix new pantry --sup` creates a project with an application module and a supervisor, as you saw in the previous lesson. Its heart is `mix.exs`, which is itself an Elixir script. After adding a few common development tools it might look like this:
+
+```elixir
+defmodule Pantry.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :pantry,
+      version: "0.1.0",
+      elixir: "~> 1.20",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {Pantry.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
+    ]
+  end
+end
+```
+
+`project/0` names the application and the Elixir versions it supports; `application/0` says which module starts its supervision tree (`mod:`) and which built-in applications it needs; `deps/0` lists **dependencies** from [Hex](https://hex.pm/), the package registry shared by Elixir and Erlang. `only:` limits a dependency to some **environments** (Mix runs in `:dev` by default, `:test` under `mix test`, and `:prod` for releases), and `runtime: false` marks tools that are not part of the running application.
+
+`mix deps.get` downloads dependencies and records the exact version of each, with a checksum, in **`mix.lock`**. Commit the lock file: it guarantees that your teammates, your CI and your production build all use the same code. `mix deps.update credo` moves one dependency forward deliberately.
+
+Version requirements use `Version` syntax. The operator `~>` is the one you will write most, and it is easy to misread, so here is what each requirement accepts:
+
+```elixir check
+requirements = ["~> 1.20", "~> 1.20.0", ">= 1.18.0 and < 2.0.0"]
+versions = ["1.19.4", "1.20.5", "1.21.0", "2.0.0"]
+
+for req <- requirements do
+  accepted = Enum.filter(versions, &Version.match?(&1, req))
+  IO.puts(String.pad_trailing(req, 24) <> Enum.join(accepted, ", "))
+end
+
+IO.inspect(Version.compare("1.20.5", "1.20.10"))
+```
+
+It prints:
+
+```text
+~> 1.20                 1.20.5, 1.21.0
+~> 1.20.0               1.20.5
+>= 1.18.0 and < 2.0.0   1.19.4, 1.20.5, 1.21.0
+:lt
+```
+
+`~> 1.20` means "1.20 or later, but below 2.0": any compatible minor release. `~> 1.20.0` is stricter, "1.20.0 or later, but below 1.21.0": patch releases only. Libraries following semantic versioning promise not to break you within a major version, so `~> major.minor` is the usual choice. The last line shows why versions are compared with `Version.compare/2` rather than as strings: 1.20.5 is *less* than 1.20.10.
+
+Configuration lives in `config/`: `config/config.exs` for compile-time settings, and `config/runtime.exs`, evaluated when the system boots, for anything that comes from the environment, such as database URLs and secrets. Code reads settings with `Application.get_env/3` or `Application.fetch_env!/2`.
+
+</Section>
+
+<Section id="toolbelt" kind="human" title="The everyday toolbelt">
+
+These are the commands an Elixir team runs, roughly in the order they show up in a day's work:
+
+| Command | What it is for |
+| --- | --- |
+| `iex -S mix` | a shell with the project loaded; `recompile` after edits |
+| `mix format` | rewrite code in the standard style; `--check-formatted` in CI |
+| `mix compile --warnings-as-errors` | fail the build on any warning, type warnings included |
+| `mix test` | run the tests; `--failed`, `--stale`, `--cover`, `mix test path/to/file_test.exs:42` |
+| `mix credo` | style and consistency checks (Credo package) |
+| `mix dialyzer` | Dialyzer's analysis of typespecs and calls (Dialyxir package) |
+| `mix docs` | HTML documentation from `@moduledoc` and `@doc` (ExDoc package) |
+| `mix hex.audit` | warn about dependencies whose authors have retired that version |
+| `mix xref graph` | the dependency graph between your modules, to keep recompilation fast |
+| `mix release` | build a self-contained release for deployment |
+
+A typical continuous-integration job runs `mix deps.get`, `mix format --check-formatted`, `mix compile --warnings-as-errors`, `mix credo --strict` and `mix test`, often with Dialyzer in a separate job because it is slow on the first run.
+
+A **release** (`mix release`) packages your compiled code, its dependencies and the Erlang runtime into one directory that runs on a server without Elixir installed: `_build/prod/rel/pantry/bin/pantry start`. The same script can open a remote `iex` shell into the running system (`bin/pantry remote`), from which you can inspect processes, read state with `:sys.get_state/1`, or trace calls in production. Many teams deploy releases in containers; others use platforms with first-class Elixir support.
+
+For exploration, data work and teaching, [Livebook](https://livebook.dev/) offers notebooks in which every cell is Elixir, with charts, tables and connections to a running application. And for machine learning, the Nx family of libraries (Nx, Axon, Bumblebee, Explorer) brings tensors, neural networks, pretrained models and data frames to the BEAM, compiling numerical code for CPUs and GPUs.
+
+</Section>
+
+<Section id="phoenix" kind="examples" title="Phoenix, Ecto and LiveView at a glance">
+
+Most Elixir developers earn their living with **Phoenix**, a web framework that follows a familiar model (router, controllers, templates, a JSON API if you want one) on top of the BEAM's process model. Each HTTP request runs in its own lightweight process, so one slow request never blocks another, and the same server handles WebSocket connections (Phoenix **Channels**) and publish-subscribe messaging (**Phoenix.PubSub**) across a cluster of machines. As of late 2026 the current releases are Phoenix 1.8 and LiveView 1.2.
+
+**Ecto** is the database layer: *schemas* map tables to structs, *changesets* validate and track changes (returning `{:ok, record}` or `{:error, changeset}`, the tuple convention again), and a composable query language compiles to SQL. Phoenix projects group related schemas and functions into *contexts*, ordinary modules such as `Shop.Orders` that form the application's internal API.
+
+**LiveView** is the feature that most surprises people coming from other ecosystems. A LiveView renders HTML on the server and keeps a **process per connected user**, holding that user's page state. When the user clicks, the browser sends an event over a WebSocket; the process updates its state; LiveView re-renders and sends only the **changed parts** of the page back. You write rich, real-time interfaces mostly in Elixir, with very little JavaScript. A minimal counter looks like this:
+
+```elixir
+defmodule ShopWeb.CounterLive do
+  use ShopWeb, :live_view
+
+  def mount(_params, _session, socket) do
+    {:ok, assign(socket, count: 0)}
+  end
+
+  def handle_event("increment", _params, socket) do
+    {:noreply, update(socket, :count, &(&1 + 1))}
+  end
+
+  def render(assigns) do
+    ~H"""
+    <p>Clicked {@count} times</p>
+    <button phx-click="increment">Click me</button>
+    """
+  end
+end
+```
+
+You know enough to read it. `mount/3` sets up the initial state; `handle_event/3` is a callback very much like a GenServer's `handle_cast`, returning `{:noreply, new_socket}`; `render/1` uses the `~H` sigil for HEEx templates, where `{@count}` interpolates a value from the state. Because each user's LiveView is a BEAM process, everything from this course applies: it is isolated, it is supervised, and if it crashes, the browser reconnects and a fresh process mounts.
+
+Beyond the web, **Nerves** builds firmware for embedded Linux devices, **Broadway** builds data-ingestion pipelines with back-pressure from queues such as Kafka or Amazon SQS, and **Oban**, a popular community library, runs background jobs that are stored in your SQL database, so they survive restarts.
+
+</Section>
+
+<Section id="project" kind="computation" title="Project: a supervised pantry service">
+
+Here is a complete small service: the stock-keeping core of a community food bank. Families place orders for several items; an order is fulfilled completely or not at all; volunteers restock; a report lists items running low. In a Mix project it would be laid out like this:
+
+```text
+pantry/
+  mix.exs
+  lib/pantry.ex                  Pantry: public API, seed data
+  lib/pantry/application.ex      the supervision tree
+  lib/pantry/item.ex             the Item struct and its String.Chars implementation
+  lib/pantry/inventory.ex        the pure core
+  lib/pantry/stock.ex            the GenServer that owns the inventory
+  test/pantry/inventory_test.exs
+```
+
+Here it is as one runnable script, with its tests at the end:
+
+```elixir check
+defmodule Pantry.Item do
+  @moduledoc "One kind of food in the pantry."
+  @enforce_keys [:sku, :name, :unit]
+  defstruct [:sku, :name, :unit, quantity: 0]
+end
+
+defimpl String.Chars, for: Pantry.Item do
+  def to_string(item), do: "#{item.name}: #{item.quantity} #{item.unit}"
+end
+
+defmodule Pantry.Inventory do
+  @moduledoc """
+  The pure core: functions from an inventory (a map of SKU to item) to a new
+  inventory. No processes, no side effects, easy to test.
+  """
+  alias Pantry.Item
+
+  def new(items), do: Map.new(items, &{&1.sku, &1})
+
+  def restock(inventory, sku, qty) when is_integer(qty) and qty > 0 do
+    case Map.fetch(inventory, sku) do
+      {:ok, %Item{} = item} -> {:ok, Map.put(inventory, sku, %{item | quantity: item.quantity + qty})}
+      :error -> {:error, {:unknown_item, sku}}
+    end
+  end
+
+  def take(inventory, sku, qty) when is_integer(qty) and qty > 0 do
+    case Map.fetch(inventory, sku) do
+      {:ok, %Item{quantity: have} = item} when have >= qty ->
+        {:ok, Map.put(inventory, sku, %{item | quantity: have - qty})}
+
+      {:ok, %Item{quantity: have}} ->
+        {:error, {:not_enough, sku, have}}
+
+      :error ->
+        {:error, {:unknown_item, sku}}
+    end
+  end
+
+  @doc "Takes every line of an order, or nothing at all."
+  def fulfil(inventory, order) do
+    Enum.reduce_while(order, {:ok, inventory}, fn {sku, qty}, {:ok, acc} ->
+      case take(acc, sku, qty) do
+        {:ok, acc} -> {:cont, {:ok, acc}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  def low_stock(inventory, threshold) do
+    inventory
+    |> Map.values()
+    |> Enum.filter(&(&1.quantity < threshold))
+    |> Enum.sort_by(& &1.sku)
+  end
+end
+
+defmodule Pantry.Stock do
+  @moduledoc "The process that owns the inventory and serialises every change to it."
+  use GenServer
+  alias Pantry.Inventory
+
+  def start_link(items), do: GenServer.start_link(__MODULE__, items, name: __MODULE__)
+
+  def fulfil(order), do: GenServer.call(__MODULE__, {:fulfil, order})
+  def restock(sku, qty), do: GenServer.call(__MODULE__, {:restock, sku, qty})
+  def low_stock(threshold), do: GenServer.call(__MODULE__, {:low_stock, threshold})
+
+  @impl true
+  def init(items), do: {:ok, Inventory.new(items)}
+
+  @impl true
+  def handle_call({:fulfil, order}, _from, inventory) do
+    case Inventory.fulfil(inventory, order) do
+      {:ok, inventory} -> {:reply, :ok, inventory}
+      {:error, _} = error -> {:reply, error, inventory}
+    end
+  end
+
+  def handle_call({:restock, sku, qty}, _from, inventory) do
+    case Inventory.restock(inventory, sku, qty) do
+      {:ok, inventory} -> {:reply, :ok, inventory}
+      {:error, _} = error -> {:reply, error, inventory}
+    end
+  end
+
+  def handle_call({:low_stock, threshold}, _from, inventory) do
+    {:reply, Inventory.low_stock(inventory, threshold), inventory}
+  end
+end
+
+defmodule Pantry do
+  @moduledoc "The public face of the application, and its supervision tree."
+  alias Pantry.Item
+
+  def start(items) do
+    children = [{Pantry.Stock, items}]
+    Supervisor.start_link(children, strategy: :one_for_one, name: Pantry.Supervisor)
+  end
+
+  def seed_items do
+    [
+      %Item{sku: "RICE-5KG", name: "Rice", unit: "bags", quantity: 40},
+      %Item{sku: "BEANS-1KG", name: "Black beans", unit: "bags", quantity: 25},
+      %Item{sku: "OIL-1L", name: "Sunflower oil", unit: "bottles", quantity: 12},
+      %Item{sku: "MILK-UHT", name: "UHT milk", unit: "cartons", quantity: 30}
+    ]
+  end
+
+  def describe({:error, {:not_enough, sku, have}}), do: "refused: only #{have} of #{sku} left"
+  def describe({:error, {:unknown_item, sku}}), do: "refused: we do not stock #{sku}"
+  def describe(:ok), do: "done"
+end
+
+# --- Running the service ---------------------------------------------------
+
+{:ok, _sup} = Pantry.start(Pantry.seed_items())
+
+orders = [
+  {"Family Okafor", [{"RICE-5KG", 2}, {"BEANS-1KG", 3}, {"OIL-1L", 1}]},
+  {"Family Haddad", [{"RICE-5KG", 1}, {"OIL-1L", 12}]},
+  {"Family Nguyen", [{"MILK-UHT", 6}, {"FLOUR-2KG", 1}]},
+  {"Family Ruiz", [{"MILK-UHT", 6}, {"OIL-1L", 4}]}
+]
+
+for {family, order} <- orders do
+  IO.puts("#{family}: #{Pantry.describe(Pantry.Stock.fulfil(order))}")
+end
+
+IO.puts("Low stock:")
+Enum.each(Pantry.Stock.low_stock(25), &IO.puts("  #{&1}"))
+
+IO.puts("Restocking oil: #{Pantry.describe(Pantry.Stock.restock("OIL-1L", 24))}")
+IO.puts("Still low: #{Pantry.Stock.low_stock(25) |> Enum.map(& &1.sku) |> Enum.join(", ")}")
+
+# --- Tests -----------------------------------------------------------------
+
+ExUnit.start(autorun: false, seed: 0, formatters: [])
+
+defmodule Pantry.InventoryTest do
+  use ExUnit.Case, async: true
+  alias Pantry.{Inventory, Item}
+
+  setup do
+    %{inventory: Inventory.new([%Item{sku: "A", name: "Apples", unit: "kg", quantity: 5}])}
+  end
+
+  test "take/3 removes stock when there is enough", %{inventory: inv} do
+    assert {:ok, %{"A" => %Item{quantity: 3}}} = Inventory.take(inv, "A", 2)
+  end
+
+  test "take/3 refuses to go below zero", %{inventory: inv} do
+    assert Inventory.take(inv, "A", 6) == {:error, {:not_enough, "A", 5}}
+  end
+
+  test "fulfil/2 is all or nothing", %{inventory: inv} do
+    assert {:error, {:unknown_item, "Z"}} = Inventory.fulfil(inv, [{"A", 1}, {"Z", 1}])
+  end
+
+  test "restock/3 only accepts known items", %{inventory: inv} do
+    assert {:ok, %{"A" => %Item{quantity: 15}}} = Inventory.restock(inv, "A", 10)
+    assert {:error, {:unknown_item, "B"}} = Inventory.restock(inv, "B", 1)
+  end
+
+  test "guards reject nonsense quantities", %{inventory: inv} do
+    assert_raise FunctionClauseError, fn -> Inventory.take(inv, "A", -1) end
+  end
+end
+
+IO.inspect(ExUnit.run(), label: "tests")
+```
+
+It prints:
+
+```text
+Family Okafor: done
+Family Haddad: refused: only 11 of OIL-1L left
+Family Nguyen: refused: we do not stock FLOUR-2KG
+Family Ruiz: done
+Low stock:
+  Black beans: 22 bags
+  UHT milk: 24 cartons
+  Sunflower oil: 7 bottles
+Restocking oil: done
+Still low: BEANS-1KG, MILK-UHT
+tests: %{total: 5, failures: 0, excluded: 0, skipped: 0}
+```
+
+The design decisions are the point of this project, so here they are explicitly.
+
+**A functional core in a process shell.** All the rules live in `Pantry.Inventory`, a module of pure functions from one inventory map to a new one. It knows nothing about processes, so its tests need no setup beyond building a map, run in microseconds and can run in parallel. `Pantry.Stock` is a thin GenServer whose only jobs are to own the current inventory and to apply changes one at a time, so two families can never be promised the same last bottle of oil. This split, sometimes called "functional core, imperative shell", is the most useful structural habit you can take from this course.
+
+**All or nothing, without rollback code.** `fulfil/2` uses `Enum.reduce_while/3` to take each line of the order from an accumulating inventory and stops at the first failure. Because data is immutable, the failed attempt simply never becomes the server's state: the Haddad family's order took a bag of rice from a *copy* and was refused at the oil, and the real inventory was untouched. In a language with mutable state you would have to undo the rice.
+
+**Errors as data, with distinct shapes.** `{:not_enough, sku, have}` and `{:unknown_item, sku}` carry exactly what a message to a volunteer needs, and `Pantry.describe/1` turns each into text with one clause apiece. Guards (`qty > 0`) reject impossible arguments by crashing, which the last test asserts: a negative quantity is a bug in the caller, not an expected situation.
+
+**Small protocol, large convenience.** Implementing `String.Chars` for `Item` let the report print `"#{item}"`, and keeps formatting decisions next to the struct.
+
+**Supervised from the start.** `Pantry.start/1` stands in for the application module; in a real project the children list would be in `Pantry.Application.start/2`. If the stock process crashed, it would restart with the seed data, which is fine for a demonstration and a prompt to think about persistence before production: the next step would be to save each change to a database through Ecto, so that a restart reloads the real stock.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the core of Elixir: immutable data and pattern matching, functions and pipelines, collections, structs, protocols and behaviours, the type checker, errors and tests, processes, GenServers and supervisors, and the tools of a Mix project. Some good next steps:
+
+- **Build the official Mix and OTP project.** The guide that starts at [Introduction to Mix](https://hexdocs.pm/elixir/introduction-to-mix.html) walks through a distributed key-value store, adding a TCP server, tasks, configuration and releases.
+- **Build something with Phoenix.** The [Phoenix guides](https://hexdocs.pm/phoenix/overview.html) start with installation and a first page, and continue to Ecto, authentication, Channels and LiveView.
+- **Practise idioms.** The [Exercism Elixir track](https://exercism.org/tracks/elixir) has dozens of exercises with free human mentoring.
+- **Learn the Erlang underneath.** The [Erlang course](/en/cs/languages/erlang/) on this site covers the BEAM's original language, its OTP behaviours, hot code loading and distribution, all of which you can call directly from Elixir.
+- **Read good code and ask questions.** The source of Elixir's standard library is clear and well documented (in Elixir 1.20, `mix source Enum.map` prints where a function is defined, and `mix source --open Enum.map` opens it in your editor), and the [Elixir Forum](https://elixirforum.com/) is a welcoming place for questions, where core team members regularly answer.
+- **Follow the type system.** Each release is extending what the checker infers; the [changelog](https://hexdocs.pm/elixir/changelog.html) and the [type system guide](https://hexdocs.pm/elixir/gradual-set-theoretic-types.html) are the places to watch for typed structs and user-written signatures.
+
+<Reflection title="Systems that expect to fail">
+
+Elixir's deepest idea is not a syntax but an attitude: build as if failure is certain, contain it so that it harms as little as possible, and make recovery an ordinary, planned part of the system. A supervisor does not pretend its children will never fail, and it does not give up on them the first time they do; it gives them a fresh start, up to a point, and passes on what it cannot handle.
+
+There is something humane in that design. The Christian tradition speaks of grace in similar terms: failure is expected rather than denied, it is named honestly rather than hidden, and it is met with the offer of a new beginning rather than a cascade of consequences. Communities that work this way, like systems that do, tend to be both more honest and more resilient. It may be worth asking where in your own work, and your own relationships, a little more room to begin again would make the whole stronger.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

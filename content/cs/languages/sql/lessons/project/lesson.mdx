@@ -1,0 +1,548 @@
+---
+title: "Project: a tool library from schema to reports"
+subtitle: Normalise a messy spreadsheet into a schema with real constraints, decide where JSON belongs, and answer a lending library's questions with everything this course has taught.
+minutes: 80
+objectives:
+  - Identify update, insertion and deletion anomalies, and normalise a table to third normal form using functional dependencies
+  - Turn a design into STRICT tables with keys, foreign keys, CHECK constraints and a partial unique index
+  - Decide when a JSON column is the right choice, and query, build and index JSON in SQLite and PostgreSQL
+  - Build reports with views, anti-joins, outer joins, CTEs and window functions
+  - Describe how SQL is tested, linted and shipped in professional projects, and where to go next
+prerequisites: [transactions-and-isolation]
+related: [math.found.functions, math.found.sets]
+references:
+  - title: "SQLite: JSON Functions And Operators"
+    url: https://www.sqlite.org/json1.html
+  - title: "PostgreSQL: JSON Types"
+    url: https://www.postgresql.org/docs/current/datatype-json.html
+    note: json versus jsonb, containment, and indexing jsonb with GIN.
+  - title: "PostgreSQL: JSON Functions and Operators"
+    url: https://www.postgresql.org/docs/current/functions-json.html
+  - title: "MySQL: The JSON Data Type"
+    url: https://dev.mysql.com/doc/refman/8.4/en/json.html
+  - title: "SQLite: Partial Indexes"
+    url: https://www.sqlite.org/partialindex.html
+    note: Including unique partial indexes, used here to allow only one open loan per tool.
+  - title: "CMU 15-445/645: Database Systems"
+    url: https://15445.courses.cs.cmu.edu/
+    note: A university course on how database systems are built, with lectures freely available online.
+---
+
+<Section id="brief" kind="motivation" title="The brief: a neighbourhood tool library">
+
+A neighbourhood has started a **tool library**: members borrow drills, ladders and lawn mowers instead of each buying their own. So far the volunteers have kept everything in one shared spreadsheet, one row per loan:
+
+| loan | member | email | tool | category | max days | specs | out | due | back |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | Adaeze Nwosu | adaeze@… | cordless drill | power tools | 7 | 18 V, battery, wood/masonry bits | 04-02 | 04-09 | 04-08 |
+| 4 | Dong-hyun Park | donghyun@… | cordless drill | power tools | 7 | 18 V, battery, wood/masonry bits | 04-12 | 04-19 | 04-21 |
+| 5 | Adaeze Nwosu | adaeze@… | circular saw | power tools | 7 | 230 V, 190 mm blade | 04-15 | 04-22 | 04-20 |
+
+It works for a few dozen loans, and then it starts to fail in ways every database designer recognises. When Adaeze changes her e-mail address, a volunteer must find and fix every row she appears in, and if one is missed, the library has two addresses for her. When a new sander is donated, it cannot be recorded until someone borrows it, because every row is a loan. When the last loan of the pasta machine is deleted to tidy up, the library forgets it owns a pasta machine. And when the rules change so that power tools may be kept for ten days, the "max days" column must be changed in hundreds of rows.
+
+Your project is to replace the spreadsheet with a proper SQLite database: design the schema, make it refuse bad data, decide what to do with the irregular "specs" column, and write the reports the volunteers need. Every step uses something from an earlier lesson.
+
+</Section>
+
+<Section id="normalisation" kind="definitions" title="Normalisation: one fact in one place">
+
+The three failures above have names: an **update anomaly** (one fact stored many times, so updates must find every copy), an **insertion anomaly** (a fact cannot be recorded without an unrelated fact) and a **deletion anomaly** (removing one fact destroys another). They all come from one table storing facts about several different things. Normalisation is the systematic way to separate them.
+
+<Definition term="Functional dependency">
+
+A set of columns X **functionally determines** a column Y, written X → Y, if any two rows that agree on X must agree on Y. In other words, Y is a <TopicLink id="math.found.functions">function</TopicLink> of X. In the spreadsheet: email → member (each address belongs to one person); tool → category; category → max days; tool → specs; loan → everything.
+
+</Definition>
+
+<Definition term="Normal forms">
+
+- **First normal form (1NF)**: every column holds a single value, with no repeating groups, and rows are identified by a key.
+- **Second normal form (2NF)**: 1NF, and no non-key column depends on only *part* of a composite key.
+- **Third normal form (3NF)**: 2NF, and no non-key column depends on another non-key column (no *transitive* dependencies such as loan → tool → category → max days).
+- **Boyce–Codd normal form (BCNF)**: for every non-trivial dependency X → Y, X is a key. It closes a few rare gaps in 3NF.
+
+</Definition>
+
+The practical recipe is to follow the dependencies. Every determinant becomes the key of its own table, and the columns it determines move there with it. Applied to the spreadsheet:
+
+- **member** (id, name, email, joined_on), with `email` unique;
+- **category** (id, name, max_days): the loan rule is now stated once;
+- **tool** (id, category_id, name, specs, retired): a tool exists whether or not anyone has borrowed it;
+- **loan** (id, tool_id, member_id, out_on, due_on, returned_on): only facts about the loan itself, plus foreign keys to the things it connects.
+
+Each anomaly is gone. Adaeze's e-mail is one value in one row. The donated sander is a row in `tool`. Deleting a loan deletes a loan, nothing more. Changing a category's loan period is a one-row `UPDATE`.
+
+Normalisation is a default, not a religion. Analytical databases often **denormalise** on purpose, copying a customer's country onto every order row so that billions of rows can be grouped without a join, and some values are deliberately copied as historical facts (an invoice keeps the price *at the time of sale*, not a reference to today's price). The skill is to know which facts you are duplicating, why, and what keeps the copies correct.
+
+</Section>
+
+<Section id="schema" kind="computation" title="The schema, with its rules">
+
+The schema below turns the design into tables. It uses almost every constraint from lesson 2, `STRICT` tables so that SQLite enforces types, and one new trick: a **partial unique index**. "A tool can be out on at most one loan at a time" means that among loans with `returned_on IS NULL`, `tool_id` must be unique. A unique index with a `WHERE` clause says exactly that, and SQLite and PostgreSQL both support it. (MySQL has no partial indexes, so there you would enforce the rule with a trigger or in application code.)
+
+```sql check
+.mode column
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE member (
+  id        INTEGER PRIMARY KEY,
+  name      TEXT NOT NULL,
+  email     TEXT NOT NULL UNIQUE,
+  joined_on TEXT NOT NULL CHECK (joined_on = date(joined_on))   -- a valid ISO date
+) STRICT;
+
+CREATE TABLE category (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT    NOT NULL UNIQUE,
+  max_days INTEGER NOT NULL CHECK (max_days > 0)                -- longest loan allowed
+) STRICT;
+
+CREATE TABLE tool (
+  id          INTEGER PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES category (id),
+  name        TEXT    NOT NULL,
+  specs       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(specs)),  -- JSON object
+  retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
+) STRICT;
+
+CREATE TABLE loan (
+  id          INTEGER PRIMARY KEY,
+  tool_id     INTEGER NOT NULL REFERENCES tool (id),
+  member_id   INTEGER NOT NULL REFERENCES member (id),
+  out_on      TEXT    NOT NULL,
+  due_on      TEXT    NOT NULL,
+  returned_on TEXT,                                              -- NULL while out
+  CHECK (due_on > out_on),
+  CHECK (returned_on IS NULL OR returned_on >= out_on)
+) STRICT;
+
+-- A tool can be out on at most one loan at a time: a partial unique index.
+CREATE UNIQUE INDEX loan_one_open ON loan (tool_id) WHERE returned_on IS NULL;
+-- Foreign keys are what joins search, so index them.
+CREATE INDEX loan_member ON loan (member_id);
+CREATE INDEX tool_category ON tool (category_id);
+INSERT INTO member (id, name, email, joined_on) VALUES
+  (1, 'Adaeze Nwosu',   'adaeze@example.org', '2025-09-14'),
+  (2, 'Bjørn Halvorsen', 'bjorn@example.org',  '2025-10-02'),
+  (3, 'Camila Duarte',  'camila@example.org', '2026-01-20'),
+  (4, 'Dong-hyun Park', 'donghyun@example.org', '2026-02-11'),
+  (5, 'Esra Yılmaz',    'esra@example.org',   '2026-03-05'),
+  (6, 'Felix Mwangi',   'felix@example.org',  '2026-04-28'),
+  (7, 'Gulnara Abenova', 'gulnara@example.org', '2026-05-18');
+
+INSERT INTO category (id, name, max_days) VALUES
+  (1, 'power tools', 7), (2, 'garden', 14), (3, 'ladders', 3), (4, 'kitchen', 7);
+
+INSERT INTO tool (id, category_id, name, specs) VALUES
+  (1, 1, 'cordless drill',   '{"volts": 18, "battery": true, "bits": ["wood", "masonry"]}'),
+  (2, 1, 'circular saw',     '{"volts": 230, "blade_mm": 190}'),
+  (3, 1, 'sander',           '{"volts": 230, "sheets": ["P80", "P120"]}'),
+  (4, 2, 'lawn mower',       '{"fuel": "petrol", "width_cm": 46}'),
+  (5, 2, 'hedge trimmer',    '{"volts": 18, "battery": true}'),
+  (6, 3, 'step ladder',      '{"steps": 6}'),
+  (7, 3, 'extension ladder', '{"steps": 24, "max_m": 7.2}'),
+  (8, 4, 'pasta machine',    '{}');
+
+INSERT INTO loan (tool_id, member_id, out_on, due_on, returned_on) VALUES
+  (1, 1, '2026-04-02', '2026-04-09', '2026-04-08'),
+  (6, 2, '2026-04-03', '2026-04-06', '2026-04-06'),
+  (4, 3, '2026-04-10', '2026-04-24', '2026-04-22'),
+  (1, 4, '2026-04-12', '2026-04-19', '2026-04-21'),
+  (2, 1, '2026-04-15', '2026-04-22', '2026-04-20'),
+  (8, 5, '2026-04-18', '2026-04-25', '2026-04-25'),
+  (1, 2, '2026-04-25', '2026-05-02', '2026-05-01'),
+  (5, 3, '2026-05-01', '2026-05-15', '2026-05-12'),
+  (7, 4, '2026-05-04', '2026-05-07', '2026-05-09'),
+  (1, 5, '2026-05-08', '2026-05-15', NULL),
+  (4, 1, '2026-05-10', '2026-05-24', NULL),
+  (6, 6, '2026-05-14', '2026-05-17', NULL),
+  (3, 2, '2026-05-16', '2026-05-23', NULL);
+
+SELECT (SELECT count(*) FROM member) AS members, (SELECT count(*) FROM tool) AS tools,
+       (SELECT count(*) FROM loan) AS loans,
+       (SELECT count(*) FROM loan WHERE returned_on IS NULL) AS out_now;
+
+-- The design refuses bad data. INSERT OR IGNORE skips a rejected row,
+-- and changes() reports 0.
+INSERT OR IGNORE INTO loan (tool_id, member_id, out_on, due_on)
+VALUES (1, 6, '2026-05-18', '2026-05-25');          -- the drill is already out
+SELECT changes() AS second_open_loan_for_drill;
+INSERT OR IGNORE INTO tool (category_id, name, specs) VALUES (1, 'jigsaw', '{volts: 18');
+SELECT changes() AS tool_with_broken_json;
+```
+
+```text
+members  tools  loans  out_now
+-------  -----  -----  -------
+7        8      13     4
+second_open_loan_for_drill
+--------------------------
+0
+tool_with_broken_json
+---------------------
+0
+```
+
+Seven members, eight tools, thirteen loans, four tools currently out. The two final statements show the rules at work: a second open loan for the drill and a tool with malformed JSON were both refused. (`INSERT OR IGNORE` turns the refusals into skipped rows so that this script can carry on; in an application you would let the error reach the code, roll back, and tell the volunteer what went wrong.)
+
+Some of the decisions in this schema, and why:
+
+- **Dates as ISO 8601 text**, checked with `joined_on = date(joined_on)`: `date()` returns `NULL` for anything that is not a valid date, so the comparison fails and the row is rejected. In PostgreSQL you would simply use the `DATE` type.
+- **`max_days` lives in `category`**, and `due_on` is stored on each loan. That looks like duplication, but it is a historical fact: if the rules change next month, existing loans keep the due date they were given.
+- **`retired` instead of `DELETE`**: a broken ladder is retired, not deleted, so its loan history remains valid. Foreign keys would refuse the delete anyway.
+- **Indexes on foreign keys**, because every report joins through them.
+
+</Section>
+
+<Section id="json" kind="examples" title="Where JSON belongs">
+
+The spreadsheet's "specs" column held different facts for different tools: voltage and battery for some, number of steps for ladders, blade size for saws, nothing at all for the pasta machine. A fully normalised design would give each kind of attribute its own column (mostly `NULL`) or a separate table per category, and both are clumsy for data that is shown to members but rarely queried. This is the case where a **JSON column** is the right tool: **semi-structured** attributes that vary by row, are read and written as a whole, and are not used to join or enforce rules.
+
+Every major database can now store and query JSON. In SQLite, JSON is stored as text, `json_valid()` in a `CHECK` keeps it well formed, and the JSON functions read and build it. SQLite 3.38 added the operators `->` (returns JSON) and `->>` (returns an SQL value) familiar from PostgreSQL and MySQL; the SQLite used here, 3.37, predates them, so this program uses `json_extract`.
+
+```sql check
+.mode column
+CREATE TABLE category (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT    NOT NULL UNIQUE,
+  max_days INTEGER NOT NULL CHECK (max_days > 0)
+) STRICT;
+CREATE TABLE tool (
+  id          INTEGER PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES category (id),
+  name        TEXT    NOT NULL,
+  specs       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(specs)),
+  retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
+) STRICT;
+INSERT INTO category (id, name, max_days) VALUES
+  (1, 'power tools', 7), (2, 'garden', 14), (3, 'ladders', 3), (4, 'kitchen', 7);
+INSERT INTO tool (id, category_id, name, specs) VALUES
+  (1, 1, 'cordless drill',   '{"volts": 18, "battery": true, "bits": ["wood", "masonry"]}'),
+  (2, 1, 'circular saw',     '{"volts": 230, "blade_mm": 190}'),
+  (3, 1, 'sander',           '{"volts": 230, "sheets": ["P80", "P120"]}'),
+  (4, 2, 'lawn mower',       '{"fuel": "petrol", "width_cm": 46}'),
+  (5, 2, 'hedge trimmer',    '{"volts": 18, "battery": true}'),
+  (6, 3, 'step ladder',      '{"steps": 6}'),
+  (7, 3, 'extension ladder', '{"steps": 24, "max_m": 7.2}'),
+  (8, 4, 'pasta machine',    '{}');
+-- Read fields from JSON with json_extract (SQLite 3.38+ also has -> and ->>).
+SELECT name,
+       json_extract(specs, '$.volts')    AS volts,
+       json_extract(specs, '$.battery')  AS battery,
+       json_array_length(specs, '$.bits') AS bit_types
+FROM tool
+WHERE json_extract(specs, '$.volts') IS NOT NULL
+ORDER BY volts, name;
+
+-- json_each turns a JSON array into rows, which can then be joined or grouped.
+SELECT t.name, j.value AS sheet_or_bit
+FROM tool AS t, json_each(t.specs, '$.bits') AS j
+UNION ALL
+SELECT t.name, j.value
+FROM tool AS t, json_each(t.specs, '$.sheets') AS j
+ORDER BY 1, 2;
+
+-- Build JSON from rows: one document per category, ready for a web page.
+SELECT json_object('category', c.name,
+                   'tools', json_group_array(t.name)) AS doc
+FROM category AS c JOIN tool AS t ON t.category_id = c.id
+GROUP BY c.id
+ORDER BY c.id;
+
+-- An index on a JSON expression makes such filters searchable.
+CREATE INDEX tool_volts ON tool (json_extract(specs, '$.volts'));
+EXPLAIN QUERY PLAN SELECT name FROM tool WHERE json_extract(specs, '$.volts') = 18;
+```
+
+```text
+name            volts  battery  bit_types
+--------------  -----  -------  ---------
+cordless drill  18     1        2
+hedge trimmer   18     1
+circular saw    230
+sander          230
+name            sheet_or_bit
+--------------  ------------
+cordless drill  masonry
+cordless drill  wood
+sander          P120
+sander          P80
+doc
+-----------------------------------------------------------------------------
+{"category":"power tools","tools":["cordless drill","circular saw","sander"]}
+{"category":"garden","tools":["lawn mower","hedge trimmer"]}
+{"category":"ladders","tools":["step ladder","extension ladder"]}
+{"category":"kitchen","tools":["pasta machine"]}
+QUERY PLAN
+`--SEARCH tool USING INDEX tool_volts (<expr>=?)
+```
+
+The first query reads fields; JSON's `true` arrived as SQLite's `1`, and a missing field is `NULL`. The second used `json_each`, a **table-valued function** that turns an array into rows, so that JSON data can be joined, filtered and grouped like any table. The third did the reverse: `json_group_array` and `json_object` build JSON from rows, which is how many web back ends produce API responses straight from the database. Finally, an index on the expression `json_extract(specs, '$.volts')` made a JSON filter a `SEARCH`, exactly like the expression indexes of lesson 8.
+
+PostgreSQL has two JSON types: `json` keeps the text as written, while `jsonb` stores a parsed binary form that is faster to query and can be indexed as a whole with a GIN index. The containment operator `@>` asks "does this document contain that one?". PostgreSQL 16 printed:
+
+```sql
+CREATE INDEX tool_specs ON tool USING GIN (specs);   -- specs is a jsonb column
+
+SELECT name, specs->>'volts' AS volts, specs->'bits' AS bits
+FROM tool
+WHERE specs @> '{"battery": true}'
+ORDER BY name;
+```
+
+```text
+      name      | volts |        bits
+----------------+-------+---------------------
+ cordless drill | 18    | ["wood", "masonry"]
+ hedge trimmer  | 18    |
+(2 rows)
+```
+
+MySQL has a native `JSON` type with `->` and `->>` as well. The SQL standard added JSON functions in SQL:2016 (`JSON_VALUE`, `JSON_QUERY`, `JSON_TABLE` and others, supported by Oracle, in part by MySQL, and by PostgreSQL from version 17) and a `JSON` data type in SQL:2023.
+
+<Misconception>
+
+"With JSON columns I don't need a schema." The schema does not disappear; it moves into application code, where no constraint enforces it, and every program that reads the column must agree on it informally. Members' e-mail addresses inside a JSON blob cannot be declared `UNIQUE`; a `category` field inside JSON cannot be a foreign key. Use JSON for the genuinely irregular parts, and real columns for everything you join on, filter on often, or need the database to protect.
+
+</Misconception>
+
+</Section>
+
+<Section id="reports" kind="examples" title="The reports">
+
+The volunteers need answers: who is late returning something, what is on the shelf now, how each member is doing, which tools are popular, how long tools sit unused, and how busy each week was. The program creates a view that joins the four tables into one readable row per loan, then builds the reports on it. The date "today" is fixed at 20 May 2026 so that the output does not change from day to day; in a real application it would be `date('now')` or `CURRENT_DATE`, or better, a parameter.
+
+```sql check
+.mode column
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE member (
+  id        INTEGER PRIMARY KEY,
+  name      TEXT NOT NULL,
+  email     TEXT NOT NULL UNIQUE,
+  joined_on TEXT NOT NULL CHECK (joined_on = date(joined_on))   -- a valid ISO date
+) STRICT;
+
+CREATE TABLE category (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT    NOT NULL UNIQUE,
+  max_days INTEGER NOT NULL CHECK (max_days > 0)                -- longest loan allowed
+) STRICT;
+
+CREATE TABLE tool (
+  id          INTEGER PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES category (id),
+  name        TEXT    NOT NULL,
+  specs       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(specs)),  -- JSON object
+  retired     INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1))
+) STRICT;
+
+CREATE TABLE loan (
+  id          INTEGER PRIMARY KEY,
+  tool_id     INTEGER NOT NULL REFERENCES tool (id),
+  member_id   INTEGER NOT NULL REFERENCES member (id),
+  out_on      TEXT    NOT NULL,
+  due_on      TEXT    NOT NULL,
+  returned_on TEXT,                                              -- NULL while out
+  CHECK (due_on > out_on),
+  CHECK (returned_on IS NULL OR returned_on >= out_on)
+) STRICT;
+
+-- A tool can be out on at most one loan at a time: a partial unique index.
+CREATE UNIQUE INDEX loan_one_open ON loan (tool_id) WHERE returned_on IS NULL;
+-- Foreign keys are what joins search, so index them.
+CREATE INDEX loan_member ON loan (member_id);
+CREATE INDEX tool_category ON tool (category_id);
+INSERT INTO member (id, name, email, joined_on) VALUES
+  (1, 'Adaeze Nwosu',   'adaeze@example.org', '2025-09-14'),
+  (2, 'Bjørn Halvorsen', 'bjorn@example.org',  '2025-10-02'),
+  (3, 'Camila Duarte',  'camila@example.org', '2026-01-20'),
+  (4, 'Dong-hyun Park', 'donghyun@example.org', '2026-02-11'),
+  (5, 'Esra Yılmaz',    'esra@example.org',   '2026-03-05'),
+  (6, 'Felix Mwangi',   'felix@example.org',  '2026-04-28'),
+  (7, 'Gulnara Abenova', 'gulnara@example.org', '2026-05-18');
+
+INSERT INTO category (id, name, max_days) VALUES
+  (1, 'power tools', 7), (2, 'garden', 14), (3, 'ladders', 3), (4, 'kitchen', 7);
+
+INSERT INTO tool (id, category_id, name, specs) VALUES
+  (1, 1, 'cordless drill',   '{"volts": 18, "battery": true, "bits": ["wood", "masonry"]}'),
+  (2, 1, 'circular saw',     '{"volts": 230, "blade_mm": 190}'),
+  (3, 1, 'sander',           '{"volts": 230, "sheets": ["P80", "P120"]}'),
+  (4, 2, 'lawn mower',       '{"fuel": "petrol", "width_cm": 46}'),
+  (5, 2, 'hedge trimmer',    '{"volts": 18, "battery": true}'),
+  (6, 3, 'step ladder',      '{"steps": 6}'),
+  (7, 3, 'extension ladder', '{"steps": 24, "max_m": 7.2}'),
+  (8, 4, 'pasta machine',    '{}');
+
+INSERT INTO loan (tool_id, member_id, out_on, due_on, returned_on) VALUES
+  (1, 1, '2026-04-02', '2026-04-09', '2026-04-08'),
+  (6, 2, '2026-04-03', '2026-04-06', '2026-04-06'),
+  (4, 3, '2026-04-10', '2026-04-24', '2026-04-22'),
+  (1, 4, '2026-04-12', '2026-04-19', '2026-04-21'),
+  (2, 1, '2026-04-15', '2026-04-22', '2026-04-20'),
+  (8, 5, '2026-04-18', '2026-04-25', '2026-04-25'),
+  (1, 2, '2026-04-25', '2026-05-02', '2026-05-01'),
+  (5, 3, '2026-05-01', '2026-05-15', '2026-05-12'),
+  (7, 4, '2026-05-04', '2026-05-07', '2026-05-09'),
+  (1, 5, '2026-05-08', '2026-05-15', NULL),
+  (4, 1, '2026-05-10', '2026-05-24', NULL),
+  (6, 6, '2026-05-14', '2026-05-17', NULL),
+  (3, 2, '2026-05-16', '2026-05-23', NULL);
+-- A view that every report can build on: one readable row per loan.
+CREATE VIEW loan_detail AS
+SELECT l.id, l.member_id, m.name AS member, t.name AS tool, c.name AS category,
+       l.out_on, l.due_on, l.returned_on,
+       l.returned_on IS NULL                 AS is_out,
+       coalesce(l.returned_on > l.due_on, 0) AS returned_late
+FROM loan AS l
+JOIN member   AS m ON m.id = l.member_id
+JOIN tool     AS t ON t.id = l.tool_id
+JOIN category AS c ON c.id = t.category_id;
+
+-- Report 1: overdue on 20 May 2026, most overdue first.
+SELECT member, tool, due_on,
+       CAST(julianday('2026-05-20') - julianday(due_on) AS INTEGER) AS days_late
+FROM loan_detail
+WHERE is_out AND due_on < '2026-05-20'
+ORDER BY days_late DESC;
+
+-- Report 2: what can be borrowed right now?
+SELECT c.name AS category, t.name AS tool
+FROM tool AS t JOIN category AS c ON c.id = t.category_id
+WHERE t.retired = 0
+  AND NOT EXISTS (SELECT 1 FROM loan AS l WHERE l.tool_id = t.id AND l.returned_on IS NULL)
+ORDER BY c.name, t.name;
+
+-- Report 3: each member's record, including members who never borrowed.
+SELECT m.name,
+       count(d.id)                    AS loans,
+       coalesce(sum(d.returned_late), 0) AS late_returns,
+       coalesce(sum(d.is_out), 0)     AS out_now
+FROM member AS m
+LEFT JOIN loan_detail AS d ON d.member_id = m.id
+GROUP BY m.id, m.name
+ORDER BY loans DESC, m.name;
+-- Report 4: the most borrowed tool in each category (ties share a rank).
+WITH counts AS (
+  SELECT c.name AS category, t.name AS tool, count(l.id) AS loans
+  FROM tool AS t
+  JOIN category AS c ON c.id = t.category_id
+  LEFT JOIN loan AS l ON l.tool_id = t.id
+  GROUP BY t.id
+),
+ranked AS (
+  SELECT *, rank() OVER (PARTITION BY category ORDER BY loans DESC) AS place
+  FROM counts
+)
+SELECT category, tool, loans FROM ranked WHERE place = 1 ORDER BY loans DESC, category, tool;
+
+-- Report 5: for the drill, how long it sat on the shelf between loans.
+SELECT l.out_on, coalesce(l.returned_on, 'still out') AS back_on,
+       CAST(julianday(l.out_on)
+            - julianday(lag(l.returned_on) OVER (ORDER BY l.out_on)) AS INTEGER) AS idle_days
+FROM loan AS l JOIN tool AS t ON t.id = l.tool_id
+WHERE t.name = 'cordless drill'
+ORDER BY l.out_on;
+
+-- Report 6: loans started per week (%W numbers weeks from Monday), with a running total.
+SELECT strftime('%Y-W%W', out_on) AS week, count(*) AS loans,
+       sum(count(*)) OVER (ORDER BY strftime('%Y-W%W', out_on)) AS running
+FROM loan
+GROUP BY week
+ORDER BY week;
+```
+
+```text
+member        tool            due_on      days_late
+------------  --------------  ----------  ---------
+Esra Yılmaz   cordless drill  2026-05-15  5
+Felix Mwangi  step ladder     2026-05-17  3
+category     tool
+-----------  ----------------
+garden       hedge trimmer
+kitchen      pasta machine
+ladders      extension ladder
+power tools  circular saw
+name             loans  late_returns  out_now
+---------------  -----  ------------  -------
+Adaeze Nwosu     3      0             1
+Bjørn Halvorsen  3      0             1
+Camila Duarte    2      0             0
+Dong-hyun Park   2      2             0
+Esra Yılmaz      2      0             1
+Felix Mwangi     1      0             1
+Gulnara Abenova  0      0             0
+category     tool            loans
+-----------  --------------  -----
+power tools  cordless drill  4
+garden       lawn mower      2
+ladders      step ladder     2
+kitchen      pasta machine   1
+out_on      back_on     idle_days
+----------  ----------  ---------
+2026-04-02  2026-04-08
+2026-04-12  2026-04-21  4
+2026-04-25  2026-05-01  4
+2026-05-08  still out   7
+week      loans  running
+--------  -----  -------
+2026-W13  2      2
+2026-W14  2      4
+2026-W15  2      6
+2026-W16  1      7
+2026-W17  1      8
+2026-W18  3      11
+2026-W19  2      13
+```
+
+Read each report as a review of the course:
+
+1. **Overdue loans** filter the view on `is_out` (a boolean expression stored as 0 or 1) and a date comparison, and compute days late with `julianday()`. Esra has had the drill for five days past its due date.
+2. **Available tools** is an anti-join written with `NOT EXISTS` (lesson 6), which stays correct even though `returned_on` is nullable.
+3. **Member records** start from `member` with a `LEFT JOIN`, so Gulnara, who joined two days ago and has not borrowed anything, appears with zeros (lesson 5); `count(d.id)` counts only real loans, and `coalesce` turns the sums of no rows into 0 (lesson 4). Dong-hyun returned both of his loans late, which is worth a friendly reminder.
+4. **Most borrowed per category** groups in one CTE and ranks in another, then filters on the rank outside, the top-N pattern of lesson 7, using `rank()` so that ties would be kept.
+5. **Idle days** uses `lag()` to compare each loan of the drill with the previous loan's return.
+6. **Loans per week** groups by a week label and adds a running total with `sum(count(*)) OVER (…)`: a window function applied to the result of a grouped query. (`%W` numbers weeks from Monday; it is not the ISO 8601 week number, which SQLite added as `%V` in version 3.46.)
+
+### Ideas for extending the project
+
+Practice by adding features of your own. Each one exercises a different lesson:
+
+- **Reservations.** Add a `reservation` table. A member may reserve a tool that is out; the next loan of that tool must go to the earliest reservation. Write the constraint and the query that finds whose turn it is.
+- **Late fees.** Store fees as integer cents (lesson 2), charge per day late, and write a transaction that records a return and its fee together (lesson 9).
+- **Search.** Use SQLite's FTS5 extension to search tool names and descriptions.
+- **Port it.** Recreate the schema in PostgreSQL with `DATE`, `BOOLEAN`, `jsonb` and identity columns, and compare the reports' plans with `EXPLAIN ANALYZE`.
+
+</Section>
+
+<Section id="professional" kind="human" title="How SQL is shipped in real projects, and where to go next">
+
+The SQL in this lesson would live in a real project in a few distinct places, each with its own practices:
+
+- **Schema changes as migrations.** The `CREATE TABLE` statements become the first numbered migration, checked into version control; every later change (a new column, a new index) is another migration, applied automatically in the same order everywhere.
+- **Queries with parameters.** Application code never pastes values into SQL text. The overdue report becomes `… WHERE is_out AND due_on < ?` with today's date passed as a parameter, which prevents SQL injection and lets the database reuse the prepared statement.
+- **Tests.** A test creates a fresh database (SQLite's `:memory:` is ideal), applies the migrations, inserts a small known data set like the one above, runs each report and compares the result with the expected rows. Data-quality checks are often written as queries that must return **zero rows**: "loans returned before they went out", "open loans on retired tools". Tools such as dbt run such tests on schedule in data warehouses.
+- **Style and linting.** Teams agree on a style (capitalised keywords, one clause per line, explicit `AS` for aliases, explicit join conditions) and enforce it with a formatter or a linter such as SQLFluff, so that reviews can focus on meaning.
+- **ORMs and query builders.** Many applications use an object-relational mapper (Django's ORM, SQLAlchemy, Hibernate, Entity Framework, Active Record) for routine reads and writes. They are productive, but the SQL they generate is still SQL: experienced developers read it, check its plans, and drop down to hand-written SQL for reports like these.
+
+Where to go from here:
+
+- **Go deeper into one database.** The [PostgreSQL documentation](https://www.postgresql.org/docs/current/) and the [SQLite documentation](https://www.sqlite.org/docs.html) are excellent and worth reading chapter by chapter, especially the pages on the query planner, indexes and concurrency.
+- **Learn how databases work inside.** Storage engines, buffer pools, query execution and recovery are the subject of courses such as Carnegie Mellon's [Database Systems](https://15445.courses.cs.cmu.edu/), whose lectures are freely available, and of Lumenary CS's [Databases](/en/cs/databases/) lesson.
+- **Analytics.** Column-oriented engines such as [DuckDB](https://duckdb.org/) run the same SQL, window functions and all, over millions of rows on a laptop, and are a natural next step for data analysis.
+- **Indexing.** Markus Winand's [Use The Index, Luke](https://use-the-index-luke.com/) is a free, practical book on making SQL fast in several databases.
+
+<Reflection title="Keeping faithful records">
+
+A lending library runs on trust: members trust that the tools will be there, and the library trusts that they will come back. The database's part in that is quiet and unglamorous. It keeps each fact once, refuses records that cannot be true, and never loses a loan halfway through being written down. There is an old wisdom that whoever is faithful in small things is faithful in large ones as well. Much of good engineering is that kind of faithfulness: constraints nobody notices, checks that catch a mistake before it becomes someone else's problem, and records that say exactly what happened.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

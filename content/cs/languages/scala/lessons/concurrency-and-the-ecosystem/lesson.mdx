@@ -1,0 +1,319 @@
+---
+title: Concurrency and the ecosystem
+subtitle: Futures and execution contexts, the eager-start pitfall, virtual threads, where Cats Effect, ZIO, Pekko and Spark fit, and the build tools and linters of professional Scala.
+minutes: 65
+objectives:
+  - Run work concurrently with Future, combine results with map, flatMap, for comprehensions and traverse, and handle failures with recover
+  - Explain that Futures start eagerly, and predict whether a for comprehension over Futures runs its steps in parallel or one after another
+  - Share state safely between threads, and run Futures on JDK 21 virtual threads
+  - Say what Cats Effect, ZIO, Apache Pekko and Apache Spark are for, and how effect types differ from Future
+  - Set up a project with sbt, Mill or Scala CLI, and use scalafmt, scalafix and compiler warnings the way teams do
+prerequisites: [errors-and-testing]
+references:
+  - title: Futures and Promises (Scala documentation)
+    url: https://docs.scala-lang.org/overviews/core/futures.html
+    note: The detailed official guide to scala.concurrent.
+  - title: "Scala 3 Book: Concurrency"
+    url: https://docs.scala-lang.org/scala3/book/concurrency.html
+  - title: Cats Effect
+    url: https://typelevel.org/cats-effect/
+  - title: ZIO
+    url: https://zio.dev/
+  - title: Apache Pekko
+    url: https://pekko.apache.org/
+    note: The open-source actor toolkit that continues Akka's 2.6 line under the Apache Software Foundation.
+  - title: Apache Spark
+    url: https://spark.apache.org/
+  - title: sbt
+    url: https://www.scala-sbt.org/
+  - title: Scaladex, the Scala library index
+    url: https://index.scala-lang.org/
+---
+
+<Section id="motivation" kind="motivation" title="Doing several things at once">
+
+A web server answers many requests at once. A price comparison page asks five suppliers for quotes and should not wait for each in turn. A data job spreads work over every core of a machine, or over a hundred machines. All of these need **concurrency**: several computations in progress at the same time.
+
+On the JVM, the basic unit of concurrency is the **thread**. Threads are powerful and dangerous: two threads that change the same variable without coordination can corrupt it in ways that appear only under load and never in your tests. Scala's answer starts with what you already know. Immutable values can be shared between threads freely, because nobody can change them. Pure functions can run on any thread in any order. The more of your program is built from these, the smaller the part where concurrency can go wrong.
+
+On top of that foundation, the standard library offers **`Future`**, a value representing a result that will be available later. This lesson teaches Futures in depth, including their most common pitfall, shows how to share state safely when you must, and then surveys the wider ecosystem: the effect libraries that many Scala teams use instead of Futures, the actor toolkit, Apache Spark, and the tools you will use to build, format and check real projects.
+
+</Section>
+
+<Section id="futures" kind="examples" title="Futures">
+
+<Definition term="Future and ExecutionContext">
+
+A **`Future[A]`** is a placeholder for a value of type `A` that is being computed, usually on another thread. It ends either successfully with a value or failed with an exception. Creating one needs an **`ExecutionContext`**, a pool of threads to run it on, passed as a `using` parameter; `ExecutionContext.Implicits.global` is a general-purpose pool sized to the number of processor cores.
+
+</Definition>
+
+```scala check
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration.*
+import scala.concurrent.ExecutionContext.Implicits.global
+
+case class Weather(city: String, celsius: Int)
+
+def fetchWeather(city: String): Future[Weather] = Future {
+  city match
+    case "Nairobi"  => Weather(city, 24)
+    case "Reykjavik" => Weather(city, 3)
+    case "Manila"   => Weather(city, 31)
+    case other      => throw IllegalArgumentException(s"no station in $other")
+}
+
+@main def futures(): Unit =
+  val one: Future[String] = fetchWeather("Nairobi").map(w => s"${w.city}: ${w.celsius} °C")
+  println(Await.result(one, 2.seconds))
+
+  val nairobi = fetchWeather("Nairobi")
+  val manila = fetchWeather("Manila")
+  val difference =
+    for
+      n <- nairobi
+      m <- manila
+    yield m.celsius - n.celsius
+  println(Await.result(difference, 2.seconds))
+
+  val all: Future[List[Weather]] = Future.traverse(List("Nairobi", "Reykjavik", "Manila"))(fetchWeather)
+  println(Await.result(all.map(_.map(_.celsius).max), 2.seconds))
+
+  val missing = fetchWeather("Atlantis")
+  val handled = missing.map(_.celsius.toString).recover { case e: IllegalArgumentException => e.getMessage }
+  println(Await.result(handled, 2.seconds))
+
+  Await.ready(missing, 2.seconds)
+  println(missing.value)
+```
+
+```text
+Nairobi: 24 °C
+7
+31
+no station in Atlantis
+Some(Failure(java.lang.IllegalArgumentException: no station in Atlantis))
+```
+
+In a real program `fetchWeather` would call a web service; here it pretends to. Everything you know about `map`, `flatMap` and for comprehensions carries over: `map` transforms the eventual value, a for comprehension combines several Futures, and **`Future.traverse`** turns a list of inputs into one Future of a list of results. An exception thrown inside a Future does not crash the program; it makes the Future *failed*, and `recover` turns chosen failures back into values, much like `catch`.
+
+**`Await.result`** blocks the current thread until the Future completes, or throws if the time limit passes first. It belongs only at the very edge of a program, in `main` or in a test; inside application code you keep composing Futures with `map` and `flatMap` and let the framework (a web server, for instance) wait at the edge. Blocking inside a Future ties up one of the pool's few threads, and enough of that can bring a server to a halt. When you truly must block, such as when calling an old blocking API, wrap the call in `blocking { ... }` so the global pool knows to add a temporary thread.
+
+### Futures start eagerly
+
+A Future starts running **as soon as it is created**, not when someone asks for its result. That makes the placement of the creation matter enormously. In the program above, `nairobi` and `manila` were created on two separate lines *before* the for comprehension, so both requests were in flight at once. Here is the difference made visible. Each task arrives at a meeting point and waits up to a second for its partner:
+
+```scala check
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import scala.concurrent.{Await, Future, blocking}
+import scala.concurrent.duration.*
+import scala.concurrent.ExecutionContext.Implicits.global
+
+// Each task arrives at a meeting point and waits up to one second for the others.
+def meet(point: CountDownLatch, id: Int): Future[String] = Future {
+  point.countDown()
+  val everyoneCame = blocking(point.await(1, TimeUnit.SECONDS))
+  if everyoneCame then s"task $id met the others" else s"task $id waited alone"
+}
+
+@main def eager(): Unit =
+  val first = CountDownLatch(2)
+  val a = meet(first, 1)
+  val b = meet(first, 2)
+  val together = for x <- a; y <- b yield List(x, y)
+  println(Await.result(together, 5.seconds))
+
+  val second = CountDownLatch(2)
+  val oneByOne =
+    for
+      x <- meet(second, 1)
+      y <- meet(second, 2)
+    yield List(x, y)
+  println(Await.result(oneByOne, 5.seconds))
+
+  val crowd = CountDownLatch(8)
+  val all = Future.traverse((1 to 8).toList)(id => meet(crowd, id))
+  println(Await.result(all, 5.seconds).count(_.endsWith("met the others")))
+```
+
+```text
+List(task 1 met the others, task 2 met the others)
+List(task 1 waited alone, task 2 met the others)
+8
+```
+
+A `CountDownLatch` is a Java concurrency tool: `countDown` records an arrival, and `await` waits until the expected number have arrived. When both Futures are created first, they run at the same time and meet. When they are created *inside* the for comprehension, the second is only created in the `flatMap` callback of the first, after the first has finished, so task 1 waits alone for its full second. `traverse` creates all eight at once, and all eight meet. The rule: **to run Futures in parallel, create them before you combine them** (or use `traverse`, `sequence` or `zip`).
+
+</Section>
+
+<Section id="shared-state" kind="examples" title="Shared state and virtual threads">
+
+If many threads must update one counter, a plain `var count = 0` with `count += 1` will lose updates: `+=` reads, adds and writes in three steps, and two threads can interleave them. Run 100 tasks of 1,000 increments each that way and the total usually comes out below 100,000, and differently every time. The tools for this are the JVM's: atomic variables, locks and concurrent collections. Even better is to avoid sharing at all: let each task compute its own result and combine the results at the end.
+
+```scala check
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.Executors
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.*
+
+@main def shared(): Unit =
+  val pool = Executors.newVirtualThreadPerTaskExecutor()
+  given ExecutionContext = ExecutionContext.fromExecutorService(pool)
+
+  val counter = AtomicInteger(0)
+  val increments = (1 to 100).map(_ => Future { for _ <- 1 to 1000 do counter.incrementAndGet() })
+  Await.result(Future.sequence(increments), 10.seconds)
+  println(counter.get)
+
+  val partialSums = (0 until 10).map(block => Future((block * 1000 + 1 to block * 1000 + 1000).map(_.toLong).sum))
+  val total = Future.sequence(partialSums).map(_.sum)
+  println(Await.result(total, 10.seconds))
+  println((1L to 10_000L).sum)
+
+  pool.shutdown()
+```
+
+```text
+100000
+50005000
+50005000
+```
+
+`AtomicInteger.incrementAndGet` performs the read-add-write as one indivisible step, so no update is lost. The second computation shares nothing: ten Futures each sum their own block of a thousand numbers, and the partial sums are combined, giving the same answer as the sequential sum. This **split, compute independently, combine** pattern is the heart of parallel data processing, from a laptop to a Spark cluster.
+
+The program also runs its Futures on **virtual threads**, a feature of JDK 21 and later. A virtual thread is managed by the JVM rather than the operating system and needs far less memory than an operating-system thread, so a program can have hundreds of thousands or even millions of them, and a virtual thread that blocks (on I/O, or `Thread.sleep`) frees its carrier thread for others. `ExecutionContext.fromExecutorService` turns any Java executor into an execution context, which is all it takes to use them from Scala. Virtual threads make simple blocking code scale much better, and the Scala community is still working out how far they change the case for the more elaborate approaches below.
+
+</Section>
+
+<Section id="ecosystem-concurrency" kind="human" title="Beyond Future: effects, actors and Spark">
+
+`Future` is in the standard library and is fine for straightforward concurrency, but it has two properties that large applications find awkward. It is **eager**: creating it starts it, so a `Future` value is a running computation, not a description of one; you cannot store it and run it twice, or retry it, without re-creating it. And it has no built-in **cancellation** or resource safety: once started, it runs to the end even if nobody wants the result.
+
+**Effect systems** address both. Their central type, `IO[A]` in Cats Effect or `ZIO[R, E, A]` in ZIO, is a *description* of a computation that, when run, produces an `A`. Nothing happens when you create one; the runtime executes the whole program at the end. Because descriptions are ordinary values, you can retry them, race them, time them out and cancel them, and libraries can guarantee that resources are released even under cancellation. Both run on **fibers**, very lightweight threads scheduled by the library. Here is the same pair of parallel requests in each, as fragments that need the libraries (so they are not run by this course's test suite):
+
+```scala
+// Cats Effect 3
+import cats.effect.{IO, IOApp}
+import cats.syntax.all.*
+import scala.concurrent.duration.*
+
+object Main extends IOApp.Simple:
+  def fetch(city: String): IO[Int] = IO.sleep(200.millis) *> IO.pure(city.length)
+
+  def run: IO[Unit] =
+    for
+      both <- (fetch("Nairobi"), fetch("Manila")).parTupled
+      _    <- IO.println(s"results: $both")
+    yield ()
+```
+
+```scala
+// ZIO 2
+import zio.*
+
+object Main extends ZIOAppDefault:
+  def fetch(city: String): Task[Int] = ZIO.sleep(200.millis) *> ZIO.succeed(city.length)
+
+  def run =
+    for
+      both <- fetch("Nairobi").zipPar(fetch("Manila"))
+      _    <- Console.printLine(s"results: $both")
+    yield ()
+```
+
+**Cats Effect** belongs to the Typelevel family of libraries (Cats, fs2 for streaming, http4s for HTTP, Doobie for databases), which lean on type classes and the vocabulary of functional programming. **ZIO** bundles more into one type: `ZIO[R, E, A]` records the environment it needs (`R`), its typed error (`E`) and its result (`A`), and comes with its own ecosystem for HTTP, streaming and configuration. Both are mature and used in production; teams usually pick one and stay with it. Neither is needed to write good Scala, and you can learn either after this course.
+
+**Actors** are a third model: independent objects that communicate only by sending messages and process one message at a time, so their internal state needs no locks. Scala's actor toolkit was **Akka**; in 2022 its company changed Akka's licence to a source-available one, and the Apache Software Foundation continued the last open-source version as **Apache Pekko**. Actors suit systems of many long-lived, stateful entities, such as one per connected device or game session, and clusters that spread them over machines.
+
+**Apache Spark** processes datasets too large for one machine. Its Scala API deliberately looks like the collections you learned in lesson 5: you `filter`, `map`, `groupBy` and aggregate a distributed `Dataset` or `DataFrame`, and Spark splits the work over a cluster using exactly the split–compute–combine idea above:
+
+```scala
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.*
+
+val spark = SparkSession.builder.appName("sales").master("local[*]").getOrCreate()
+import spark.implicits.*
+
+val sales = spark.read.option("header", "true").option("inferSchema", "true").csv("sales.csv")
+sales.groupBy($"city")
+  .agg(sum($"units" * $"unitPrice").as("revenue"))
+  .orderBy(desc("revenue"))
+  .show()
+```
+
+Spark itself is built with Scala 2 (Spark 4 uses Scala 2.13), so data-engineering teams often work in Scala 2.13 even while application teams have moved to Scala 3. Check Spark's documentation for the Scala versions your release supports. Apache Kafka, Apache Flink's older APIs and many other data tools also have Scala roots.
+
+</Section>
+
+<Section id="tooling" kind="human" title="Building, formatting and checking real projects">
+
+### Build tools
+
+For anything beyond a few files, you need a build tool that manages dependencies, compiles incrementally, runs tests and packages the result.
+
+- **sbt** is the long-standing standard, used by most open-source libraries. A minimal `build.sbt`:
+
+```scala
+ThisBuild / scalaVersion := "3.10.1"
+
+lazy val root = project
+  .in(file("."))
+  .settings(
+    name := "bookings",
+    libraryDependencies += "org.scalameta" %% "munit" % "<version>" % Test
+  )
+```
+
+Sources go in `src/main/scala` and tests in `src/test/scala`. You start sbt once and type commands into its shell: `compile`, `test`, `run`, `console` (a REPL with your project on the class path), and `~testQuick`, which reruns the affected tests every time you save. The `%%` operator appends the Scala version to the library name, because libraries are published separately for each Scala binary version.
+
+- **Mill** is a younger build tool whose build files are ordinary Scala code; teams that find sbt's settings model hard to follow often prefer it.
+- **Scala CLI**, which you have used all along, scales up to small multi-file projects with `//> using` directives, and can export a project to sbt or Mill when it outgrows them.
+
+Libraries are published to **Maven Central** and can be searched on **Scaladex**, the Scala library index. In a using directive, a dependency is written `//> using dep com.lihaoyi::os-lib:<version>`, where `::` plays the role of `%%`.
+
+### Formatting, linting and compiler warnings
+
+- **scalafmt** formats code according to a `.scalafmt.conf` file in the repository; teams run it in CI so that style discussions disappear from code review. `scala fmt` runs it with no setup.
+- **scalafix** rewrites and lints code: it can remove unused imports, enforce rules such as "no `.get` on Option", and automate migrations between library versions.
+- **Compiler warnings** are free bug reports. Most professional builds enable options such as `-deprecation`, `-feature` and `-Wunused:all`, and many add `-Werror` so that warnings, including non-exhaustive matches, fail the build.
+- **Editors**: Metals (for VS Code, Neovim and others) and IntelliJ IDEA's Scala plugin provide completion, navigation, inferred-type hints and refactoring.
+
+### Other targets and the toolkit
+
+**Scala.js** compiles Scala to JavaScript for browsers and Node.js, and **Scala Native** compiles to a native executable with fast start-up; libraries often publish for all three platforms. The **Scala Toolkit** is a curated set of small libraries (for files, JSON, HTTP and testing) that the Scala Center recommends for scripts and small applications, and Scala CLI can add it with one directive.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A for comprehension over Futures runs its steps in parallel."** It runs them one after another if the Futures are created inside it, because each step is created in the callback of the previous one. Create independent Futures first, then combine them.
+
+</Misconception>
+
+<Misconception>
+
+**"`Await.result` is how you get the value out of a Future."** In application code you never get it out; you transform it with `map` and `flatMap` and let the framework at the edge wait. `Await` is for `main` methods and tests.
+
+</Misconception>
+
+<Misconception>
+
+**"Using Cats Effect or ZIO is required for serious Scala."** Many successful Scala systems use plain Futures, or plain blocking code on virtual threads, plus the standard library. Effect systems pay off in long-running services with many concurrent, cancellable operations and resources to manage; adopt one deliberately, as a team, not because it seems obligatory.
+
+</Misconception>
+
+<Misconception>
+
+**"Immutability makes concurrency bugs impossible."** It removes data races on the immutable parts. You can still have races on the mutable parts that remain (a `var`, a mutable collection, a database row), and logical races such as two requests both reading a balance before either writes it. Those need atomic operations, transactions or a single owner of the state.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

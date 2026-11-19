@@ -1,0 +1,387 @@
+---
+title: Exceptions and resource cleanup
+subtitle: How .NET reports failure, how to handle it where you can do something useful, and how to release resources no matter what.
+minutes: 55
+objectives:
+  - Throw, catch and filter exceptions, and order catch clauses correctly
+  - Choose between exceptions, the Try pattern and result values for a given kind of failure
+  - Define a domain exception and wrap low-level exceptions with context, keeping the original as InnerException
+  - Release resources deterministically with IDisposable, using statements and using declarations
+  - Explain finally, rethrowing with throw;, and what happens to exceptions nobody catches
+prerequisites: [nullability-and-patterns]
+references:
+  - title: Exceptions and exception handling
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/csharp/fundamentals/exceptions/
+    note: "The language side: try, catch, finally, filters and throw expressions."
+  - title: Best practices for exceptions
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/standard/exceptions/best-practices-for-exceptions
+    note: Guidance from the .NET team on when and how to throw and catch.
+  - title: "The Trouble with Checked Exceptions: a conversation with Anders Hejlsberg"
+    author: Bill Venners with Bruce Eckel
+    year: 2003
+    url: https://www.artima.com/articles/the-trouble-with-checked-exceptions
+    note: Why C# does not have Java's checked exceptions, in its designer's words.
+  - title: Implement a Dispose method
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/standard/garbage-collection/implementing-dispose
+    note: The full dispose pattern, including the rare cases that need a finalizer.
+---
+
+<Section id="motivation" kind="motivation" title="When things go wrong">
+
+Programs meet failure constantly. A file has been deleted, a network times out, a user types "three" where a number belongs, a configuration has two values for the same key, a method is called with an argument that makes no sense. Some of these are expected and should be handled quietly; some mean the program has a bug and should stop loudly; some mean the outside world is having a bad day and the operation should be retried or reported.
+
+.NET's main mechanism for reporting failure is the **exception**: an object describing what went wrong, *thrown* from the point of failure and *caught* by the nearest code that has said it can handle it. Between the two, the runtime unwinds the call stack, abandoning each method on the way. Good exception handling is mostly about two decisions: **where** to catch (only where you can do something useful), and **what to clean up** on the way out (always). This lesson covers both, and the closely related question of releasing resources such as files and connections.
+
+</Section>
+
+<Section id="mechanics" kind="definitions" title="Throwing and catching">
+
+<Definition term="Exception">
+
+An object of a class derived from `System.Exception`, carrying a `Message`, a `StackTrace` showing where it was thrown, and optionally an `InnerException` that caused it. `throw` raises one; the runtime then searches the call stack, from the current method outwards, for a `catch` clause whose type matches.
+
+</Definition>
+
+The base class library uses a small set of exception types consistently, and you should too:
+
+| Type | Thrown when |
+| --- | --- |
+| `ArgumentException`, `ArgumentNullException`, `ArgumentOutOfRangeException` | a caller passed an invalid argument: a bug in the caller |
+| `InvalidOperationException` | the object is in the wrong state for this call (reading a closed stream, `First` on an empty sequence) |
+| `FormatException` | text is not in the expected format (`int.Parse("three")`) |
+| `KeyNotFoundException` | a dictionary has no such key |
+| `IOException` and its subclasses | the file system or a stream failed |
+| `HttpRequestException`, `TimeoutException`, `OperationCanceledException` | network failures, timeouts and cancellations |
+| `NotSupportedException`, `NotImplementedException` | the operation is not supported / not written yet |
+
+Here is a configuration reader that meets four different problems in five lines of input:
+
+```csharp check
+// Reading settings such as "timeout=30" from lines of text.
+string[] lines = ["timeout=30", "retries=three", "colour", "timeout=45", "port=99999"];
+var settings = new Dictionary<string, int>();
+
+foreach (string line in lines)
+{
+    try
+    {
+        var (key, value) = ParseSetting(line);
+        settings.Add(key, value);
+        Console.WriteLine($"ok      {key} = {value}");
+    }
+    catch (FormatException e)
+    {
+        Console.WriteLine($"format  '{line}': {e.Message}");
+    }
+    catch (ArgumentOutOfRangeException e) when (e.ParamName == "value")
+    {
+        Console.WriteLine($"range   '{line}': {e.ActualValue} is not allowed");
+    }
+    catch (ArgumentException e)
+    {
+        Console.WriteLine($"dup     '{line}': {e.Message}");
+    }
+    finally
+    {
+        Console.WriteLine($"        (finished '{line}')");
+    }
+}
+
+Console.WriteLine($"Loaded {settings.Count} settings.");
+
+static (string Key, int Value) ParseSetting(string line)
+{
+    string[] parts = line.Split('=');
+    if (parts.Length != 2)
+        throw new FormatException("expected key=value");
+
+    int value = int.Parse(parts[1]);   // throws FormatException for "three"
+    if (parts[0] == "port")
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(value, 65535);
+    return (parts[0], value);
+}
+```
+
+It prints:
+
+```text
+ok      timeout = 30
+        (finished 'timeout=30')
+format  'retries=three': The input string 'three' was not in a correct format.
+        (finished 'retries=three')
+format  'colour': expected key=value
+        (finished 'colour')
+dup     'timeout=45': An item with the same key has already been added. Key: timeout
+        (finished 'timeout=45')
+range   'port=99999': 99999 is not allowed
+        (finished 'port=99999')
+Loaded 1 settings.
+```
+
+How the search for a handler works:
+
+- **Catch clauses are tried in order**, and the first whose type matches wins. A clause for a base class catches all its subclasses, so specific types must come before general ones: `ArgumentOutOfRangeException` derives from `ArgumentException`, so its clause must come first. (The compiler reports an error if a clause can never be reached.)
+- **Exception filters**, `catch (...) when (condition)`, add a condition. If it is false, the search continues as if that clause were not there. Filters are also a good place for logging, because they run *before* the stack is unwound; exercise 4 shows how surprising that order can be.
+- **`finally` always runs**: after the `try` completes normally, after a `catch` handles an exception, and even when an exception passes through uncaught or the block executes a `return`. It is where cleanup goes.
+- **Guard helpers** such as `ArgumentOutOfRangeException.ThrowIfGreaterThan` (.NET 8) throw a standard exception with a standard message and the parameter's name filled in automatically.
+- The duplicate `timeout` was caught by the general `ArgumentException` clause, because `Dictionary.Add` throws an `ArgumentException` for duplicate keys. Use the indexer (`settings[key] = value`) if the last value should win, or `TryAdd` to test.
+
+One more point of style. An exception's `Message` is written for developers, and the framework's messages may be translated into the user's language or reworded between versions. Show users your own wording, chosen from the exception's *type* and data, and send the full exception, message and stack trace together, to your logs.
+
+</Section>
+
+<Section id="design" kind="examples" title="Domain exceptions and wrapping">
+
+Libraries and applications often define their own exception types, so that callers can catch *their* failures specifically. A good custom exception derives from `Exception` (or a more specific standard type), has a name ending in `Exception`, and carries useful data as properties. When a low-level exception means something higher-level, **wrap** it: throw a new exception that explains what was being attempted, and pass the original as the inner exception so no detail is lost.
+
+```csharp check
+// A domain exception, and wrapping a low-level error with context.
+var store = new StockStore();
+store.Reserve("rice", 5);
+Console.WriteLine($"rice left: {store.Available("rice")}");
+
+foreach ((string item, int qty) in new[] { ("rice", 50), ("salt", 1) })
+{
+    try
+    {
+        store.Reserve(item, qty);
+    }
+    catch (OutOfStockException e)
+    {
+        Console.WriteLine($"{e.GetType().Name}: {e.Message} (wanted {e.Requested}, have {e.Available})");
+    }
+    catch (InventoryException e)
+    {
+        Console.WriteLine($"{e.GetType().Name}: {e.Message}");
+        Console.WriteLine($"  caused by {e.InnerException?.GetType().Name}: {e.InnerException?.Message}");
+    }
+}
+
+class InventoryException(string message, Exception? inner = null) : Exception(message, inner);
+
+sealed class OutOfStockException(string item, int requested, int available)
+    : InventoryException($"not enough {item}")
+{
+    public int Requested { get; } = requested;
+    public int Available { get; } = available;
+}
+
+sealed class StockStore
+{
+    private readonly Dictionary<string, int> _stock = new() { ["rice"] = 20, ["beans"] = 12 };
+
+    public int Available(string item) => _stock[item];
+
+    public void Reserve(string item, int quantity)
+    {
+        int available;
+        try
+        {
+            available = _stock[item];
+        }
+        catch (KeyNotFoundException e)
+        {
+            throw new InventoryException($"unknown item '{item}'", e);
+        }
+        if (quantity > available) throw new OutOfStockException(item, quantity, available);
+        _stock[item] = available - quantity;
+    }
+}
+```
+
+It prints:
+
+```text
+rice left: 15
+OutOfStockException: not enough rice (wanted 50, have 15)
+InventoryException: unknown item 'salt'
+  caused by KeyNotFoundException: The given key 'salt' was not present in the dictionary.
+```
+
+`OutOfStockException` derives from `InventoryException`, so a caller can catch either the specific case or the whole family. It carries `Requested` and `Available`, so a user interface can show a helpful message without parsing text. And when an unknown item causes a `KeyNotFoundException` deep inside the store, the caller sees an `InventoryException` that says which item was unknown, with the original exception preserved as `InnerException` for logs and debugging.
+
+### Rethrowing
+
+Sometimes a catch block needs to do something (record a metric, roll back a change) and then let the exception continue. Write `throw;` on its own:
+
+```csharp
+catch (Exception e)
+{
+    transaction.Rollback();
+    logger.LogError(e, "Order {OrderId} failed", order.Id);
+    throw;          // rethrows the same exception, stack trace intact
+}
+```
+
+`throw e;` would also rethrow, but it resets the stack trace to this line, destroying the most useful piece of debugging information. Catching `Exception` is reasonable at this kind of boundary, where you rethrow, and at the very top of a program or request, where you log and report. Catching it and carrying on in the middle of ordinary code hides bugs.
+
+</Section>
+
+<Section id="cleanup" kind="examples" title="Deterministic cleanup with using">
+
+The garbage collector reclaims memory, but it decides *when*, and memory is not the only resource. Open files, network sockets, database connections, locks and native handles must be released promptly and reliably, or the program runs out of them. In .NET such objects implement **`IDisposable`**, whose single method `Dispose` releases them, and C# guarantees the call with `using`:
+
+```csharp check
+// using guarantees cleanup, even when an exception escapes.
+try
+{
+    using var log = new Resource("log file");
+    using var connection = new Resource("database connection");
+    Console.WriteLine("working...");
+    throw new InvalidOperationException("something went wrong mid-way");
+}
+catch (InvalidOperationException e)
+{
+    Console.WriteLine($"caught: {e.Message}");
+}
+
+// The block form limits the resource's lifetime to the braces.
+using (var lockFile = new Resource("lock file"))
+{
+    Console.WriteLine("holding the lock");
+}
+Console.WriteLine("after the block");
+
+sealed class Resource : IDisposable
+{
+    private readonly string _name;
+    private bool _disposed;
+
+    public Resource(string name)
+    {
+        _name = name;
+        Console.WriteLine($"open  {_name}");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Console.WriteLine($"close {_name}");
+    }
+}
+```
+
+It prints:
+
+```text
+open  log file
+open  database connection
+working...
+close database connection
+close log file
+caught: something went wrong mid-way
+open  lock file
+holding the lock
+close lock file
+after the block
+```
+
+- A **using declaration** (`using var x = ...;`, C# 8) disposes the variable at the end of the enclosing block. Several are disposed in *reverse* order of creation, so the connection closes before the log it might write to.
+- A **using statement** (`using (var x = ...) { ... }`) disposes at the end of its own braces, which is useful when a resource should be released before the method ends.
+- Disposal happens **even when an exception is thrown**. A `using` is exactly a `try` with a `finally` that calls `Dispose`, which is why both resources closed before the `catch` ran.
+- `Dispose` should be safe to call more than once, hence the `_disposed` flag.
+
+Asynchronous resources (a network stream, a database connection in async code) implement `IAsyncDisposable` instead, and are released with `await using`. You will meet `await` in the next lesson.
+
+<Note>
+
+The rule for your own types is simple: if a class *owns* a disposable object (creates it and keeps it in a field), the class should itself implement `IDisposable` and dispose what it owns. Classes that wrap raw operating-system handles need more (a `SafeHandle`, or rarely a finalizer); the reference above explains the full pattern, and most application code never needs it.
+
+</Note>
+
+</Section>
+
+<Section id="choosing" kind="human" title="Exceptions, Try methods or results?">
+
+Exceptions are not the only way to report failure, and experienced C# developers choose deliberately:
+
+- **Bugs** (a null argument that should never be null, an index out of range, a method called in the wrong state): throw. The program, or at least this request, should stop, and the stack trace should lead straight to the mistake. Do not catch these except at the top level to log them.
+- **Expected, frequent outcomes** (parsing user input, looking up a key that may be absent, a login with a wrong password): use the **Try pattern** (`int.TryParse`, `Dictionary.TryGetValue`) or return a result value. Throwing and catching an exception costs microseconds, thousands of times more than returning a `bool`, and using exceptions for ordinary control flow makes code hard to follow.
+- **Environmental failures** (the disk is full, the network timed out, the database is down): throw, and catch at the layer that can decide what to do: retry, use a fallback, or report to the user. Libraries such as Polly (and the resilience features built into .NET's `HttpClient` factory) implement retry and circuit-breaker policies for these.
+- **Validation of input with many possible problems** (a form with ten fields): collect all the errors into a list and return them together, rather than throwing on the first one. Users prefer to hear about every mistake at once.
+
+Here is the validation case. Nothing in it throws: each problem is an ordinary, expected outcome, recorded as a message, and every message reaches the user at once:
+
+```csharp check
+// Expected problems are data: collect them instead of throwing on the first.
+var forms = new[]
+{
+    new SignUp("Wanjiru", "wanjiru@example.org", "34"),
+    new SignUp("", "not-an-email", "abc"),
+    new SignUp("Tomás", "tomas@example.org", "-2"),
+};
+
+foreach (SignUp form in forms)
+{
+    List<string> errors = Validate(form);
+    Console.WriteLine(errors.Count == 0
+        ? $"accepted {form.Name}"
+        : $"rejected: {string.Join("; ", errors)}");
+}
+
+static List<string> Validate(SignUp form)
+{
+    List<string> errors = [];
+    if (string.IsNullOrWhiteSpace(form.Name))
+        errors.Add("name is required");
+    if (!form.Email.Contains('@'))
+        errors.Add("email needs an @");
+    if (!int.TryParse(form.Age, out int age))
+        errors.Add($"age '{form.Age}' is not a number");
+    else if (age is < 13 or > 120)
+        errors.Add($"age {age} is out of range");
+    return errors;
+}
+
+record SignUp(string Name, string Email, string Age);
+```
+
+It prints:
+
+```text
+accepted Wanjiru
+rejected: name is required; email needs an @; age 'abc' is not a number
+rejected: age -2 is out of range
+```
+
+The second form had three problems and the user hears about all three. Contrast this with the configuration reader at the start of the lesson, where each line failed independently and exceptions carried the reason out of a parsing helper. Both are reasonable: the question is always whether failure is a normal part of the operation's job (return it) or a sign that something has gone wrong around it (throw it). In ASP.NET Core, model validation works the same way as `Validate`, producing a dictionary of field names and messages that becomes an HTTP 400 response listing every problem.
+
+Some teams go further and return a `Result` type (success with a value, or failure with an error) from all business operations, in the style of functional languages; C# 15's union types make this more natural. It is a legitimate style, but mixing it inconsistently with exceptions is worse than either alone. Follow your codebase's convention.
+
+### What happens if nobody catches it
+
+An exception that escapes `Main` (or a top-level statement) ends the process: .NET prints the exception type, message and stack trace to the console and exits with a non-zero code. In a web application, ASP.NET Core catches unhandled exceptions per request, logs them and returns an HTTP 500 error, while the server keeps running. Either way, unhandled exceptions should end up in your logs, with enough context to find the bug. A few failures cannot be caught at all: a `StackOverflowException` from runaway recursion ends the process immediately.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Wrap everything in try/catch to be safe."** A catch that cannot fix the problem only hides it. The program carries on in a broken state, and the eventual failure appears far from its cause. Catch where you can do something useful; let everything else propagate to a top-level handler that logs it.
+
+</Misconception>
+
+<Misconception>
+
+**"C# has checked exceptions like Java."** It does not. A method's signature never lists what it throws, and the compiler never forces you to catch. This was a deliberate choice: in a 2003 interview (linked below), Anders Hejlsberg explained that in large systems checked exceptions tend to make versioning harder, because adding a new exception to a method breaks every caller, and they encourage empty catch blocks written only to satisfy the compiler. The cost of C#'s choice is that you must read documentation to know what can be thrown. Document notable exceptions in XML comments (`<exception cref="...">`) and read the documentation of what you call.
+
+</Misconception>
+
+<Misconception>
+
+**"The garbage collector will close my file, so `using` is optional."** The collector frees memory when it needs memory, which may be minutes later, or never before the process exits. Until then the file stays locked and the connection stays open. Dispose resources yourself, as soon as you are done with them.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

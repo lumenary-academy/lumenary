@@ -1,0 +1,387 @@
+---
+title: Units, pointers and memory
+subtitle: Organising programs into units with interfaces and implementations, then typed pointers, the heap, and how Object Pascal decides what is freed for you.
+minutes: 55
+objectives:
+  - Write a unit with interface, implementation and initialization sections, and use it from a program
+  - Explain how the compiler finds units and what .ppu files are
+  - Use typed pointers with New, Dispose, @, ^ and nil to build linked structures
+  - Distinguish managed types, which are freed automatically, from memory you must free yourself
+  - Find leaks and dangling pointers, and know when modern code should avoid raw pointers
+prerequisites: [procedures-and-functions, arrays-records-sets-and-strings]
+references:
+  - title: "Free Pascal Reference Guide: Programs, units, blocks"
+    url: https://www.freepascal.org/docs-html/current/ref/ref.html
+    note: The structure of units, the uses clause, and initialization and finalization sections.
+  - title: "Free Pascal Programmer's Guide: memory issues"
+    url: https://www.freepascal.org/docs-html/current/prog/prog.html
+    note: How the heap manager works, and the heaptrc unit for tracing leaks.
+  - title: "Free Pascal User's Guide: compiling units"
+    url: https://www.freepascal.org/docs-html/current/user/user.html
+    note: Search paths, .ppu files and how fpc decides what to recompile.
+---
+
+<Section id="motivation" kind="motivation" title="Programs bigger than one file">
+
+Wirth's original Pascal had no modules: a program was one file, and that was one of the main complaints against it as a language for real work. UCSD Pascal and then Turbo Pascal 4 (1987) added **units**, and they have been the backbone of every Pascal program since. A unit has an **interface**, the part other code may use, and an **implementation**, the part that is nobody else's business. It is compiled separately, so large programs build quickly, and its private parts can change without touching its users.
+
+The second half of this lesson is about memory. Pascal has always had **pointers**, typed so that the compiler knows what each one points to, and a **heap** from which you allocate with `New` and to which you return memory with `Dispose`. Object Pascal then added types that manage their own memory: strings, dynamic arrays and interfaces are freed automatically when nothing refers to them any more. Knowing which is which is essential, because the rest (objects of classes, and anything you allocate yourself) is your responsibility.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The anatomy of a unit">
+
+<Definition term="Unit">
+
+A separately compiled module, in a file whose name matches the unit's name. Its **interface** section declares what other units and programs may use; its **implementation** section contains the bodies of the interface's routines and any private declarations. Optional **initialization** and **finalization** sections run once, before the main program starts and after it ends.
+
+</Definition>
+
+A program lists the units it needs in its `uses` clause. The compiler looks for each unit's compiled form, a `.ppu` file (Free Pascal's equivalent of Delphi's `.dcu`), and if it is missing or older than the source file `unitname.pas`, compiles the source first. The search follows the unit path (`-Fu` on the command line, or the project options in Lazarus). Here is a small unit, saved as `temperatures.pas`:
+
+```pascal
+unit Temperatures;
+{$mode objfpc}{$H+}
+
+interface                          { what other units and programs may use }
+
+type
+  TCelsius = Double;
+
+function ToFahrenheit(C: TCelsius): Double;
+function Describe(C: TCelsius): string;
+function ConversionCount: Integer;
+
+implementation                     { how it is done: private to this unit }
+
+uses
+  SysUtils;
+
+const
+  Freezing = 0.0;                  { not in the interface, so invisible outside }
+
+var
+  Conversions: Integer;            { the unit's private state }
+
+function ToFahrenheit(C: TCelsius): Double;
+begin
+  Inc(Conversions);
+  Result := C * 9 / 5 + 32;
+end;
+
+function Describe(C: TCelsius): string;
+begin
+  if C <= Freezing then
+    Result := Format('%.1f °C (freezing)', [C])
+  else
+    Result := Format('%.1f °C = %.1f °F', [C, ToFahrenheit(C)]);
+end;
+
+function ConversionCount: Integer;
+begin
+  Result := Conversions;
+end;
+
+initialization                     { runs once, before the main program starts }
+  Conversions := 0;
+end.
+```
+
+and a program that uses it, saved as `main.pas` in the same directory:
+
+```pascal
+program Weather;
+{$mode objfpc}{$H+}
+
+uses
+  Temperatures;
+
+begin
+  WriteLn(Describe(21.5));
+  WriteLn(Describe(-4));
+  WriteLn(Temperatures.ToFahrenheit(100):0:1);   { a qualified name }
+  WriteLn('Conversions: ', ConversionCount);
+end.
+```
+
+`fpc main.pas` compiled both files, leaving `temperatures.ppu` and `temperatures.o` beside the sources, and the program printed:
+
+```text
+21.5 °C = 70.7 °F
+-4.0 °C (freezing)
+212.0
+Conversions: 2
+```
+
+The counter is 2 because `Describe(-4)` takes the freezing branch without converting. Everything in the implementation section is private: a program that tries to use `Freezing` fails with `Error: Identifier not found "Freezing"`. The variable `Conversions` is also private, and clients read it through the function `ConversionCount`, so no client can reset it by accident. If two units have a routine of the same name, qualify it with the unit name, as in `Temperatures.ToFahrenheit`; otherwise the unit listed last in `uses` wins.
+
+Some rules worth knowing:
+
+- Units listed in the **interface** `uses` clause are needed by the interface itself; those only needed by the code go in the **implementation** `uses` clause. Two units may use each other only if at least one of the references is in an implementation section.
+- The `System` unit is used implicitly by every program. Other standard units you will use constantly are `SysUtils` (strings, files, exceptions, dates), `Classes` (lists, streams, `TStringList`), `Math`, `StrUtils`, `DateUtils`, and `Generics.Collections` for generic containers.
+- Delphi's library uses **dotted unit names**, such as `System.SysUtils` and `Vcl.Forms`; Free Pascal 3.2's library uses the short names, and code shared between the two often lists units conditionally.
+- In this course, every complete, tested program is a single file, so the units it defines are written into the program itself. In real projects, every non-trivial type or group of routines gets its own unit.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Pointers and the heap">
+
+<Definition term="Typed pointer">
+
+A value of type `^T` is the address of a value of type `T`, or `nil`. `@X` gives the address of a variable, `P^` is the value `P` points to, `New(P)` allocates a fresh `T` on the heap and sets `P` to its address, and `Dispose(P)` returns that memory.
+
+</Definition>
+
+```pascal check
+program Pointers;
+{$mode objfpc}{$H+}
+
+type
+  PNode = ^TNode;                { may be declared before TNode: pointers allow it }
+  TNode = record
+    Value: string;
+    Next: PNode;
+  end;
+
+const
+  Cities: array[1..3] of string = ('Lagos', 'Quito', 'Hanoi');
+
+var
+  X: Integer;
+  P, Q: PInteger;                { PInteger = ^Integer, declared in the System unit }
+  Top, Node: PNode;
+  Name: string;
+
+procedure Push(var Stack: PNode; const V: string);
+var
+  N: PNode;
+begin
+  New(N);                        { allocate a TNode on the heap }
+  N^.Value := V;
+  N^.Next := Stack;
+  Stack := N;
+end;
+
+function Pop(var Stack: PNode): string;
+var
+  N: PNode;
+begin
+  N := Stack;
+  Result := N^.Value;
+  Stack := N^.Next;
+  Dispose(N);                    { give the memory back }
+end;
+
+begin
+  X := 41;
+  P := @X;                       { @ takes an address }
+  P^ := P^ + 1;                  { ^ after a pointer follows it }
+  WriteLn('X = ', X);
+
+  New(Q);                        { an Integer of our own on the heap }
+  Q^ := 7;
+  P := Q;                        { two pointers, one Integer }
+  P^ := P^ * 6;
+  WriteLn('Q^ = ', Q^);
+  Dispose(Q);
+  Q := nil;                      { Q no longer points anywhere; P is now dangling! }
+
+  Top := nil;
+  for Name in Cities do
+    Push(Top, Name);
+
+  Node := Top;
+  Write('Stack from the top:');
+  while Assigned(Node) do        { Assigned(Node) means Node <> nil }
+  begin
+    Write(' ', Node^.Value);
+    Node := Node^.Next;
+  end;
+  WriteLn;
+
+  while Top <> nil do
+    WriteLn('popped ', Pop(Top));
+end.
+```
+
+It prints:
+
+```text
+X = 42
+Q^ = 42
+Stack from the top: Hanoi Quito Lagos
+popped Hanoi
+popped Quito
+popped Lagos
+```
+
+Follow the pointers:
+
+- `P := @X` makes `P` point at the variable `X`, so `P^ := P^ + 1` changes `X`.
+- `New(Q)` allocates an `Integer` on the heap. After `P := Q`, both pointers refer to it, so changing `P^` changes `Q^`.
+- After `Dispose(Q)`, the memory is gone, but `P` still holds its old address. `P` is now a **dangling pointer**: using `P^` would read or overwrite memory that may belong to something else. Setting `Q := nil` protects `Q`, not `P`. This is the central danger of manual memory management, in Pascal as in C.
+- `PNode = ^TNode` is declared before `TNode` exists. Pascal allows this one forward reference, and only within the same `type` section, precisely so that records can point to records of their own type.
+- `Push` and `Pop` build a **linked stack**: each node holds a value and a pointer to the node below. `Pop` disposes of each node it removes, so when the stack is empty, every node allocated by `New` has been returned.
+
+</Section>
+
+<Section id="computation" kind="computation" title="A tree, and proving that nothing leaked">
+
+Recursive structures and pointers go together. This program builds a **binary search tree** of words, counting repeats, prints it in alphabetical order, and then frees it. To check its own memory management, it compares the heap in use before building the tree and after freeing it, using `GetFPCHeapStatus` from the `System` unit.
+
+```pascal check
+program Tree;
+{$mode objfpc}{$H+}
+
+type
+  PTreeNode = ^TTreeNode;
+  TTreeNode = record
+    Word: string;
+    Count: Integer;
+    Left, Right: PTreeNode;
+  end;
+
+{ Insert Word into the tree rooted at Root, or count it again if present. }
+procedure Insert(var Root: PTreeNode; const Word: string);
+begin
+  if Root = nil then
+  begin
+    New(Root);
+    Root^.Word := Word;
+    Root^.Count := 1;
+    Root^.Left := nil;
+    Root^.Right := nil;
+  end
+  else if Word < Root^.Word then
+    Insert(Root^.Left, Word)
+  else if Word > Root^.Word then
+    Insert(Root^.Right, Word)
+  else
+    Inc(Root^.Count);
+end;
+
+{ Visit left subtree, node, right subtree: alphabetical order. }
+procedure PrintInOrder(Root: PTreeNode);
+begin
+  if Root = nil then
+    Exit;
+  PrintInOrder(Root^.Left);
+  WriteLn(Root^.Word:8, Root^.Count:3);
+  PrintInOrder(Root^.Right);
+end;
+
+function Depth(Root: PTreeNode): Integer;
+var
+  L, R: Integer;
+begin
+  if Root = nil then
+    Exit(0);
+  L := Depth(Root^.Left);
+  R := Depth(Root^.Right);
+  if L > R then Result := L + 1 else Result := R + 1;
+end;
+
+{ Free children before the node itself: after Dispose, Root^ must not be used. }
+procedure FreeTree(var Root: PTreeNode);
+begin
+  if Root = nil then
+    Exit;
+  FreeTree(Root^.Left);
+  FreeTree(Root^.Right);
+  Dispose(Root);               { also releases the node's string }
+  Root := nil;
+end;
+
+const
+  Words: array[1..10] of string =
+    ('mango', 'kiwi', 'papaya', 'kiwi', 'banana', 'lime', 'mango', 'date', 'kiwi', 'yam');
+
+var
+  Root: PTreeNode;
+  W: string;
+  Before: PtrUInt;
+
+begin
+  Before := GetFPCHeapStatus.CurrHeapUsed;
+  Root := nil;
+  for W in Words do
+    Insert(Root, W);
+  PrintInOrder(Root);
+  WriteLn('Depth: ', Depth(Root));
+  WriteLn('Heap in use grew: ', GetFPCHeapStatus.CurrHeapUsed > Before);
+  FreeTree(Root);
+  WriteLn('Heap back where it started: ', GetFPCHeapStatus.CurrHeapUsed = Before);
+end.
+```
+
+It prints:
+
+```text
+  banana  1
+    date  1
+    kiwi  3
+    lime  1
+   mango  2
+  papaya  1
+     yam  1
+Depth: 4
+Heap in use grew: TRUE
+Heap back where it started: TRUE
+```
+
+`Insert` takes the root as a `var` parameter: when it reaches an empty place (`nil`), it allocates a node and stores its address in the parent's `Left` or `Right` field, which is exactly the variable it was passed. `PrintInOrder` visits the left subtree, the node and the right subtree, which for a search tree gives sorted order. `FreeTree` must free the children before the node, because after `Dispose(Root)` the fields `Root^.Left` and `Root^.Right` must no longer be read.
+
+Replace `FreeTree(Root)` with `Root := nil` and the last line becomes `Heap back where it started: FALSE`: setting a pointer to `nil` frees nothing, and the seven nodes are **leaked**. In a short program that hardly matters; in a server or a desktop application that runs for weeks, leaks accumulate until memory runs out.
+
+`Dispose` also finalises the node's `string` field, releasing the string's memory. That is because `Dispose` knows the type of the record. The untyped routines `GetMem` and `FreeMem`, which allocate raw bytes, know nothing about managed fields; use them only for buffers of plain data, typically when talking to C libraries.
+
+</Section>
+
+<Section id="human" kind="human" title="Memory management in practice">
+
+Professional Object Pascal code uses raw pointers much less than this lesson might suggest. In practice:
+
+- **Managed types handle themselves.** Strings, dynamic arrays and interface references are reference-counted and freed automatically, even when stored in records and arrays. Most everyday data lives in them.
+- **Objects of classes are freed explicitly**, with `Free`, inside `try … finally` blocks (Lessons 6 and 7), or are owned by a container or a component that frees them. This covers most of what C programmers do with pointers.
+- **Containers replace hand-made lists and trees.** `TStringList`, `TFPGList`, `TList<T>` and `TDictionary<K, V>` are tested, efficient and safe; write your own linked structures when you need something they do not offer, or to learn.
+- **Raw pointers remain for interfacing with C** (`PChar`, `PByte`, pointer arithmetic with `Inc(P)`), for performance-critical code, and for low-level work.
+
+To find memory bugs, compile with **`-gh`**, which links Free Pascal's `heaptrc` unit: it records every allocation and can report the blocks that were never freed, with the place they were allocated if you also compile with **`-gl`**. Lazarus has check boxes for both in its project options. On Linux, **Valgrind** finds leaks and uses of freed memory as well. A good habit is to set a pointer to `nil` after freeing what it points to (`FreeAndNil` does this for objects) and to test with `Assigned` before use, so that mistakes fail loudly rather than silently.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"`Dispose(P)` sets `P` to `nil`."** It returns the memory and leaves `P` holding a stale address. Set it to `nil` yourself, and remember that other pointers to the same memory are now dangling too.
+
+</Misconception>
+
+<Misconception>
+
+**"Setting a pointer to `nil` frees the memory."** It only forgets the address. Without `Dispose` (or `Free`, for objects), the memory stays allocated until the program ends: a leak.
+
+</Misconception>
+
+<Misconception>
+
+**"Strings and dynamic arrays inside records leak when the record is disposed."** `Dispose` on a typed pointer finalises the record's managed fields. Only untyped `FreeMem` skips them, which is why it should not be used for records that contain strings.
+
+</Misconception>
+
+<Misconception>
+
+**"A unit is like a C header file."** A unit is compiled once into a `.ppu` that records its interface exactly; users are checked against it, and the compiler recompiles what depends on a changed interface. There is no textual inclusion and no separate header to keep in step.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with Free Pascal 3.2.2.
+
+<Exercises/>
+
+</Section>

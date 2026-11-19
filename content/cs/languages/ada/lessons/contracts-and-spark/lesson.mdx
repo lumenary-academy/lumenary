@@ -1,0 +1,424 @@
+---
+title: Contracts, predicates and SPARK
+subtitle: Preconditions, postconditions, predicates and type invariants that state what code promises, how to check them, and how SPARK proves them before the program runs.
+minutes: 60
+objectives:
+  - Write preconditions and postconditions, using 'Old and 'Result, and explain who is responsible for each
+  - Constrain subtypes with static and dynamic predicates, and private types with type invariants
+  - Control contract checking with -gnata and pragma Assertion_Policy, and explain GNAT's default
+  - Describe what SPARK is, what GNATprove proves, and the Global, Depends and Loop_Invariant annotations
+  - Combine contracts with unit tests (AUnit) and coverage in a professional workflow
+prerequisites: [subprograms-and-exceptions, packages-and-generics]
+references:
+  - title: "Ada Reference Manual, 6.1.1 Preconditions and postconditions, 3.2.4 Subtype predicates, 7.3.2 Type invariants"
+    url: https://ada-lang.io/docs/arm
+    note: The standard's definitions of Ada 2012's contract aspects.
+  - title: "learn.adacore.com: Introduction to SPARK"
+    url: https://learn.adacore.com/courses/intro-to-spark/index.html
+    note: A free course on the SPARK subset and GNATprove, with examples.
+  - title: SPARK User's Guide
+    url: https://docs.adacore.com/spark2014-docs/html/ug/
+    note: The reference for SPARK_Mode, flow analysis, proof and every SPARK annotation.
+  - title: The SPARK programming language (AdaCore)
+    url: https://www.adacore.com/about-spark
+    note: An overview of SPARK with links to industrial case studies.
+---
+
+<Section id="motivation" kind="motivation" title="Promises written in code">
+
+Every subprogram makes promises and has expectations. `Reserve` expects the seat to be free and promises that afterwards it is taken. A sorting routine promises that its output is in order. A thermostat's band promises that its lower limit never exceeds its upper limit. In most languages these live in comments, and comments drift out of date without anybody noticing.
+
+In the 1980s Bertrand Meyer built the idea of **design by contract** into the Eiffel language: a routine's **precondition** is what callers must guarantee, its **postcondition** is what the routine guarantees in return, and a class **invariant** is what is always true of its objects between operations. Ada 2012 made contracts part of the Ada standard, as **aspects** attached to declarations, and added **subtype predicates**, which constrain the values of a subtype with any Boolean expression.
+
+Contracts in Ada serve three audiences at once. Readers get a precise, unambiguous specification next to the declaration. Testing gets automatic checks at every call, so a broken promise is caught at the moment it is broken rather than three modules later. And proof tools get a specification to prove the code against: with **SPARK**, contracts can be verified for every possible input before the program ever runs. This lesson covers all three.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Pre, Post, predicates and invariants">
+
+<Definition term="Precondition and postcondition">
+
+`Pre => Condition` on a subprogram is checked on entry; it is the **caller's** obligation. `Post => Condition` is checked on return; it is the **subprogram's** obligation. In a postcondition, `X'Old` denotes the value `X` had on entry, and for a function `F'Result` denotes the value being returned.
+
+</Definition>
+
+<Definition term="Subtype predicate">
+
+`Static_Predicate` and `Dynamic_Predicate` add a condition to a subtype, checked wherever a value is converted to the subtype, assigned to an object of it or passed as a parameter of it. A **static** predicate is restricted to simple membership tests, so it can be used in `case` statements and `for` loops; a **dynamic** predicate may use any expression.
+
+</Definition>
+
+<Definition term="Type invariant">
+
+`Type_Invariant => Condition` on a private type is checked whenever a value of the type leaves the package that declares it: on return from its visible subprograms and on conversions. Inside the package, the invariant may be broken temporarily, as an implementation sometimes must.
+
+</Definition>
+
+The condition is ordinary Ada, and Ada 2012 added several expressions that make contracts readable: **if expressions**, **case expressions**, **quantified expressions** (`for all`, `for some`) and expression functions. A contract can call functions, which is how good contracts stay short: `Pre => Is_Free (Map, S)` reads better than the array test it stands for.
+
+When a contract fails, Ada raises `Ada.Assertions.Assertion_Error`, with a message naming the kind of contract and where it was declared. But there is a catch that surprises everyone once: **whether contracts are checked is a policy decision**, set by `pragma Assertion_Policy` or a compiler switch. GNAT's default is to **ignore** them. Compile with `-gnata` (in an Alire or gprbuild project, add it to the compiler switches), or put `pragma Assertion_Policy (Check);` at the top of a file, as the programs in this lesson do. The same applies to `pragma Assert`, which checks a condition at any point in the code.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Contracts at work">
+
+A coach has eight seats, some already booked. `Reserve` books a free seat, and `First_Free` finds the lowest free one:
+
+```ada check
+pragma Ada_2022;
+pragma Assertion_Policy (Check);    -- check every contract (like -gnata)
+with Ada.Text_IO;    use Ada.Text_IO;
+with Ada.Assertions; use Ada.Assertions;
+with Ada.Exceptions; use Ada.Exceptions;
+
+procedure Main is
+   type Seat is range 1 .. 8;
+   type Seat_Map is array (Seat) of Boolean;     -- True means taken
+
+   function Is_Free (Map : Seat_Map; S : Seat) return Boolean is (not Map (S));
+
+   function Free_Count (Map : Seat_Map) return Natural is
+     ([for S in Seat => (if Map (S) then 0 else 1)]'Reduce ("+", 0));
+
+   procedure Reserve (Map : in out Seat_Map; S : Seat)
+     with Pre  => Is_Free (Map, S),
+          Post => not Is_Free (Map, S)
+                  and then Free_Count (Map) = Free_Count (Map'Old) - 1
+   is
+   begin
+      Map (S) := True;
+   end Reserve;
+
+   --  Returns the lowest free seat; the caller must make sure one exists.
+   function First_Free (Map : Seat_Map) return Seat
+     with Pre  => Free_Count (Map) > 0,
+          Post => Is_Free (Map, First_Free'Result)
+                  and then (for all S in Seat'First .. First_Free'Result - 1 =>
+                              not Is_Free (Map, S))
+   is
+   begin
+      for S in Seat loop
+         if Is_Free (Map, S) then
+            return S;
+         end if;
+      end loop;
+      raise Program_Error;   -- unreachable when the precondition holds
+   end First_Free;
+
+   Coach : Seat_Map := [3 | 4 => True, others => False];
+begin
+   Put_Line ("Free seats:" & Free_Count (Coach)'Image);
+   Reserve (Coach, First_Free (Coach));
+   Reserve (Coach, First_Free (Coach));
+   Put_Line ("After two bookings, first free seat:" & First_Free (Coach)'Image
+             & ", free seats:" & Free_Count (Coach)'Image);
+   Reserve (Coach, 4);                          -- already taken
+   Put_Line ("not reached");
+exception
+   when E : Assertion_Error =>
+      Put_Line ("Assertion_Error: " & Exception_Message (E));
+end Main;
+```
+
+It prints:
+
+```text
+Free seats: 6
+After two bookings, first free seat: 5, free seats: 4
+Assertion_Error: failed precondition from main.adb:17
+```
+
+Read the contracts as specifications:
+
+- `Reserve` requires the seat to be free, and promises that afterwards it is not free **and** that exactly one free seat has gone. The second clause compares `Free_Count (Map)` after the call with `Free_Count (Map'Old)`, the count on entry. It rules out an implementation that books the seat correctly but also books another one by mistake.
+- `First_Free` requires that a free seat exists, and promises not just *a* free seat but the *lowest*: every seat before the result is taken. Its body ends with `raise Program_Error`, which the precondition makes unreachable.
+- `Free_Count` uses two Ada 2022 features: an iterated aggregate that maps each seat to 0 or 1, and the `'Reduce` attribute, which folds it with `"+"` starting from 0.
+- The last call breaks `Reserve`'s precondition: seat 4 was booked from the start. The failure is reported at the **call**, with a message pointing at the precondition's line, so the blame falls on the caller, where it belongs.
+
+Now delete the line `pragma Assertion_Policy (Check);` and run the program again. GNAT 14 printed:
+
+```text
+Free seats: 6
+After two bookings, first free seat: 5, free seats: 4
+not reached
+```
+
+The double booking went through silently. Contracts that are not checked are documentation, nothing more. Professional teams therefore build with `-gnata` in development and testing; many high-integrity projects keep the checks in production too, accepting their cost, and the strongest projects remove the need for them by proving them, as the last section shows.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Predicates and invariants">
+
+Predicates turn subtypes into precise descriptions of valid data:
+
+```ada check
+pragma Ada_2022;
+pragma Assertion_Policy (Check);
+with Ada.Text_IO;    use Ada.Text_IO;
+with Ada.Assertions; use Ada.Assertions;
+
+procedure Main is
+   --  A static predicate: a list of values, usable in case statements and loops.
+   type Month is (Jan, Feb, Mar, Apr, May, Jun, Jul, Aug, Sep, Oct, Nov, Dec);
+   subtype Long_Month is Month
+     with Static_Predicate => Long_Month in Jan | Mar | May | Jul | Aug | Oct | Dec;
+
+   --  A dynamic predicate: any Boolean expression about the value.
+   subtype Even is Integer
+     with Dynamic_Predicate => Even mod 2 = 0;
+
+   type Reading_List is array (Positive range <>) of Integer;
+   subtype Sorted_List is Reading_List
+     with Dynamic_Predicate =>
+       (for all I in Sorted_List'First .. Sorted_List'Last - 1 =>
+          Sorted_List (I) <= Sorted_List (I + 1));
+
+   function Median (L : Sorted_List) return Integer is (L ((L'First + L'Last) / 2));
+
+   E : Even := 10;
+begin
+   Put ("Months with 31 days:");
+   for M in Long_Month loop
+      Put (" " & M'Image);
+   end loop;
+   New_Line;
+
+   Put_Line ("Median:" & Median ([2, 3, 5, 8, 13])'Image);
+
+   begin
+      Put_Line ("Median:" & Median ([5, 2, 9])'Image);
+   exception
+      when Assertion_Error =>
+         Put_Line ("[5, 2, 9] is not a Sorted_List");
+   end;
+
+   E := E + 2;
+   Put_Line ("E =" & E'Image);
+   E := E + 1;
+   Put_Line ("not reached");
+exception
+   when Assertion_Error =>
+      Put_Line ("E + 1 is not Even");
+end Main;
+```
+
+It prints:
+
+```text
+Months with 31 days: JAN MAR MAY JUL AUG OCT DEC
+Median: 5
+[5, 2, 9] is not a Sorted_List
+E = 12
+E + 1 is not Even
+```
+
+`Long_Month` has a static predicate, so a `for` loop over it visits exactly its seven months. `Sorted_List` is a whole precondition packed into a subtype: `Median` takes a `Sorted_List`, so it never needs to check for itself, and passing an unsorted list fails at the call. And `Even` shows that a predicate is checked on every assignment, not only at declarations. A failed predicate raises `Assertion_Error` too.
+
+Type invariants protect private types in the same way, at the package boundary:
+
+```ada check
+pragma Ada_2022;
+pragma Assertion_Policy (Check);
+with Ada.Text_IO;    use Ada.Text_IO;
+with Ada.Assertions; use Ada.Assertions;
+with Ada.Exceptions; use Ada.Exceptions;
+
+procedure Main is
+
+   package Thermostats is
+      type Celsius is range -50 .. 150;
+      type Band is private
+        with Type_Invariant => Is_Valid (Band);   -- checked at the package boundary
+
+      function Is_Valid (B : Band) return Boolean;
+      function Make (Low, High : Celsius) return Band;
+      procedure Shift (B : in out Band; By : Integer);
+      procedure Set_High (B : in out Band; High : Celsius);
+      function Image (B : Band) return String;
+   private
+      type Band is record
+         Low  : Celsius := 18;
+         High : Celsius := 22;
+      end record;
+      function Is_Valid (B : Band) return Boolean is (B.Low <= B.High);
+   end Thermostats;
+
+   package body Thermostats is
+      function Make (Low, High : Celsius) return Band is ((Low, High));
+
+      procedure Shift (B : in out Band; By : Integer) is
+      begin
+         B.Low  := Celsius (Integer (B.Low) + By);
+         B.High := Celsius (Integer (B.High) + By);
+      end Shift;
+
+      procedure Set_High (B : in out Band; High : Celsius) is
+      begin
+         B.High := High;   -- nothing here stops High going below Low...
+      end Set_High;
+
+      function Image (B : Band) return String is
+        (B.Low'Image & " .." & B.High'Image);
+   end Thermostats;
+
+   use Thermostats;
+   Office : Band := Make (19, 23);
+begin
+   Shift (Office, -2);
+   Put_Line ("Office band:" & Image (Office));
+   Set_High (Office, 15);                       -- ...but the invariant does
+   Put_Line ("not reached");
+exception
+   when E : Assertion_Error =>
+      Put_Line ("Assertion_Error: " & Exception_Message (E));
+end Main;
+```
+
+It prints:
+
+```text
+Office band: 17 .. 21
+Assertion_Error: failed invariant from main.adb:12
+```
+
+`Set_High` has a bug: it accepts a new upper limit without comparing it with the lower one. The invariant catches the bug the moment the broken band would leave the package, in this case on return from `Set_High`, and the message points at the invariant's declaration on line 12. Without the invariant the program would carry on with a band from 17 to 15, and the error would show up later as a heating system behaving strangely. Note that the invariant is declared on the partial view in the visible part, but its function `Is_Valid` is completed in the private part, where the components are visible.
+
+</Section>
+
+<Section id="human" kind="human" title="SPARK: from checking to proving">
+
+Run-time checks find a broken contract when a test happens to break it. **SPARK** aims higher: to show, before the program runs, that no input can break it.
+
+SPARK is a **subset of Ada** together with a tool, **GNATprove**. The subset leaves out or restricts the features that make reasoning about programs intractable: functions with side effects, aliasing between parameters, and unrestricted pointers (SPARK allows pointers under an ownership model similar to Rust's). A unit opts in with the aspect `SPARK_Mode` on a library package or subprogram, so SPARK and full Ada mix in one program. GNATprove then performs two kinds of analysis:
+
+- **Flow analysis** checks that no variable is read before it is initialised, and that each subprogram reads and writes exactly the global data its `Global` aspect declares, with the information flow its `Depends` aspect describes.
+- **Proof** generates a logical formula, a *verification condition*, for every check the language would make at run time (every range check, index check, overflow and division by zero) and for every contract and loop invariant, and passes them to automatic provers (Alt-Ergo, CVC5 and Z3, through the Why3 platform). A proved check can never fail.
+
+AdaCore's guidance for adopting SPARK describes levels a project can aim for, from **Stone** (the code is valid SPARK) through **Bronze** (flow analysis is clean) and **Silver** (absence of run-time errors is proved, so no exception can be raised) to **Gold** (key properties are proved from contracts) and **Platinum** (full functional correctness). Silver is the common industrial target: it rules out whole classes of bugs, including buffer overflows and integer overflows, with modest effort.
+
+Here is code written as SPARK users write it. GNAT treats the annotations as run-time checks, which is how it was run here; GNATprove, which is not part of this course's toolchain, would try to prove them for all inputs:
+
+```ada check
+pragma Ada_2022;
+pragma Assertion_Policy (Check);
+with Ada.Text_IO; use Ada.Text_IO;
+
+procedure Main is
+
+   --  In a real project this would be a library package declared "with SPARK_Mode".
+   package Altimeter is
+      type Feet is range 0 .. 60_000;
+      type Reading_Array is array (Positive range <>) of Feet;
+
+      Smoothed : Feet := 0;     -- the package's state
+
+      function Clamp (Raw : Integer) return Feet is
+        (if Raw < 0 then 0
+         elsif Raw > Integer (Feet'Last) then Feet'Last
+         else Feet (Raw));
+
+      --  Global and Depends state exactly what Update reads and writes.
+      procedure Update (Raw : Integer)
+        with Global  => (In_Out => Smoothed),
+             Depends => (Smoothed => (Smoothed, Raw)),
+             Post    => Smoothed = (Smoothed'Old + Clamp (Raw)) / 2;
+
+      function Count_Above (Readings : Reading_Array; Limit : Feet) return Natural
+        with Post => Count_Above'Result <= Readings'Length;
+   end Altimeter;
+
+   package body Altimeter is
+      procedure Update (Raw : Integer) is
+      begin
+         Smoothed := (Smoothed + Clamp (Raw)) / 2;
+      end Update;
+
+      function Count_Above (Readings : Reading_Array; Limit : Feet) return Natural is
+         Count : Natural := 0;
+      begin
+         for I in Readings'Range loop
+            if Readings (I) > Limit then
+               Count := Count + 1;
+            end if;
+            pragma Loop_Invariant (Count <= I - Readings'First + 1);
+         end loop;
+         return Count;
+      end Count_Above;
+   end Altimeter;
+
+   use Altimeter;
+   type Raw_List is array (Positive range <>) of Integer;
+begin
+   for Raw of Raw_List'[12_000, 12_400, -30, 75_000] loop
+      Update (Raw);
+      Put_Line (Raw'Image & " ft raw ->" & Smoothed'Image & " ft smoothed");
+   end loop;
+   Put_Line ("Readings above 10000 ft:"
+             & Count_Above ([9_500, 10_200, 11_000, 8_000], 10_000)'Image);
+end Main;
+```
+
+It prints:
+
+```text
+ 12000 ft raw -> 6000 ft smoothed
+ 12400 ft raw -> 9200 ft smoothed
+-30 ft raw -> 4600 ft smoothed
+ 75000 ft raw -> 32300 ft smoothed
+Readings above 10000 ft: 2
+```
+
+`Global => (In_Out => Smoothed)` says `Update` reads and writes the package variable `Smoothed` and touches no other global state; `Depends` says the new `Smoothed` is computed from the old one and from `Raw`. `Clamp` guarantees the result is a valid `Feet` whatever `Raw` is, which is why the raw -30 and 75 000 do not raise exceptions. In `Count_Above`, the **loop invariant** states something true on every iteration (the count never exceeds the number of readings seen so far); provers reason about loops through such invariants, and it is exactly what is needed to show that `Count + 1` cannot overflow and that the postcondition holds. Writing good loop invariants is the main new skill SPARK asks of you.
+
+### Contracts and tests together
+
+Proof does not replace testing in most projects; the two cover each other's blind spots. A typical professional Ada workflow:
+
+- Unit tests with **AUnit**, AdaCore's xUnit-style framework (`alr with aunit` adds it to an Alire project), or with **GNATtest**, which generates a test harness from your specifications.
+- All tests built with `-gnata`, so that every contract acts as an extra check on every test.
+- Structural coverage measured with **GNATcoverage**, up to the MC/DC coverage that avionics standards such as DO-178C require for the most critical software.
+- SPARK for the components where a failure is unacceptable, often starting at Bronze or Silver and going further where it pays.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"Contracts are always checked."** In GNAT they are ignored unless you compile with `-gnata` or set `pragma Assertion_Policy (Check)`. Check your build settings before trusting a contract to stop anything.
+
+</Misconception>
+
+<Misconception>
+
+**"A precondition is the subprogram's job to check."** It is the caller's obligation. The subprogram may assume it, and the failure is reported against the call. If a subprogram must cope with any input, it needs no precondition; it should handle the bad cases itself.
+
+</Misconception>
+
+<Misconception>
+
+**"Contracts must not have side effects, so they can call only built-in operators."** They may call functions, and should: `Is_Free (Map, S)` is clearer than the raw expression. The rule is that the functions they call must not change anything, because checking a contract must never alter the program's behaviour.
+
+</Misconception>
+
+<Misconception>
+
+**"A good postcondition repeats the code."** `Post => Area'Result = Width * Height` on a function whose body is `Width * Height` adds nothing: if the code is wrong, so is the contract. Useful contracts describe *what* is true afterwards at a different level from *how* the code achieves it. `First_Free` promises that every earlier seat is taken, not how it searched; a sort promises an ordered permutation of its input, not which algorithm it used. When a contract and its code look the same, look for the property a reviewer would actually want to know.
+
+</Misconception>
+
+<Misconception>
+
+**"SPARK proves that a program does what its users want."** It proves that the code satisfies its contracts and raises no run-time errors. If the contracts state the wrong thing, the proof is of the wrong thing. Writing the right specification remains a human job, and reviewing contracts is part of a SPARK project's work.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GNAT 14.
+
+<Exercises/>
+
+</Section>

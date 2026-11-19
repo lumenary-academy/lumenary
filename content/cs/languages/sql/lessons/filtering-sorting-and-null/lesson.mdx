@@ -1,0 +1,388 @@
+---
+title: Filtering, sorting and NULL
+subtitle: Precise conditions with WHERE, values computed with CASE and functions, sorting and paging, and the three-valued logic that NULL brings to all of it.
+minutes: 60
+objectives:
+  - Write WHERE conditions with comparisons, AND, OR, NOT, BETWEEN, IN and LIKE, and parenthesise them correctly
+  - Compute values with CASE expressions and common string, number and date functions
+  - Sort by several keys, control where NULLs sort, remove duplicates with DISTINCT, and page through results
+  - Evaluate conditions in SQL's three-valued logic and explain why `= NULL` never matches
+  - Use IS NULL, COALESCE and NULLIF, and avoid the NOT IN trap
+prerequisites: [tables-and-constraints]
+related: [math.found.propositional-logic, math.found.logic-statements]
+references:
+  - title: "SQLite: Core Functions"
+    url: https://www.sqlite.org/lang_corefunc.html
+  - title: "SQLite: Date And Time Functions"
+    url: https://www.sqlite.org/lang_datefunc.html
+  - title: "SQLite: NULL Handling in SQLite Versus Other Database Engines"
+    url: https://www.sqlite.org/nulls.html
+    note: A table of how different engines treat NULL in the corner cases.
+  - title: "PostgreSQL: Comparison Functions and Operators"
+    url: https://www.postgresql.org/docs/current/functions-comparison.html
+    note: Including IS DISTINCT FROM and the rules for comparisons with NULL.
+  - title: "PostgreSQL: Pattern Matching"
+    url: https://www.postgresql.org/docs/current/functions-matching.html
+    note: LIKE, ILIKE, SIMILAR TO and regular expressions.
+---
+
+<Section id="motivation" kind="motivation" title="Asking exactly the right question">
+
+Most real queries are not "give me the table" but "give me *these* rows": orders from two cities over a certain amount, members who joined last spring and have not borrowed anything, sensors whose last reading is missing. The `WHERE` clause is where that precision lives, and getting it wrong rarely produces an error. It produces a plausible answer that is quietly wrong.
+
+Two things cause most of those quiet mistakes. The first is operator precedence: `AND` binds more tightly than `OR`, exactly as multiplication binds more tightly than addition, and a missing pair of parentheses changes the meaning. The second is `NULL`. SQL uses `NULL` to mark a value that is missing or unknown, and to stay honest about what it does not know, SQL's logic has three truth values instead of two. Once you have seen how that works, you will read every `WHERE` clause differently.
+
+All the examples use one table of orders from a small online shop. Two of its columns allow `NULL`: `coupon` (no coupon was used) and `delivered_on` (not delivered yet).
+
+</Section>
+
+<Section id="predicates" kind="examples" title="Conditions in WHERE">
+
+A condition, also called a **predicate**, is an expression that is true or false of each row (or, as you will see, unknown). The building blocks are comparisons (`=`, `<>` or `!=` for "not equal", `<`, `<=`, `>`, `>=`), the connectives `AND`, `OR` and `NOT`, and a few convenient forms:
+
+- `x BETWEEN a AND b` means `x >= a AND x <= b`: both ends included.
+- `x IN (a, b, c)` means `x = a OR x = b OR x = c`.
+- `s LIKE pattern` matches text, where `%` stands for any run of characters (including none) and `_` for exactly one character.
+
+```sql check
+.mode column
+CREATE TABLE orders (
+  id           INTEGER PRIMARY KEY,
+  customer     TEXT NOT NULL,
+  city         TEXT NOT NULL,
+  total_cents  INTEGER NOT NULL,
+  placed_on    TEXT NOT NULL,          -- ISO 8601 dates sort correctly as text
+  coupon       TEXT,                   -- NULL: no coupon used
+  delivered_on TEXT                    -- NULL: not delivered yet
+);
+INSERT INTO orders VALUES
+  (1, 'Amara Okafor',   'Lagos',     4200, '2026-03-02', NULL,     '2026-03-04'),
+  (2, 'Mateo Silva',    'São Paulo', 1850, '2026-03-02', 'SPRING', '2026-03-03'),
+  (3, 'Yuki Sato',      'Osaka',     9900, '2026-03-05', NULL,     NULL),
+  (4, 'Priya Nair',     'Kochi',     3100, '2026-03-07', 'SPRING', '2026-03-09'),
+  (5, 'Lars Eriksen',   'Bergen',    1200, '2026-03-08', 'WELCOME', NULL),
+  (6, 'Fatima Haddad',  'Lagos',     7600, '2026-03-11', NULL,     '2026-03-12'),
+  (7, 'Tomás Herrera',  'Osaka',     2500, '2026-03-15', NULL,     NULL);
+
+-- AND binds more tightly than OR. Compare these two queries.
+SELECT id, city, total_cents FROM orders
+WHERE city = 'Lagos' OR city = 'Osaka' AND total_cents > 5000;
+
+SELECT id, city, total_cents FROM orders
+WHERE (city = 'Lagos' OR city = 'Osaka') AND total_cents > 5000;
+
+-- BETWEEN is inclusive at both ends; IN tests membership in a list.
+SELECT id, placed_on FROM orders
+WHERE placed_on BETWEEN '2026-03-05' AND '2026-03-08'
+  AND city IN ('Osaka', 'Kochi', 'Bergen');
+
+-- LIKE: % matches any run of characters, _ exactly one character.
+SELECT customer FROM orders WHERE customer LIKE '%a %';
+-- SQLite's LIKE ignores case for ASCII letters; PostgreSQL's does not.
+SELECT customer FROM orders WHERE customer LIKE 'l_rs%';
+```
+
+```text
+id  city   total_cents
+--  -----  -----------
+1   Lagos  4200
+3   Osaka  9900
+6   Lagos  7600
+id  city   total_cents
+--  -----  -----------
+3   Osaka  9900
+6   Lagos  7600
+id  placed_on
+--  ----------
+3   2026-03-05
+4   2026-03-07
+5   2026-03-08
+customer
+-------------
+Amara Okafor
+Priya Nair
+Fatima Haddad
+customer
+------------
+Lars Eriksen
+```
+
+The first query was probably meant to find large orders from Lagos or Osaka, but it reads as `city = 'Lagos' OR (city = 'Osaka' AND total_cents > 5000)`, so it returned the small Lagos order too. The rule of thumb professionals follow: whenever a condition mixes `AND` and `OR`, write the parentheses, even where they are not needed.
+
+Dates stored as ISO 8601 text (`YYYY-MM-DD`) compare correctly as strings, because the most significant part comes first; that is why `BETWEEN` works on `placed_on`. In PostgreSQL and MySQL you would use a real `DATE` column and write `DATE '2026-03-05'`. One more `BETWEEN` caution: with timestamps, `BETWEEN '2026-03-05' AND '2026-03-08'` stops at midnight at the start of the 8th. For ranges of time, the safe pattern is a half-open interval: `placed_at >= '2026-03-05' AND placed_at < '2026-03-09'`.
+
+**Pattern matching differs between databases.** SQLite's `LIKE` ignores the case of ASCII letters, which is why `'l_rs%'` matched Lars. PostgreSQL's `LIKE` is case-sensitive and it offers `ILIKE` for case-insensitive matching; MySQL's case behaviour depends on the column's collation. For anything more complex, PostgreSQL has regular expressions (`city ~ '^S'`), MySQL has `REGEXP`, and SQLite has its own `GLOB`, which uses `*` and `?` like a shell and is case-sensitive.
+
+</Section>
+
+<Section id="expressions" kind="computation" title="CASE, functions and sorting">
+
+`CASE` is SQL's conditional expression. The *searched* form tests conditions in order and returns the value of the first true one, or the `ELSE` value (or `NULL` if there is no `ELSE`). Because it is an expression, it can appear anywhere a value can: in the `SELECT` list, in `WHERE`, in `ORDER BY`, inside a function call.
+
+Every database also has a library of functions. The names of the common ones mostly agree (`upper`, `lower`, `length`, `trim`, `replace`, `round`, `abs`), but substring and date functions vary a lot: the standard writes `SUBSTRING(s FROM 1 FOR 3)`, SQLite `substr(s, 1, 3)`, and both PostgreSQL and MySQL accept `substring(s, 1, 3)`. Dates vary most of all. SQLite has `date()`, `julianday()` and `strftime()` working on text; PostgreSQL subtracts two `DATE`s directly to get a number of days and has `EXTRACT(YEAR FROM d)`; MySQL has `DATEDIFF(a, b)`.
+
+```sql check
+.mode column
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer TEXT NOT NULL, city TEXT NOT NULL,
+  total_cents INTEGER NOT NULL, placed_on TEXT NOT NULL,
+  coupon TEXT, delivered_on TEXT
+);
+INSERT INTO orders VALUES
+  (1, 'Amara Okafor',   'Lagos',     4200, '2026-03-02', NULL,     '2026-03-04'),
+  (2, 'Mateo Silva',    'São Paulo', 1850, '2026-03-02', 'SPRING', '2026-03-03'),
+  (3, 'Yuki Sato',      'Osaka',     9900, '2026-03-05', NULL,     NULL),
+  (4, 'Priya Nair',     'Kochi',     3100, '2026-03-07', 'SPRING', '2026-03-09'),
+  (5, 'Lars Eriksen',   'Bergen',    1200, '2026-03-08', 'WELCOME', NULL),
+  (6, 'Fatima Haddad',  'Lagos',     7600, '2026-03-11', NULL,     '2026-03-12'),
+  (7, 'Tomás Herrera',  'Osaka',     2500, '2026-03-15', NULL,     NULL);
+
+-- CASE chooses a value; functions transform values.
+SELECT id,
+       upper(substr(city, 1, 3))                AS code,
+       round(total_cents / 100.0, 1)            AS total,
+       CASE WHEN total_cents >= 5000 THEN 'large'
+            WHEN total_cents >= 2000 THEN 'medium'
+            ELSE 'small' END                    AS size,
+       CAST(julianday(delivered_on) - julianday(placed_on) AS INTEGER) AS days
+FROM orders
+ORDER BY days DESC NULLS LAST, id;
+
+-- DISTINCT removes duplicate rows from the result.
+SELECT DISTINCT city FROM orders ORDER BY city;
+
+-- Page 2 of a listing, three orders per page.
+SELECT id, customer FROM orders ORDER BY placed_on, id LIMIT 3 OFFSET 3;
+```
+
+```text
+id  code  total  size    days
+--  ----  -----  ------  ----
+1   LAG   42.0   medium  2
+4   KOC   31.0   medium  2
+2   SãO   18.5   small   1
+6   LAG   76.0   large   1
+3   OSA   99.0   large
+5   BER   12.0   small
+7   OSA   25.0   medium
+city
+---------
+Bergen
+Kochi
+Lagos
+Osaka
+São Paulo
+id  customer
+--  -------------
+4   Priya Nair
+5   Lars Eriksen
+6   Fatima Haddad
+```
+
+Look closely at the code for São Paulo: `SãO`. SQLite's built-in `upper()` and `lower()` only know the 26 ASCII letters, so the `ã` was left alone. (SQLite can be built with the ICU library for full Unicode case rules; PostgreSQL and MySQL handle Unicode case out of the box.) Small surprises like this are why it pays to test queries on data that looks like your real data, accents and all.
+
+The undelivered orders have no `days`: arithmetic with `NULL` gives `NULL`. They sorted last because of `NULLS LAST`, a standard clause that SQLite has supported since version 3.30 and PostgreSQL for much longer; MySQL lacks it, and there you write `ORDER BY days IS NULL, days DESC`. Without the clause, databases disagree: **SQLite and MySQL put NULLs first** in ascending order, **PostgreSQL and Oracle put them last**. If it matters, say which you want.
+
+`DISTINCT` applies to the whole row of the result, not to one column: `SELECT DISTINCT city, coupon` returns each distinct *pair*.
+
+### Paging through results
+
+`LIMIT 3 OFFSET 3` skipped three rows and returned the next three, which is how many web pages show "page 2". It has two weaknesses. The database must still produce and throw away all the skipped rows, so page 5,000 is slow; and if rows are inserted while someone is paging, items shift between pages. The professional alternative is **keyset pagination**: remember the sort key of the last row shown and ask for rows after it.
+
+```sql
+-- The last row on the previous page had placed_on = '2026-03-08' and id = 5.
+SELECT id, customer FROM orders
+WHERE (placed_on, id) > ('2026-03-08', 5)      -- row values: SQLite 3.15+, PostgreSQL, MySQL
+ORDER BY placed_on, id
+LIMIT 3;
+```
+
+With an index on `(placed_on, id)` this is fast on any page. Either way, paging needs an `ORDER BY` whose keys are unique, here `placed_on` with `id` as a tie-breaker; otherwise the database may legally return the tied rows in a different order each time, and some rows appear on two pages while others appear on none.
+
+</Section>
+
+<Section id="null" kind="definitions" title="NULL and three-valued logic">
+
+<Definition term="NULL">
+
+`NULL` is a marker meaning "no value here": unknown, missing, or not applicable. It is not zero, not an empty string and not false. Every type can be `NULL` unless the column forbids it with `NOT NULL`.
+
+</Definition>
+
+What should `delivered_on = '2026-03-04'` be for an order whose delivery date is unknown? It might be true; it might be false. SQL's answer is a third truth value, **unknown**, and any comparison involving `NULL` yields it. Even `NULL = NULL` is unknown: two unknown dates are not known to be equal.
+
+The connectives extend to three values in the only consistent way. Think of unknown as "could be true or false" and ask whether the answer depends on which. `false AND unknown` is false whatever the unknown turns out to be; `true AND unknown` depends on it, so it is unknown. The program below prints the full table (SQLite represents true as `1` and false as `0`, so a `CASE` turns each value into a word):
+
+```sql check
+.mode column
+-- Three-valued logic. SQLite represents TRUE as 1 and FALSE as 0;
+-- a CASE turns each result into a word so that NULL (unknown) is visible.
+CREATE TABLE tv (p, q);
+INSERT INTO tv VALUES (1, 1), (1, 0), (1, NULL), (0, 0), (0, NULL), (NULL, NULL);
+
+SELECT CASE WHEN p IS NULL THEN 'unknown' WHEN p THEN 'true' ELSE 'false' END AS p,
+       CASE WHEN q IS NULL THEN 'unknown' WHEN q THEN 'true' ELSE 'false' END AS q,
+       CASE WHEN (p AND q) IS NULL THEN 'unknown' WHEN p AND q THEN 'true' ELSE 'false' END AS p_and_q,
+       CASE WHEN (p OR q) IS NULL THEN 'unknown' WHEN p OR q THEN 'true' ELSE 'false' END AS p_or_q,
+       CASE WHEN (NOT p) IS NULL THEN 'unknown' WHEN NOT p THEN 'true' ELSE 'false' END AS not_p
+FROM tv;
+```
+
+```text
+p        q        p_and_q  p_or_q   not_p
+-------  -------  -------  -------  -------
+true     true     true     true     false
+true     false    false    true     false
+true     unknown  unknown  true     false
+false    false    false    false    true
+false    unknown  false    unknown  true
+unknown  unknown  unknown  unknown  unknown
+```
+
+This is **Kleene's three-valued logic**, and if you know <TopicLink id="math.found.propositional-logic">propositional logic</TopicLink> you can check that it agrees with ordinary logic whenever no value is unknown. The rule that matters most in practice is how SQL *uses* the result:
+
+<Theorem name="WHERE keeps only TRUE">
+
+`WHERE`, `HAVING`, `ON` and `CASE WHEN` keep a row (or take a branch) only when the condition is **true**. Unknown is treated like false. A `CHECK` constraint is the opposite: it rejects a row only when its condition is **false**, so unknown passes.
+
+</Theorem>
+
+The consequences show up immediately:
+
+```sql check
+.mode column
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer TEXT NOT NULL, city TEXT NOT NULL,
+  total_cents INTEGER NOT NULL, placed_on TEXT NOT NULL,
+  coupon TEXT, delivered_on TEXT
+);
+INSERT INTO orders VALUES
+  (1, 'Amara Okafor',   'Lagos',     4200, '2026-03-02', NULL,     '2026-03-04'),
+  (2, 'Mateo Silva',    'São Paulo', 1850, '2026-03-02', 'SPRING', '2026-03-03'),
+  (3, 'Yuki Sato',      'Osaka',     9900, '2026-03-05', NULL,     NULL),
+  (4, 'Priya Nair',     'Kochi',     3100, '2026-03-07', 'SPRING', '2026-03-09'),
+  (5, 'Lars Eriksen',   'Bergen',    1200, '2026-03-08', 'WELCOME', NULL),
+  (6, 'Fatima Haddad',  'Lagos',     7600, '2026-03-11', NULL,     '2026-03-12'),
+  (7, 'Tomás Herrera',  'Osaka',     2500, '2026-03-15', NULL,     NULL);
+
+-- = NULL is never true. Use IS NULL.
+SELECT count(*) AS eq_null  FROM orders WHERE delivered_on = NULL;
+SELECT count(*) AS is_null  FROM orders WHERE delivered_on IS NULL;
+
+-- A row is kept by WHERE only if the condition is TRUE, so NULLs drop out of
+-- both a condition and its negation.
+SELECT count(*) AS spring     FROM orders WHERE coupon = 'SPRING';
+SELECT count(*) AS not_spring FROM orders WHERE coupon <> 'SPRING';
+
+-- COALESCE picks the first non-NULL argument.
+SELECT id,
+       coalesce(coupon, '(none)')           AS coupon,
+       coalesce(delivered_on, 'in transit') AS delivered
+FROM orders WHERE id <= 4;
+
+-- NULLIF(a, b) is NULL when a = b, else a. Its classic use: x / NULLIF(y, 0).
+SELECT typeof(10 / 0) AS sqlite_div_by_zero, typeof(10 / nullif(0, 0)) AS portable;
+
+-- The NOT IN trap: one NULL in the list makes NOT IN unknown for every row.
+SELECT count(*) AS not_in_list FROM orders WHERE id NOT IN (1, 2);
+SELECT count(*) AS not_in_list_with_null FROM orders WHERE id NOT IN (1, 2, NULL);
+```
+
+```text
+eq_null
+-------
+0
+is_null
+-------
+3
+spring
+------
+2
+not_spring
+----------
+1
+id  coupon  delivered
+--  ------  ----------
+1   (none)  2026-03-04
+2   SPRING  2026-03-03
+3   (none)  in transit
+4   SPRING  2026-03-09
+sqlite_div_by_zero  portable
+------------------  --------
+null                null
+not_in_list
+-----------
+5
+not_in_list_with_null
+---------------------
+0
+```
+
+Seven orders: two used `SPRING`, one used another coupon, four used none. Yet "coupon is SPRING" and "coupon is not SPRING" together count only three, because for the four `NULL` coupons both conditions are unknown. If you mean "not SPRING, including no coupon", say so: `coupon <> 'SPRING' OR coupon IS NULL`, or `coalesce(coupon, '') <> 'SPRING'`.
+
+The last two queries show the most famous trap. `id NOT IN (1, 2, NULL)` means `id <> 1 AND id <> 2 AND id <> NULL`. The last part is unknown for every row, so the whole condition is never true and the query returns nothing. Nobody writes `NULL` in a list by hand, but they write `NOT IN (SELECT member_id FROM loan)`, and if one loan has a `NULL` member, the query silently returns no rows at all. Lesson 6 shows the safe alternative, `NOT EXISTS`.
+
+The query on division also shows a dialect difference: SQLite returns `NULL` for division by zero, PostgreSQL and SQL Server raise an error, and MySQL returns `NULL` with a warning. Writing `x / NULLIF(y, 0)` gives `NULL` everywhere.
+
+### Comparing values that may be NULL
+
+Sometimes you want "equal, treating two NULLs as equal", for example to find rows whose value changed between two versions of a table. The standard spelling is `a IS NOT DISTINCT FROM b` (and its negation `IS DISTINCT FROM`). Each database has its own:
+
+```sql
+a IS NOT DISTINCT FROM b     -- standard; PostgreSQL; SQLite 3.39+
+a IS b                       -- SQLite (any version)
+a <=> b                      -- MySQL
+```
+
+### NULL in other places
+
+- **Strings and arithmetic.** `'a' || NULL` and `NULL + 1` are both `NULL`. (MySQL's `CONCAT('a', NULL)` is also `NULL`.) Oracle Database is a famous exception in a different direction: it treats the empty string `''` as `NULL`.
+- **Uniqueness.** A `UNIQUE` column may hold many `NULL`s in SQLite, PostgreSQL and MySQL, because no two `NULL`s are known to be equal. SQL Server allows only one. PostgreSQL 15 added `UNIQUE NULLS NOT DISTINCT` for the other behaviour.
+- **Aggregates.** `count(column)`, `sum`, `avg`, `min` and `max` skip `NULL`s, which the next lesson explores.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions about NULL">
+
+<Misconception>
+
+"`NULL` is the same as zero or the empty string." It is not a value at all but the absence of one. A product whose price is `NULL` does not cost nothing; its price is unknown. Mixing the two meanings leads to averages that are silently wrong.
+
+</Misconception>
+
+<Misconception>
+
+"A condition and its negation together cover every row." Not when NULLs are involved: rows where the condition is unknown satisfy neither `p` nor `NOT p`. Whenever you split a table into "matches" and "doesn't match", ask what happens to the NULLs.
+
+</Misconception>
+
+<Misconception>
+
+"To find missing values, write `WHERE x = NULL`." This compares with an unknown value, which is never true, so it returns nothing and raises no error. Write `x IS NULL`. Many linters and code reviewers flag `= NULL` on sight.
+
+</Misconception>
+
+Codd, who introduced `NULL`, later argued that one kind of marker is not enough (he proposed separate markers for "unknown" and "not applicable"), while others, notably C. J. Date and Hugh Darwen, argued that relational databases should have no `NULL` at all. The language kept a single `NULL`. The practical response is design: declare columns `NOT NULL` unless absence is a genuine, meaningful state, and handle the remaining `NULL`s deliberately with `IS NULL`, `COALESCE` and explicit conditions.
+
+</Section>
+
+<Section id="practice" kind="human" title="NULL beyond the database">
+
+`NULL` does not stay inside the database. Every driver maps it to something in the host language: `None` in Python, `null` in Java and JavaScript, `nil` in Ruby, and in Go a special wrapper type such as `sql.NullString`, because Go's plain strings cannot be absent. Wherever a column allows `NULL`, the application code must handle the missing case, and a surprising number of production bugs are a `NULL` that nobody expected arriving in code that assumed a value.
+
+That is the strongest practical argument for `NOT NULL` with sensible defaults. A few patterns experienced schema designers use:
+
+- **Booleans should almost always be `NOT NULL`.** A nullable flag has three states, and code that tests `if is_active` will quietly treat unknown as false.
+- **Use a separate row, not a `NULL`, for "not applicable" data.** If only some members have a mailing address, an `address` table with a row per member who has one is often cleaner than six nullable columns in `member`.
+- **Distinguish "unknown" from "empty".** An empty string for a middle name can mean "this person has no middle name"; `NULL` can mean "we never asked". If the difference matters to your application, document which is which and enforce it with a `CHECK`.
+- **Make "missing" explicit in queries.** Reviewers look for `IS NULL` handling next to every `<>`, `NOT IN` and outer join, and for `coalesce` in front of every sum shown to a user.
+
+None of this removes `NULL` from your life. Outer joins and aggregates over empty sets create `NULL`s even in a schema without a single nullable column, as the next lessons show. The goal is that every `NULL` in a result is one you expected.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
