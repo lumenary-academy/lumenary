@@ -1,0 +1,437 @@
+---
+title: System calls
+subtitle: The door between your program and the Linux kernel, how to pass it arguments, read its answers and errors, and ask it for memory.
+minutes: 60
+objectives:
+  - Explain what a system call is and why user programs cannot do their own input and output
+  - Make Linux system calls with the x86-64 register convention, including r10 for the fourth argument
+  - Detect and decode errors returned as negative numbers from −4095 to −1
+  - Allocate memory with mmap, fill it and give it back with munmap
+  - Use strace to watch the system calls a program makes, and say how libc wraps them
+prerequisites: [stack-and-calling-convention]
+references:
+  - title: syscall(2), Linux manual page
+    url: https://man7.org/linux/man-pages/man2/syscall.2.html
+    note: The per-architecture table of instruction, number register, argument registers and return register.
+  - title: syscalls(2), Linux manual page
+    url: https://man7.org/linux/man-pages/man2/syscalls.2.html
+    note: Every Linux system call, with the kernel version that introduced it.
+  - title: mmap(2), Linux manual page
+    url: https://man7.org/linux/man-pages/man2/mmap.2.html
+    note: The arguments and flags used in this lesson's memory-mapping program.
+  - title: errno(3), Linux manual page
+    url: https://man7.org/linux/man-pages/man3/errno.3.html
+    note: The meaning of each error number, such as EBADF and ENOMEM.
+  - title: strace
+    url: https://strace.io/
+    note: The system-call tracer used throughout this lesson.
+---
+
+<Section id="motivation" kind="motivation" title="Why a program cannot just print">
+
+Your programs have been calling `write` and `exit` since the first lesson. It is time to look at what those calls really are, and why a program cannot simply put characters on the screen by itself.
+
+A modern processor runs code at different **privilege levels**. The operating system's **kernel** runs in kernel mode, where every instruction is allowed: talking to disks and network cards, changing the memory map, switching between programs. Ordinary programs run in **user mode**, where those instructions are forbidden and where each program sees only its own memory. That separation is what stops a buggy game from corrupting your files or a web page from reading another program's passwords.
+
+So when a user program needs anything outside its own memory (a file, the terminal, the network, the clock, more memory, another process), it must **ask the kernel**. The request is a **system call**: a controlled jump into the kernel at an entry point the kernel chose, with the request described in registers. The kernel checks the request, does the work if it is allowed, and returns to the program with an answer. Every `print` in every language, every file read and every network packet ends in one of these calls.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The Linux x86-64 system-call convention">
+
+<Definition term="system call">
+
+A **system call** is a request from a user program to the operating-system kernel, made with a special instruction that switches the processor to kernel mode at a fixed kernel entry point. On x86-64 that instruction is `syscall`.
+
+</Definition>
+
+On Linux for x86-64 the registers are used like this:
+
+| Register | Role |
+| --- | --- |
+| `rax` | the system-call **number** on entry; the **result** on return |
+| `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` | arguments 1 to 6 |
+| `rcx`, `r11` | **destroyed** by the `syscall` instruction |
+| everything else | preserved |
+
+This is almost the function-calling convention from the last lesson, with one difference: the fourth argument goes in **`r10` instead of `rcx`**. The reason is the instruction itself. `syscall` saves the address to return to in `rcx` and the flags in `r11` so that the kernel can come back, so `rcx` cannot carry an argument.
+
+Some numbers you will use (the complete table is in the kernel source and in the `syscalls(2)` manual page):
+
+| Number | Call | Arguments |
+| --- | --- | --- |
+| 0 | `read` | fd, buffer, count |
+| 1 | `write` | fd, buffer, count |
+| 3 | `close` | fd |
+| 9 | `mmap` | address, length, protection, flags, fd, offset |
+| 11 | `munmap` | address, length |
+| 60 | `exit` | status (ends this thread) |
+| 63 | `uname` | pointer to a `struct utsname` |
+| 231 | `exit_group` | status (ends every thread of the process) |
+| 257 | `openat` | directory fd, path, flags, mode |
+
+The numbers belong to **Linux on x86-64** only. 32-bit x86 Linux uses different numbers and the `int 0x80` instruction; ARM64 and RISC-V Linux share yet another table (where `write` is 64). Never copy system-call numbers between architectures.
+
+### Results and errors
+
+A system call returns its result in `rax`. On success that is a meaningful value: the number of bytes written, a new file descriptor, an address. On failure, the raw kernel interface returns a **negative error number**, `−errno`, always in the range **−4095 to −1**. So the standard test for failure is an unsigned comparison:
+
+```asm
+        cmp     rax, -4095
+        jae     .Lerror          # rax is -4095 .. -1: a failure, and -rax is the error number
+```
+
+Why test that exact range instead of simply "is `rax` negative"? Because the range is the kernel's actual promise. Results are 64-bit values, and the kernel only guarantees that the top 4095 of them are never valid answers; the C library's wrappers use exactly this range test. On 32-bit systems, where memory addresses above 2 GB looked negative as signed numbers, code that tested the sign treated successful `mmap` calls as failures.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Calls, errors and memory">
+
+### Catching an error
+
+This program writes to file descriptor 42, which it never opened, then prints what the kernel answered. It uses two small helper functions: `print_str` and `print_i64`, a signed version of the printer from the last lesson that adds a minus sign for negative numbers.
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+msg:    .ascii  "Is anyone listening?\n"
+        .equ    msg_len, . - msg
+said:   .ascii  "write returned "
+        .equ    said_len, . - said
+errno_is:
+        .ascii  "error number "
+        .equ    errno_is_len, . - errno_is
+
+        .text
+        .globl _start
+_start:
+        mov     eax, 1              # write(42, msg, msg_len)
+        mov     edi, 42             # a file descriptor this program never opened
+        lea     rsi, [rip + msg]
+        mov     edx, msg_len
+        syscall
+        mov     rbx, rax            # keep the result: rbx is callee-saved
+
+        lea     rdi, [rip + said]
+        mov     esi, said_len
+        call    print_str
+        mov     rdi, rbx
+        call    print_i64
+
+        cmp     rbx, -4095          # results from -4095 to -1 are errors
+        jb      .Lexit              # (unsigned compare: anything below is a real result)
+        lea     rdi, [rip + errno_is]
+        mov     esi, errno_is_len
+        call    print_str
+        mov     rdi, rbx
+        neg     rdi                 # -9 -> error number 9
+        call    print_i64
+
+.Lexit:
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# print_str(address: rdi, length: rsi)
+print_str:
+        mov     rdx, rsi
+        mov     rsi, rdi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        ret
+
+# print_i64(n: rdi) -- signed decimal and a newline
+print_i64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        test    rax, rax
+        jns     .Lpositive
+        neg     rax                 # work with the absolute value
+.Lpositive:
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        test    rdi, rdi            # was the number negative?
+        jns     .Lwrite
+        dec     rsi
+        mov     BYTE PTR [rsi], '-'
+.Lwrite:
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+write returned -9
+error number 9
+```
+
+Error 9 is `EBADF`, "bad file descriptor". The names live in the C header `errno.h` and the `errno(3)` manual page. Running the program under `strace` shows the same thing from the kernel's side; `strace` decodes the error for you:
+
+```text
+execve("./a", ["./a"], 0x7ffd14a7b150 /* 95 vars */) = 0
+write(42, "Is anyone listening?\n", 21) = -1 EBADF (Bad file descriptor)
+write(1, "write returned ", 15)         = 15
+write(1, "-9\n", 3)                     = 3
+write(1, "error number ", 13)           = 13
+write(1, "9\n", 2)                      = 2
+exit(0)                                 = ?
++++ exited with 0 +++
+```
+
+`strace` prints `-1 EBADF` because it shows calls the way C programmers see them, which brings us to a detail of the C library: its wrapper functions turn the kernel's `−9` into a return value of `−1` and store `9` in the variable `errno`. In assembly without libc you get the raw `−9` and decode it yourself.
+
+### Asking for memory
+
+Our programs have used fixed buffers in `.bss` and on the stack. When a program needs memory whose size it only learns while running, it asks the kernel with `mmap`, which maps fresh pages into the program's address space. (C's `malloc` does this too, behind the scenes, and carves the pages into smaller pieces.) A page on x86-64 Linux is normally 4096 bytes, and anonymous pages arrive filled with zeros.
+
+`mmap` takes six arguments, so this is where `r10` earns its place. The flags are constants from the kernel headers; `.equ` gives them names:
+
+```asm check
+        .intel_syntax noprefix
+
+        .equ    SYS_WRITE, 1
+        .equ    SYS_MMAP, 9
+        .equ    SYS_MUNMAP, 11
+        .equ    SYS_EXIT, 60
+        .equ    PROT_READ, 1
+        .equ    PROT_WRITE, 2
+        .equ    MAP_PRIVATE, 0x02
+        .equ    MAP_ANONYMOUS, 0x20
+        .equ    PAGE, 4096
+        .equ    ROWS, 5
+
+        .text
+        .globl _start
+_start:
+        # p = mmap(NULL, PAGE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+        mov     eax, SYS_MMAP
+        xor     edi, edi            # address: let the kernel choose
+        mov     esi, PAGE           # length
+        mov     edx, PROT_READ | PROT_WRITE
+        mov     r10d, MAP_PRIVATE | MAP_ANONYMOUS   # 4th argument: r10, not rcx
+        mov     r8, -1              # no file
+        xor     r9d, r9d            # offset 0
+        syscall
+        cmp     rax, -4095
+        jae     .Lfail
+        mov     rbx, rax            # rbx = our fresh, zero-filled page
+
+        # Draw a triangle: row r (1..ROWS) has r stars and a newline.
+        mov     rdi, rbx            # rdi = where the next byte goes
+        mov     ecx, 1              # r = 1
+.Lrow:
+        mov     edx, ecx            # stars left in this row
+.Lstar:
+        mov     BYTE PTR [rdi], '*'
+        inc     rdi
+        dec     edx
+        jnz     .Lstar
+        mov     BYTE PTR [rdi], 10
+        inc     rdi
+        inc     ecx
+        cmp     ecx, ROWS
+        jbe     .Lrow
+
+        # write(1, p, bytes drawn)
+        mov     rdx, rdi
+        sub     rdx, rbx
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        mov     rsi, rbx
+        syscall
+
+        # munmap(p, PAGE)
+        mov     eax, SYS_MUNMAP
+        mov     rdi, rbx
+        mov     esi, PAGE
+        syscall
+
+        mov     eax, SYS_EXIT
+        xor     edi, edi
+        syscall
+
+.Lfail:
+        mov     eax, SYS_EXIT
+        mov     edi, 1
+        syscall
+```
+
+It prints:
+
+```text
+*
+**
+***
+****
+*****
+```
+
+Under `strace` it showed the following; the address the kernel chose changes from run to run, because of address space layout randomisation:
+
+```text
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x761ce60ca000
+write(1, "*\n**\n***\n****\n*****\n", 20) = 20
+munmap(0x761ce60ca000, 4096)            = 0
+```
+
+User-space addresses on x86-64 Linux are normally below `0x800000000000`, the lower half of the 48-bit address space; the upper half belongs to the kernel. That is why the program can keep the pointer in a register and use it like any other number.
+
+<Example title="Asking the kernel who it is">
+
+Some calls fill a structure you provide. `uname` writes six fixed-size text fields of 65 bytes each, each ending in a zero byte: the system name, the network name, the kernel release, the version, the machine type and the domain. The program prints the first and the fifth. Its `print_cstr` finds the terminating zero, then finishes with `je print_str`, a **tail call**: jumping to another function instead of calling it means that function's `ret` returns straight to our caller.
+
+```asm check
+        .intel_syntax noprefix
+
+        .equ    SYS_WRITE, 1
+        .equ    SYS_UNAME, 63
+        .equ    SYS_EXIT, 60
+        .equ    FIELD, 65                # each field of struct utsname is 65 bytes
+
+        .section .bss
+utsname:
+        .skip   6 * FIELD               # sysname, nodename, release, version, machine, domainname
+
+        .section .rodata
+space:  .ascii  " "
+newline: .ascii "\n"
+
+        .text
+        .globl _start
+_start:
+        mov     eax, SYS_UNAME          # uname(&utsname)
+        lea     rdi, [rip + utsname]
+        syscall
+        test    rax, rax
+        jnz     .Lfail                  # 0 means success
+
+        lea     rdi, [rip + utsname]    # field 0: the operating system's name
+        call    print_cstr
+        lea     rdi, [rip + space]
+        mov     esi, 1
+        call    print_str
+        lea     rdi, [rip + utsname + 4 * FIELD]    # field 4: the machine type
+        call    print_cstr
+        lea     rdi, [rip + newline]
+        mov     esi, 1
+        call    print_str
+
+        mov     eax, SYS_EXIT
+        xor     edi, edi
+        syscall
+.Lfail:
+        mov     eax, SYS_EXIT
+        mov     edi, 1
+        syscall
+
+# print_cstr(address: rdi) -- print a zero-terminated string
+print_cstr:
+        xor     esi, esi                # length = 0
+.Lscan:
+        cmp     BYTE PTR [rdi + rsi], 0
+        je      print_str               # found the end: print_str(rdi, rsi) and return from there
+        inc     rsi
+        jmp     .Lscan
+
+# print_str(address: rdi, length: rsi)
+print_str:
+        mov     rdx, rsi
+        mov     rsi, rdi
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        syscall
+        ret
+```
+
+On any x86-64 Linux system it prints:
+
+```text
+Linux x86_64
+```
+
+The kernel release and host name fields would differ from machine to machine, which is why this program leaves them out.
+
+</Example>
+
+</Section>
+
+<Section id="human" kind="human" title="System calls in real systems">
+
+**They are not free.** A system call switches privilege level, saves and restores state, and on processors that need mitigations for speculative-execution attacks, may flush internal buffers. Measured costs range from around a hundred nanoseconds to over a microsecond depending on processor, kernel and mitigations. That is why C's `printf` collects output in a buffer and calls `write` once per line or once per few kilobytes, and why our programs that write one digit per call would be slow at scale.
+
+**Some calls avoid the kernel entirely.** Asking the time is so common that Linux maps a small library called the **vDSO** into every process; functions such as `clock_gettime` read the time from shared memory without a `syscall`. If you `strace` a program that reads the clock in a loop, you will often see no system calls at all.
+
+**Linux keeps its system-call interface stable.** A program that called `write` with number 1 in 2005 still runs today; the kernel developers treat breaking user programs as a bug. That is unusual. On macOS, Windows and OpenBSD, the only supported interface is the system library, and the raw numbers may change between releases. This is why Go, which makes system calls directly on Linux, goes through the system library on macOS, and why assembly that bypasses libc is a Linux habit, not a universal one.
+
+**Partial results are real.** `write` may write fewer bytes than you asked, especially to pipes and sockets, and many calls can fail with `EINTR` when a signal arrives. Robust code loops: write, add the result to the pointer, subtract it from the count, and repeat until the count is zero, retrying on `EINTR`. The small examples here skip that loop; production code does not.
+
+**Seccomp and containers filter them.** Because every interaction with the outside world is a system call, they are where security policies are enforced. Container runtimes and browsers install **seccomp** filters that allow only the calls a program needs, and tools like `strace` are the first step in writing such a policy.
+
+</Section>
+
+<Section id="reading" kind="reading" title="Finding the numbers yourself">
+
+You should never have to trust a table in a tutorial, including this one. Everything a system-call programmer needs is already on a Linux machine with the kernel headers installed (the `linux-libc-dev` package on Debian and Ubuntu):
+
+- **Call numbers.** `/usr/include/x86_64-linux-gnu/asm/unistd_64.h` (the path varies a little between distributions) has one line per call, such as `#define __NR_write 1` and `#define __NR_exit_group 231`. In the kernel's own source tree, the master list for x86-64 is `arch/x86/entry/syscalls/syscall_64.tbl`.
+- **Constants.** The flag values used with `mmap` come from `/usr/include/asm-generic/mman-common.h`, where you will find `PROT_WRITE` defined as `0x2` and `MAP_ANONYMOUS` as `0x20`. `grep -r` across `/usr/include` finds almost any constant in seconds.
+- **Meaning.** Section 2 of the manual describes each call: `man 2 write`, `man 2 mmap`. Its *ERRORS* section lists every error number the call can return and why, which is how you learn that `write` on an unopened descriptor gives `EBADF`.
+- **Structure layouts.** For calls that fill a structure, such as `uname` or `fstat`, the manual page shows the C declaration. Work out each field's offset from its size and alignment, as we did with `struct utsname`, or let a C compiler tell you by printing `offsetof(struct stat, st_size)` in a three-line C program.
+
+The manual pages describe the C library wrappers, so read them with one translation in mind: where the page says "returns −1 and sets errno to EBADF", the raw call returns −9 in `rax`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Putting the fourth argument in `rcx`.** That is the function-call convention. For `syscall` the fourth argument goes in `r10`, because the instruction overwrites `rcx`. An `mmap` with its flags in `rcx` receives whatever was in `r10` instead and usually fails with `EINVAL`.
+
+</Misconception>
+
+<Misconception>
+
+**Checking for errors with "is `rax` negative?".** It happens to work for most calls on x86-64 today, but it is not the kernel's contract, and it broke on 32-bit systems, where valid addresses could have the top bit set. The robust test is the unsigned comparison against −4095 shown in this lesson, the same one the C library uses.
+
+</Misconception>
+
+<Misconception>
+
+**Expecting `errno` without libc.** `errno` is a C library variable. The raw kernel interface returns the negated error number in `rax` and sets nothing else.
+
+</Misconception>
+
+<Misconception>
+
+**Using `exit` in a multithreaded program.** Linux's `exit` (60) ends only the calling thread. C's `exit()` function calls `exit_group` (231), which ends the whole process. In our single-threaded programs they behave the same.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs and return values below were checked by running the programs.
+
+<Exercises/>
+
+</Section>

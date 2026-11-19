@@ -1,6 +1,7 @@
 import type { MetadataRoute } from "next";
 import { LOCALES } from "@/i18n/config";
 import { getComputeReport, getGraph, getLeanReport, lessonSlugs, trailSlugs } from "@/lib/content";
+import { getCourses } from "@/lib/courses";
 import { href } from "@/lib/href";
 
 export const dynamic = "force-static";
@@ -24,6 +25,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
     "contribute/",
     "languages/",
     "verification/",
+    "lingua/",
+    ...getCourses().flatMap((c) => [`${c.path}/`, ...c.slugs.map((s) => `${c.path}/${s}/`)]),
     ...lessonSlugs().flatMap((s) => [`math/lessons/${s}/`, `practice/${s}/`]),
     ...trailSlugs().map((s) => `math/trails/${s}/`),
     ...getGraph().topics.map((t) => `math/topics/${t.id}/`),

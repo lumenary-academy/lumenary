@@ -1,0 +1,366 @@
+---
+title: The memory hierarchy
+subtitle: Why the processor spends much of its time waiting, how caches hide the wait, and how to write code that the caches like.
+minutes: 55
+objectives:
+  - Describe the levels of the memory hierarchy and their latencies as orders of magnitude
+  - Explain temporal and spatial locality, and why they make caches work
+  - Split an address into tag, index and offset, and simulate a set-associative LRU cache
+  - Classify misses as compulsory, capacity or conflict
+  - Predict how array traversal order, loop order and tiling change cache behaviour, and measure it
+prerequisites: [logic-to-processor, bits-and-bytes, complexity]
+related: [math.comp.algorithms-and-efficiency]
+references:
+  - title: What every programmer should know about memory
+    author: Ulrich Drepper
+    year: 2007
+    url: https://lwn.net/Articles/250967/
+    note: A long, detailed tour of caches, DRAM and how to program for them (LWN series; a PDF version is also available).
+  - title: Latency numbers every programmer should know (interactive)
+    author: Colin Scott
+    url: https://colin-scott.github.io/personal_website/research/interactive_latency.html
+    note: An interactive chart of approximate latencies by year; treat the numbers as orders of magnitude.
+  - title: Designs, lessons and advice from building large distributed systems
+    author: Jeff Dean
+    year: 2009
+    url: https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf
+    note: The keynote slides that popularised a table of "numbers everyone should know".
+  - title: Evaluating associativity in CPU caches
+    author: Mark D. Hill and Alan Jay Smith
+    year: 1989
+    url: https://doi.org/10.1109/12.40842
+    note: The source of the compulsory, capacity and conflict classification of misses.
+  - title: The working set model for program behavior
+    author: Peter J. Denning
+    year: 1968
+    url: https://doi.org/10.1145/363095.363141
+---
+
+<Section id="motivation" kind="motivation" title="Same work, different speed">
+
+Here are two ways to add up every number in a large two-dimensional array: row by row, or column by column. They do exactly the same additions, the same number of times, and both are $O(n^2)$. Yet on a real computer one of them can be several times slower than the other, and in a compiled language the gap can be ten times or more. Big-O notation, from <LessonLink slug="complexity">Complexity</LessonLink>, counts operations and assumes every memory access costs the same. On real hardware that assumption is false by orders of magnitude.
+
+The reason is physical. A modern processor core can start several instructions every third of a nanosecond, but fetching a value from main memory takes on the order of 100 nanoseconds, the time for several hundred instructions. If the processor really had to wait for main memory on every load, it would sit idle almost all of the time. It does not, because between the core and main memory sit several layers of smaller, faster memories, the **caches**, that keep copies of recently used data. When a program's accesses follow predictable patterns, the caches hide nearly all of the waiting. When they do not, the program runs at the speed of memory, not of the processor.
+
+This lesson explains that hierarchy, simulates a cache in Python, and shows how the order in which you touch data decides which kind of program you have written.
+
+</Section>
+
+<Section id="hierarchy" kind="definitions" title="The levels, and how far away each one is">
+
+Each level of the hierarchy is larger, slower and cheaper per byte than the one above it. The numbers below are **rough orders of magnitude** for a typical laptop or server in the mid-2020s. Exact values vary severalfold between processors and change over the years, so learn the *ratios*, not the digits.
+
+| Level | Typical size | Typical latency | If 1 ns were 1 second |
+| --- | --- | --- | --- |
+| Registers | hundreds of bytes to a few KB per core | under 1 ns (one cycle) | under a second |
+| L1 cache | 32–64 KB per core | about 1 ns (a few cycles) | about a second |
+| L2 cache | 0.25–2 MB per core | a few ns | a few seconds |
+| L3 cache | several MB to 100+ MB, shared | 10–20 ns | 10–20 seconds |
+| Main memory (DRAM) | gigabytes | 50–100 ns | 1–2 minutes |
+| NVMe SSD, random read | terabytes | tens of µs | about a day |
+| Round trip within a data centre | – | hundreds of µs | several days |
+| Hard disk seek | terabytes | several ms | a few months |
+| Round trip between continents | – | 100–200 ms | several years |
+
+<Figure caption="The same latencies on a logarithmic scale: each tick is ten times the one before. Values are approximate orders of magnitude, not measurements of any particular machine.">
+<svg viewBox="0 0 470 240" role="img" aria-label="Horizontal bars on a logarithmic time axis from 1 nanosecond to 1 second. L1 cache is about 1 nanosecond, L2 a few nanoseconds, L3 about 15 nanoseconds, DRAM about 80 nanoseconds, an SSD read about 50 microseconds, a data-centre round trip about half a millisecond, a disk seek about 5 milliseconds, and an intercontinental round trip about 150 milliseconds.">
+  <g fill="var(--compute)" fillOpacity="0.55">
+    <rect x="130" y="12" width="3" height="16" />
+    <rect x="130" y="36" width="21.7" height="16" />
+    <rect x="130" y="60" width="42.3" height="16" />
+    <rect x="130" y="84" width="68.5" height="16" />
+  </g>
+  <g fill="var(--gold)" fillOpacity="0.6">
+    <rect x="130" y="108" width="169.2" height="16" />
+    <rect x="130" y="156" width="241.2" height="16" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="0.5">
+    <rect x="130" y="132" width="205.2" height="16" />
+    <rect x="130" y="180" width="294.5" height="16" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">
+    <text x="122" y="24">L1 cache</text>
+    <text x="122" y="48">L2 cache</text>
+    <text x="122" y="72">L3 cache</text>
+    <text x="122" y="96">DRAM</text>
+    <text x="122" y="120">SSD read</text>
+    <text x="122" y="144">data-centre round trip</text>
+    <text x="122" y="168">disk seek</text>
+    <text x="122" y="192">across continents</text>
+  </g>
+  <line x1="130" y1="206" x2="454" y2="206" stroke="currentColor" strokeWidth="1" />
+  <g stroke="currentColor" strokeWidth="1">
+    <line x1="130" y1="203" x2="130" y2="209" /><line x1="166" y1="204" x2="166" y2="208" /><line x1="202" y1="204" x2="202" y2="208" />
+    <line x1="238" y1="203" x2="238" y2="209" /><line x1="274" y1="204" x2="274" y2="208" /><line x1="310" y1="204" x2="310" y2="208" />
+    <line x1="346" y1="203" x2="346" y2="209" /><line x1="382" y1="204" x2="382" y2="208" /><line x1="418" y1="204" x2="418" y2="208" />
+    <line x1="454" y1="203" x2="454" y2="209" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="130" y="222">1 ns</text><text x="238" y="222">1 µs</text><text x="346" y="222">1 ms</text><text x="454" y="222">1 s</text>
+  </g>
+</svg>
+</Figure>
+
+Two lessons hide in this table. First, the jumps are enormous: from L1 to DRAM is about a hundredfold, from DRAM to SSD a thousandfold, from SSD to a disk seek a hundredfold. Second, the bottom rows are set by physics that engineering cannot beat. Light in optical fibre travels at about 200,000 km per second, so every 1,000 km between two machines adds at least 10 ms to a round trip, whatever the hardware.
+
+**Latency is not bandwidth.** Latency is how long until the *first* byte arrives; bandwidth is how many bytes per second flow once data is streaming. DRAM delivers on the order of ten gigabytes per second or more to a single core once a stream is going, even though each individual miss takes about 100 ns. Much of the art of fast code is turning latency-bound access (one unpredictable address at a time) into bandwidth-bound access (long predictable streams).
+
+**Why not make all memory fast?** Because the fast kinds are expensive and the big kinds are slow. The SRAM in caches uses six transistors per bit and must sit close to the core; DRAM uses one transistor and a capacitor per bit, is far denser, but needs refreshing and sits centimetres away on separate chips; flash is denser still and keeps data without power, but reads take microseconds and writes longer. Even within one technology, a bigger memory is slower, because signals must travel further and more entries must be searched. So designers build a pyramid and rely on programs to cooperate.
+
+</Section>
+
+<Section id="locality" kind="intuition" title="Locality: why caches work at all">
+
+A cache helps only if data you used recently is likely to be needed again soon. Remarkably often, it is. Programs exhibit **locality of reference**:
+
+<Definition term="temporal and spatial locality">
+
+**Temporal locality**: an item accessed now is likely to be accessed again soon (a loop counter, a running total, the instructions of a loop body). **Spatial locality**: an item near one accessed now is likely to be accessed soon (the next element of an array, the next instruction, the other fields of the same object).
+
+</Definition>
+
+Caches exploit temporal locality by **keeping** recently used data, and spatial locality by moving data in blocks: when you read one byte, the hardware fetches the whole surrounding **cache line**, 64 bytes on most current x86-64 and Arm processors (some designs use 128). Reading one 8-byte number from an array therefore brings in the next seven for free. Hardware **prefetchers** go further: when they notice a steady stride, they fetch lines before the program asks for them.
+
+<Analogy>
+
+You are writing an essay in a library. Your desk holds the few books you are using right now (registers and L1); the trolley beside you holds the dozen you have used today (L2 and L3); the shelves hold everything else (main memory), and the off-site store needs a day's notice (the disk). You work quickly as long as you mostly reach for books on the desk, and when you do fetch from the shelves, you bring back the neighbouring volumes too, because you will probably want them. A student who needs one sentence from each of a thousand different books, in random order, will spend the day walking.
+
+</Analogy>
+
+Peter Denning's **working set** idea (1968) sharpens this: at any moment a program is actively using some set of data. If the working set fits in a level of the hierarchy, the program runs at roughly that level's speed. Much performance work consists of shrinking the working set or reordering the computation so that it fits.
+
+</Section>
+
+<Section id="caches" kind="computation" title="How a cache works, and a simulator">
+
+A cache holds a fixed number of lines. When the processor requests an address, the cache must find out quickly whether it holds the line containing that address. It does so by splitting the address into three fields.
+
+<Definition term="offset, index, tag; associativity">
+
+With lines of $B$ bytes, the low $\log_2 B$ bits of an address are the **offset** within the line. The lines of the cache are grouped into $S$ **sets**; the next $\log_2 S$ bits, the **index**, say which set a line must go in. The remaining high bits, the **tag**, are stored with the line to tell apart the many memory lines that share a set. A cache whose sets hold $W$ lines each is **$W$-way set-associative**; with $W = 1$ it is **direct-mapped** (each line has exactly one possible place), and with a single set it is **fully associative** (any line can go anywhere). When a set is full and a new line arrives, a **replacement policy**, usually an approximation of *least recently used* (LRU), chooses the victim.
+
+</Definition>
+
+<Example title="Splitting an address">
+
+A 32 KiB, 8-way cache with 64-byte lines has $32768 / 64 = 512$ lines in $512 / 8 = 64$ sets. So the offset is the low 6 bits and the index the next 6 bits. For the address `0x12345`: the offset is `0x12345 & 0x3F` $= 5$; the line number is `0x12345 >> 6` $= 1165$; the index is $1165 \bmod 64 = 13$; the tag is $1165 / 64$, rounded down, $= 18$. The hardware compares the tag 18 against the eight tags stored in set 13, all at once.
+
+</Example>
+
+Misses come in three kinds, a classification due to Mark Hill:
+
+- **Compulsory** (cold) misses: the first access to a line can never hit.
+- **Capacity** misses: the working set is larger than the cache, so lines are evicted before they are reused.
+- **Conflict** misses: the cache has room, but too many lines in use map to the same set and evict each other.
+
+Writes add one more decision. Most caches are **write-back**: a write updates only the cached copy and marks the line dirty, and the line is written to memory when it is evicted. That turns many writes to the same line into one memory transfer.
+
+The simulator below models exactly this: it tracks which lines are in each set (not the data itself) and counts hits and misses. It then replays the addresses touched by traversing an $n \times n$ array of 8-byte numbers stored row by row, as C arrays and NumPy arrays are by default.
+
+```python run
+from collections import OrderedDict
+
+class Cache:
+    """A set-associative cache with LRU replacement. It tracks only which lines are present."""
+    def __init__(self, size_bytes=32 * 1024, line_bytes=64, ways=8):
+        self.line_bytes, self.ways = line_bytes, ways
+        self.num_sets = size_bytes // (line_bytes * ways)
+        self.sets = [OrderedDict() for _ in range(self.num_sets)]
+        self.hits = self.misses = 0
+
+    def access(self, address):
+        line = address // self.line_bytes            # which 64-byte block of memory
+        index = line % self.num_sets                 # which set it must live in
+        tag = line // self.num_sets                  # tells apart the lines that share a set
+        s = self.sets[index]
+        if tag in s:
+            self.hits += 1
+            s.move_to_end(tag)                       # now the most recently used
+        else:
+            self.misses += 1
+            if len(s) == self.ways:
+                s.popitem(last=False)                # evict the least recently used
+            s[tag] = True
+
+    def report(self, label):
+        total = self.hits + self.misses
+        print(f"{label:34} {total:>8,} accesses  {self.misses:>8,} misses  ({self.misses / total:6.1%})")
+
+def traverse(n, order, cache, elem=8):
+    """Visit every element of an n x n array of 8-byte numbers stored row by row (C order)."""
+    for a in range(n):
+        for b in range(n):
+            i, j = (a, b) if order == "row" else (b, a)
+            cache.access((i * n + j) * elem)
+
+for n, order in [(512, "row"), (512, "column"), (520, "column"), (64, "column")]:
+    c = Cache()
+    traverse(n, order, c)
+    c.report(f"{n} x {n}, {order} by {order}")
+```
+
+Four results, four lessons.
+
+1. **Row by row: 12.5% misses.** Each 64-byte line holds 8 numbers; the first access to a line misses and the next seven hit. These are all compulsory misses, and a hardware prefetcher would hide most of them too.
+2. **Column by column, 512 × 512: every access misses.** Consecutive accesses are 4,096 bytes apart, so each touches a new line, and by the time the traversal comes back for the neighbouring number in the same line, the line is long gone. Worse, a stride of 4,096 bytes is a multiple of $64 \times 64$, so every element of a column maps to the *same set*: only 8 of the cache's 512 lines are usable. Those are conflict misses.
+3. **Column by column, 520 × 520: about 25%.** Padding each row by eight numbers spreads a column across all the sets, and much of each line survives until it is reused. Power-of-two array sizes are a classic trap, and padding is the classic fix.
+4. **A 64 × 64 array, column by column: 12.5%.** The whole array is 32 KiB and fits in the cache, so order barely matters. Traversal order matters once the working set outgrows the cache.
+
+</Section>
+
+<Section id="order" kind="examples" title="Why traversal order matters">
+
+### Row-major and column-major
+
+A two-dimensional array is stored in one-dimensional memory, so a language must choose. C, C++ and NumPy (by default) store **row-major**: the elements of a row are adjacent. Fortran, MATLAB, Julia and R store **column-major**. The cache-friendly loop runs its *innermost* index over adjacent elements: `for i: for j: a[i][j]` in C or NumPy, the opposite in Fortran or Julia. (Python's own list of lists is different again: each row is a separate object holding pointers to separately allocated numbers, so even row-by-row access chases pointers. This is one reason NumPy exists.)
+
+### Loop order in matrix multiplication
+
+Matrix multiplication $C = AB$ with the textbook loop order `i, j, k` computes each $C_{ij}$ as a dot product of row $i$ of $A$ with column $j$ of $B$, so its innermost loop walks *down a column* of $B$. Swapping the loops to `i, k, j` computes the same sums in a different order: the inner loop now walks along a row of $B$ and a row of $C$. Better still is **tiling** (or *blocking*): split the matrices into small square tiles that fit in the cache together, and finish all the work on one set of tiles before moving on.
+
+```python run
+from collections import OrderedDict
+
+class Cache:
+    def __init__(self, size_bytes, line_bytes, ways):
+        self.line_bytes, self.ways = line_bytes, ways
+        self.num_sets = size_bytes // (line_bytes * ways)
+        self.sets = [OrderedDict() for _ in range(self.num_sets)]
+        self.hits = self.misses = 0
+
+    def access(self, address):
+        line = address // self.line_bytes
+        s, tag = self.sets[line % self.num_sets], line // self.num_sets
+        if tag in s:
+            self.hits += 1
+            s.move_to_end(tag)
+        else:
+            self.misses += 1
+            if len(s) == self.ways:
+                s.popitem(last=False)
+            s[tag] = True
+
+def matmul_trace(n, order, cache, tile=16):
+    """Feed the cache the memory accesses of C = A x B (n x n doubles, row-major) in a given loop order."""
+    A, B, C = 0, n * n * 8, 2 * n * n * 8                 # three arrays, one after another in memory
+    at = lambda base, r, c: base + (r * n + c) * 8
+    if order == "ijk":
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    cache.access(at(A, i, k)); cache.access(at(B, k, j))
+                cache.access(at(C, i, j))
+    elif order == "ikj":
+        for i in range(n):
+            for k in range(n):
+                cache.access(at(A, i, k))
+                for j in range(n):
+                    cache.access(at(B, k, j)); cache.access(at(C, i, j))
+    elif order == "tiled":
+        for kk in range(0, n, tile):
+            for jj in range(0, n, tile):
+                for i in range(n):
+                    for k in range(kk, kk + tile):
+                        cache.access(at(A, i, k))
+                        for j in range(jj, jj + tile):
+                            cache.access(at(B, k, j)); cache.access(at(C, i, j))
+
+n = 64
+for order in ["ijk", "ikj", "tiled"]:
+    c = Cache(size_bytes=8 * 1024, line_bytes=64, ways=4)   # a small cache, so the effect shows at small n
+    matmul_trace(n, order, c)
+    total = c.hits + c.misses
+    print(f"C = A x B, n={n}, loop order {order:5}: {total:>7,} accesses, {c.misses:>7,} misses ({c.misses / total:5.1%})")
+```
+
+Same arithmetic, same result, and the miss rate drops from about one access in two to a few per cent. Optimised linear-algebra libraries (the BLAS implementations that NumPy calls) apply tiling at every level, registers, L1, L2 and L3, which is a large part of why `a @ b` in NumPy can be thousands of times faster than a triple loop in Python (the rest is avoiding the interpreter and using vector instructions). The same thinking drives the design of GPU kernels for machine learning, as you will see in <LessonLink slug="accelerators-and-parallelism">Accelerators and parallelism</LessonLink>.
+
+### Measuring it for real
+
+Simulations count misses; the real question is time. The block below times NumPy summing a 2000 × 2000 array of floats (32 MB, larger than most caches) row by row and column by column, and then reads 4 million elements in order and in a random order. Your numbers will differ from anyone else's: they depend on your processor's caches and prefetchers, and on the browser if you run it there.
+
+```python run
+import time
+import numpy as np
+
+n = 2000
+a = np.arange(n * n, dtype=np.float64).reshape(n, n)   # 32 MB, stored row by row (C order)
+
+def timed(label, f, repeat=3):
+    best = float("inf")
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        result = f()
+        best = min(best, time.perf_counter() - t0)
+    print(f"{label:38} {best * 1000:8.1f} ms")
+    return best, result
+
+t_rows, s1 = timed("sum each row (contiguous slices)", lambda: sum(a[i, :].sum() for i in range(n)))
+t_cols, s2 = timed("sum each column (stride of 16,000 B)", lambda: sum(a[:, j].sum() for j in range(n)))
+assert s1 == s2
+print(f"same arithmetic, same answer; columns took {t_cols / t_rows:.1f} times as long")
+
+flat = a.ravel()
+rng = np.random.default_rng(0)
+perm = rng.permutation(flat.size)
+t_seq, _ = timed("gather 4M elements in order", lambda: flat[np.arange(flat.size)].sum())
+t_rand, _ = timed("gather 4M elements in random order", lambda: flat[perm].sum())
+print(f"random order took {t_rand / t_seq:.1f} times as long")
+```
+
+When this lesson was tested, columns took a little over twice as long as rows, and random order took between one and a half and four times as long as sequential order, depending on whether the code ran natively or in a browser. Large modern caches and prefetchers soften the effect for an array of this size; push the array well beyond your L3 cache, or write the loops in C, and the gaps grow to many times.
+
+### Data layout beyond arrays
+
+The same reasoning applies to every data structure. A **linked list** scatters its nodes across memory, so traversing it is a chain of dependent loads, each possibly a cache miss: this is called *pointer chasing*, and it is why an array (a Python `list` of references, or better a NumPy array of values) usually beats a linked list in practice even where their big-O costs match. When you process one field of many records, an **array of structures** drags every record's other fields through the cache, while a **structure of arrays** (one array per field) touches only what you need; column-oriented databases and data-frame libraries are built on that idea.
+
+</Section>
+
+<Section id="beyond" kind="human" title="The same idea at every level">
+
+Caching is not only a hardware trick. The same pattern, a small fast store in front of a big slow one, exploiting locality, recurs at every layer you will study:
+
+- **Virtual memory.** Every address a program uses is translated by the hardware to a physical address, using page tables kept in memory, and a small cache of recent translations called the **TLB**. Main memory itself acts as a cache for disk. That is the next lesson, <LessonLink slug="operating-systems">Operating systems</LessonLink>.
+- **The operating system's page cache** keeps recently read file contents in spare RAM, which is why the second time you open a big file is much faster than the first, and why "free" memory on a busy Linux machine is usually small.
+- **Databases** keep a buffer pool of disk pages in memory and choose data layouts (B-trees, column stores) for locality; see <LessonLink slug="databases">Databases</LessonLink>.
+- **The web** relies on browser caches, content delivery networks with servers near users, and in-memory caches such as Redis or Memcached in front of databases.
+
+In every case the questions are the same ones you have just asked: what is the working set, does it fit, how are items placed and evicted, and what happens on a miss?
+
+**Tools for the real thing.** On Linux, `lscpu` and the files under `/sys/devices/system/cpu/cpu0/cache/` describe your caches; `perf stat -e cache-references,cache-misses ./program` counts real misses with the processor's hardware counters; and Valgrind's `cachegrind` simulates the caches instruction by instruction, much like our simulator but for whole programs.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Two algorithms with the same big-O run at the same speed."** Big-O hides constant factors, and memory behaviour is often the biggest of them. An $O(n \log n)$ algorithm with good locality can beat an $O(n)$ one that misses the cache on every step for all practical $n$.
+
+</Misconception>
+
+<Misconception>
+
+**"A bigger cache is simply better."** Bigger caches are slower to search and further away, which is why there are several levels instead of one large one. Each level balances size against latency.
+
+</Misconception>
+
+<Misconception>
+
+**"Memory access costs the same everywhere."** The RAM model of complexity theory assumes so; hardware does not. An access can cost one cycle or several hundred depending on where the data happens to be.
+
+</Misconception>
+
+<Misconception>
+
+**"An SSD is just slow RAM."** It is a block device: data moves in pages of kilobytes, through the operating system, with latencies of tens of microseconds, about a thousand times DRAM's. Code that treats storage like memory (many small random reads) pays for every one.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

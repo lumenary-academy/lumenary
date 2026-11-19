@@ -2,11 +2,15 @@ import "server-only";
 import type { Locale } from "@/i18n/config";
 import type { RenderedExercise } from "@/components/exercises/types";
 import { getExercises, getLesson } from "./content";
+import type { Exercise } from "./schema";
 import { mdInline, mdToHtml } from "./markdown";
 
 export function renderExercises(slug: string, locale: Locale): RenderedExercise[] {
-  const { exercises } = getExercises(slug, locale);
-  const lessonTitle = getLesson(slug, locale).frontmatter.title;
+  return renderExerciseList(getExercises(slug, locale).exercises, slug, getLesson(slug, locale).frontmatter.title);
+}
+
+/** Exercises with their markdown and maths rendered to HTML, for the client components. */
+export function renderExerciseList(exercises: Exercise[], slug: string, lessonTitle: string): RenderedExercise[] {
   return exercises.map((ex) => {
     const base = {
       id: ex.id,
@@ -27,6 +31,8 @@ export function renderExercises(slug: string, locale: Locale): RenderedExercise[
         return { ...base, type: "set", answer: ex.answer, feedback: ex.feedback.map((f) => ({ match: f.match, html: mdInline(f.message) })) };
       case "python":
         return { ...base, type: "python", starter: ex.starter, tests: ex.tests };
+      case "text":
+        return { ...base, type: "text", answers: ex.answers, ...(ex.lang ? { lang: ex.lang } : {}), feedback: ex.feedback.map((f) => ({ match: f.match, html: mdInline(f.message) })) };
     }
   });
 }

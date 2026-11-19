@@ -1,0 +1,338 @@
+---
+title: Dynamic memory and its bugs
+subtitle: The stack, static storage and the heap, malloc, calloc, realloc and free, ownership, and the sanitizers that catch the mistakes.
+minutes: 65
+objectives:
+  - Explain the difference between automatic, static and allocated storage, and when each is right
+  - Allocate, resize and free memory with malloc, calloc, realloc and free, checking every result
+  - Build a growable array with amortised constant-time appends
+  - State and follow ownership rules for allocated memory, including flexible array members
+  - Recognise leaks, overflows, use-after-free and double free, and find them with AddressSanitizer and Valgrind
+prerequisites: [structs-enums-and-unions]
+references:
+  - title: cppreference.com, Dynamic memory management
+    url: https://en.cppreference.com/w/c/memory
+    note: malloc, calloc, realloc, free and aligned_alloc, with their exact guarantees.
+  - title: AddressSanitizer (Clang documentation)
+    url: https://clang.llvm.org/docs/AddressSanitizer.html
+    note: What ASan detects, how it works, its cost, and its options.
+  - title: GCC manual, Instrumentation Options
+    url: https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html
+    note: The -fsanitize options supported by GCC, including address, undefined and leak.
+  - title: Valgrind
+    url: https://valgrind.org/
+    note: A dynamic analysis framework; its Memcheck tool finds memory errors without recompiling.
+---
+
+<Section id="motivation" kind="motivation" title="Memory you ask for">
+
+So far every variable in our programs has had a size known when the program was compiled: an `int`, an array of 5 elements, a struct. Real programs rarely know their sizes in advance. A text editor does not know how long the file will be; a web server does not know how many connections will arrive; a compiler does not know how many functions it will meet. They must ask for memory **while running**, keep it as long as they need it, and give it back.
+
+C hands that job entirely to you. There is no garbage collector: memory you allocate stays allocated until you free it, and freeing it is your promise that nothing will use it again. Get it right and C programs are lean and predictable, which is why C runs in places where memory is counted in kilobytes. Get it wrong and you get the bugs that dominate security advisories: reading or writing past the end of a block, using memory after freeing it, freeing it twice, or never freeing it at all. This lesson teaches the functions, the ownership discipline that keeps them safe, and the tools that find the mistakes anyway.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Three kinds of storage">
+
+| Storage | Where it lives | Lifetime | Examples |
+| --- | --- | --- | --- |
+| automatic | the stack | until the enclosing block ends | local variables, parameters |
+| static | a fixed data area | the whole run of the program | globals, `static` locals, string literals |
+| allocated | the heap | from `malloc` until `free` | anything whose size or lifetime is decided at run time |
+
+The stack is fast and automatic but small (typically 8 MB for a Linux program's main thread) and tied to function calls. Static storage is simple but fixed. The **heap** is a large pool managed by the C library's allocator, which obtains memory from the operating system (with system calls such as `mmap` and `brk`) and hands it out in pieces.
+
+<Definition term="allocation functions">
+
+`malloc(n)` returns a pointer to `n` bytes of uninitialised memory, or `NULL` if it cannot. `calloc(count, size)` returns zero-filled memory for `count` elements of `size` bytes, checking the multiplication for overflow. `realloc(p, n)` resizes the block at `p` to `n` bytes, moving it if necessary, and returns the new address (or `NULL`, leaving the old block untouched). `free(p)` releases a block obtained from these functions; `free(NULL)` does nothing.
+
+</Definition>
+
+All three allocation functions return memory suitably aligned for any ordinary type, as a `void *` that converts to any object pointer without a cast in C.
+
+```c check
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    size_t days = 7;                    /* imagine this came from a file or the user */
+    double *rain = malloc(days * sizeof *rain);
+    if (rain == NULL) {
+        fprintf(stderr, "out of memory\n");
+        return EXIT_FAILURE;
+    }
+
+    for (size_t i = 0; i < days; i++) {
+        rain[i] = (double)(i * i % 5);  /* some made-up measurements */
+    }
+
+    double total = 0;
+    for (size_t i = 0; i < days; i++) total += rain[i];
+    printf("total %.1f mm, average %.2f mm\n", total, total / (double)days);
+
+    free(rain);                         /* every malloc has exactly one free */
+    rain = NULL;                        /* so a later mistake fails loudly */
+
+    int *counts = calloc(10, sizeof *counts);   /* calloc zero-fills */
+    if (counts == NULL) return EXIT_FAILURE;
+    printf("calloc'd counts start at %d and %d\n", counts[0], counts[9]);
+    free(counts);
+    return 0;
+}
+```
+
+```text
+total 11.0 mm, average 1.57 mm
+calloc'd counts start at 0 and 0
+```
+
+The idiom `malloc(days * sizeof *rain)` takes the element size from the pointer itself, so it stays correct if the type of `rain` changes. Checking for `NULL` matters even though Linux rarely refuses small allocations: on embedded systems, under memory limits in containers, or with sizes computed from untrusted input, allocation does fail, and dereferencing `NULL` turns a recoverable error into a crash. Setting the pointer to `NULL` after `free` costs nothing and turns a later accidental use into an immediate, obvious crash instead of silent corruption.
+
+</Section>
+
+<Section id="computation" kind="computation" title="A growable array">
+
+The single most useful thing to build with `realloc` is a **dynamic array** (called a vector in C++ and a list in Python): an array that grows as you append to it. The trick that makes it efficient is to grow **geometrically**, doubling the capacity each time it fills, rather than adding one slot at a time.
+
+```c check
+#include <stdio.h>
+#include <stdlib.h>
+
+/* A growable array of ints: the most useful data structure C does not have. */
+typedef struct {
+    int *data;
+    size_t len;        /* elements in use */
+    size_t cap;        /* elements allocated */
+} IntVec;
+
+/* Returns 0 on success, -1 if memory ran out (the vector is unchanged). */
+int vec_push(IntVec *v, int value) {
+    if (v->len == v->cap) {
+        size_t new_cap = v->cap ? v->cap * 2 : 4;
+        int *grown = realloc(v->data, new_cap * sizeof *grown);
+        if (grown == NULL) return -1;     /* old block is still valid */
+        v->data = grown;
+        v->cap = new_cap;
+        printf("  grew to capacity %zu\n", new_cap);
+    }
+    v->data[v->len++] = value;
+    return 0;
+}
+
+void vec_free(IntVec *v) {
+    free(v->data);
+    *v = (IntVec){0};                     /* back to the empty state */
+}
+
+int main(void) {
+    IntVec squares = {0};                 /* all zero: a valid empty vector */
+    for (int i = 1; i <= 20; i++) {
+        if (vec_push(&squares, i * i) != 0) {
+            vec_free(&squares);
+            return EXIT_FAILURE;
+        }
+    }
+    printf("len %zu, cap %zu, last %d\n", squares.len, squares.cap,
+           squares.data[squares.len - 1]);
+    vec_free(&squares);
+    printf("after free: len %zu, cap %zu\n", squares.len, squares.cap);
+    return 0;
+}
+```
+
+```text
+  grew to capacity 4
+  grew to capacity 8
+  grew to capacity 16
+  grew to capacity 32
+len 20, cap 32, last 400
+after free: len 0, cap 0
+```
+
+Twenty appends caused only four reallocations. With doubling, the total number of elements ever copied during growth is less than twice the final length, so each append costs constant time **on average** (amortised), even though an individual append occasionally copies everything. Growing by a fixed amount instead (say 10 slots) would make the total copying quadratic.
+
+Two details separate correct code from almost-correct code. First, `realloc`'s result goes into a temporary, `grown`: writing `v->data = realloc(v->data, …)` directly would overwrite the only pointer to the old block with `NULL` when the allocation fails, leaking it. Second, the struct starts as `{0}`, which is a valid empty vector, because `realloc(NULL, n)` behaves like `malloc(n)` and `free(NULL)` does nothing. Designing types so that "all zeros" means "empty" removes a whole class of initialisation bugs.
+
+A real implementation would also check that `v->cap * 2` cannot overflow `size_t` before multiplying, and production libraries often grow by a factor of 1.5 instead of 2, which lets freed blocks be reused more easily. The idea is the same.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Ownership">
+
+Every allocated block must be freed **exactly once**, by someone, after everyone has finished with it. C has no syntax for "someone", so programmers establish it by convention:
+
+<Definition term="ownership">
+
+The **owner** of an allocated block is the part of the program responsible for freeing it. Ownership can be **transferred** (a function that returns allocated memory gives it to its caller) or **lent** (a function that receives a pointer only uses it during the call). A pointer that does not own its target is **borrowing** it and must not outlive the owner.
+
+</Definition>
+
+The rules should be written in comments on every function that allocates or takes pointers, and the code should follow simple patterns: a function named `…_new` or `…_create` returns an owned object, with a matching `…_free` or `…_destroy`; a function that takes `const char *` borrows.
+
+```c check
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* A message that owns its text, stored in the same allocation
+   thanks to a flexible array member. */
+typedef struct {
+    size_t length;
+    char text[];       /* flexible array member: no size here */
+} Message;
+
+Message *message_new(const char *text) {
+    size_t n = strlen(text);
+    Message *m = malloc(sizeof *m + n + 1);     /* header + characters + '\0' */
+    if (m == NULL) return NULL;
+    m->length = n;
+    memcpy(m->text, text, n + 1);
+    return m;                                    /* caller owns it: free with free() */
+}
+
+/* Returns a newly allocated string "a + sep + b"; the caller must free it. */
+char *join(const char *a, const char *sep, const char *b) {
+    size_t la = strlen(a), ls = strlen(sep), lb = strlen(b);
+    char *out = malloc(la + ls + lb + 1);
+    if (out == NULL) return NULL;
+    memcpy(out, a, la);
+    memcpy(out + la, sep, ls);
+    memcpy(out + la + ls, b, lb + 1);           /* includes b's '\0' */
+    return out;
+}
+
+int main(void) {
+    char buffer[32] = "Saturday market";
+    Message *m = message_new(buffer);
+    if (m == NULL) return EXIT_FAILURE;
+
+    strcpy(buffer, "overwritten!");             /* fine: m has its own copy */
+    printf("message (%zu chars): %s\n", m->length, m->text);
+
+    char *place = join("Kumasi", ", ", "Ghana");
+    if (place == NULL) { free(m); return EXIT_FAILURE; }
+    printf("place: %s\n", place);
+
+    free(place);
+    free(m);
+    return 0;
+}
+```
+
+```text
+message (15 chars): Saturday market
+place: Kumasi, Ghana
+```
+
+`message_new` copies the text into memory it allocates, so the message **owns** its characters and is unaffected when the original buffer is overwritten. It also uses a **flexible array member**: `char text[]` at the end of the struct has no size of its own, and one `malloc` of `sizeof *m + n + 1` bytes holds both the header and the characters. One allocation means one `free`, better cache locality and less allocator overhead. `join` returns a new string and transfers ownership to its caller, which the comment says and `main` honours. Notice how the failure path frees what was already allocated: error handling and ownership go together, which is why the `goto cleanup` pattern from lesson 3 is common in allocation-heavy code.
+
+C23 standardises `strdup` and `strndup`, long available on POSIX systems, which allocate a copy of a string; the caller owns the result.
+
+</Section>
+
+<Section id="examples" kind="examples" title="The bugs, and the tools that catch them">
+
+The four classic heap bugs are easy to write and, without tools, often invisible. Here is the first, an off-by-one loop that writes one element past a 5-element block:
+
+```c
+int *scores = malloc(5 * sizeof *scores);
+for (int i = 0; i <= 5; i++) {      /* <= : one element too many */
+    scores[i] = 100;
+}
+free(scores);
+```
+
+Compiled normally, this program ran and exited with status 0 on our machine: the stray write landed in allocator bookkeeping or padding, and nothing noticed. That is the danger: the corruption may surface much later, somewhere else, or only under an attacker's chosen input. Compiled with **AddressSanitizer** (`gcc -g -fsanitize=address,undefined`), the same program stops at the bad write. The start of the report, with addresses shortened:
+
+```text
+==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x503000000054 ...
+WRITE of size 4 at 0x503000000054 thread T0
+    #0 ... in main bug1.c:6
+
+0x503000000054 is located 0 bytes to the right of 20-byte region [0x503000000040,0x503000000054)
+allocated by thread T0 here:
+    #0 ... in __interceptor_malloc ...
+    #1 ... in main bug1.c:4
+```
+
+It names the bug, the line of the bad write, the size of the block, and the line that allocated it. A **use after free** gets an equally clear report (`heap-use-after-free`, with three stack traces: the bad access, the `free` and the original `malloc`); without the sanitizer, our test of that bug printed a meaningless number, −794597505, and exited normally. A **double free** is reported as `attempting double-free`. And at exit, ASan's leak checker lists memory that was never freed:
+
+```text
+==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 9 byte(s) in 1 object(s) allocated from:
+    #0 ... in __interceptor_malloc ...
+    #1 ... in copy_name bug3.c:5
+    #2 ... in main bug3.c:11
+
+SUMMARY: AddressSanitizer: 9 byte(s) leaked in 1 allocation(s).
+```
+
+That leak came from calling a function that returns an owned string and ignoring the result: an ownership bug, found mechanically.
+
+### The tools
+
+- **AddressSanitizer** (`-fsanitize=address`, in GCC and Clang) instruments every memory access. Programs run roughly twice as slowly and use more memory, which is fine for tests and development builds. It finds overflows of heap, stack and global arrays, use after free, double free and leaks.
+- **UndefinedBehaviorSanitizer** (`-fsanitize=undefined`) catches signed overflow, invalid shifts, misaligned pointers and more; lesson 9 covers it. The two are usually enabled together.
+- **Valgrind's Memcheck** runs an unmodified program in a simulated processor and reports similar errors, more slowly (often 10–50 times) but without recompiling. On the leak above it reported `9 bytes in 1 blocks are definitely lost` with the same stack.
+- **Static analysers** (GCC's `-fanalyzer`, Clang's static analyser, clang-tidy, commercial tools) find some of these bugs without running the code at all.
+
+Professional C projects run their whole test suite under sanitizers in continuous integration, so that a memory bug fails a build rather than a customer's system.
+
+</Section>
+
+<Section id="human" kind="human" title="How professionals manage memory">
+
+Large C programs rarely call `malloc` and `free` for every little object. Over decades, a few strategies have proved themselves:
+
+- **Arenas (region allocation).** Allocate one large block, hand out pieces by bumping a pointer, and free the whole region at once when a phase of work ends: a request in a server, a file in a compiler, a frame in a game. Individual objects are never freed, so they cannot be freed twice or leaked one by one, and allocation costs a few instructions. Compilers and web servers use arenas heavily; the Apache HTTP Server's memory pools are a well-known example.
+- **Pools of fixed-size objects.** When a program creates and destroys many objects of one size (network connections, tree nodes), keeping a free list of them avoids the general allocator's overhead and fragmentation.
+- **Fewer, larger allocations.** A flexible array member, a struct of arrays instead of an array of pointers, or one buffer for many strings: every allocation avoided is one that cannot fail, leak or be freed wrongly, and the data ends up closer together in memory, which caches reward.
+- **A replacement allocator.** Production systems sometimes link a different `malloc` implementation, such as jemalloc or mimalloc, for better performance under many threads, without changing their code.
+- **Clear ownership at module boundaries.** Libraries often let the caller supply the memory (a buffer and its size) or an allocator, so the library never decides on its own where memory comes from. That is why so many C APIs take a buffer argument instead of returning a newly allocated string.
+
+All of these build on the same discipline this lesson teaches: know who owns each block, and make freeing it someone's explicit job.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**`p = realloc(p, n);`** If `realloc` fails, it returns `NULL` and the old block is still allocated, but you have just overwritten the only pointer to it. Assign to a temporary, check, then update.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting the terminator when allocating for a string.** `malloc(strlen(s))` is one byte short. A string of length n needs n + 1 bytes.
+
+</Misconception>
+
+<Misconception>
+
+**"The program works, so there are no memory bugs."** Overflows and uses after free usually do not crash; they corrupt something that matters later. Only tools and tests that exercise the code under a sanitizer give real confidence.
+
+</Misconception>
+
+<Misconception>
+
+**Overflow in the size calculation.** `malloc(count * size)` with a large `count` can wrap around to a small number, allocate a tiny block, and invite an overflow. `calloc(count, size)` checks the multiplication; for `malloc`, check `count > SIZE_MAX / size` first.
+
+</Misconception>
+
+<Misconception>
+
+**Freeing memory that was not allocated, or freeing it twice.** Only pointers returned by `malloc`, `calloc` or `realloc` may be passed to `free`, and only once. Freeing a pointer into the middle of a block, a string literal or a local array is undefined behaviour.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GCC; the sanitizer reports come from GCC 11's AddressSanitizer.
+
+<Exercises/>
+
+</Section>

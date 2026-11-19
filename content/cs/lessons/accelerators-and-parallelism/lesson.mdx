@@ -1,0 +1,454 @@
+---
+title: Accelerators and distributed training
+subtitle: Why models train on GPUs and TPUs, what limits those chips, and how one training run is spread across tens of thousands of them.
+minutes: 80
+objectives:
+  - Use arithmetic intensity and the roofline model to predict whether an operation is compute-bound or memory-bound
+  - Compare FP32, BF16, FP16 and FP8, and explain mixed-precision training
+  - Budget the memory of a training run — weights, gradients, optimiser states and activations
+  - Explain data, tensor, pipeline, sequence and expert parallelism, and how ZeRO and FSDP shard state
+  - Implement ring all-reduce and count the data it moves
+  - Explain FlashAttention as an IO-aware algorithm, and implement its online-softmax core
+  - Describe how large runs survive hardware failures, and choose a checkpoint interval
+prerequisites: [memory-hierarchy, distributed-systems, attention-and-transformers, language-models]
+related: [math.algebra.linear-algebra, math.comp.numerical-analysis]
+references:
+  - title: "How to Scale Your Model"
+    author: Google DeepMind
+    year: 2025
+    url: https://jax-ml.github.io/scaling-book/
+    note: A free book on rooflines, sharding and parallelism for transformers on TPUs and GPUs.
+  - title: "In-Datacenter Performance Analysis of a Tensor Processing Unit"
+    author: Jouppi et al.
+    year: 2017
+    url: https://arxiv.org/abs/1704.04760
+  - title: "Mixed Precision Training"
+    author: Micikevicius et al.
+    year: 2017
+    url: https://arxiv.org/abs/1710.03740
+  - title: "FP8 Formats for Deep Learning"
+    author: Micikevicius et al.
+    year: 2022
+    url: https://arxiv.org/abs/2209.05433
+  - title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"
+    author: Rajbhandari, Rasley, Ruwase, He
+    year: 2019
+    url: https://arxiv.org/abs/1910.02054
+  - title: "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel"
+    author: Zhao et al.
+    year: 2023
+    url: https://arxiv.org/abs/2304.11277
+  - title: "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism"
+    author: Shoeybi et al.
+    year: 2019
+    url: https://arxiv.org/abs/1909.08053
+  - title: "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM"
+    author: Narayanan et al.
+    year: 2021
+    url: https://arxiv.org/abs/2104.04473
+    note: How tensor, pipeline and data parallelism combine.
+  - title: "GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism"
+    author: Huang et al.
+    year: 2018
+    url: https://arxiv.org/abs/1811.06965
+  - title: "Reducing Activation Recomputation in Large Transformer Models"
+    author: Korthikanti et al.
+    year: 2022
+    url: https://arxiv.org/abs/2205.05198
+    note: Activation memory formulas, sequence parallelism and selective recomputation.
+  - title: "Training Deep Nets with Sublinear Memory Cost"
+    author: Chen, Xu, Zhang, Guestrin
+    year: 2016
+    url: https://arxiv.org/abs/1604.06174
+  - title: "Ring Attention with Blockwise Transformers for Near-Infinite Context"
+    author: Liu, Zaharia, Abbeel
+    year: 2023
+    url: https://arxiv.org/abs/2310.01889
+  - title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding"
+    author: Lepikhin et al.
+    year: 2020
+    url: https://arxiv.org/abs/2006.16668
+  - title: "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+    author: Dao, Fu, Ermon, Rudra, Ré
+    year: 2022
+    url: https://arxiv.org/abs/2205.14135
+  - title: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"
+    author: Tri Dao
+    year: 2023
+    url: https://arxiv.org/abs/2307.08691
+  - title: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"
+    author: Shah et al.
+    year: 2024
+    url: https://arxiv.org/abs/2407.08608
+  - title: "The Llama 3 Herd of Models"
+    author: Llama Team, Meta
+    year: 2024
+    url: https://arxiv.org/abs/2407.21783
+    note: Section 3 describes the 16,000-GPU training infrastructure and its failures in unusual detail.
+  - title: PyTorch Distributed overview
+    url: https://pytorch.org/docs/stable/distributed.html
+  - title: NVIDIA Collective Communications Library (NCCL)
+    url: https://developer.nvidia.com/nccl
+  - title: DeepSpeed
+    author: Microsoft
+    url: https://www.deepspeed.ai
+---
+
+<Section id="motivation" kind="motivation" title="Three thousand years on one chip">
+
+Meta's largest Llama 3 model, with 405 billion parameters, was trained with about $3.8 \times 10^{25}$ floating-point operations ([Llama 3 report](https://arxiv.org/abs/2407.21783)); frontier runs as of 2026 are larger still. A top data-centre GPU of 2023–24 sustains perhaps $4 \times 10^{14}$ FLOP/s on real training workloads. Divide: $9.5 \times 10^{10}$ seconds, about three thousand years.
+
+So the run used up to 16,000 GPUs at once, and took a couple of months. That raises two problems, which organise this lesson:
+
+1. **Speed.** Why do these chips exist at all, what limits how fast they go, and how do we keep them busy?
+2. **Fit.** The model, its gradients and its optimiser states need terabytes of memory; one chip has tens of gigabytes. How do we split one model across thousands of chips so that they behave like one, and survive when some of them break?
+
+You will need the <LessonLink slug="memory-hierarchy">memory hierarchy</LessonLink> and the communication patterns of <LessonLink slug="distributed-systems">distributed systems</LessonLink>; both turn out to be the heart of the matter.
+
+</Section>
+
+<Section id="hardware" kind="definitions" title="Why GPUs and TPUs: matrix multiplies and memory bandwidth">
+
+The transformer's cost is almost all **matrix multiplication**. Multiplying an $m \times k$ matrix by a $k \times n$ matrix takes $2mkn$ floating-point operations, every one independent of the others until the final sums. That is the ideal workload for hardware with thousands of simple arithmetic units working in parallel. GPUs began as graphics processors, which have the same shape of work; since 2017 they have included **tensor cores**, units that perform small matrix multiplies in one instruction. Google's **TPUs** ([Jouppi et al.](https://arxiv.org/abs/1704.04760)) take the idea further with **systolic arrays**: grids of multiply–accumulate cells through which operands flow in lockstep. As of 2026 the main families are NVIDIA's Hopper and Blackwell GPUs, Google's TPU generations, AMD's Instinct accelerators and Amazon's Trainium chips, with others in development.
+
+Arithmetic is the cheap part. Every operand has to be brought from **high-bandwidth memory (HBM)** — tens of gigabytes stacked beside the chip — into small, fast on-chip memories (registers and SRAM) and the results written back. An H100-class GPU can do roughly $10^{15}$ BF16 FLOP/s but move only about $3 \times 10^{12}$ bytes/s from HBM. Whether an operation is fast depends on how much arithmetic it does per byte it moves.
+
+<Definition term="Arithmetic intensity and the roofline">
+
+The **arithmetic intensity** of an operation is the number of FLOPs it performs per byte moved between main memory and the chip. On hardware with peak compute $P$ (FLOP/s) and memory bandwidth $B$ (bytes/s), the **roofline model** says the attainable throughput is
+
+$$
+\text{attainable FLOP/s} = \min\left(P, \; \text{intensity} \times B\right).
+$$
+
+Operations with intensity above the **ridge point** $P / B$ are **compute-bound**; below it they are **memory-bound** and the arithmetic units sit idle waiting for data.
+
+</Definition>
+
+For a square $n \times n$ matrix multiply in BF16 (2 bytes per number), the FLOPs are $2n^3$ and the bytes about $3 \cdot 2n^2$, so the intensity is about $n/3$: large matrix multiplies are compute-bound. An elementwise operation such as GELU reads and writes each number once and does a handful of FLOPs on it: intensity around 1, hopelessly memory-bound.
+
+```python run
+# Illustrative accelerator, roughly an H100-class GPU (dense BF16 peak and HBM bandwidth).
+PEAK_FLOPS = 989e12        # FLOP/s
+BANDWIDTH = 3.35e12        # bytes/s
+RIDGE = PEAK_FLOPS / BANDWIDTH
+print(f"ridge point: {RIDGE:.0f} FLOPs per byte\n")
+
+def roofline(flops, bytes_moved):
+    intensity = flops / bytes_moved
+    attainable = min(PEAK_FLOPS, intensity * BANDWIDTH)
+    bound = "compute-bound" if intensity >= RIDGE else "memory-bound"
+    return intensity, attainable, bound
+
+def matmul(m, k, n, bytes_per=2):
+    """(m x k) @ (k x n) in BF16: read both inputs, write the output."""
+    return 2 * m * k * n, bytes_per * (m * k + k * n + m * n)
+
+cases = {
+    "square matmul 8192^3":           matmul(8192, 8192, 8192),
+    "training matmul, 4096 tokens":   matmul(4096, 8192, 8192),
+    "decode, batch 1 (matrix-vector)": matmul(1, 8192, 8192),
+    "decode, batch 64":               matmul(64, 8192, 8192),
+    "elementwise GELU on 64M values": (8 * 64e6, 2 * 2 * 64e6),   # ~8 FLOPs per value; read + write
+}
+for name, (f, b) in cases.items():
+    ai, att, bound = roofline(f, b)
+    print(f"{name:34s} intensity {ai:8.1f}  attainable {att / 1e12:6.1f} TFLOP/s  {bound}")
+```
+
+Three lessons follow. Training, which pushes thousands of tokens through each weight matrix at once, is compute-bound and can use the hardware well. Generating text one token at a time is memory-bound — a fact that shapes all of <LessonLink slug="inference-at-scale">Serving models</LessonLink>. And the many small elementwise operations in a network (normalisation, activations, residual adds) waste the chip unless they are **fused** into the matrix multiplies around them, so that intermediate values stay on-chip instead of making a round trip to HBM. Compilers such as XLA and PyTorch's `torch.compile`, and hand-written kernels, exist largely to do that fusion.
+
+The standard measure of how well a training run uses its hardware is **model FLOPs utilisation (MFU)**: useful model FLOPs per second ($6ND$ divided by wall-clock time) as a fraction of the cluster's peak. Well-tuned large runs reach roughly 35–50%. Google reported 46% for PaLM in 2022, Meta 38–43% for Llama 3 405B. The rest is lost to memory-bound operations, communication, pipeline bubbles and failures.
+
+</Section>
+
+<Section id="precision" kind="definitions" title="Number formats: how many bits does a weight need?">
+
+A floating-point number has a sign, an exponent (which sets the **range**) and a mantissa (which sets the **precision**). Fewer bits mean less memory, less bandwidth and faster arithmetic: tensor cores run 16-bit matrix multiplies many times faster than plain 32-bit arithmetic, and 8-bit about twice as fast again.
+
+| Format | Sign / exponent / mantissa bits | Range | Precision near 1 | Used for |
+| --- | --- | --- | --- | --- |
+| FP32 | 1 / 8 / 23 | about $10^{\pm 38}$ | about 7 decimal digits | master weights, optimiser states, accumulation |
+| FP16 | 1 / 5 / 10 | up to 65,504 | about 3 digits | older mixed precision; needs loss scaling |
+| BF16 | 1 / 8 / 7 | same as FP32 | about 2–3 digits | the default for training compute |
+| FP8 (E4M3, E5M2) | 1 / 4 / 3 or 1 / 5 / 2 | small; needs scaling factors | about 1 digit | matrix multiplies in recent large runs |
+
+**BF16** ("brain float", from Google) keeps FP32's 8-bit exponent and so its range, sacrificing precision. That trade suits deep learning: gradients span many orders of magnitude, but each value needs only a few significant digits. FP16 has more precision but overflows above 65,504 and underflows easily, which is why FP16 training needed *loss scaling*.
+
+```python run
+import numpy as np
+
+def to_bf16(x):
+    """Round float32 values to bfloat16 (keep the top 16 bits, round to nearest even), return as float32."""
+    bits = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    rounding = 0x7FFF + ((bits >> 16) & 1)
+    bits = ((bits + rounding) >> 16) << 16
+    return bits.astype(np.uint32).view(np.float32)
+
+for name, dtype in [("float32", np.float32), ("float16", np.float16)]:
+    info = np.finfo(dtype)
+    print(f"{name}: smallest step above 1 = {float(info.eps):.1e}, largest value = {float(info.max):.1e}")
+print("bfloat16: smallest step above 1 = 7.8e-03, largest value = 3.4e+38  (float32's range, 8 bits of precision)")
+
+print("\n1 + 0.001 in bf16 :", to_bf16(np.float32(1.001)))
+with np.errstate(over="ignore"):
+    print("70000 in float16  :", np.float16(70000.0))   # beyond float16's range
+print("70000 in bf16     :", to_bf16(np.float32(70000.0)))
+
+# Why optimisers keep an FP32 'master' copy of the weights:
+# 10,000 small updates of 1e-4 should move a weight from 1.0 to 2.0.
+w32 = np.float32(1.0)
+w16 = to_bf16(np.float32(1.0))
+for _ in range(10000):
+    w32 = np.float32(w32 + np.float32(1e-4))
+    w16 = to_bf16(np.float32(w16 + np.float32(1e-4)))
+print(f"\nafter 10,000 updates of 1e-4: float32 weight = {float(w32):.4f}, bf16 weight = {float(w16):.4f}")
+```
+
+The last line is the key to **mixed-precision training** ([Micikevicius et al., 2017](https://arxiv.org/abs/1710.03740)). A weight stored in BF16 cannot absorb an update smaller than about half its spacing: $1 + 10^{-4}$ rounds straight back to 1, ten thousand times in a row. So training keeps an FP32 **master copy** of the weights and the optimiser states, casts weights to BF16 for the forward and backward passes, and accumulates the sums inside matrix multiplies in FP32.
+
+**FP8** goes further, with per-tensor or per-block scaling factors so that values fit its tiny range ([FP8 formats](https://arxiv.org/abs/2209.05433)). DeepSeek-V3 (late 2024) was the first widely documented frontier-scale run to do most matrix multiplies in FP8; since then FP8 training has spread, and 4-bit formats (such as the Open Compute Project's microscaling MXFP4 and NVIDIA's NVFP4) are supported in hardware and actively researched for training as well as inference. Lower precision is one of the fastest-moving areas of the field; what is experimental in one year is routine two years later.
+
+</Section>
+
+<Section id="memory" kind="examples" title="The memory budget of a training run">
+
+Count bytes per parameter for mixed-precision training with the Adam optimiser:
+
+| Item | Format | Bytes per parameter |
+| --- | --- | --- |
+| Weights used in compute | BF16 | 2 |
+| Gradients | BF16 | 2 |
+| Master weights | FP32 | 4 |
+| Adam first moment $m$ | FP32 | 4 |
+| Adam second moment $v$ | FP32 | 4 |
+| **Total** | | **16** |
+
+This is the accounting of the [ZeRO paper](https://arxiv.org/abs/1910.02054). A 7-billion-parameter model needs $16 \times 7 \times 10^9 = 112$ GB before a single activation is stored — more than an 80 GB GPU holds. A 70B model needs 1.12 TB: at least fourteen such GPUs just for the training state.
+
+**Activations** come on top: every intermediate value from the forward pass that the backward pass will need. They scale with batch size × sequence length × width × layers. [Korthikanti et al.](https://arxiv.org/abs/2205.05198) give, for one transformer layer in 16-bit precision with sequence length $s$, micro-batch size $b$, width $h$ and $a$ attention heads, about
+
+$$
+s\,b\,h \left(34 + \frac{5\,a\,s}{h}\right) \text{ bytes.}
+$$
+
+<Example title="Activations of a 70B-class layer">
+
+Take $s = 4096$, $b = 1$, $h = 8192$, $a = 64$. Then $sbh \approx 3.36 \times 10^7$ and $5as/h = 160$, so one layer stores about $3.36 \times 10^7 \times 194 \approx 6.5$ GB for a *single* sequence. With 80 layers that is over 500 GB.
+
+Two standard remedies:
+
+- The $5as/h$ term is the $s \times s$ attention matrix and its softmax. FlashAttention (below) never stores it, leaving $34\,sbh \approx 1.1$ GB per layer.
+- **Activation checkpointing** (or *recomputation*, [Chen et al., 2016](https://arxiv.org/abs/1604.06174)) stores only each layer's input and recomputes the rest during the backward pass. Full recomputation costs one extra forward pass, about a third more compute; *selective* recomputation of only the cheap-to-recompute, memory-hungry pieces gets most of the saving for a few percent.
+
+</Example>
+
+Memory, not arithmetic, is usually what forces a model to be split across chips. The next section is about how.
+
+</Section>
+
+<Section id="parallelism" kind="definitions" title="Five ways to split a training run">
+
+Think of a training step as a big array of work with several axes: the batch, the layers, the matrices inside each layer, the sequence, and (for MoE models) the experts. Each kind of parallelism splits along one axis.
+
+**Data parallelism (DP).** Every device holds a full copy of the model and processes a different slice of the batch. After the backward pass the devices **all-reduce** their gradients — each ends up with the sum — and take identical optimiser steps. Simple and efficient, but every device must fit the whole training state.
+
+**Sharded data parallelism: ZeRO and FSDP.** Plain data parallelism stores the same optimiser states, gradients and weights $N$ times over. ZeRO ([Rajbhandari et al.](https://arxiv.org/abs/1910.02054)) removes the redundancy in stages: stage 1 shards the optimiser states across the $N$ data-parallel devices, stage 2 also the gradients, stage 3 also the weights, bringing the 16 bytes per parameter down to $16/N$. In stage 3 each layer's weights are gathered from all devices just before they are needed and discarded afterwards, at the cost of about 1.5 times the communication of plain DP. PyTorch's **FSDP** ([Zhao et al.](https://arxiv.org/abs/2304.11277)) implements the same idea and is the default way to train mid-sized models.
+
+**Tensor parallelism (TP).** Split the individual weight matrices. In the Megatron scheme ([Shoeybi et al.](https://arxiv.org/abs/1909.08053)) an MLP's first matrix is split by columns and the second by rows, so each device computes a slice of the hidden layer and a partial output, and one all-reduce sums the partial outputs; attention is split by heads in the same way. This communicates on *every* layer, forward and backward, so it needs the fastest links available — in practice, the GPUs within one server or one NVLink domain, typically 8 and in newer rack-scale systems up to 72.
+
+**Pipeline parallelism (PP).** Split the layers into consecutive **stages** on different devices, and pass activations from stage to stage. To keep stages busy, the batch is cut into $m$ **micro-batches** that flow through the pipeline one after another. There are still idle periods while the pipeline fills and drains — the **bubble** — which for $p$ stages in the simple GPipe schedule ([Huang et al.](https://arxiv.org/abs/1811.06965)) is a fraction
+
+$$
+\frac{p - 1}{m + p - 1}
+$$
+
+of the step. Many micro-batches make the bubble small; cleverer schedules (interleaved stages, "one forward, one backward") shrink it further and save memory. Pipelines communicate only at stage boundaries, so they tolerate slower links between servers.
+
+**Sequence (context) parallelism.** For very long sequences, split along the sequence. Elementwise operations and MLPs are independent per position; attention is not, so devices pass blocks of keys and values around a ring while each computes attention for its own queries ([ring attention](https://arxiv.org/abs/2310.01889)).
+
+**Expert parallelism (EP).** In a mixture-of-experts model (<LessonLink slug="language-models">previous lesson</LessonLink>) place different experts on different devices. Each MoE layer then needs an **all-to-all** exchange: every device sends each of its tokens to the device holding that token's chosen experts, and receives the results back ([GShard](https://arxiv.org/abs/2006.16668)).
+
+Real runs combine them. Llama 3 405B used what Meta called 4D parallelism — tensor, pipeline, context and FSDP-style data parallelism — with the most communication-hungry axis (TP) inside servers and the least (DP) spanning the whole cluster ([Llama 3 report](https://arxiv.org/abs/2407.21783)). Choosing the degrees of each, for a given model and cluster, is a large part of a training-infrastructure team's job; the Megatron team's [2021 paper](https://arxiv.org/abs/2104.04473) and Google DeepMind's book [How to Scale Your Model](https://jax-ml.github.io/scaling-book/) work through the trade-offs.
+
+### Collective communication
+
+All of this rests on a handful of **collective** operations, implemented by libraries such as NVIDIA's [NCCL](https://developer.nvidia.com/nccl) and exposed through [PyTorch Distributed](https://pytorch.org/docs/stable/distributed.html) or JAX:
+
+| Collective | Before | After | Used by |
+| --- | --- | --- | --- |
+| all-reduce | each device has an array | each has the sum of all arrays | DP gradients, TP outputs |
+| reduce-scatter | each has an array | each has the sum of one slice | ZeRO/FSDP gradients |
+| all-gather | each has one slice | each has all slices | ZeRO/FSDP weights |
+| all-to-all | each has a piece for every other device | each has the pieces addressed to it | MoE expert parallelism |
+| broadcast | one device has an array | all have it | initialisation |
+
+The classic **ring all-reduce** arranges $N$ devices in a ring and splits each array into $N$ chunks. In a *reduce-scatter* phase, partial sums travel round the ring for $N-1$ steps until each device owns the complete sum of one chunk; in an *all-gather* phase, the completed chunks travel round once more. Each device sends $2(N-1)/N$ times the array size, essentially independent of $N$, which is optimal for bandwidth. Here it is, together with a data-parallel gradient step and a tensor-parallel MLP:
+
+```python run
+import numpy as np
+
+def ring_allreduce(arrays):
+    """Sum equal-shaped 1-D arrays held by N workers with the ring algorithm.
+    Returns every worker's final array and how many numbers each worker sent."""
+    N = len(arrays)
+    chunks = [np.array_split(np.array(a, dtype=float), N) for a in arrays]
+    sent = [0] * N
+    # Phase 1, reduce-scatter: pass partial sums round the ring, each worker adding its own piece.
+    for step in range(N - 1):
+        msgs = [(i, (i - step) % N, chunks[i][(i - step) % N].copy()) for i in range(N)]
+        for i, c, data in msgs:
+            chunks[(i + 1) % N][c] += data
+            sent[i] += data.size
+    # Now worker i holds the complete sum of chunk (i + 1) % N.
+    # Phase 2, all-gather: pass the completed chunks round the ring.
+    for step in range(N - 1):
+        msgs = [(i, (i + 1 - step) % N, chunks[i][(i + 1 - step) % N].copy()) for i in range(N)]
+        for i, c, data in msgs:
+            chunks[(i + 1) % N][c] = data
+            sent[i] += data.size
+    return [np.concatenate(ch) for ch in chunks], sent
+
+# --- Data parallelism: 4 workers, each with a quarter of the batch ---------------------------
+rng = np.random.default_rng(0)
+X = rng.normal(size=(64, 12))
+y = X @ rng.normal(size=12) + 0.1 * rng.normal(size=64)
+w = np.zeros(12)
+
+def grad(Xb, yb, w):                       # gradient of mean squared error
+    return 2 * Xb.T @ (Xb @ w - yb) / len(yb)
+
+shards = np.split(np.arange(64), 4)
+local_grads = [grad(X[s], y[s], w) for s in shards]
+summed, sent = ring_allreduce(local_grads)
+avg = summed[0] / 4
+print("all workers agree:          ", all(np.allclose(s, summed[0]) for s in summed))
+print("equals full-batch gradient: ", np.allclose(avg, grad(X, y, w)))
+print("numbers sent per worker:", sent, f"(gradient size 12; 2(N-1)/N x 12 = {2 * 3 / 4 * 12:.0f})")
+
+# --- Tensor parallelism: one MLP split across 2 devices ---------------------------------------
+d, f = 8, 32
+x = rng.normal(size=(5, d))
+W1, W2 = rng.normal(size=(d, f)), rng.normal(size=(f, d))
+gelu = lambda z: 0.5 * z * (1 + np.tanh(0.7978845608 * (z + 0.044715 * z**3)))
+full = gelu(x @ W1) @ W2
+
+halves = [slice(0, f // 2), slice(f // 2, f)]
+partial = [gelu(x @ W1[:, h]) @ W2[h, :] for h in halves]   # device 0 and device 1, no communication
+print("\ntensor-parallel MLP matches:", np.allclose(partial[0] + partial[1], full),
+      "- one all-reduce (the sum) per MLP")
+```
+
+The tensor-parallel split works because GELU acts on each hidden unit separately: splitting $W_1$ by columns gives each device complete hidden units, and splitting $W_2$ by rows lets each device turn its own hidden units into a partial output. The only communication is the final sum. In real systems communication is also **overlapped** with computation — the gradients of the last layers are all-reduced while the backward pass is still working on earlier ones — so a well-tuned run hides much of it.
+
+The physical network matters as much as the algorithm. Within a server, GPUs talk over NVLink at hundreds of gigabytes per second each way; between servers, over InfiniBand or RDMA-capable Ethernet at tens of gigabytes per second per GPU; TPUs are wired into pods by a dedicated inter-chip interconnect in a torus topology. Parallelism strategies are designed around this hierarchy, just as caches are designed around the memory hierarchy.
+
+</Section>
+
+<Section id="flash" kind="computation" title="FlashAttention: the same maths, fewer trips to memory">
+
+Standard attention computes the $n \times n$ score matrix $S = QK^{\top}$, writes it to HBM, reads it back to compute the softmax $P$, writes $P$, and reads it again to compute $PV$. For long sequences those $n^2$-sized reads and writes, not the arithmetic, dominate the running time — attention is memory-bound for the same reason GELU is.
+
+[FlashAttention](https://arxiv.org/abs/2205.14135) (Dao and colleagues, 2022) computes *exactly* the same result without ever storing $S$ or $P$ in HBM. It loads blocks of $Q$, $K$ and $V$ into on-chip SRAM, computes the scores for that block, and folds them into the output immediately. The difficulty is the softmax, whose denominator needs every score in the row. The fix is the **online softmax**: keep, for each query, the running maximum $m$, the running sum of exponentials $\ell$ and the running weighted sum of values $o$. When a new block arrives with a larger maximum $m'$, rescale the old $\ell$ and $o$ by $e^{m - m'}$ and add the new block's contributions. At the end, $o / \ell$ is the exact attention output.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+n, d, block = 2048, 64, 256
+Q, K, V = (rng.normal(size=(n, d)) for _ in range(3))
+
+def standard_attention(Q, K, V):
+    S = Q @ K.T / np.sqrt(d)                  # the full n x n score matrix
+    P = np.exp(S - S.max(axis=1, keepdims=True))
+    return (P / P.sum(axis=1, keepdims=True)) @ V, S.size
+
+def tiled_attention(Q, K, V, block):
+    """Exact attention that visits K and V one block at a time (the FlashAttention idea).
+    For each query row keep a running max m, running normaliser l and running output o."""
+    m = np.full(n, -np.inf)
+    l = np.zeros(n)
+    o = np.zeros((n, V.shape[1]))
+    largest = 0
+    for start in range(0, n, block):
+        Kb, Vb = K[start:start + block], V[start:start + block]
+        S = Q @ Kb.T / np.sqrt(d)             # only an n x block slice of scores
+        largest = max(largest, S.size)
+        m_new = np.maximum(m, S.max(axis=1))
+        rescale = np.exp(m - m_new)           # correct the old sums for the new maximum
+        P = np.exp(S - m_new[:, None])
+        l = l * rescale + P.sum(axis=1)
+        o = o * rescale[:, None] + P @ Vb
+        m = m_new
+    return o / l[:, None], largest
+
+out_std, size_std = standard_attention(Q, K, V)
+out_tiled, size_tiled = tiled_attention(Q, K, V, block)
+print("identical results:", np.allclose(out_std, out_tiled))
+print(f"largest score array: standard {size_std:,} numbers, tiled {size_tiled:,} numbers")
+```
+
+The real kernel also tiles the queries, so that each working set fits in a GPU's SRAM (a couple of hundred kilobytes per streaming multiprocessor), and for the backward pass it recomputes the scores from $Q$ and $K$ rather than storing them — extra FLOPs that are cheaper than the memory traffic they replace. The paper proves the number of HBM accesses falls from order $nd + n^2$ to order $n^2 d^2 / M$ for SRAM of size $M$, and reported several-fold speedups on attention, plus linear rather than quadratic memory.
+
+FlashAttention is the cleanest example of an important lesson: on modern hardware, **an algorithm's IO is often its true cost**, and counting FLOPs alone misleads. [FlashAttention-2](https://arxiv.org/abs/2307.08691) improved how work is divided among GPU threads, and [FlashAttention-3](https://arxiv.org/abs/2407.08608) used the asynchronous features and FP8 support of NVIDIA's Hopper GPUs. Every major training and serving framework now uses kernels of this kind.
+
+</Section>
+
+<Section id="failures" kind="human" title="Failures at scale">
+
+A cluster of 16,000 GPUs is a machine that is always partly broken. If each GPU server fails on average once every few years, a cluster of thousands of servers sees failures every few hours. Meta's Llama 3 report is unusually candid: over a 54-day stretch of pre-training they counted more than 400 unexpected interruptions, about three-quarters attributed to hardware — GPUs and their memory above all — and still achieved over 90% effective training time thanks to heavy automation ([Llama 3 report](https://arxiv.org/abs/2407.21783), section 3).
+
+The main defences:
+
+- **Checkpointing.** Periodically save everything needed to resume — weights, optimiser states, data-loader position, random-number states. At hundreds of terabytes per checkpoint for the largest models, this is itself a distributed-systems problem: each device writes its own shard, often first to host memory and then asynchronously to storage, so training pauses only briefly.
+- **Choosing the interval.** Checkpoint too often and you waste time saving; too rarely and each failure throws away more work. If saving takes time $\delta$ and failures arrive on average every $M$ (the mean time between failures), a classic first-order approximation due to Young (1974) puts the best interval at about
+$$
+\tau \approx \sqrt{2\,\delta\,M}.
+$$
+- **Fast detection and replacement.** Health checks, hot spare machines, and automatic restarts matter more than any single clever trick; a hung collective operation on one GPU can stall all 16,000.
+- **Silent data corruption.** Occasionally a chip computes a wrong answer *without* reporting an error. At this scale it does happen, and teams watch for symptoms such as sudden loss jumps or gradient norms that disagree across replicas.
+- **Loss spikes.** Training occasionally diverges for reasons that are not hardware at all: a bad batch, an optimiser instability. Google's PaLM team handled spikes by rolling back to a checkpoint about a hundred steps earlier and skipping a few hundred batches of data around the spike. Stability tricks — careful initialisation, normalising queries and keys, gradient clipping, lower learning rates for some parameters — are part of every large recipe.
+
+This is <LessonLink slug="reliability-engineering">reliability engineering</LessonLink> at its most expensive: at typical cloud rental prices, an idle hour of a 16,000-GPU cluster costs on the order of tens of thousands of US dollars.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Twice the GPUs, half the time."** Only if communication, pipeline bubbles and the batch size all scale too. Beyond some batch size, larger batches stop speeding up learning per token, and each added axis of parallelism brings communication overhead. Scaling efficiency is engineered, not given.
+
+</Misconception>
+
+<Misconception>
+
+**"FlashAttention approximates attention."** It computes exact attention (up to floating-point rounding). Its speed comes from moving fewer bytes, not from doing less maths. Approximate attention methods are a different family.
+
+</Misconception>
+
+<Misconception>
+
+**"FP8 training means the whole model is in FP8."** Typically only the large matrix multiplies run in FP8, with scaling factors; accumulation, master weights, optimiser states, normalisation and often the attention softmax stay in higher precision.
+
+</Misconception>
+
+<Misconception>
+
+**"ZeRO-3 and FSDP reduce compute."** They reduce *memory* per device by sharding state, at the cost of *more* communication. Each device still does the full forward and backward computation for its slice of the batch.
+
+</Misconception>
+
+<Misconception>
+
+**"Peak FLOPs on the spec sheet is what you get."** Real training reaches perhaps 35–50% of peak; memory-bound operations, communication and failures take the rest. Compare chips on realistic workloads, and remember that the spec-sheet figure for sparse or low-precision arithmetic may not apply to your model.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

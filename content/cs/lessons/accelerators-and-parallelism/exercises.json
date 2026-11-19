@@ -1,0 +1,199 @@
+{
+  "lesson": "accelerators-and-parallelism",
+  "exercises": [
+    {
+      "id": "training-state-memory",
+      "type": "integer",
+      "difficulty": "warm-up",
+      "mode": "H",
+      "prompt": "Using the lesson's accounting of 16 bytes per parameter for mixed-precision training with Adam, how many gigabytes (1 GB = $10^9$ bytes) of training state does a 13-billion-parameter model need, before activations?",
+      "answer": 208,
+      "feedback": [
+        {
+          "match": "26",
+          "message": "That is the BF16 weights alone (2 bytes per parameter). Training also stores gradients, FP32 master weights and two Adam moments."
+        },
+        {
+          "match": "52",
+          "message": "That counts 4 bytes per parameter — the FP32 weights only. The full mixed-precision Adam state is 16 bytes per parameter."
+        }
+      ],
+      "hints": [
+        "2 (BF16 weights) + 2 (BF16 gradients) + 4 (FP32 master) + 4 + 4 (Adam moments) = 16 bytes."
+      ],
+      "solution": "$16 \\times 13 \\times 10^9 = 2.08 \\times 10^{11}$ bytes $= 208$ GB. That is more than two 80 GB GPUs before a single activation — which is why even mid-sized models are trained with ZeRO/FSDP sharding. With ZeRO stage 3 across 8 GPUs, each holds $208 / 8 = 26$ GB."
+    },
+    {
+      "id": "pipeline-bubble",
+      "type": "integer",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "A model is split into $p = 8$ pipeline stages and each step uses $m = 24$ micro-batches, with the simple GPipe schedule. What percentage of the step is bubble (idle time)? Round to the nearest whole percent.",
+      "answer": 23,
+      "feedback": [
+        {
+          "match": "29",
+          "message": "Close — that is $(p-1)/m = 7/24$. The denominator is $m + p - 1$: the step lasts that many micro-batch slots."
+        },
+        {
+          "match": "33",
+          "message": "Not yet — use $(p-1)/(m+p-1)$."
+        }
+      ],
+      "hints": [
+        "Bubble fraction $= (p - 1)/(m + p - 1)$.",
+        "$7/31$."
+      ],
+      "solution": "$(p-1)/(m+p-1) = 7/31 \\approx 0.226$, about **23%**. The first stage idles while the pipeline drains, the last while it fills, each for $p - 1$ slots. Doubling the micro-batches to 48 brings it to $7/55 \\approx 13\\%$; interleaved schedules reduce it further without needing a larger batch."
+    },
+    {
+      "id": "roofline-time",
+      "type": "python",
+      "difficulty": "core",
+      "mode": "C",
+      "prompt": "Write `matmul_time(m, k, n, peak, bandwidth, bytes_per=2)` returning the roofline estimate, in seconds, of multiplying an $m \\times k$ matrix by a $k \\times n$ matrix: the FLOPs are $2mkn$, the bytes moved are `bytes_per` $\\times (mk + kn + mn)$, and the time is the **larger** of FLOPs/`peak` and bytes/`bandwidth`.\n\nAlso write `is_memory_bound(m, k, n, peak, bandwidth, bytes_per=2)` returning `True` when the memory time is the larger one.",
+      "starter": "def matmul_time(m, k, n, peak, bandwidth, bytes_per=2):\n    # your code here\n    return 0.0\n\ndef is_memory_bound(m, k, n, peak, bandwidth, bytes_per=2):\n    # your code here\n    return False\n",
+      "tests": "import math\nP, B = 1e15, 3e12\nt = matmul_time(8192, 8192, 8192, P, B)\nassert math.isclose(t, 2 * 8192**3 / P), t\nt1 = matmul_time(1, 8192, 8192, P, B)\nassert math.isclose(t1, 2 * (8192 + 8192 * 8192 + 8192) / B), t1\nassert is_memory_bound(1, 8192, 8192, P, B) is True\nassert is_memory_bound(8192, 8192, 8192, P, B) is False\n# fp8 halves the bytes, so a borderline case can flip\nassert is_memory_bound(256, 8192, 8192, P, B, bytes_per=2) is True\nassert is_memory_bound(256, 8192, 8192, P, B, bytes_per=1) is False\n",
+      "reference": "def matmul_time(m, k, n, peak, bandwidth, bytes_per=2):\n    flops = 2 * m * k * n\n    bytes_moved = bytes_per * (m * k + k * n + m * n)\n    return max(flops / peak, bytes_moved / bandwidth)\n\ndef is_memory_bound(m, k, n, peak, bandwidth, bytes_per=2):\n    flops = 2 * m * k * n\n    bytes_moved = bytes_per * (m * k + k * n + m * n)\n    return bytes_moved / bandwidth > flops / peak\n",
+      "hints": [
+        "Compute `flops = 2*m*k*n` and `bytes_moved = bytes_per*(m*k + k*n + m*n)`.",
+        "Compute time is `flops / peak`, memory time is `bytes_moved / bandwidth`; the roofline time is their maximum."
+      ],
+      "solution": "```python\ndef matmul_time(m, k, n, peak, bandwidth, bytes_per=2):\n    flops = 2 * m * k * n\n    bytes_moved = bytes_per * (m * k + k * n + m * n)\n    return max(flops / peak, bytes_moved / bandwidth)\n\ndef is_memory_bound(m, k, n, peak, bandwidth, bytes_per=2):\n    flops = 2 * m * k * n\n    bytes_moved = bytes_per * (m * k + k * n + m * n)\n    return bytes_moved / bandwidth > flops / peak\n```\n\nWith 256 rows (think: 256 tokens decoded together) and a large weight matrix, the intensity is about $2 \\cdot 256 / 2 = 256$ FLOPs per byte in BF16, just below this chip's ridge of $10^{15} / (3 \\times 10^{12}) \\approx 333$. Storing the weights in 8 bits halves the bytes and pushes it over the ridge. This is exactly why low-precision weights speed up inference so effectively."
+    },
+    {
+      "id": "online-softmax",
+      "type": "python",
+      "difficulty": "stretch",
+      "mode": "C",
+      "prompt": "Write `blockwise_attention_row(scores, values, block)` that computes `softmax(scores) @ values` for **one query** — `scores` has shape `(n,)`, `values` shape `(n, d)` — by visiting the data `block` positions at a time with the online-softmax recurrence: keep a running maximum `m`, running normaliser `l` and running weighted sum `o`, rescaling `l` and `o` by `exp(m_old - m_new)` whenever the maximum grows.\n\nIt must not overflow even when scores are in the thousands.",
+      "starter": "import numpy as np\n\ndef blockwise_attention_row(scores, values, block):\n    m = -np.inf\n    l = 0.0\n    o = np.zeros(values.shape[1])\n    # your code here\n    return o\n",
+      "tests": "import numpy as np\nrng = np.random.default_rng(5)\ns = rng.normal(size=37) * 3\nv = rng.normal(size=(37, 4))\nexpected = np.exp(s - s.max()) / np.exp(s - s.max()).sum() @ v\nfor b in [1, 5, 8, 37, 100]:\n    out = blockwise_attention_row(s, v, b)\n    assert np.allclose(out, expected), f'block={b}: got {out}, expected {expected}'\nhuge = blockwise_attention_row(s * 1000, v, 6)\nassert np.all(np.isfinite(huge)), 'rescale with the running maximum to avoid overflow'\nassert np.allclose(huge, v[np.argmax(s)]), 'with huge scores the softmax picks the top value'\n",
+      "reference": "import numpy as np\n\ndef blockwise_attention_row(scores, values, block):\n    m = -np.inf\n    l = 0.0\n    o = np.zeros(values.shape[1])\n    for start in range(0, len(scores), block):\n        s = scores[start:start + block]\n        v = values[start:start + block]\n        m_new = max(m, float(s.max()))\n        rescale = np.exp(m - m_new)\n        p = np.exp(s - m_new)\n        l = l * rescale + p.sum()\n        o = o * rescale + p @ v\n        m = m_new\n    return o / l\n",
+      "hints": [
+        "Loop `for start in range(0, len(scores), block)` and slice out `s` and `v` for the block.",
+        "New maximum: `m_new = max(m, s.max())`. Rescale factor for what you have so far: `np.exp(m - m_new)` (which is 0 on the first block, since `m` starts at minus infinity).",
+        "`p = np.exp(s - m_new)`; update `l = l * rescale + p.sum()` and `o = o * rescale + p @ v`. Return `o / l` at the end."
+      ],
+      "solution": "```python\ndef blockwise_attention_row(scores, values, block):\n    m = -np.inf\n    l = 0.0\n    o = np.zeros(values.shape[1])\n    for start in range(0, len(scores), block):\n        s = scores[start:start + block]\n        v = values[start:start + block]\n        m_new = max(m, float(s.max()))\n        rescale = np.exp(m - m_new)\n        p = np.exp(s - m_new)\n        l = l * rescale + p.sum()\n        o = o * rescale + p @ v\n        m = m_new\n    return o / l\n```\n\nInvariant: after each block, $\\ell = \\sum_j e^{s_j - m}$ and $o = \\sum_j e^{s_j - m} v_j$ over the positions seen so far, with $m$ their maximum. When the maximum rises from $m$ to $m'$, multiplying both by $e^{m - m'}$ restores the invariant. At the end $o / \\ell$ is exactly the softmax-weighted average. FlashAttention applies this to blocks of many queries at once, inside on-chip SRAM."
+    },
+    {
+      "id": "zero-stages",
+      "type": "choice",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "In data-parallel training across $N$ GPUs, what does ZeRO stage 3 (or FSDP with full sharding) do?",
+      "options": [
+        {
+          "id": "a",
+          "label": "Shards optimiser states, gradients and weights across the $N$ GPUs, gathering each layer's weights just before use.",
+          "correct": true,
+          "feedback": "Yes — per-GPU training state falls from 16 to about $16/N$ bytes per parameter, paid for with extra all-gather traffic."
+        },
+        {
+          "id": "b",
+          "label": "Splits each weight matrix across GPUs so they compute different parts of every layer.",
+          "correct": false,
+          "feedback": "Not yet — that is tensor parallelism. In ZeRO each GPU still computes whole layers for its own slice of the batch; it just doesn't *store* all the weights between uses."
+        },
+        {
+          "id": "c",
+          "label": "Assigns different layers to different GPUs and passes activations between them.",
+          "correct": false,
+          "feedback": "Not yet — that is pipeline parallelism."
+        },
+        {
+          "id": "d",
+          "label": "Reduces the FLOPs each GPU must perform per step.",
+          "correct": false,
+          "feedback": "Not quite — compute per GPU is unchanged. ZeRO trades extra communication for less memory."
+        }
+      ],
+      "hints": [
+        "ZeRO stands for Zero Redundancy Optimizer. What is redundant in plain data parallelism?"
+      ],
+      "solution": "(a). In plain data parallelism every GPU stores identical copies of weights, gradients and optimiser states. ZeRO stage 1 shards the optimiser states, stage 2 adds the gradients, stage 3 adds the weights themselves, which are all-gathered layer by layer when needed. Compute per GPU is unchanged; communication rises by about half compared with plain data parallelism."
+    },
+    {
+      "id": "ring-allreduce-traffic",
+      "type": "integer",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "Four GPUs all-reduce an 8 GB gradient with the ring algorithm. How many gigabytes does each GPU send?",
+      "answer": 12,
+      "feedback": [
+        {
+          "match": "6",
+          "message": "That is one phase only. Ring all-reduce has a reduce-scatter phase and an all-gather phase, each sending $(N-1)/N$ of the data."
+        },
+        {
+          "match": "24",
+          "message": "Not yet — each GPU sends chunks of size $S/N$, not the whole array, at each of the $2(N-1)$ steps."
+        },
+        {
+          "match": "32",
+          "message": "Not yet — that would be sending the full array to every other GPU. The ring sends only $2(N-1)/N$ times the array."
+        }
+      ],
+      "hints": [
+        "Each GPU sends $2(N-1)/N \\times S$.",
+        "$2 \\times 3/4 \\times 8$."
+      ],
+      "solution": "Each array is split into $N = 4$ chunks of 2 GB. Each of the $2(N-1) = 6$ steps sends one chunk: $6 \\times 2 = 12$ GB, i.e. $2(N-1)/N \\times S = 1.5 \\times 8$. As $N$ grows this approaches $2S$ and stops growing, which is why ring all-reduce scales to large clusters (latency, which grows with $N$, is handled by tree-shaped and hierarchical variants)."
+    },
+    {
+      "id": "which-parallelism-intra-node",
+      "type": "choice",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "A team has servers of 8 GPUs joined by fast NVLink, and slower links between servers. Which form of parallelism should they keep **inside** a server?",
+      "options": [
+        {
+          "id": "a",
+          "label": "Tensor parallelism",
+          "correct": true,
+          "feedback": "Yes — it all-reduces activations in every layer, forward and backward, so it needs the fastest links."
+        },
+        {
+          "id": "b",
+          "label": "Data parallelism",
+          "correct": false,
+          "feedback": "Not the best choice — data parallelism communicates once per step (the gradient all-reduce), which can be overlapped with the backward pass, so it tolerates slower links. It usually spans the whole cluster."
+        },
+        {
+          "id": "c",
+          "label": "Pipeline parallelism",
+          "correct": false,
+          "feedback": "Not the best choice — pipelines send activations only at stage boundaries, a modest amount, so stages are commonly placed on different servers."
+        }
+      ],
+      "hints": [
+        "Which scheme communicates most often, and on the critical path of every layer?"
+      ],
+      "solution": "Tensor parallelism. It splits each layer's matrices, so every layer ends with an all-reduce of activations that the next layer must wait for. Pipeline parallelism communicates only between stages and data parallelism once per step, so those go across servers. The usual layout: TP inside a server (or NVLink domain), PP across a few servers, DP or FSDP across everything."
+    },
+    {
+      "id": "checkpoint-interval",
+      "type": "integer",
+      "difficulty": "stretch",
+      "mode": "H",
+      "prompt": "Saving a checkpoint pauses training for $\\delta = 5$ minutes, and the cluster fails on average once every $M = 8$ hours. Using Young's approximation $\\tau \\approx \\sqrt{2 \\delta M}$, how many minutes apart should checkpoints be? Round to the nearest minute.",
+      "answer": 69,
+      "feedback": [
+        {
+          "match": "49",
+          "message": "Close — that is $\\sqrt{\\delta M}$. Don't forget the factor 2 inside the square root."
+        },
+        {
+          "match": "9",
+          "message": "Not yet — convert $M$ to minutes first: 8 hours = 480 minutes."
+        }
+      ],
+      "hints": [
+        "Use the same units: $M = 480$ minutes.",
+        "$\\sqrt{2 \\times 5 \\times 480} = \\sqrt{4800}$."
+      ],
+      "solution": "$\\tau \\approx \\sqrt{2 \\times 5 \\times 480} = \\sqrt{4800} \\approx 69.3$, so about **69 minutes**. Intuition: each checkpoint costs $\\delta$, and each failure loses on average half an interval, $\\tau / 2$. Per unit time the waste is about $\\delta/\\tau + \\tau/(2M)$, minimised at $\\tau = \\sqrt{2\\delta M}$. Making checkpoints asynchronous (small $\\delta$) lets you checkpoint far more often, which is why large runs invest in it."
+    }
+  ]
+}

@@ -1,0 +1,383 @@
+---
+title: Security fundamentals
+subtitle: Thinking like a defender — threat models, the classic vulnerabilities, and the habits that prevent them.
+minutes: 85
+objectives:
+  - State the goals of security (confidentiality, integrity, availability) and build a simple threat model with STRIDE
+  - Explain injection, demonstrate SQL injection on a toy table, and fix it with parameterised queries
+  - Explain cross-site scripting and prevent it with contextual output encoding
+  - Distinguish authentication from authorisation, and store passwords with salted, slow hashes
+  - Apply least privilege and defence in depth, and explain why memory-safe languages matter
+  - Describe software supply-chain risks and how responsible disclosure works
+prerequisites: [operating-systems, networking, databases, testing]
+related: [math.applied.cryptography, math.applied.information-theory]
+references:
+  - title: OWASP Top 10
+    url: https://owasp.org/www-project-top-ten/
+    note: The Open Worldwide Application Security Project's regularly updated list of the most critical web application security risks.
+  - title: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/
+    note: Concise, practical guidance; see in particular the cheat sheets on SQL injection prevention, cross-site scripting prevention and password storage.
+  - title: "OWASP Password Storage Cheat Sheet"
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+    note: Current recommended algorithms and cost parameters.
+  - title: Threat Modeling Manifesto
+    url: https://www.threatmodelingmanifesto.org/
+  - title: "The Protection of Information in Computer Systems"
+    author: Jerome Saltzer and Michael Schroeder
+    year: 1975
+    url: https://web.mit.edu/Saltzer/www/publications/protection/
+    note: The classic statement of least privilege, fail-safe defaults, complete mediation and other design principles.
+  - title: "Chromium: memory safety"
+    url: https://www.chromium.org/Home/chromium-security/memory-safety/
+  - title: SLSA — Supply-chain Levels for Software Artifacts
+    url: https://slsa.dev/
+  - title: "RFC 9116: A File Format to Aid in Security Vulnerability Disclosure (security.txt)"
+    url: https://www.rfc-editor.org/rfc/rfc9116
+  - title: "Python: hashlib"
+    url: https://docs.python.org/3/library/hashlib.html
+---
+
+<Section id="motivation" kind="motivation" title="Defending against an adversary">
+
+Software now holds people's money, medical records, private messages and votes. Every other lesson in this course has dealt with failures that are, in a sense, *indifferent*: a disk dies, a packet is lost, a programmer makes a mistake. Security is different because the failures are caused by an **adversary** — someone who studies your system, looks for the one input you did not anticipate, and keeps trying. A bug that occurs one time in a billion by chance can be triggered every time on purpose.
+
+That changes how you must think. It is not enough that a system works for reasonable inputs; it must stay safe for the worst inputs an intelligent opponent can construct. And because an attacker needs only one way in while defenders must close all of them, security depends on getting many unglamorous things right: validating input, encoding output, checking permissions on every request, storing secrets properly, updating dependencies. Most real breaches come not from exotic techniques but from these basics, done wrong.
+
+This lesson teaches the basics as a defender. The attack demonstrations are textbook examples run against toy code you write yourself. Probing systems you do not own or have not been explicitly authorised to test is illegal in most countries, whatever your intentions; the last section explains how to report a problem you stumble on.
+
+</Section>
+
+<Section id="goals" kind="definitions" title="What security protects">
+
+<Definition term="The CIA triad">
+
+**Confidentiality**: information is disclosed only to those authorised to see it. **Integrity**: information and systems are changed only in authorised ways, and unauthorised changes are detected. **Availability**: authorised users can use the system and its data when they need to.
+
+</Definition>
+
+A data leak violates confidentiality; an attacker silently changing the bank account number on an invoice violates integrity; ransomware that encrypts a hospital's records, or a flood of traffic that takes a service offline, violates availability. Related goals are often added: **authenticity** (data and messages really come from who they claim), **accountability** or **non-repudiation** (actions can be traced to whoever performed them), and **privacy** (people keep control over information about themselves, which can be violated even by fully authorised access).
+
+Security is always relative to a **threat model**: *against whom*, and *protecting what*. A password manager, a student's homework site and a voting system face different adversaries and need very different defences. Saying a system is "secure" without saying against what is meaningless.
+
+</Section>
+
+<Section id="threat-modelling" kind="examples" title="Threat modelling">
+
+**Threat modelling** is the structured practice of finding security problems in a *design*, before they are built. A widely used framing reduces it to four questions:
+
+1. What are we building?
+2. What can go wrong?
+3. What are we going to do about it?
+4. Did we do a good enough job?
+
+For the first question, draw a **data-flow diagram**: the components, the data stores, the flows between them, and the **trust boundaries** — the places where data passes between parts with different levels of trust, such as from the public internet into your server. Most vulnerabilities sit on a trust boundary, where untrusted data meets code that assumes otherwise.
+
+<Figure caption="A data-flow diagram for a clinic's appointment-booking service. Dashed lines are trust boundaries.">
+
+<svg viewBox="0 0 600 220" role="img" aria-label="Patients' browsers send requests across the internet trust boundary to a web application, which reads and writes a database and calls an external email provider across a second trust boundary" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+  <defs>
+    <marker id="sec-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="15" y="80" width="110" height="50" rx="6"/>
+    <circle cx="300" cy="105" r="48"/>
+    <path d="M470 35 h110 M470 75 h110"/>
+    <rect x="470" y="140" width="110" height="50" rx="6"/>
+  </g>
+  <g fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="6 5">
+    <line x1="185" y1="10" x2="185" y2="210"/>
+    <path d="M420 120 L600 120"/>
+    <path d="M420 120 L420 210"/>
+  </g>
+  <g stroke="currentColor" stroke-width="1.4" fill="none">
+    <line x1="125" y1="98" x2="250" y2="98" marker-end="url(#sec-arrow)"/>
+    <line x1="250" y1="114" x2="125" y2="114" marker-end="url(#sec-arrow)"/>
+    <line x1="342" y1="82" x2="468" y2="58" marker-end="url(#sec-arrow)"/>
+    <line x1="343" y1="125" x2="468" y2="160" marker-end="url(#sec-arrow)"/>
+  </g>
+  <g fill="currentColor" text-anchor="middle">
+    <text x="70" y="102">patient's</text>
+    <text x="70" y="117">browser</text>
+    <text x="300" y="101">booking</text>
+    <text x="300" y="116">web app</text>
+    <text x="525" y="60">appointments DB</text>
+    <text x="525" y="170">email provider</text>
+    <text x="188" y="92" font-size="10">HTTPS requests</text>
+    <text x="188" y="132" font-size="10">pages</text>
+  </g>
+  <g fill="currentColor" font-size="10" font-style="italic">
+    <text x="192" y="205">internet boundary</text>
+    <text x="428" y="205">third party</text>
+  </g>
+</svg>
+
+</Figure>
+
+For the second question, Microsoft's **STRIDE** mnemonic gives one category of threat per security property, which makes it hard to forget a whole class. Applied to the booking service:
+
+| Threat | Violates | Example in the booking service |
+| --- | --- | --- |
+| **S**poofing | authenticity | someone logs in as another patient with a guessed or stolen password |
+| **T**ampering | integrity | a request is modified to move someone else's appointment |
+| **R**epudiation | accountability | a staff member cancels appointments and no log shows who did it |
+| **I**nformation disclosure | confidentiality | changing `/appointments/1043` to `/appointments/1044` shows another patient's visit |
+| **D**enial of service | availability | a script books every slot for the next month |
+| **E**levation of privilege | authorisation | a patient account reaches the staff-only admin page |
+
+For each threat you then decide: **mitigate** it (add a control), **eliminate** it (remove the feature), **transfer** it (to a provider or insurer), or **accept** it, explicitly and in writing. Threat modelling is most valuable early, in the design review of <LessonLink slug="program-design">Designing programs</LessonLink>, and should be revisited whenever the data-flow diagram changes.
+
+</Section>
+
+<Section id="injection" kind="computation" title="Injection">
+
+**Injection** happens when untrusted data is pasted into something that will be *interpreted* — an SQL query, a shell command, an HTML page, a template — so that the data can change the meaning of the code around it. You saw in <LessonLink slug="compilers-and-interpreters">Languages, interpreters and compilers</LessonLink> that a parser decides structure from text; injection is the attacker supplying some of that text.
+
+SQL injection is the textbook case. Here it is, against a toy table in a private in-memory database:
+
+```python run
+import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE users (name TEXT PRIMARY KEY, is_admin INTEGER NOT NULL)")
+db.executemany("INSERT INTO users VALUES (?, ?)",
+               [("amara", 1), ("kenji", 0), ("sofia", 0), ("o'connor", 0)])
+
+def find_user_unsafe(name):
+    sql = f"SELECT name, is_admin FROM users WHERE name = '{name}'"     # string building: never
+    print("    query text:", sql)
+    return db.execute(sql).fetchall()
+
+def find_user_safe(name):
+    return db.execute("SELECT name, is_admin FROM users WHERE name = ?", (name,)).fetchall()
+
+print("ordinary input:", find_user_unsafe("kenji"))
+
+crafted = "nobody' OR '1'='1"
+print("crafted input: ", find_user_unsafe(crafted))      # the input rewrote the WHERE clause
+print("parameterised: ", find_user_safe(crafted))        # compared as a name: no match
+
+try:
+    find_user_unsafe("o'connor")                          # injection bugs are correctness bugs too
+except sqlite3.OperationalError as err:
+    print("an honest name with an apostrophe:", err)
+print("parameterised: ", find_user_safe("o'connor"))
+```
+
+The crafted input closes the string literal early and adds `OR '1'='1'`, a condition true for every row, so a login check written this way would let anyone in. The same flaw lets attackers read other tables, modify data, and sometimes run commands on the server. And notice the last lines: the unsafe version also fails for perfectly legitimate names like O'Connor or N'Dour.
+
+**Parameterised queries** fix it completely. The query text, with its `?` placeholders, is parsed *first*; the values are supplied afterwards, as data, and can never become syntax. That is the general principle behind every injection defence: **keep code and data separate, using an API that enforces the separation.**
+
+- For SQL: placeholders always. Query builders and ORMs use them for you; raw string formatting into SQL should fail code review. Table and column names cannot be parameters, so if users choose them, map their choice through an allow-list.
+- For shell commands: call programs with an argument list, `subprocess.run(["convert", path, "out.png"])`, never `shell=True` with user data in the string.
+- Input validation (rejecting names with odd characters) is a useful *extra* layer, but not the fix: a legitimate value can contain an apostrophe, and the right encoding depends on where the data ends up.
+
+</Section>
+
+<Section id="xss" kind="examples" title="Cross-site scripting">
+
+**Cross-site scripting** (XSS) is injection into a web page. If a site inserts user-supplied text into HTML without encoding it, a user can supply HTML — including a `<script>` element — that runs in *other users'* browsers, with their session: it can read the page, act on their behalf, or steal data. *Stored* XSS saves the payload (in a comment, a profile name); *reflected* XSS bounces it off a request parameter; *DOM-based* XSS happens entirely in client-side JavaScript.
+
+The defence is **contextual output encoding**: when data is placed into HTML, characters with special meaning (`<`, `>`, `&`, quotes) are replaced by entities, so the browser displays them instead of interpreting them. Different contexts need different encodings, and some need more than encoding:
+
+```python run
+import html
+from urllib.parse import urlparse
+
+author = 'Zoë "night owl"'
+comment = 'Great talk! <script>alert("this ran in your browser")</script>'
+
+unsafe = f"<li><b>{author}</b>: {comment}</li>"
+safe = f"<li><b>{html.escape(author)}</b>: {html.escape(comment)}</li>"
+print("unsafe:", unsafe)
+print("safe:  ", safe)
+
+def safe_link(url, text):
+    """Escaping is not enough in an href: a javascript: URL is valid, harmless-looking text."""
+    if urlparse(url).scheme not in ("http", "https"):
+        url = "#"
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
+
+print(safe_link("https://example.org/talks?id=7&lang=sw", "Slides"))
+print(safe_link("javascript:alert(1)", "Slides"))
+```
+
+In practice you rarely call `html.escape` yourself: modern template engines (Jinja2, Django templates) and front-end frameworks (React, Vue) **escape by default**, and XSS appears where developers bypass that — `|safe` filters, `innerHTML`, `dangerouslySetInnerHTML`. If users must submit rich text, sanitise it with a maintained allow-list HTML sanitiser rather than a home-made regular expression. Defence in depth adds a **Content Security Policy** header, which tells browsers to refuse inline scripts and scripts from unexpected origins, and the `HttpOnly` cookie flag, which keeps session cookies out of JavaScript's reach.
+
+</Section>
+
+<Section id="authn-authz" kind="definitions" title="Authentication and authorisation">
+
+<Definition term="Authentication and authorisation">
+
+**Authentication** establishes *who* is making a request. **Authorisation** decides whether that identity is *allowed* to perform this action on this resource.
+
+</Definition>
+
+They fail in different ways and need different defences.
+
+**Authentication** is based on factors: something you know (a password), something you have (a phone, a hardware key), something you are (a fingerprint). Combining factors — **multi-factor authentication** — defeats most password theft. The strongest widely deployed option is **phishing-resistant** authentication with hardware keys or *passkeys* (the FIDO2/WebAuthn standards), where a cryptographic key never leaves the device and only works for the genuine website, so a convincing fake login page gets nothing usable. After login, a server issues a **session token**: it must be generated with a cryptographically secure random generator (Python's `secrets` module, never `random`), sent only over HTTPS, and stored in a cookie marked `Secure`, `HttpOnly` and `SameSite`.
+
+**Authorisation** failures topped the 2021 OWASP Top 10 as *broken access control*. The commonest form is the one in the STRIDE table: the server authenticates the user, then serves `/invoices/1044` without checking that invoice 1044 belongs to them. Rules that prevent it:
+
+- **Check on the server, on every request.** Hiding a button in the user interface is not access control.
+- **Deny by default.** A new endpoint should be inaccessible until a rule grants access, not accessible until someone remembers to restrict it.
+- **Centralise the checks**, in one well-tested function or middleware, rather than scattering `if user.is_admin` through the code — the principle Saltzer and Schroeder called *complete mediation*: every access to every object is checked.
+- **Test authorisation explicitly**: for each endpoint, a test that another user, and an anonymous user, are refused.
+
+</Section>
+
+<Section id="passwords" kind="computation" title="Storing passwords">
+
+Sooner or later, many databases are stolen. Password storage is designed for that day: even with the whole `users` table, an attacker should learn as little as possible.
+
+- **Never store passwords in plain text**, or with reversible encryption.
+- **Never store a plain fast hash** such as SHA-256 of the password. Hash functions are designed to be fast; a single modern GPU computes billions of SHA-256 hashes per second, so common and short passwords fall to guessing almost immediately.
+- **Add a unique random salt per password.** With a salt, identical passwords produce different hashes, so an attacker cannot see who shares a password and cannot use precomputed tables; each password must be attacked separately.
+- **Use a deliberately slow, memory-hard password-hashing function**: Argon2id (the current first recommendation of OWASP's cheat sheet), scrypt, bcrypt, or PBKDF2 where a FIPS-validated algorithm is required. Their cost parameters make each guess expensive — ideally tens of milliseconds and many megabytes — which honest servers barely notice and attackers multiply by billions of guesses.
+- **Compare in constant time**, and store the algorithm and parameters with each hash so you can raise the cost later and upgrade hashes when users next log in.
+
+```python run
+import hashlib
+import hmac
+import secrets
+import time
+
+if not hasattr(hashlib, "scrypt"):    # the in-browser Python loads OpenSSL's functions on demand
+    import _hashlib, importlib
+    importlib.reload(hashlib)
+
+# Cost parameters. n=2**14 keeps this demo quick; production values are higher (see OWASP).
+N, R, P = 2**14, 8, 1
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=N, r=R, p=P, dklen=32)
+    return f"scrypt${N}${R}${P}${salt.hex()}${digest.hex()}"
+
+def verify_password(password, stored):
+    _, n, r, p, salt_hex, digest_hex = stored.split("$")
+    digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                            n=int(n), r=int(r), p=int(p), dklen=32)
+    return hmac.compare_digest(digest.hex(), digest_hex)     # constant-time comparison
+
+amara = hash_password("correct horse battery staple")
+kenji = hash_password("correct horse battery staple")       # same password, different salt
+print("stored format:", amara.rsplit("$", 2)[0] + "$<16-byte salt>$<32-byte hash>")
+print("same password, same stored value?", amara == kenji)        # no: the salts differ
+print("right password:", verify_password("correct horse battery staple", amara))
+print("wrong password:", verify_password("correct horse battery stapler", amara))
+
+def guesses_per_second(fn, seconds=0.3):
+    count, start = 0, time.perf_counter()
+    while time.perf_counter() - start < seconds:
+        fn(f"guess{count}".encode())
+        count += 1
+    return count / (time.perf_counter() - start)
+
+fast = guesses_per_second(lambda pw: hashlib.sha256(b"salt" + pw).digest())
+slow = guesses_per_second(lambda pw: hashlib.scrypt(pw, salt=b"salt", n=N, r=R, p=P, dklen=32))
+print(f"SHA-256: {fast:,.0f} guesses/s   scrypt: {slow:,.0f} guesses/s   (about {fast / slow:,.0f}x slower)")
+```
+
+On one CPU core, scrypt here is thousands of times slower per guess than SHA-256, and its memory requirement (16 MiB at these settings) blunts the advantage of GPUs and custom chips, which have plenty of arithmetic but little memory per core. Two further notes from practice. Do not invent your own scheme: use a maintained library (`argon2-cffi`, `bcrypt`, or your framework's password hasher) that handles encoding and upgrades. And the best way to handle passwords may be to hold fewer of them, by supporting passkeys or delegating sign-in to an established identity provider. The cryptography underneath — what makes a hash function or a random token secure — is the subject of <LessonLink slug="applied-cryptography">Applied cryptography</LessonLink>.
+
+</Section>
+
+<Section id="least-privilege" kind="human" title="Least privilege and defence in depth">
+
+Saltzer and Schroeder's 1975 paper set out design principles that still organise the field. Two matter most day to day.
+
+**Least privilege**: every program and every user should operate with the smallest set of privileges needed for the job. The reporting service gets a database role that can only `SELECT` from the reporting views, not drop tables. A web server process does not run as root. A CI job that publishes documentation cannot also deploy to production. A token expires in an hour, not never. When something is compromised — and something eventually will be — least privilege limits what the attacker gains.
+
+**Defence in depth**: no single control is perfect, so layer independent ones. Parameterised queries prevent SQL injection; a least-privilege database role limits the damage if one is missed; encryption at rest protects a stolen disk; monitoring and audit logs detect what got through; backups restore availability. Related principles from the same paper: **fail-safe defaults** (deny unless explicitly allowed), **economy of mechanism** (keep security-critical code small and simple, so it can be reviewed), and **open design** (security must not depend on the design being secret — an idea going back to Auguste Kerckhoffs's 1883 principles for military ciphers).
+
+</Section>
+
+<Section id="memory-safety" kind="human" title="Memory safety">
+
+In C and C++, the programmer is responsible for staying within the bounds of every buffer and for using memory only while it is allocated. The compiler does not check, and the consequences of a mistake are not an exception but **undefined behaviour**: the program reads or writes whatever memory happens to be there.
+
+```c
+void greet(const char *name) {
+    char buf[16];
+    strcpy(buf, name);              /* no bounds check: a longer name overwrites the stack */
+    printf("Hello, %s\n", buf);
+}
+```
+
+Such bugs — **buffer overflows**, out-of-bounds reads, **use-after-free**, double frees — are a gift to attackers, because carefully chosen input can overwrite return addresses or function pointers and take control of the program. The 2014 **Heartbleed** bug in OpenSSL was a single missing bounds check in a heartbeat message handler that let anyone read up to 64 KiB of a server's memory per request, including private keys and passwords.
+
+The scale is the point. The Chromium project reports that around 70% of its high-severity security bugs are memory-safety problems, and Microsoft has published a similar figure for its products. Decades of mitigations — stack canaries, address-space layout randomisation, non-executable memory, sanitisers, fuzzing — make exploitation harder but do not remove the bugs. **Memory-safe languages** remove the whole class: Python, Java, C#, Go and Swift check bounds and manage memory automatically, and **Rust** achieves memory safety without a garbage collector, through its ownership and borrowing rules, checked at compile time. This is why security agencies in several countries, and major vendors, now recommend that organisations write new code in memory-safe languages and plan migrations for the most exposed C and C++ components, such as parsers of untrusted input. Existing C and C++ will be with us for decades, so the practical strategy is both: new components in memory-safe languages, and hardening plus fuzzing for the old.
+
+</Section>
+
+<Section id="supply-chain" kind="human" title="The software supply chain">
+
+A typical application is mostly other people's code: hundreds of open-source packages, pulled in transitively, built by CI systems, shipped in container images. Each link can be attacked:
+
+- **Malicious packages**: names one typo away from popular ones ("typosquatting"), or internal package names registered on a public index so that build tools fetch the attacker's version ("dependency confusion").
+- **Compromised maintainers and projects**: in 2024 a backdoor was discovered in the `xz` compression library ([CVE-2024-3094](https://nvd.nist.gov/vuln/detail/CVE-2024-3094)), inserted over two years by a contributor who had earned maintainer trust. It was caught, by luck and diligence, shortly before it reached most stable Linux distributions.
+- **Vulnerable dependencies**: the 2021 Log4Shell vulnerability in the widely used Java logging library Log4j ([CVE-2021-44228](https://nvd.nist.gov/vuln/detail/CVE-2021-44228)) allowed remote code execution, and organisations spent weeks just discovering where they used it.
+- **Compromised build systems**, where attackers alter software after the source is reviewed but before it is shipped.
+
+Defences are a matter of hygiene, applied consistently: add dependencies deliberately and prefer well-maintained ones; **pin versions with a lock file that records hashes** (`pip install --require-hashes`, `package-lock.json`), so the bytes you install are the bytes you reviewed; scan for known vulnerabilities in CI (`pip-audit`, Dependabot, OSV-Scanner); keep a **software bill of materials** (SBOM) so you can answer "do we use Log4j?" in minutes; protect CI credentials as carefully as production ones; and verify signatures and build provenance where available, as frameworks such as [SLSA](https://slsa.dev/) and the Sigstore project aim to make routine.
+
+</Section>
+
+<Section id="disclosure" kind="human" title="Responsible disclosure">
+
+Sooner or later you may notice a vulnerability in someone else's system — a page that shows other users' data, an exposed key in a public repository. What you do next matters, ethically and legally.
+
+**Coordinated (responsible) disclosure** means reporting privately to the organisation able to fix the problem, giving them reasonable time to do so, and only then discussing it publicly. In practice:
+
+- **Stop at the minimum** needed to show the problem exists. Do not download, keep or share other people's data, do not escalate access, and do not disrupt the service.
+- **Find the right channel**: a `/.well-known/security.txt` file ([RFC 9116](https://www.rfc-editor.org/rfc/rfc9116)), a published vulnerability disclosure policy or bug bounty programme, or the project's security advisory process. For open-source projects, never file a public issue for a vulnerability.
+- **Write a clear report**: what is affected, how to reproduce it, the impact, and your contact details.
+- **Agree on a timeline.** Many researchers and teams use a deadline of around 90 days before publication, shortened if the flaw is being actively exploited. Vulnerabilities receive public CVE identifiers so that everyone can refer to the same issue.
+
+As a defender, make this easy: publish a `security.txt` and a disclosure policy, promise not to take legal action against good-faith research that follows it, respond quickly, fix, and credit the reporter. Organisations that welcome reports learn about their weaknesses from friends rather than from attackers.
+
+<Reflection title="Faithful in little things">
+
+"He that is faithful in that which is least is faithful also in much" (Luke 16:10, King James Version). Much of security is faithfulness in small, unseen things: the parameter instead of the string, the permission check on the hundredth endpoint, the dependency updated on a quiet Friday. The people whose records and messages pass through our systems will never see that care, but they depend on it. Treating their data as we would want our own family's treated is a simple test that clarifies many technical decisions.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"If nobody knows how it works, nobody can break it."** Security through obscurity fails as soon as the secret leaks, and secrets in deployed software — binaries, JavaScript bundles, ex-employees' memories — always leak eventually. Obscurity can add a little cost for attackers, but security must rest on keys and controls that remain sound when the design is public.
+
+</Misconception>
+
+<Misconception>
+
+**"We are too small to be a target."** Most attacks are automated: bots scan the entire IPv4 address space for known vulnerabilities and default credentials continuously, regardless of who owns each address. Small organisations are often hit precisely because their basics are weakest.
+
+</Misconception>
+
+<Misconception>
+
+**"The site uses HTTPS, so it is secure."** HTTPS protects data *in transit* between the browser and the server, and proves which server you reached. It says nothing about injection flaws, broken access control, or how the server stores your data.
+
+</Misconception>
+
+<Misconception>
+
+**"Validating input prevents injection."** Validation helps, but data that is valid in one context (a name with an apostrophe) is dangerous in another (an SQL string literal). The reliable defence is at the point of use: parameterise queries, encode output for its context, and pass arguments as lists.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

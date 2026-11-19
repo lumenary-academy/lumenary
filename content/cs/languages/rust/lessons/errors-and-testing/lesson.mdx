@@ -1,0 +1,486 @@
+---
+title: Error handling and testing
+subtitle: Panics for bugs, Result for everything else, the ? operator, error types people can act on, and the tests that keep it all honest.
+minutes: 60
+objectives:
+  - Decide between panicking and returning a Result, and explain what a panic does
+  - Propagate errors with the ? operator on Result and Option, using From to convert error types
+  - Define a custom error type that implements Display and std::error::Error, with a source chain
+  - Use Box<dyn Error> in application code and describe what the thiserror and anyhow crates add
+  - Write unit tests, integration tests and doc tests, and run and read them with cargo test
+prerequisites: [collections-iterators-closures]
+related: [math.found.proof-techniques]
+references:
+  - title: "The Rust Programming Language, chapter 9: Error Handling"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch09-00-error-handling.html
+  - title: "The Rust Programming Language, chapter 11: Writing Automated Tests"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch11-01-writing-tests.html
+  - title: The std::error::Error trait
+    url: https://doc.rust-lang.org/std/error/trait.Error.html
+  - title: "The Cargo Book: cargo test"
+    url: https://doc.rust-lang.org/cargo/commands/cargo-test.html
+  - title: thiserror
+    url: https://crates.io/crates/thiserror
+    note: A derive macro for writing library error types with little boilerplate.
+  - title: anyhow
+    url: https://crates.io/crates/anyhow
+    note: A flexible error type for applications, with context messages.
+---
+
+<Section id="motivation" kind="motivation" title="Two kinds of failure">
+
+Programs fail in two very different ways, and Rust insists that you tell them apart.
+
+Some failures are **bugs**: an index past the end of an array, a "can't happen" branch that happened, a function called with an argument its documentation forbids. There is no sensible way for the program to carry on, because its own logic is wrong. Rust's response is to **panic**: stop the current thread, print a message saying where, and let the developer fix the code.
+
+Other failures are **part of normal life**: a file is missing, a user types "seven" where a number belongs, a server does not answer. These must be handled, because they will happen in production every day. Rust's response is the `Result` type you met in lesson 5: the function returns `Err(reason)`, and the caller decides what to do.
+
+Many languages blur this line with exceptions, which any function may throw and which travel invisibly up the stack until something catches them (or nothing does). In Rust, a function's signature tells you whether it can fail and how, and the `?` operator makes passing errors along nearly as short as ignoring them. Combined with tests, which this lesson also covers, that is how Rust teams build software that fails rarely and, when it does, fails clearly.
+
+</Section>
+
+<Section id="panic" kind="definitions" title="Panics">
+
+<Definition term="panic">
+
+A **panic** is Rust's response to an unrecoverable error. `panic!("message")` triggers one explicitly; so do failed `assert!`s, out-of-bounds indexing, integer overflow in debug builds, division by zero, and `unwrap` or `expect` on `None` or `Err`. By default a panic **unwinds** the thread: it runs the destructors of everything on the stack, prints the message and location, and ends the thread. A panic in the main thread ends the program with exit status 101.
+
+</Definition>
+
+You saw panic messages in lessons 2 and 4. The macros worth knowing are `panic!`, `assert!(condition, "message")`, `assert_eq!(left, right)`, `unreachable!()` (for branches your logic rules out) and `todo!()` (a placeholder that compiles and panics if reached, handy while sketching). Release builds can be configured to **abort** instead of unwinding, which makes binaries smaller and is common in embedded work.
+
+When should *your* code panic? When continuing would be wrong and the situation indicates a bug: a broken invariant inside your own data structure, an impossible state, a precondition violated by a caller who was told not to. Libraries in particular should almost never panic on bad *input*, because the caller is better placed to decide what to do. A good rule from experienced teams: if a stranger could trigger the failure by feeding your program unexpected data, return a `Result`; if only a programmer's mistake could trigger it, a panic with a clear message is fine.
+
+</Section>
+
+<Section id="question-mark" kind="definitions" title="The ? operator">
+
+Handling every `Result` with a `match` gets long. The **`?` operator** does the common thing in one character.
+
+<Definition term="the ? operator">
+
+Applied to a `Result`, `expr?` evaluates to the `Ok` value if there is one; if there is an `Err(e)`, it returns `Err(From::from(e))` from the enclosing function immediately. Applied to an `Option`, `expr?` evaluates to the `Some` value or returns `None`. It can only be used inside a function whose return type is compatible (a `Result` or an `Option`, respectively).
+
+</Definition>
+
+```rust check
+use std::num::ParseIntError;
+
+// `?` returns early with the error; otherwise it unwraps the Ok value.
+fn parse_port(text: &str) -> Result<u16, ParseIntError> {
+    let port: u16 = text.trim().parse()?;
+    Ok(port)
+}
+
+fn add_ports(a: &str, b: &str) -> Result<u32, ParseIntError> {
+    Ok(parse_port(a)? as u32 + parse_port(b)? as u32)
+}
+
+// `?` works on Option too, inside a function that returns Option.
+fn initials(full_name: &str) -> Option<String> {
+    let mut parts = full_name.split_whitespace();
+    let first = parts.next()?.chars().next()?;
+    let last = parts.last()?.chars().next()?;
+    Some(format!("{first}.{last}."))
+}
+
+fn main() {
+    println!("{:?}", parse_port(" 8080 "));
+    println!("{:?}", parse_port("eighty"));
+    println!("{:?}", parse_port("70000"));
+    match add_ports("80", "x443") {
+        Ok(sum) => println!("sum {sum}"),
+        Err(e) => println!("could not add: {e}"),
+    }
+    println!("{:?} {:?}", initials("Grace Hopper"), initials("Plato"));
+}
+```
+
+```text
+Ok(8080)
+Err(ParseIntError { kind: InvalidDigit })
+Err(ParseIntError { kind: PosOverflow })
+could not add: invalid digit found in string
+Some("G.H.") None
+```
+
+`parse_port` is three characters away from ignoring errors altogether, yet it handles them all: the `?` after `parse()` passes any `ParseIntError` straight to the caller. `add_ports` uses `?` twice in one expression; the first failure wins. `initials` shows `?` on `Option`: four operations, any of which may come up empty, without a single nested `if`. (Look back at `parse_setting` in lesson 3: its first let-else could now be written as one `?`, and Clippy, Rust's linter, would suggest exactly that.)
+
+### Five things to do with a Result
+
+Whenever a function hands you a `Result`, you are choosing among a small set of moves. Naming them helps you choose deliberately:
+
+| Move | Code | When |
+| --- | --- | --- |
+| Propagate | `value?` | the caller is better placed to decide |
+| Handle | `match` / `if let Err(e) = ...` | you can recover here: retry, skip a line, ask again |
+| Substitute | `unwrap_or(default)`, `unwrap_or_else(f)` | a sensible default exists and failure needs no report |
+| Convert | `map_err(...)`, `ok_or(...)`, `.ok()` | the error must change type or meaning before moving on |
+| Assert | `expect("why this cannot fail")` | failure would mean a bug in your own program |
+
+Most functions in a real codebase propagate; a few places near the top (the main loop, a request handler, a command-line entry point) handle and report. That shape, errors flowing upward to a handful of places that know what to do, is what makes large Rust programs easy to audit: search for `expect` and `unwrap` and you have found every place the program can deliberately crash.
+
+The `Debug` output of the errors (`ParseIntError { kind: PosOverflow }`) is for programmers; the `Display` output used by `{e}` ("invalid digit found in string") is for people. Every error type provides both.
+
+</Section>
+
+<Section id="custom-errors" kind="examples" title="Error types people can act on">
+
+A library should return errors its callers can inspect: which line, which field, what went wrong, and what lower-level error caused it. The idiomatic shape is an enum with one variant per failure, plus three trait implementations:
+
+- `Display`, the message for people;
+- `std::error::Error`, which marks the type as an error and optionally exposes the underlying cause through `source()`;
+- <code>From&lt;OtherError&gt;</code> for each lower-level error, so that `?` converts automatically.
+
+```rust check
+use std::error::Error;
+use std::fmt;
+use std::num::{ParseFloatError, ParseIntError};
+
+#[derive(Debug)]
+struct Item {
+    sku: String,
+    quantity: u32,
+    price: f64,
+}
+
+/// Everything that can go wrong with one line of the stock file.
+#[derive(Debug)]
+enum LineError {
+    WrongFieldCount(usize),
+    BadQuantity(ParseIntError),
+    BadPrice(ParseFloatError),
+}
+
+impl fmt::Display for LineError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            LineError::WrongFieldCount(n) => write!(f, "expected 3 fields, found {n}"),
+            LineError::BadQuantity(_) => write!(f, "quantity is not a whole number"),
+            LineError::BadPrice(_) => write!(f, "price is not a number"),
+        }
+    }
+}
+
+impl Error for LineError {
+    // The underlying error, so callers can walk the chain of causes.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            LineError::WrongFieldCount(_) => None,
+            LineError::BadQuantity(e) => Some(e),
+            LineError::BadPrice(e) => Some(e),
+        }
+    }
+}
+
+// From impls let `?` convert the library errors into ours automatically.
+impl From<ParseIntError> for LineError {
+    fn from(e: ParseIntError) -> Self {
+        LineError::BadQuantity(e)
+    }
+}
+
+impl From<ParseFloatError> for LineError {
+    fn from(e: ParseFloatError) -> Self {
+        LineError::BadPrice(e)
+    }
+}
+
+fn parse_line(line: &str) -> Result<Item, LineError> {
+    let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+    let [sku, quantity, price] = fields[..] else {
+        return Err(LineError::WrongFieldCount(fields.len()));
+    };
+    Ok(Item {
+        sku: sku.to_string(),
+        quantity: quantity.parse()?,
+        price: price.parse()?,
+    })
+}
+
+fn main() {
+    let file = "TEA-01, 40, 3.50\nMUG-07, ten, 8.00\nPOT-02, 3\nJAR-11, 12, 2,5\nSPN-03, 25, 0.75";
+    let mut stock = Vec::new();
+    for (number, line) in file.lines().enumerate() {
+        match parse_line(line) {
+            Ok(item) => stock.push(item),
+            Err(e) => {
+                print!("line {}: {e}", number + 1);
+                if let Some(cause) = e.source() {
+                    print!(" (caused by: {cause})");
+                }
+                println!();
+            }
+        }
+    }
+    let value: f64 = stock.iter().map(|i| i.quantity as f64 * i.price).sum();
+    println!("loaded {} items worth {value:.2}", stock.len());
+    let skus: Vec<&str> = stock.iter().map(|i| i.sku.as_str()).collect();
+    println!("{skus:?}");
+}
+```
+
+```text
+line 2: quantity is not a whole number (caused by: invalid digit found in string)
+line 3: expected 3 fields, found 2
+line 4: expected 3 fields, found 4
+loaded 2 items worth 158.75
+["TEA-01", "SPN-03"]
+```
+
+In `parse_line`, `quantity.parse()?` produces a `ParseIntError` on failure, and `?` calls `LineError::from` to turn it into `LineError::BadQuantity`; the same happens for the price. The slice pattern `let [sku, quantity, price] = fields[..] else { ... }` checks the field count and names the fields in one step. The caller prints each error's message and walks to its `source()`, giving output that a person can actually fix ("line 2: quantity is not a whole number (caused by: invalid digit found in string)") rather than a bare "error".
+
+Writing `Display`, `Error` and `From` by hand is mechanical, and in professional code it is usually generated by the **thiserror** crate, whose derive macro lets you write the message as an attribute on each variant and mark the fields that are sources or `From` conversions. The resulting type is exactly what you would have written by hand, so it costs nothing at run time and adds no public dependency to your API.
+
+</Section>
+
+<Section id="box-dyn-error" kind="examples" title="Errors in applications">
+
+Inside an application (as opposed to a library), you often don't need callers to distinguish error kinds; you need to report the failure clearly and stop or move on. <code>Box&lt;dyn Error&gt;</code>, a boxed trait object holding *any* error type, serves well, and `?` converts any error into it. Even a plain string can become one, through `.into()`.
+
+```rust check
+use std::collections::HashMap;
+use std::error::Error;
+
+// In application code, Box<dyn Error> can hold any error type, so `?` works on all of them.
+fn average_rating(reviews: &str) -> Result<f64, Box<dyn Error>> {
+    let mut scores = Vec::new();
+    for line in reviews.lines() {
+        let (_, score) = line.split_once(':').ok_or("a review line has no ':'")?;
+        let score: u8 = score.trim().parse()?;
+        if !(1..=5).contains(&score) {
+            return Err(format!("score {score} is outside 1..=5").into());
+        }
+        scores.push(score as f64);
+    }
+    if scores.is_empty() {
+        return Err("no reviews".into());
+    }
+    Ok(scores.iter().sum::<f64>() / scores.len() as f64)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut shops = HashMap::new();
+    shops.insert("Mama Ngina's Kitchen", "Wanjiru: 5\nOtieno: 4\nAkinyi: 4");
+    shops.insert("Café Lisboa", "Rui: 3\nInês: seven");
+    shops.insert("Seoul Garden", "Min-jun: 9");
+    shops.insert("Empty Plate", "");
+
+    let mut names: Vec<_> = shops.keys().copied().collect();
+    names.sort();
+    for name in names {
+        match average_rating(shops[name]) {
+            Ok(avg) => println!("{name}: {avg:.2}"),
+            Err(e) => println!("{name}: cannot rate ({e})"),
+        }
+    }
+
+    // `?` in main: an Err here would end the program with a non-zero exit status.
+    let best = average_rating("A: 5\nB: 5")?;
+    println!("a perfect shop scores {best}");
+    Ok(())
+}
+```
+
+```text
+Café Lisboa: cannot rate (invalid digit found in string)
+Empty Plate: cannot rate (no reviews)
+Mama Ngina's Kitchen: 4.33
+Seoul Garden: cannot rate (score 9 is outside 1..=5)
+a perfect shop scores 5
+```
+
+`ok_or("...")?` turns a `None` into an error with a message, and `Err(format!(...).into())` builds one from a `String`. Note also that `main` itself returns <code>Result&lt;(), Box&lt;dyn Error&gt;&gt;</code>. If `main` returns an `Err`, Rust prints it with its `Debug` format and exits with status 1. For example, a program whose `main` does `let port: u16 = "http".parse()?;` prints
+
+```text
+Error: ParseIntError { kind: InvalidDigit }
+```
+
+and exits with status 1. That is good enough for a script but not for a polished tool, which should print a friendly message and choose its exit code.
+
+The **anyhow** crate is the standard upgrade for applications: its `anyhow::Error` is like a boxed error but adds context as it travels (`.context("while reading config.toml")?`), and prints the whole chain of causes. The common division of labour in the ecosystem is **thiserror for libraries, anyhow for applications**: libraries expose precise error enums that callers can match on, and applications collect them, add context, and report them.
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing">
+
+Rust's test framework is built into the compiler and Cargo; you need no extra library to start. A test is any function marked `#[test]`; it passes if it returns without panicking. Unit tests usually live at the bottom of the file they test, in a module compiled only for tests:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_numbers() {
+        assert!(luhn_valid("8763 2209 5512 0047"));
+        assert!(luhn_valid("271828182847"));
+    }
+
+    #[test]
+    fn single_digit_change() {
+        assert!(!luhn_valid("271828182841"));
+    }
+}
+```
+
+`#[cfg(test)]` means "compile this only when building tests", so test code never ends up in your release binary, and `use super::*` brings the parent module's items, private ones included, into scope. Running `cargo test` on a library crate containing such tests, plus one example in a documentation comment, prints:
+
+```text
+running 3 tests
+test tests::bad_input ... ok
+test tests::single_digit_change ... ok
+test tests::valid_numbers ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests luhn
+
+running 1 test
+test src/lib.rs - luhn_valid (line 3) ... ok
+```
+
+The programs in this course must each be a single file with a `main`, so the next one runs the same kind of checks by calling the test functions from `main`. The function under test implements the **Luhn checksum**, the check digit on payment card numbers, which catches any single mistyped digit:
+
+```rust check
+/// Checks a number with the Luhn algorithm, used by payment cards and some ID numbers.
+/// Spaces are allowed; any other non-digit makes the number invalid.
+fn luhn_valid(number: &str) -> bool {
+    let digits: Option<Vec<u32>> = number
+        .chars()
+        .filter(|c| *c != ' ')
+        .map(|c| c.to_digit(10))
+        .collect();
+    let Some(digits) = digits else {
+        return false;
+    };
+    if digits.len() < 2 {
+        return false;
+    }
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                let doubled = d * 2;
+                if doubled > 9 { doubled - 9 } else { doubled }
+            } else {
+                d
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+// In a real crate these would be #[test] functions run by `cargo test`.
+// Here main calls them, so the program checks itself when it runs.
+fn valid_numbers() {
+    assert!(luhn_valid("8763 2209 5512 0047"));
+    assert!(luhn_valid("271828182847"));
+}
+
+fn single_digit_change() {
+    assert!(!luhn_valid("271828182841"));
+    assert!(!luhn_valid("8763 2209 5512 0049"));
+}
+
+fn bad_input() {
+    assert!(!luhn_valid(""), "empty input");
+    assert!(!luhn_valid("0"), "a single digit");
+    assert!(!luhn_valid("2718-2818-2847"), "dashes are not allowed");
+}
+
+fn main() {
+    let tests: [(&str, fn()); 3] = [
+        ("valid_numbers", valid_numbers),
+        ("single_digit_change", single_digit_change),
+        ("bad_input", bad_input),
+    ];
+    for (name, test) in tests {
+        test();
+        println!("test {name} ... ok");
+    }
+    println!("all {} tests passed", tests.len());
+}
+```
+
+```text
+test valid_numbers ... ok
+test single_digit_change ... ok
+test bad_input ... ok
+all 3 tests passed
+```
+
+When a test fails, `cargo test` shows which one and why. Here is a test that wrongly expected 15 digits, with `assert_eq!`'s report of both sides:
+
+```text
+test tests::digit_count ... FAILED
+
+failures:
+
+---- tests::digit_count stdout ----
+
+thread 'tests::digit_count' (2319418) panicked at src/lib.rs:52:9:
+assertion `left == right` failed: cards on file have 15 digits
+  left: 16
+ right: 15
+```
+
+The rest of the toolkit:
+
+- **Integration tests** go in a `tests/` directory next to `src/`. Each file there is compiled as a separate crate that can only use your library's public API, the way your users will.
+- **Doc tests**: code blocks in `///` documentation comments are compiled and run by `cargo test`, so examples in your documentation can never silently go stale. That is the "Doc-tests" section above.
+- `#[should_panic(expected = "...")]` marks a test that must panic; a test may also return `Result<(), E>` and use `?` inside; `#[ignore]` skips slow tests unless asked.
+- `cargo test luhn` runs only tests whose names contain "luhn"; `cargo test -- --nocapture` shows `println!` output from passing tests.
+- Beyond the built-in framework, teams commonly add **property-based testing** (the `proptest` crate generates hundreds of random inputs and shrinks failures to a minimal example), **snapshot testing** (`insta`), **fuzzing** (`cargo fuzz`) and **benchmarks** (`criterion`).
+
+</Section>
+
+<Section id="practice-pro" kind="human" title="How Rust teams handle errors and tests">
+
+Some conventions you will find in most professional Rust codebases:
+
+- **No `unwrap` on external input.** Code review treats each `unwrap` as a claim that failure is impossible; if it isn't obvious why, use `expect("reason")` or handle the error. Clippy can be configured to forbid `unwrap` outside tests.
+- **Errors carry context.** "No such file" is useless without the file name. Libraries put the relevant data in their error variants; applications add context with anyhow as errors propagate.
+- **One error enum per module or crate, not per function**, so callers match on a small, stable set of cases. Mark public enums `#[non_exhaustive]` if you expect to add variants later without breaking callers.
+- **Tests sit next to the code**, run on every commit in continuous integration, and include the bug you just fixed, so it can never come back.
+- **Test behaviour, not implementation.** Integration tests that use only the public API survive refactoring; tests that poke at private internals often have to be rewritten with them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Panics are Rust's exceptions."** You *can* catch a panic with `std::panic::catch_unwind`, but it exists for special cases such as keeping a thread pool alive or stopping a panic at a boundary with C code. Using panics for ordinary control flow is unidiomatic, slow, and doesn't work at all when panics are configured to abort.
+
+</Misconception>
+
+<Misconception>
+
+**"`?` just ignores errors."** It does the opposite: it returns the error to the caller immediately, converting it with `From` along the way. The error is still there; the decision about it is handed upward to code that knows more.
+
+</Misconception>
+
+<Misconception>
+
+**"<code>Box&lt;dyn Error&gt;</code> is always good enough."** It is convenient in applications, but a library that returns it forces callers to inspect errors at run time instead of matching on variants. Give library users a concrete error type.
+
+</Misconception>
+
+<Misconception>
+
+**"If it compiles, it works, so Rust code doesn't need tests."** The compiler rules out memory errors and data races, not wrong answers. The Luhn function above would compile just as happily with the doubling applied to the wrong digits. Tests check the logic; the type system checks the plumbing.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

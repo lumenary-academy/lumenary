@@ -1,0 +1,393 @@
+---
+title: Errors as values
+subtitle: Returning, wrapping and inspecting errors, custom error types, errors.Is and errors.As, and where panic and recover fit.
+minutes: 55
+objectives:
+  - Return and check errors with the if err != nil pattern, adding context as errors travel up
+  - Wrap errors with fmt.Errorf and %w, and test for them with errors.Is
+  - Define custom error types with Unwrap, and extract them with errors.As and errors.AsType
+  - Report several problems at once with errors.Join
+  - Explain when to panic, and use recover only at boundaries
+prerequisites: [structs-methods-interfaces]
+references:
+  - title: "Go blog: Error handling and Go"
+    url: https://go.dev/blog/error-handling-and-go
+  - title: "Go blog: Working with Errors in Go 1.13"
+    url: https://go.dev/blog/go1.13-errors
+    note: The design of wrapping, errors.Is and errors.As.
+  - title: "Go blog: Errors are values"
+    url: https://go.dev/blog/errors-are-values
+  - title: The errors package
+    url: https://pkg.go.dev/errors
+  - title: "Go blog: Defer, Panic, and Recover"
+    url: https://go.dev/blog/defer-panic-and-recover
+---
+
+<Section id="motivation" kind="motivation" title="Failure is ordinary">
+
+Programs that talk to the world fail all the time, in ordinary ways: a file is missing, a number is mistyped, a server is slow, a disk is full. Go's position is that these failures are not exceptional and should not be handled by an invisible mechanism that jumps across functions. Instead, a function that can fail **returns an error as an ordinary value**, alongside its result, and the caller decides what to do with it right there.
+
+`error` is a tiny built-in interface:
+
+```go
+type error interface {
+	Error() string
+}
+```
+
+Any type with an `Error() string` method is an error. A function returns `nil` for success and a non-nil error for failure, and callers write the most recognisable three lines in Go:
+
+```go
+if err != nil {
+	return fmt.Errorf("loading settings: %w", err)
+}
+```
+
+Newcomers often find this repetitive, and the Go team has openly debated alternatives for years without finding one the community preferred. Experienced Go programmers mostly come to value it: every place that can fail is visible in the code, each error picks up context on its way up ("loading settings: reading config.json: permission denied"), and nothing escapes unnoticed through a stack of functions. This lesson covers the whole toolkit around that simple idea.
+
+</Section>
+
+<Section id="basics" kind="examples" title="Creating, wrapping and checking errors">
+
+```go check
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"strconv"
+)
+
+// A sentinel error: a package-level value callers can test for.
+var ErrOutOfStock = errors.New("out of stock")
+
+var stock = map[string]int{"rice": 12, "beans": 0}
+
+func reserve(item string, qty int) error {
+	have, ok := stock[item]
+	if !ok {
+		return fmt.Errorf("reserve %q: unknown item", item) // a new error with a formatted message
+	}
+	if have < qty {
+		return fmt.Errorf("reserve %d %s: %w", qty, item, ErrOutOfStock) // %w wraps
+	}
+	stock[item] -= qty
+	return nil
+}
+
+func parseQty(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("quantity %q: %w", s, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("quantity %d: must be positive", n)
+	}
+	return n, nil
+}
+
+func main() {
+	for _, order := range [][2]string{{"rice", "5"}, {"beans", "1"}, {"tea", "2"}, {"rice", "lots"}} {
+		qty, err := parseQty(order[1])
+		if err != nil {
+			fmt.Println("rejected:", err)
+			continue
+		}
+		if err := reserve(order[0], qty); err != nil {
+			fmt.Println("rejected:", err)
+			if errors.Is(err, ErrOutOfStock) { // looks through the wrapping
+				fmt.Println("  -> offering a back-order instead")
+			}
+			continue
+		}
+		fmt.Println("reserved", qty, order[0], "| left:", stock[order[0]])
+	}
+
+	_, err := os.Open("/no/such/dir/inventory.csv")
+	fmt.Println(err)
+	fmt.Println(errors.Is(err, fs.ErrNotExist))
+}
+```
+
+```text
+reserved 5 rice | left: 7
+rejected: reserve 1 beans: out of stock
+  -> offering a back-order instead
+rejected: reserve "tea": unknown item
+rejected: quantity "lots": strconv.Atoi: parsing "lots": invalid syntax
+open /no/such/dir/inventory.csv: no such file or directory
+true
+```
+
+The building blocks:
+
+- **`errors.New("...")`** creates an error with a fixed message. Declared once at package level and exported, such a value is a **sentinel error** that callers can compare against: `io.EOF`, `fs.ErrNotExist` and `sql.ErrNoRows` are famous ones. By convention their names start with `Err`.
+- **`fmt.Errorf`** builds an error with a formatted message. With the **`%w`** verb it also **wraps** another error: the new error's message includes the old one, and the old error is kept inside, retrievable later.
+- **`errors.Is(err, target)`** reports whether `err`, or any error it wraps, is `target`. It sees through any number of layers of wrapping, which is why `reserve`'s added context ("reserve 1 beans: ...") doesn't stop the caller from recognising `ErrOutOfStock`. Comparing with `==` would fail as soon as anyone wrapped the error.
+- The standard library follows the same rules. `os.Open` returns an error whose message names the file, and `errors.Is(err, fs.ErrNotExist)` recognises "file not found" on every operating system, whatever the underlying system error was.
+
+Notice the two shapes of the check in `main`. When a call returns a value *and* an error, the value is needed afterwards, so the error is checked on the next line: `qty, err := parseQty(...)` followed by `if err != nil`. When a call returns only an error, the check can be folded into the `if`: `if err := reserve(...); err != nil { ... }`, which keeps `err` scoped to the `if` and avoids accidentally reusing a stale `err` later in the function.
+
+Error messages in Go are lower-case, without final punctuation, because they are usually embedded in longer messages: "rejected: quantity \"lots\": strconv.Atoi: parsing \"lots\": invalid syntax" reads as one chain from the most general context to the most specific cause.
+
+</Section>
+
+<Section id="custom" kind="definitions" title="Custom error types, errors.As and errors.AsType">
+
+<Definition term="wrapping and unwrapping">
+
+An error **wraps** another if it has a method `Unwrap() error` that returns it (or `Unwrap() []error` for several). `errors.Is` and `errors.As` follow these methods through the whole chain. `errors.As(err, &target)` finds the first error in the chain that can be assigned to `target`'s type and stores it there; `errors.AsType[T](err)` (Go 1.26) does the same and returns the match and a boolean.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// A custom error type carries structured information about the failure.
+type LineError struct {
+	Line int
+	Err  error // the underlying cause
+}
+
+func (e *LineError) Error() string { return fmt.Sprintf("line %d: %v", e.Line, e.Err) }
+
+// Unwrap lets errors.Is and errors.As look inside.
+func (e *LineError) Unwrap() error { return e.Err }
+
+var ErrEmptyName = errors.New("empty name")
+
+func parseScores(text string) (map[string]int, error) {
+	scores := map[string]int{}
+	for i, line := range strings.Split(text, "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, &LineError{Line: i + 1, Err: errors.New("missing ':'")}
+		}
+		if strings.TrimSpace(name) == "" {
+			return nil, &LineError{Line: i + 1, Err: ErrEmptyName}
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return nil, &LineError{Line: i + 1, Err: err}
+		}
+		scores[strings.TrimSpace(name)] = n
+	}
+	return scores, nil
+}
+
+func main() {
+	inputs := []string{
+		"Amaru: 17\nKiri: 21",
+		"Amaru: 17\nKiri 21",
+		"Amaru: 17\n : 4",
+		"Amaru: 17\nKiri: twenty",
+	}
+	for _, in := range inputs {
+		scores, err := parseScores(in)
+		if err == nil {
+			fmt.Println("ok:", scores)
+			continue
+		}
+		fmt.Println("error:", err)
+
+		// errors.As finds an error of a given type anywhere in the chain.
+		var le *LineError
+		if errors.As(err, &le) {
+			fmt.Println("  at line", le.Line)
+		}
+		// errors.AsType (Go 1.26) does the same with a type parameter instead of a variable.
+		if ne, ok := errors.AsType[*strconv.NumError](err); ok {
+			fmt.Printf("  could not convert %q\n", ne.Num)
+		}
+		if errors.Is(err, ErrEmptyName) {
+			fmt.Println("  a name is missing")
+		}
+	}
+}
+```
+
+```text
+ok: map[Amaru:17 Kiri:21]
+error: line 2: missing ':'
+  at line 2
+error: line 2: empty name
+  at line 2
+  a name is missing
+error: line 2: strconv.Atoi: parsing "twenty": invalid syntax
+  at line 2
+  could not convert "twenty"
+```
+
+A custom type such as `LineError` carries structured data (here, the line number) that a caller can act on, while its `Error` method keeps the message readable. Its `Unwrap` method exposes the cause, so the caller can look *through* a `LineError` and find the `*strconv.NumError` that `strconv.Atoi` produced, with the offending text in its `Num` field, or recognise the sentinel `ErrEmptyName`.
+
+`errors.As` takes a pointer to a variable of the type you are looking for. `errors.AsType`, added in Go 1.26, uses a type parameter instead, so the check fits on one line in an `if` and can't be given the wrong kind of pointer. Older code uses `errors.As` everywhere; both work.
+
+When should you create a custom type rather than a sentinel or a wrapped message? Use a **sentinel** when callers only need to know *which* failure happened; a **custom type** when they need *data* about it (a line number, a field name, a retry-after delay); and plain **`fmt.Errorf` wrapping** for everything else, which is most errors. Don't export error types or sentinels you don't want to support forever: once callers test for them, they are part of your API.
+
+</Section>
+
+<Section id="join-panic" kind="examples" title="Several errors at once, and panics">
+
+```go check
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+type Signup struct {
+	Name, Email string
+	Age         int
+}
+
+// errors.Join reports every problem at once instead of stopping at the first.
+func validate(s Signup) error {
+	var errs []error
+	if strings.TrimSpace(s.Name) == "" {
+		errs = append(errs, errors.New("name is required"))
+	}
+	if !strings.Contains(s.Email, "@") {
+		errs = append(errs, fmt.Errorf("email %q has no @", s.Email))
+	}
+	if s.Age < 13 {
+		errs = append(errs, fmt.Errorf("age %d is under 13", s.Age))
+	}
+	return errors.Join(errs...) // nil if errs is empty
+}
+
+// safeDivide turns a panic into an ordinary error at a boundary.
+func safeDivide(a, b int) (q int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered: %v", r)
+		}
+	}()
+	return a / b, nil
+}
+
+func main() {
+	fmt.Println(validate(Signup{"Leilani", "lei@example.org", 30}))
+	err := validate(Signup{" ", "nobody", 9})
+	fmt.Println(err)
+
+	fmt.Println(safeDivide(10, 3))
+	fmt.Println(safeDivide(1, 0))
+}
+```
+
+```text
+<nil>
+name is required
+email "nobody" has no @
+age 9 is under 13
+3 <nil>
+0 recovered: runtime error: integer divide by zero
+```
+
+**`errors.Join`** (Go 1.20) combines several errors into one whose message lists them on separate lines; it returns `nil` if all its arguments are nil, so the validation function can end with a single `return errors.Join(errs...)`. Form validation, configuration checks and batch jobs use it to report every problem in one pass instead of making the user fix them one at a time. `errors.Is` and `errors.As` search all the joined errors.
+
+**Panics** are for bugs, not for failures. A panic stops the normal flow of the current goroutine, runs its deferred calls, and, unless something recovers, crashes the program with a stack trace. The runtime panics on programming errors: an index out of range, a nil pointer dereference, a division by zero, writing to a nil map. Your own code should panic only when continuing would be wrong and the cause is a programmer's mistake, such as an impossible `switch` case. A common idiom is a `Must` function used during program start-up, where failure means the program is misconfigured: `regexp.MustCompile` panics if its pattern, written in the source code, is invalid.
+
+**`recover`**, called inside a deferred function, stops a panic and returns its value. `safeDivide` uses it to turn a division-by-zero panic into an ordinary error. In real code, recover belongs only at boundaries, where one failing piece of work must not bring down the rest: the `net/http` server recovers from a panic in one request handler so that other requests keep being served. Using panic and recover as a general exception mechanism is unidiomatic, and the Go team's style guides say so.
+
+</Section>
+
+<Section id="history" kind="history" title="The long debate about if err != nil">
+
+Go's error handling is the most discussed feature of the language. Surveys of Go developers have repeatedly listed its verbosity among their top complaints, and the Go team has taken that seriously. In 2018 it published draft designs for Go 2 that included a `check`/`handle` mechanism; in 2019 it proposed a built-in `try` function that would return early on error. Both drew thousands of comments, and both were withdrawn, largely because many experienced users felt that hiding the control flow would cost more in readability than it saved in typing. Smaller changes did land: wrapping with `%w`, `errors.Is` and `errors.As` in Go 1.13 (2019), `errors.Join` in Go 1.20, and `errors.AsType` in Go 1.26.
+
+In 2025 the Go team wrote on its blog that, after many proposals and no consensus, it would stop pursuing new syntax for error handling for the foreseeable future. Whatever one thinks of that decision, it means the patterns in this lesson are the ones you will read and write in Go codebases for years to come, and tooling (editors that collapse the three-line checks, linters that catch ignored errors) has grown up around them.
+
+</Section>
+
+<Section id="design-example" kind="examples" title="Worked example: designing the errors of a package">
+
+Suppose you are writing a package `transfer` that moves money between accounts. Before writing code, decide what callers will need to *do* differently for each failure, because that determines what to export.
+
+- An account that doesn't exist: the caller shows "check the account number". A sentinel is enough: `var ErrNoAccount = errors.New("transfer: no such account")`.
+- Insufficient funds: the caller wants to show *how much* is missing. That needs data, so export a type: `type InsufficientFundsError struct { Need, Have Money }`, with an `Error` method.
+- A database timeout or a network glitch: the caller can only retry or apologise. Don't export anything new; wrap the underlying error with context (`fmt.Errorf("transfer %s: %w", id, err)`) and let callers test for general conditions such as `context.DeadlineExceeded`.
+
+Callers then write:
+
+```go
+err := transfer.Send(from, to, amount)
+switch {
+case err == nil:
+	fmt.Println("sent")
+case errors.Is(err, transfer.ErrNoAccount):
+	fmt.Println("check the account number")
+default:
+	if e, ok := errors.AsType[*transfer.InsufficientFundsError](err); ok {
+		fmt.Printf("you need %v more\n", e.Need-e.Have)
+	} else {
+		log.Printf("transfer failed: %v", err)
+	}
+}
+```
+
+Two sentinels and one type are a small, stable surface that callers can rely on for years. Everything else stays an implementation detail you are free to change.
+
+### What errors cost
+
+An error value is cheap: an interface holding a pointer. Creating one with `errors.New` at package level costs nothing per use, while `fmt.Errorf` formats a string and allocates each time, which only matters in very hot paths, where returning a pre-made sentinel is the usual fix. Unlike exceptions in many languages, Go errors carry **no stack trace**. The chain of context messages usually tells you more than a trace would; when you need one, the runtime's stack can be captured explicitly, and some error libraries do this for you.
+
+</Section>
+
+<Section id="practice-pro" kind="human" title="How Go teams handle errors">
+
+Practices you will find in most professional Go codebases:
+
+- **Handle each error once.** Either deal with it (retry, use a fallback, report it to the user) or return it with context, not both. Logging an error and then returning it produces the same failure in the logs several times over, once per layer.
+- **Add context that the caller doesn't have.** Wrap with what *this* function was trying to do and with which inputs: `fmt.Errorf("parse invoice %s: %w", id, err)`. Avoid empty phrases like "failed to"; every error message is already about failing.
+- **Decide whether to wrap or not.** `%w` makes the inner error part of your API: callers can now depend on it with `errors.Is`. If you don't want to promise that (say, the database driver is an implementation detail), use `%v`, which keeps the message but hides the error.
+- **Check errors from `Close` on files you wrote.** For files opened for writing, `Close` is where buffered data may fail to reach the disk. A deferred close that ignores the error is fine for reading and risky for writing.
+- **Use linters.** `errcheck` (included in the popular golangci-lint bundle) finds errors that are silently ignored; `go vet` checks `fmt.Errorf` formats.
+- **Structured logging at the top.** Errors bubble up to a handler or `main`, which logs them once with `log/slog` (the standard structured logger since Go 1.21), including fields such as the request ID, and decides the user-visible response or exit code.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`errors.Is` is the same as `==`."** `==` compares one error value with another; `errors.Is` also searches every error wrapped inside. As soon as some layer adds context with `%w`, `==` stops matching and `errors.Is` keeps working. Use `errors.Is` for sentinels.
+
+</Misconception>
+
+<Misconception>
+
+**"`%v` and `%w` in `fmt.Errorf` are interchangeable."** Both put the inner error's message into the new message, but only `%w` keeps the inner error inspectable. With `%v`, `errors.Is` and `errors.As` can no longer find it.
+
+</Misconception>
+
+<Misconception>
+
+**"Go has no exceptions, so panics are Go's exceptions."** Panics exist, but they signal bugs. A library that panics on bad input forces every caller to recover; return an error instead. Recover belongs at a small number of boundaries, such as a server's per-request handler.
+
+</Misconception>
+
+<Misconception>
+
+**"Ignoring an error is harmless if the program keeps running."** A failed write, an unparsed number treated as zero, or a missing file treated as empty will produce wrong results later, far from the cause. Ignore an error only deliberately, with `_ =` and a comment saying why.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

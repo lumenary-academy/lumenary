@@ -1,0 +1,383 @@
+---
+title: Hash tables
+subtitle: Constant-time lookup on average — how it works, what it assumes, and what happens when an attacker breaks the assumption.
+minutes: 60
+objectives:
+  - Explain how a hash function turns keys into bucket numbers, and what makes a hash function good
+  - Implement a hash map with separate chaining and resizing, and a set with open addressing
+  - Prove the expected O(1 + α) cost of chaining and the 1/(1 − α) probe bound for open addressing, and state the assumptions behind them
+  - Explain hash flooding, why Python randomises string hashes, and how CPython's dict and set are built
+prerequisites: [lists-stacks-queues, complexity]
+related: [math.prob.probability-intro, math.number.modular-arithmetic, math.prob.probability-theory]
+references:
+  - title: "CPython: notes on dictionaries (dictnotes.txt)"
+    url: https://github.com/python/cpython/blob/main/Objects/dictnotes.txt
+    note: How dictionaries are used in practice and which tunings were tried.
+  - title: "CPython source: Objects/dictobject.c"
+    url: https://github.com/python/cpython/blob/main/Objects/dictobject.c
+    note: The long comments near the top explain the compact layout, the probe sequence and the choice of load factor.
+  - title: "PEP 456: Secure and interchangeable hash algorithm"
+    author: Christian Heimes
+    year: 2013
+    url: https://peps.python.org/pep-0456/
+    note: Why Python moved string hashing to SipHash, with the history of hash-flooding attacks.
+  - title: "PEP 412: Key-Sharing Dictionary"
+    author: Mark Shannon
+    year: 2012
+    url: https://peps.python.org/pep-0412/
+  - title: "Denial of Service via Algorithmic Complexity Attacks"
+    author: Scott A. Crosby and Dan S. Wallach
+    year: 2003
+    url: https://www.usenix.org/legacy/events/sec03/tech/full_papers/crosby/crosby.pdf
+    note: The paper that showed how to bring servers down by feeding their hash tables colliding keys.
+  - title: "Universal classes of hash functions"
+    author: J. Lawrence Carter and Mark N. Wegman
+    year: 1979
+    url: https://doi.org/10.1016/0022-0000(79)90044-8
+  - title: "Swiss Tables design notes"
+    author: Abseil
+    url: https://abseil.io/about/design/swisstables
+    note: The open-addressing design behind Google's C++ tables, Rust's HashMap and (since Go 1.24) Go's maps.
+  - title: "Faster Go maps with Swiss Tables"
+    author: The Go Blog
+    url: https://go.dev/blog/swisstable
+  - title: "JEP 180: Handle Frequent HashMap Collisions with Balanced Trees"
+    author: OpenJDK
+    url: https://openjdk.org/jeps/180
+---
+
+<Section id="motivation" kind="motivation" title="Finding one key among fifty million">
+
+A sign-up form must answer one question, many times a second: *is this username taken?* With fifty million existing users, scanning a list takes fifty million comparisons. Keeping the names sorted lets binary search answer in about 26 comparisons, but every new user must then be squeezed into the right place in the array, which costs $O(n)$. A balanced search tree (next lesson) does both in $O(\log n)$.
+
+A **hash table** does better on average: lookup, insertion and deletion in **expected constant time**, independent of how many keys are stored. It is the structure behind Python's `dict` and `set`, the symbol tables of compilers, database hash joins, caches like Memcached and Redis, deduplication in backup systems, and the "have I seen this before?" check inside countless algorithms. The idea fits in a sentence: *compute where the key should be, and look only there.*
+
+The price is in the fine print. "Expected" depends on an assumption about the keys and the hash function. Most of the time the assumption holds. When an attacker can choose the keys, it can be broken, and in 2011 that brought down web servers across several programming languages. This lesson covers both the idea and the fine print.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="From pigeonholes to hash functions">
+
+Start with the easy case. If the keys are student numbers from 0 to 999, use an array of 1000 slots and store student $k$ in slot $k$. Every operation is one array access: $O(1)$. This is **direct addressing**.
+
+Most keys are not small integers. Usernames, URLs, coordinates and tuples come from a universe far larger than any array we could allocate. So we choose a table of $m$ **buckets** and a **hash function** $h$ that maps every possible key to a bucket number in $\{0, 1, \ldots, m-1\}$. To store a key, compute $h(\text{key})$ and put it in that bucket. To look it up, compute $h(\text{key})$ again and look only in that bucket.
+
+<Analogy>
+
+A busy post office sorts letters into pigeonholes labelled with the last two digits of the postcode. A clerk looking for a letter does not search the whole office, only one pigeonhole. Two letters with different postcodes may share a pigeonhole, so each pigeonhole holds a small pile, but the piles stay small as long as the postcodes are spread evenly over the hundred labels.
+
+</Analogy>
+
+Two keys landing in the same bucket is a **collision**. Collisions are not a rare accident to be engineered away; they are certain. There are more possible keys than buckets, so by the pigeonhole principle some bucket receives many possible keys. Worse, collisions appear much sooner than intuition suggests: with 365 buckets, 23 random keys already give a better-than-even chance that two of them collide (the *birthday paradox*). A hash table therefore needs two ingredients: a hash function that spreads keys evenly, and a **collision-resolution** strategy for keys that share a bucket.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="hash function">
+
+A **hash function** maps keys to integers. A table with $m$ buckets uses $h(k) \bmod m$ (or, when $m$ is a power of two, the low bits of $h(k)$) as the bucket number. It must be **deterministic** and **consistent with equality**: if $a = b$ then $h(a) = h(b)$. It should be fast and spread typical keys evenly.
+
+</Definition>
+
+<Definition term="load factor">
+
+The **load factor** of a table with $n$ keys and $m$ buckets is $\alpha = n/m$.
+
+</Definition>
+
+<Definition term="separate chaining">
+
+In **separate chaining**, each bucket holds a small list (a *chain*) of the entries that hash to it.
+
+</Definition>
+
+<Definition term="open addressing">
+
+In **open addressing**, all entries live in the table's array itself, at most one per slot. Each key has a **probe sequence** of slots to try in order; insertion takes the first empty slot, and search follows the same sequence until it finds the key or an empty slot. **Linear probing** tries $h(k), h(k)+1, h(k)+2, \ldots$ (mod $m$).
+
+</Definition>
+
+<Definition term="simple uniform hashing">
+
+The **simple uniform hashing** assumption: each key is equally likely to land in any of the $m$ buckets, independently of where other keys land. It is a *model* of a good hash function on typical data, not a theorem about any particular function.
+
+</Definition>
+
+</Section>
+
+<Section id="hash-functions" kind="human" title="What makes a good hash function">
+
+A hash function has one hard rule and one soft goal.
+
+The hard rule is **consistency with equality**. If two keys are equal, they must hash the same, or a lookup would search the wrong bucket and miss a key that is there. Python enforces this through the [`__hash__` and `__eq__` contract](https://docs.python.org/3/reference/datamodel.html#object.__hash__): `1 == 1.0 == True`, so `hash(1) == hash(1.0) == hash(True)`. It also explains why lists and dicts are **unhashable**: if you could put a list in a set and then append to it, its hash would change, and the set would look for it in the wrong bucket forever. Tuples of hashable items, strings, numbers and `frozenset`s are fine. A class that defines `__eq__` without `__hash__` becomes unhashable, which is Python protecting you from breaking the rule.
+
+The soft goal is **spreading**. A hash function that sends many typical keys to the same few buckets turns the table into a few long lists. Compare two ways to hash a string:
+
+- **Sum of character codes.** Fast, but anagrams like `"listen"` and `"silent"` collide, and similar keys such as `user0042` and `user0024` produce nearby sums, crowding into a narrow band of buckets.
+- **Polynomial hash.** Treat the characters $c_0 c_1 \ldots c_{\ell-1}$ as digits in base $B$: $h = c_0 B^{\ell-1} + c_1 B^{\ell-2} + \cdots + c_{\ell-1}$, reduced modulo a large number. Position now matters, and small changes to the key scatter the result.
+
+```python run
+import sys
+
+def sum_hash(s):
+    return sum(map(ord, s))
+
+def poly_hash(s, base=131, mod=(1 << 61) - 1):
+    h = 0
+    for ch in s:
+        h = (h * base + ord(ch)) % mod      # Horner's rule
+    return h
+
+keys = [f"user{i:04d}" for i in range(5000)]
+m = 1024
+for name, h in [("sum of codes", sum_hash), ("polynomial", poly_hash)]:
+    buckets = [0] * m
+    for k in keys:
+        buckets[h(k) % m] += 1
+    used = sum(1 for b in buckets if b)
+    print(f"{name:13} buckets used: {used:4} of {m}   longest chain: {max(buckets)}")
+
+print(sum_hash("listen") == sum_hash("silent"), poly_hash("listen") == poly_hash("silent"))
+
+# Python's own hashes: small ints hash to themselves (with one oddity), strings do not.
+print(hash(42), hash(-1), hash(1.0) == hash(1))
+print("this interpreter reduces numbers modulo", sys.hash_info.modulus)
+```
+
+All 5000 sums fall in a narrow range of values, so they use only a few dozen buckets and pile hundreds of keys into each, while the polynomial hash fills the table evenly. Python's integers hash to themselves for small values, except that `hash(-1)` is `-2`, because CPython's C code uses `-1` to signal an error. The modulus in the last line is $2^{61}-1$ on a 64-bit machine and $2^{31}-1$ on a 32-bit one, which is what you will see if this page is running Python in WebAssembly.
+
+For strings and bytes, CPython uses **SipHash** (currently the SipHash-1-3 variant) with a secret random key chosen when the interpreter starts ([PEP 456](https://peps.python.org/pep-0456/), [`Python/pyhash.c`](https://github.com/python/cpython/blob/main/Python/pyhash.c)). That is why `hash("hello")` changes every time you restart Python, and why the order of a set of strings may change between runs. The section on hash flooding explains why that randomness is a feature. Strings also cache their hash after the first computation, so looking up the same string key repeatedly costs nothing extra.
+
+</Section>
+
+<Section id="chaining" kind="human" title="Separate chaining, and why it is O(1) on average">
+
+With separate chaining, each bucket holds a list of `(key, value)` pairs. Insert: hash, then scan the bucket's list, replacing the value if the key is there and appending otherwise. Search and delete: hash, then scan that one list. All the cost is in the scan, so the question is how long the chains are.
+
+<Theorem name="Expected cost of chaining">
+
+Under simple uniform hashing, in a table of $m$ buckets holding $n$ keys:
+
+1. an unsuccessful search compares, in expectation, $\alpha = n/m$ keys;
+2. a successful search for a key chosen uniformly from those stored compares, in expectation, at most $1 + \alpha/2$ keys.
+
+So every operation costs $O(1 + \alpha)$ expected time, and $O(1)$ if the table keeps $\alpha$ below a constant.
+
+</Theorem>
+
+<Proof>
+
+(1) The missing key $k$ hashes to some bucket $b$. For each stored key $x$, let $X_x$ be 1 if $x$ is in bucket $b$ and 0 otherwise; by the assumption, $\Pr[X_x = 1] = 1/m$. The number of keys compared is $\sum_x X_x$, and by linearity of expectation its mean is $n \cdot \frac{1}{m} = \alpha$.
+
+(2) Suppose new keys are appended to the end of their chain, and number the stored keys $x_1, \ldots, x_n$ in order of insertion. Searching for $x_i$ compares $x_i$ itself plus every earlier key $x_j$ ($j < i$) in the same bucket, each there with probability $1/m$. So the expected cost of finding $x_i$ is $1 + \frac{i-1}{m}$, and averaging over $i$ gives
+
+$$\frac{1}{n}\sum_{i=1}^{n}\left(1 + \frac{i-1}{m}\right) = 1 + \frac{n-1}{2m} \le 1 + \frac{\alpha}{2}.$$
+
+</Proof>
+
+The proof uses only linearity of expectation, which holds even when the indicator variables are dependent (see <TopicLink id="math.prob.probability-theory">probability theory</TopicLink>). To keep $\alpha$ bounded as keys arrive, the table **resizes**: when $\alpha$ passes a threshold (0.75 is common for chaining), allocate about twice as many buckets and reinsert every entry, since each key's bucket depends on $m$. A single resize costs $\Theta(n)$, but by the doubling argument from <LessonLink slug="lists-stacks-queues">the previous lesson</LessonLink> the cost is amortised $O(1)$ per insertion.
+
+Notice the two kinds of averaging stacked together: *expected* over the randomness of hashing, and *amortised* over the sequence of operations. The worst case is still bad: if every key lands in the same bucket, each operation scans a chain of length $n$.
+
+```python run
+class ChainedHashMap:
+    """Separate chaining. The bucket count is a power of two; the table doubles when n/m > 0.75."""
+    def __init__(self, buckets=8):
+        self.buckets = [[] for _ in range(buckets)]
+        self.n = 0
+        self.comparisons = 0                   # instrumentation: key comparisons made
+
+    def _bucket(self, key):
+        return self.buckets[hash(key) & (len(self.buckets) - 1)]   # low bits of the hash
+
+    def put(self, key, value):
+        bucket = self._bucket(key)
+        for i, (k, _) in enumerate(bucket):
+            self.comparisons += 1
+            if k == key:
+                bucket[i] = (key, value)
+                return
+        bucket.append((key, value))
+        self.n += 1
+        if self.n > 0.75 * len(self.buckets):
+            self._resize(2 * len(self.buckets))
+
+    def get(self, key, default=None):
+        for k, v in self._bucket(key):
+            self.comparisons += 1
+            if k == key:
+                return v
+        return default
+
+    def delete(self, key):
+        bucket = self._bucket(key)
+        for i, (k, _) in enumerate(bucket):
+            if k == key:
+                bucket.pop(i)
+                self.n -= 1
+                return
+        raise KeyError(key)
+
+    def _resize(self, new_count):
+        old = self.buckets
+        self.buckets = [[] for _ in range(new_count)]
+        for bucket in old:
+            for k, v in bucket:
+                self._bucket(k).append((k, v))
+
+    def longest_chain(self):
+        return max(len(b) for b in self.buckets)
+
+capitals = ChainedHashMap()
+for country, city in [("Kenya", "Nairobi"), ("Peru", "Lima"), ("Japan", "Tokyo"),
+                      ("Ghana", "Accra"), ("Nepal", "Kathmandu"), ("Chile", "Santiago"),
+                      ("Egypt", "Cairo"), ("Fiji", "Suva"), ("Laos", "Vientiane")]:
+    capitals.put(country, city)
+capitals.delete("Fiji")
+print(capitals.get("Nepal"), capitals.get("Fiji", "gone"), "| keys:", capitals.n,
+      "| buckets:", len(capitals.buckets))
+print("longest chain:", capitals.longest_chain(), "(can vary between runs: string hashes are randomised)")
+
+# Now an adversary who knows we use the low bits of hash(), and that hash(int) is the int itself.
+import random
+for label, keys in [("random keys", random.Random(1).sample(range(10**9), 2000)),
+                    ("multiples of 2**16", [i * 2**16 for i in range(2000)])]:
+    table = ChainedHashMap()
+    for k in keys:
+        table.put(k, True)
+    print(f"{label:20} comparisons per insert: {table.comparisons / 2000:7.1f}"
+          f"   longest chain: {table.longest_chain()}")
+```
+
+With random keys each insertion compares well under one key on average, and the longest chain stays short. With 2000 keys whose low 16 bits are all zero, every key lands in bucket 0 at every table size, every insertion scans the whole chain, and the table has become a slow list: about 1000 comparisons per insertion, so $\Theta(n^2)$ in total. Python's real `dict` does not fall for these particular keys (its probe sequence mixes in the high bits of the hash, as we will see), but every hash table has *some* set of colliding keys. The question is whether an attacker can find them.
+
+</Section>
+
+<Section id="open-addressing" kind="human" title="Open addressing">
+
+Chaining spends memory on a list per bucket and a pointer per entry, and following those pointers is slow on modern hardware. **Open addressing** stores entries directly in one array. With **linear probing**, a key whose home slot $h(k)$ is taken goes to the next free slot, wrapping round at the end. A search starts at the home slot and walks forward until it finds the key (success) or an empty slot (failure: if the key were present, insertion would have put it no later than that empty slot).
+
+Two consequences follow.
+
+- **The load factor must stay below 1**, and in practice well below: the table resizes long before it is full.
+- **Deletion needs care.** Simply emptying a slot could cut a probe sequence in two, so a later search would stop early and miss a key stored beyond the gap. The usual fix is a **tombstone**: mark the slot "deleted". Searches walk past tombstones; insertions may reuse them. Tombstones accumulate, so resizing also clears them out.
+
+How long are the probe sequences? The cleanest bound comes from an idealised model.
+
+<Theorem name="Probes in open addressing">
+
+Assume **uniform hashing**: each key's probe sequence is a uniformly random ordering of the $m$ slots, independent of other keys. In a table holding $n < m$ keys, the expected number of probes in an unsuccessful search is at most $\dfrac{1}{1 - \alpha}$.
+
+</Theorem>
+
+<Proof>
+
+The first probe always happens. A probe beyond the $i$-th happens only if the first $i$ slots examined are all occupied. The first examined slot is occupied with probability $n/m$; given that, the second (a uniformly random *different* slot) is occupied with probability $(n-1)/(m-1)$; and so on. So
+
+$$\Pr[\text{more than } i \text{ probes}] = \frac{n}{m}\cdot\frac{n-1}{m-1}\cdots\frac{n-i+1}{m-i+1} \le \alpha^i,$$
+
+because $\frac{n-j}{m-j} \le \frac{n}{m}$ when $n \le m$. The expected number of probes is $\sum_{i \ge 0} \Pr[\text{more than } i \text{ probes}] \le \sum_{i \ge 0} \alpha^i = \frac{1}{1-\alpha}$.
+
+</Proof>
+
+At $\alpha = 0.5$ that is 2 probes; at $\alpha = 0.9$ it is 10. Linear probing is worse than this ideal, because occupied slots clump into **clusters**, and a key landing anywhere in a cluster extends it. Donald Knuth's classic analysis (in *The Art of Computer Programming*, volume 3) shows that, with an ideal random hash function, an unsuccessful search under linear probing takes about $\frac{1}{2}\left(1 + \frac{1}{(1-\alpha)^2}\right)$ probes: 2.5 at $\alpha = 0.5$ but about 50 at $\alpha = 0.9$. Linear probing is popular anyway, because consecutive slots share cache lines: ten probes in one cache line can cost less than two scattered ones.
+
+```python run
+import random
+
+def avg_probes_unsuccessful(m, alpha, trials=4000, seed=7):
+    """Fill a linear-probing table of m slots to load alpha with random home slots, then measure misses."""
+    rng = random.Random(seed)
+    occupied = [False] * m
+    for _ in range(int(alpha * m)):
+        i = rng.randrange(m)                  # an ideal hash: a uniformly random home slot
+        while occupied[i]:
+            i = (i + 1) % m
+        occupied[i] = True
+    total = 0
+    for _ in range(trials):
+        i, probes = rng.randrange(m), 1
+        while occupied[i]:                    # a missing key walks to the first empty slot
+            i, probes = (i + 1) % m, probes + 1
+        total += probes
+    return total / trials
+
+m = 1 << 14
+print(" load   measured   Knuth (linear)   ideal 1/(1-a)")
+for a in [0.25, 0.5, 0.75, 0.9]:
+    knuth = 0.5 * (1 + 1 / (1 - a) ** 2)
+    print(f"{a:5.2f} {avg_probes_unsuccessful(m, a):10.2f} {knuth:14.2f} {1 / (1 - a):14.2f}")
+```
+
+Modern high-performance tables refine open addressing rather than abandon it. **Swiss tables**, designed at Google ([Abseil's notes](https://abseil.io/about/design/swisstables)) and now behind Rust's `HashMap` and, since Go 1.24, Go's built-in maps ([Go blog](https://go.dev/blog/swisstable)), keep a byte of metadata per slot with a few bits of each key's hash, and use SIMD instructions to check a whole group of 8 or 16 slots in one step. **Cuckoo hashing** (Pagh and Rodler, 2004) gives each key two possible homes and guarantees worst-case $O(1)$ lookups, at the price of more complicated insertion.
+
+</Section>
+
+<Section id="cpython" kind="human" title="Inside Python's dict and set">
+
+CPython's `dict` is an open-addressing table, and its source comments are among the best essays on hashing in practice ([`dictobject.c`](https://github.com/python/cpython/blob/main/Objects/dictobject.c), [`dictnotes.txt`](https://github.com/python/cpython/blob/main/Objects/dictnotes.txt)). The essentials:
+
+- **Compact layout (since Python 3.6).** A dict keeps two arrays: a dense **entries** array of `(hash, key, value)` records in insertion order, and a sparse **index** table of $2^k$ small integers pointing into it. Probing happens in the small index table, iteration walks the dense entries, and that is why dicts remember insertion order (guaranteed by the language since 3.7; see [What's New in Python 3.6](https://docs.python.org/3/whatsnew/3.6.html)). It also saves a lot of memory compared with a sparse table of full records.
+- **Load factor at most 2/3.** When the entries array fills to two-thirds of the index size, the dict is rebuilt in a larger table, sized from the number of live entries (currently with at least three times as many slots), which also discards deleted entries.
+- **Perturbed probing.** The probe sequence is $i \leftarrow (5i + 1 + \text{perturb}) \bmod 2^k$, where `perturb` starts as the full hash and is shifted right by 5 bits at every step. Early probes depend on the low bits, but soon every bit of the hash has had its say, which is why the "multiples of $2^{16}$" keys above do not trouble a real dict. Once `perturb` reaches 0, the recurrence $i \leftarrow 5i + 1 \bmod 2^k$ visits every slot, so a free slot is always found.
+- **Sets** use the same ideas, but probe a run of up to 9 neighbouring slots linearly before jumping, to take advantage of cache lines ([`setobject.c`](https://github.com/python/cpython/blob/main/Objects/setobject.c)).
+- **Key-sharing.** Instances of the same class usually have the same attribute names, so their `__dict__`s can share one keys table and store only the values ([PEP 412](https://peps.python.org/pep-0412/)).
+
+Other languages chose differently. Java's `HashMap` uses chaining, and since Java 8 it converts a bucket's chain into a small balanced tree when it grows long, so the worst case becomes $O(\log n)$ instead of $O(n)$ ([JEP 180](https://openjdk.org/jeps/180)). That change was itself a response to hash flooding.
+
+</Section>
+
+<Section id="flooding" kind="human" title="Hash flooding and randomised hashing">
+
+Every analysis above assumed that keys behave as if randomly hashed. For keys chosen by an **adversary** that assumption is false: with a fixed, publicly known hash function, an attacker can compute thousands of keys that collide and send them to your server. Each insertion then costs $\Theta(n)$, and a request of a few hundred kilobytes can keep a processor busy for minutes.
+
+Scott Crosby and Dan Wallach described such *algorithmic complexity attacks* in 2003. In December 2011, a presentation at the Chaos Communication Congress showed that the web frameworks of PHP, Java, Python, Ruby and others parsed form fields into hash tables with predictable string hashes, so a single crafted HTTP request could exhaust a server. The fixes followed a common pattern:
+
+1. **Randomise the hash function.** Choose a secret key at start-up and mix it into every string hash. An attacker who cannot see the key cannot precompute collisions. Python offered this as an option in 2012 and enabled it by default in Python 3.3; the environment variable [`PYTHONHASHSEED`](https://docs.python.org/3/using/cmdline.html#envvar-PYTHONHASHSEED) fixes the seed when you need reproducible runs.
+2. **Use a keyed hash that resists collision-finding.** Randomising a weak function is not enough if the secret can be inferred from timing or output. SipHash, designed by Jean-Philippe Aumasson and Daniel J. Bernstein for exactly this job, is fast on short inputs and is used for string keys by CPython ([PEP 456](https://peps.python.org/pep-0456/)) and by default in Rust's `HashMap`.
+3. **Limit the damage.** Cap the number of form fields per request, or (like Java) bound the worst case of a single bucket.
+
+The theory behind step 1 is **universal hashing** (Carter and Wegman, 1979). Instead of fixing one hash function, pick one *at random* from a family $\mathcal{H}$ such that, for any two distinct keys $x \ne y$, $\Pr_{h \in \mathcal{H}}[h(x) = h(y)] \le 1/m$. In the chaining proof above, all we used was that each other key collides with the searched one with probability at most $1/m$, and that now holds **for every fixed set of keys**: the randomness lives in our choice of function, not in the data. An adversary who does not know which $h$ we picked cannot defeat the expected bound.
+
+<Note>
+
+Randomised hashing has a visible side effect: iteration order of a `set` of strings can change between runs of the same program. Code (and tests) that depend on that order are buggy. When order matters, sort, or use a `dict`, whose order is insertion order.
+
+</Note>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Hash table operations are O(1)."** They are $O(1)$ *expected*, under assumptions about the hash function and the keys, and *amortised* over resizes. The worst case is $O(n)$ per operation. For most programs the distinction never shows; for anything that accepts keys from the internet, it is a security property.
+
+</Misconception>
+
+<Misconception>
+
+**"Equal hashes mean equal keys."** Hashes compress: different keys can and do share a hash value, so a table must always compare the keys themselves after matching the hash. The implication runs one way only: equal keys must have equal hashes.
+
+</Misconception>
+
+<Misconception>
+
+**"I can use a list as a key if I promise not to change it."** Python does not take promises. Use a tuple. And if you write a class with `__eq__`, define `__hash__` from the same immutable fields, or leave instances unhashable.
+
+</Misconception>
+
+<Misconception>
+
+**"Sets are ordered" or "sets are sorted".** Small sets of small integers often print in increasing order because `hash(i) == i`, which makes it look as if sets sort. They do not, and a set of strings can come out in a different order on every run.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

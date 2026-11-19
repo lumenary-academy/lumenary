@@ -1,0 +1,411 @@
+---
+title: The stack and the calling convention
+subtitle: push, pop, call and ret, and the System V AMD64 rules that let functions written by different people, in different languages, call each other.
+minutes: 65
+objectives:
+  - Explain how push, pop, call and ret use rsp and the stack
+  - Write functions that take arguments in rdi, rsi, rdx, rcx, r8 and r9 and return a value in rax
+  - Tell caller-saved from callee-saved registers, and save the ones your function must preserve
+  - Keep the stack 16-byte aligned at every call, and use a frame pointer when it helps
+  - Write a recursive function in assembly and explain each stack frame it creates
+prerequisites: [flags-and-jumps]
+references:
+  - title: System V Application Binary Interface, AMD64 Architecture Processor Supplement
+    url: https://gitlab.com/x86-psABIs/x86-64-ABI
+    note: The specification of the calling convention used here. Chapter 3, "Low Level System Information", is the part to read.
+  - title: x64 calling convention (Microsoft Learn)
+    author: Microsoft
+    url: https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
+    note: The different convention used on 64-bit Windows, for comparison.
+  - title: Calling conventions for different C++ compilers and operating systems
+    author: Agner Fog
+    url: https://www.agner.org/optimize/
+    note: One of Agner Fog's optimisation manuals; a practical comparison of conventions across systems.
+---
+
+<Section id="motivation" kind="motivation" title="Why functions need rules">
+
+Look back at the last lesson's programs: the number-printing loop appears twice, copied by hand. In any language you would make it a **function**, written once and called from anywhere. At the machine level a function is just code at a label, but two problems appear immediately:
+
+1. **How does it get back?** The function may be called from ten places. When it finishes it must continue right after whichever call invoked it, so somebody must remember that return address.
+2. **Who owns which register?** The caller has values in registers it still needs. The function needs registers to work. If both use `rbx` without coordinating, one destroys the other's data.
+
+The processor solves the first problem with the **stack** and the `call` and `ret` instructions. The second is solved by agreement: a **calling convention** that says where arguments go, where the result comes back, and which registers each side may change. On Linux, macOS and the BSDs on x86-64 that agreement is the **System V AMD64 ABI**, and every C compiler, Rust compiler, Go's foreign-function interface and debugger on those systems follows it. Learn it once, and your assembly can call C, be called from C, and show up correctly in a debugger.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The stack, push, pop, call and ret">
+
+<Definition term="the stack">
+
+The **stack** is a region of memory used last-in, first-out. The register `rsp` holds the address of its **top**, the most recently stored item. On x86-64 the stack **grows downwards**: storing a new item decreases `rsp`.
+
+</Definition>
+
+Four instructions use it directly:
+
+| Instruction | Equivalent to |
+| --- | --- |
+| `push x` | `sub rsp, 8` then `mov [rsp], x` |
+| `pop x` | `mov x, [rsp]` then `add rsp, 8` |
+| `call label` | `push` the address of the next instruction, then `jmp label` |
+| `ret` | `pop` an address and jump to it |
+
+So `call` *is* the answer to "how does it get back": the return address waits on the stack, and `ret` takes it off. Nested and even recursive calls work automatically, because each call pushes its own return address on top of the previous ones.
+
+Linux gives each new process a stack (by default up to 8 MB for the main thread; `ulimit -s` shows the limit in kilobytes) and starts it with `rsp` pointing at the program's argument count, followed by pointers to the arguments and environment. A function may also simply **reserve** stack space for local variables with `sub rsp, n` and release it with `add rsp, n`; between those, the memory at `[rsp]` to `[rsp + n - 1]` belongs to it.
+
+Here is the stack in action without any functions. `push` and `pop` reverse a word, because the last character pushed is the first popped:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+word_in: .ascii "stressed"
+        .equ    word_len, . - word_in
+
+        .section .bss
+word_out: .skip word_len + 1
+
+        .text
+        .globl _start
+_start:
+        lea     rsi, [rip + word_in]
+        xor     ecx, ecx
+.Lpush:                             # push every character, first to last
+        movzx   eax, BYTE PTR [rsi + rcx]
+        push    rax                 # push always moves 8 bytes
+        inc     ecx
+        cmp     ecx, word_len
+        jb      .Lpush
+
+        lea     rdi, [rip + word_out]
+        xor     ecx, ecx
+.Lpop:                              # pop them back: last in, first out
+        pop     rax
+        mov     [rdi + rcx], al
+        inc     ecx
+        cmp     ecx, word_len
+        jb      .Lpop
+
+        mov     BYTE PTR [rdi + rcx], 10
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + word_out]
+        mov     edx, word_len + 1
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+desserts
+```
+
+Every `push` is matched by a `pop`, so `rsp` ends where it began. That balance is the first rule of stack use: a function must leave `rsp` exactly as it found it before it executes `ret`, or `ret` will pop something that is not a return address.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="The System V AMD64 calling convention">
+
+The convention divides the work between the **caller** (the code doing the `call`) and the **callee** (the function being called).
+
+### Arguments and results
+
+| | Integers and pointers | Floating-point values |
+| --- | --- | --- |
+| Arguments 1–6 | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` | `xmm0`–`xmm7` (first eight) |
+| Further arguments | on the stack, the 7th nearest the top | on the stack |
+| Return value | `rax` (and `rdx` for a second 64-bit half) | `xmm0` |
+
+Say the order aloud a few times, "di, si, dx, cx, eight, nine", until it sticks; you will type it thousands of times. The same six registers in the same order carry the first six arguments to every C function on Linux, so knowing them lets you read any call in a debugger: whatever is in `rdi` at the `call` is the first argument.
+
+### Who saves which registers
+
+<Definition term="caller-saved and callee-saved registers">
+
+**Callee-saved** registers (`rbx`, `rbp`, `r12`, `r13`, `r14`, `r15`, and `rsp`) must hold the same values when a function returns as when it was called. A function that wants to use one must save it first (usually with `push`) and restore it before `ret`.
+
+**Caller-saved** registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`, and all the `xmm` registers) may be changed freely by any function. A caller that needs one of them after a call must save it itself, or better, keep the value in a callee-saved register.
+
+</Definition>
+
+In practice: put values that must survive calls in `rbx` and `r12`–`r15`, and use the argument registers and `rax`, `r10`, `r11` for short-lived temporaries.
+
+### Stack alignment
+
+The ABI requires `rsp` to be a **multiple of 16 immediately before every `call`**. The `call` then pushes 8 bytes, so on entry to a function `rsp` is 8 more than a multiple of 16, and a function that will itself call others must adjust by an odd number of 8-byte pushes (or a `sub rsp` amount ending in 8) before its own calls. Why care? Some instructions that load 16 bytes at once (for example `movaps`, which C library functions use) crash on an unaligned address. Linux starts `_start` with `rsp` aligned to 16, so our calls from `_start` are aligned as long as we have pushed an even number of times.
+
+### The red zone
+
+A small gift for **leaf** functions (ones that call nothing): on Linux, the 128 bytes just *below* `rsp` are guaranteed not to be overwritten by signal handlers, so a leaf function may use `[rsp - 8]` to `[rsp - 128]` as scratch space without moving `rsp` at all. Compilers use it often. Kernel code cannot, which is why the Linux kernel is compiled with the red zone switched off.
+
+<Note>
+
+64-bit **Windows** uses a different convention: arguments in `rcx`, `rdx`, `r8`, `r9`, a 32-byte "shadow space" reserved by the caller, `rsi` and `rdi` callee-saved, and no red zone. Assembly that calls into the other system's libraries must be written for the other convention.
+
+</Note>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Writing functions">
+
+### A reusable printing function
+
+The decimal printer becomes a function `print_u64` that takes its number in `rdi`. Its buffer now lives on the stack instead of in `.bss`, so each call gets fresh space. It uses only caller-saved registers, so it saves nothing.
+
+```asm check
+        .intel_syntax noprefix
+
+        .text
+        .globl _start
+_start:
+        mov     edi, 7
+        call    print_u64
+        mov     edi, 1984
+        call    print_u64
+        mov     rdi, -1             # all ones: the largest unsigned 64-bit number
+        call    print_u64
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# print_u64(n: rdi) -- write n in decimal and a newline to standard output.
+# Uses only caller-saved registers, so it saves nothing.
+print_u64:
+        sub     rsp, 24             # a 24-byte buffer on the stack (room for 20 digits + newline)
+        lea     r8, [rsp + 23]      # r8 = the last byte of the buffer
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8             # rsi = start of the digits written so far
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi            # length
+        mov     eax, 1              # write(1, rsi, rdx)
+        mov     edi, 1
+        syscall
+
+        add     rsp, 24             # give the buffer back
+        ret
+```
+
+It prints:
+
+```text
+7
+1984
+18446744073709551615
+```
+
+Because `print_u64` is a leaf function, it could have used the red zone and skipped the `sub` and `add` entirely. Writing them out makes the reservation visible, which is worth more while learning.
+
+### Recursion and callee-saved registers
+
+A recursive function needs a value to survive its own recursive call. `factorial` keeps `n` in `rbx`, which the convention promises every callee will preserve, and it keeps that promise itself by saving the caller's `rbx` with `push` and restoring it with `pop`:
+
+```asm check
+        .intel_syntax noprefix
+
+        .text
+        .globl _start
+_start:
+        mov     edi, 10
+        call    factorial
+        mov     rdi, rax
+        call    print_u64
+
+        mov     edi, 20
+        call    factorial
+        mov     rdi, rax
+        call    print_u64
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# factorial(n: rdi) -> rax = n!   (recursive, for 0 <= n <= 20)
+factorial:
+        cmp     rdi, 1
+        ja      .Lrecurse
+        mov     eax, 1              # 0! = 1! = 1
+        ret
+.Lrecurse:
+        push    rbx                 # rbx is callee-saved: save the caller's value
+        mov     rbx, rdi            # keep n where the recursive call cannot change it
+        lea     rdi, [rdi - 1]
+        call    factorial           # rax = (n - 1)!
+        imul    rax, rbx            # rax = n * (n - 1)!
+        pop     rbx                 # restore the caller's rbx
+        ret
+
+# print_u64(n: rdi): as in the previous program.
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+3628800
+2432902008176640000
+```
+
+Trace `factorial(3)`. It pushes the caller's `rbx`, keeps 3 in `rbx` and calls `factorial(2)`, which pushes that 3, keeps 2 and calls `factorial(1)`, which returns 1 at once. Back in `factorial(2)`: 1 × 2 = 2, pop restores `rbx` to 3, return. Back in `factorial(3)`: 2 × 3 = 6, pop restores the original `rbx`, return. At the deepest point the stack held, from the top: a return address, a saved 3, a return address, a saved original `rbx`, and the first return address. Each such group is a **stack frame**. The `push rbx` also keeps the stack aligned: entry leaves `rsp` 8 off a multiple of 16, one push fixes that, and the recursive `call` happens on an aligned stack. And 20! is the largest factorial that fits in 64 bits; 21! would silently wrap.
+
+### Stack arguments and the frame pointer
+
+When a function takes more than six integer arguments, the rest travel on the stack. The caller pushes them last-first, calls, and removes them afterwards. The callee finds them above its return address. Setting up `rbp` as a **frame pointer** gives every argument and local a fixed offset, however `rsp` moves during the function:
+
+```asm check
+        .intel_syntax noprefix
+
+        .text
+        .globl _start
+_start:
+        # sum8(1, 2, 3, 4, 5, 6, 7, 8): six arguments in registers, two on the stack.
+        push    8                   # stack arguments are pushed last-first...
+        push    7                   # ...so the 7th ends up nearest the top
+        mov     r9d, 6
+        mov     r8d, 5
+        mov     ecx, 4
+        mov     edx, 3
+        mov     esi, 2
+        mov     edi, 1
+        call    sum8
+        add     rsp, 16             # the caller removes its stack arguments
+
+        mov     rdi, rax
+        call    print_u64
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# sum8(a, b, c, d, e, f, g, h) -> rax = a + b + ... + h
+sum8:
+        push    rbp                 # prologue: save the caller's frame pointer
+        mov     rbp, rsp            # rbp now marks this call's frame
+        lea     rax, [rdi + rsi]
+        add     rax, rdx
+        add     rax, rcx
+        add     rax, r8
+        add     rax, r9
+        add     rax, [rbp + 16]     # 7th argument: above the saved rbp and the return address
+        add     rax, [rbp + 24]     # 8th argument
+        pop     rbp                 # epilogue
+        ret
+
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints `36`. Inside `sum8`, after the prologue, the frame looks like this, from `rbp` upwards:
+
+| Address | Contents |
+| --- | --- |
+| `[rbp]` | the caller's saved `rbp` |
+| `[rbp + 8]` | the return address pushed by `call` |
+| `[rbp + 16]` | the 7th argument |
+| `[rbp + 24]` | the 8th argument |
+
+Locals, if there were any, would sit *below* `rbp` at `[rbp - 8]`, `[rbp - 16]` and so on, after a `sub rsp, n`. The saved `rbp` values also chain the frames together, which is how debuggers and profilers walk the stack to print a backtrace. Compilers at `-O2` usually omit the frame pointer to free `rbp` as a sixteenth general register, but several Linux distributions (Fedora 38 and Ubuntu 24.04 among them) now build their packages with frame pointers kept, because whole-system profiling is much easier with them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Using a callee-saved register without saving it.** A function that writes `rbx` and returns works perfectly in your test, then corrupts a caller that kept a loop counter in `rbx`. The bug appears far from its cause. Push every callee-saved register you touch at entry, and pop them in reverse order before every `ret`.
+
+</Misconception>
+
+<Misconception>
+
+**Expecting an argument register to survive a call.** After `call print_u64`, `rdi`, `rsi`, `rdx`, `rcx`, `r8`–`r11` and `rax` may hold anything. If you need a value afterwards, keep it in a callee-saved register. (This is why the `_start` code above reloads `edi` before every call.)
+
+</Misconception>
+
+<Misconception>
+
+**Unbalanced stack before `ret`.** If a function pushes three times and pops twice, `ret` pops a saved register value and jumps to it as if it were an address. The usual result is a segmentation fault at a strange address. Count your pushes and pops, and check that every `sub rsp, n` has its `add rsp, n`.
+
+</Misconception>
+
+<Misconception>
+
+**Ignoring alignment because "it works".** Calls between your own assembly functions do not care about alignment, so a misaligned stack can go unnoticed for weeks, until the program calls a C library function that uses 16-byte aligned stores, and crashes inside `printf`. Keep the 16-byte rule from the start.
+
+</Misconception>
+
+</Section>
+
+<Section id="human" kind="human" title="The stack and security">
+
+The return address lives in ordinary writable memory, right next to local buffers. If a function copies more data into a stack buffer than it can hold, the extra bytes overwrite the saved registers and then the return address, and `ret` jumps wherever the attacker's data says. That is the classic **stack buffer overflow**, behind decades of security vulnerabilities.
+
+Modern systems layer defences around it. **Stack canaries** (GCC's `-fstack-protector`) put a random value between the buffers and the return address and check it before `ret`. **Non-executable stacks** stop injected bytes from running as code. **Address space layout randomisation** moves the stack and libraries on every run. **Shadow stacks** (Intel CET, now supported by recent Linux kernels for user programs) keep a second, protected copy of every return address and fault if the two disagree. Security engineers who analyse attacks and defences spend much of their time in exactly the frames you drew in this lesson.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by running the programs.
+
+<Exercises/>
+
+</Section>

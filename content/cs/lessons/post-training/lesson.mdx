@@ -1,0 +1,487 @@
+---
+title: Post-training
+subtitle: How a next-token predictor becomes an assistant — supervised fine-tuning, preference learning, RL from human and AI feedback, RL with verifiable rewards, and cheap adaptation with LoRA.
+minutes: 80
+objectives:
+  - Explain supervised fine-tuning and instruction tuning, including loss masking and chat templates
+  - Derive the Bradley–Terry reward-model loss and the KL-regularised RLHF objective, and describe PPO at the level of ideas
+  - Derive the DPO loss from the RLHF objective and implement it, with its gradient, in numpy
+  - Describe Constitutional AI and RL from AI feedback, and their strengths and risks
+  - Explain RL with verifiable rewards and GRPO-style group-relative advantages, and run a tiny example
+  - Explain LoRA's low-rank update, count its parameters, and show when it suffices
+prerequisites: [language-models, training-in-practice, accelerators-and-parallelism]
+related: [math.applied.optimisation, math.applied.information-theory, math.algebra.advanced-linear-algebra, math.prob.probability-theory]
+references:
+  - title: "Training language models to follow instructions with human feedback"
+    author: Ouyang et al. (OpenAI)
+    year: 2022
+    url: https://arxiv.org/abs/2203.02155
+    note: InstructGPT, the template for modern RLHF.
+  - title: "Deep reinforcement learning from human preferences"
+    author: Christiano et al.
+    year: 2017
+    url: https://arxiv.org/abs/1706.03741
+  - title: "Learning to summarize from human feedback"
+    author: Stiennon et al.
+    year: 2020
+    url: https://arxiv.org/abs/2009.01325
+  - title: "Proximal Policy Optimization Algorithms"
+    author: Schulman et al.
+    year: 2017
+    url: https://arxiv.org/abs/1707.06347
+  - title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    author: Rafailov et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.18290
+  - title: "Constitutional AI: Harmlessness from AI Feedback"
+    author: Bai et al. (Anthropic)
+    year: 2022
+    url: https://arxiv.org/abs/2212.08073
+  - title: "Training a Helpful and Harmless Assistant with Reinforcement Learning from Human Feedback"
+    author: Bai et al. (Anthropic)
+    year: 2022
+    url: https://arxiv.org/abs/2204.05862
+  - title: "RLAIF: Scaling Reinforcement Learning from Human Feedback with AI Feedback"
+    author: Lee et al. (Google)
+    year: 2023
+    url: https://arxiv.org/abs/2309.00267
+  - title: "Finetuned Language Models Are Zero-Shot Learners"
+    author: Wei et al. (Google)
+    year: 2021
+    url: https://arxiv.org/abs/2109.01652
+    note: FLAN, instruction tuning on many tasks.
+  - title: "Self-Instruct: Aligning Language Models with Self-Generated Instructions"
+    author: Wang et al.
+    year: 2022
+    url: https://arxiv.org/abs/2212.10560
+  - title: "LIMA: Less Is More for Alignment"
+    author: Zhou et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.11206
+  - title: "Scaling Laws for Reward Model Overoptimization"
+    author: Gao, Schulman, Hilton
+    year: 2022
+    url: https://arxiv.org/abs/2210.10760
+  - title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models"
+    author: Shao et al.
+    year: 2024
+    url: https://arxiv.org/abs/2402.03300
+    note: Introduces GRPO.
+  - title: "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning"
+    author: DeepSeek-AI
+    year: 2025
+    url: https://arxiv.org/abs/2501.12948
+  - title: "Tulu 3: Pushing Frontiers in Open Language Model Post-Training"
+    author: Lambert et al. (Ai2)
+    year: 2024
+    url: https://arxiv.org/abs/2411.15124
+    note: A fully open post-training recipe; coins the term RLVR.
+  - title: "LoRA: Low-Rank Adaptation of Large Language Models"
+    author: Hu et al.
+    year: 2021
+    url: https://arxiv.org/abs/2106.09685
+  - title: "QLoRA: Efficient Finetuning of Quantized LLMs"
+    author: Dettmers et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.14314
+  - title: "Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning"
+    author: Aghajanyan, Zettlemoyer, Gupta
+    year: 2020
+    url: https://arxiv.org/abs/2012.13255
+  - title: TRL — Transformer Reinforcement Learning
+    author: Hugging Face
+    url: https://github.com/huggingface/trl
+    note: Open-source implementations of SFT, DPO, PPO, GRPO and more.
+---
+
+<Section id="motivation" kind="motivation" title="From autocomplete to assistant">
+
+Ask a freshly pretrained base model "What is the capital of Kenya?" and it may answer "Nairobi" — or continue with "What is the capital of Uganda? What is the capital of Tanzania?", because on the web a question is often followed by more questions. A base model (<LessonLink slug="language-models">Language models</LessonLink>) knows a great deal, but it does not *try* to do anything. It continues text.
+
+**Post-training** is everything done after pretraining to shape the model's behaviour: to follow instructions, hold a conversation, use a consistent format, refuse clearly harmful requests, admit uncertainty, reason through hard problems, and call tools. It uses a tiny fraction of the pretraining data, yet it is what users experience. At frontier labs it has grown from a modest finishing step in 2022 to a major phase of its own; with reinforcement learning on reasoning tasks, labs have said publicly that they are scaling post-training compute substantially.
+
+A typical recipe as of 2026, simplified, runs:
+
+1. **Supervised fine-tuning (SFT)** on demonstrations of good behaviour.
+2. **Preference optimisation** — RLHF, DPO or a relative — against human or AI judgements of which responses are better.
+3. **Reinforcement learning with verifiable rewards** on maths, code and other checkable tasks.
+
+…often iterated over several rounds, with safety training woven throughout. We take each in turn, then look at LoRA, the standard way to fine-tune cheaply.
+
+</Section>
+
+<Section id="sft" kind="definitions" title="Supervised fine-tuning and instruction tuning">
+
+<Definition term="Supervised fine-tuning (SFT)">
+
+Continue training the pretrained model with the same next-token cross-entropy loss, but on a curated dataset of (prompt, ideal response) pairs. The loss is usually **masked** so that only the response tokens count: the model learns to *produce* good answers, not to predict users' prompts.
+
+</Definition>
+
+Conversations are flattened into one token sequence using a **chat template**: special tokens mark who is speaking. A schematic example (every model family has its own exact format):
+
+```text
+<|system|>You are a helpful assistant.<|end|>
+<|user|>What is the capital of Kenya?<|end|>
+<|assistant|>The capital of Kenya is Nairobi.<|end|>
+```
+
+During SFT only the tokens after `<|assistant|>` (including the closing `<|end|>`, so the model learns when to stop) contribute to the loss. At inference time the serving system builds the same template, ends it with `<|assistant|>`, and lets the model continue. The system and role structure is also what later lets a model be trained to give the developer's instructions priority over text that merely claims authority (<LessonLink slug="safety-and-alignment">AI safety and alignment</LessonLink>).
+
+Where the data comes from has changed over time:
+
+- **Human demonstrations.** InstructGPT ([Ouyang et al., 2022](https://arxiv.org/abs/2203.02155)) used about 13,000 prompts with responses written by contractors.
+- **Many tasks reformatted as instructions.** Google's FLAN ([Wei et al., 2021](https://arxiv.org/abs/2109.01652)) rewrote dozens of existing NLP datasets as natural-language instructions and found that training on them improved performance on *unseen* tasks — the origin of the term **instruction tuning**.
+- **Synthetic data.** [Self-Instruct](https://arxiv.org/abs/2212.10560) showed a model could bootstrap instruction data from its own outputs. Today most SFT data at most labs is generated by models — earlier versions, larger models, or the same model with extra help — and then filtered by people, other models and automatic checks.
+
+How much is needed? The [LIMA](https://arxiv.org/abs/2305.11206) paper fine-tuned a strong base model on just 1,000 carefully chosen examples and got a capable assistant, proposing a "superficial alignment hypothesis": the knowledge is learned in pretraining, and SFT mostly teaches format and style. That is a useful corrective to the idea that SFT teaches knowledge, though later work found that quality *and* scale of post-training data both keep helping, especially for reasoning and tool use.
+
+SFT has a ceiling. It can only imitate, so the model can be no better than its demonstrations, and it never sees its own mistakes. For that we need feedback on what the model itself produces.
+
+</Section>
+
+<Section id="rlhf" kind="definitions" title="Reward models and RLHF">
+
+It is much easier for a person to say which of two answers is better than to write the ideal answer. **Reinforcement learning from human feedback (RLHF)** exploits that asymmetry. Developed for robotics and games ([Christiano et al., 2017](https://arxiv.org/abs/1706.03741)), applied to summarisation ([Stiennon et al., 2020](https://arxiv.org/abs/2009.01325)) and then to InstructGPT and ChatGPT, it has three steps: collect comparisons, train a reward model, optimise the policy against it.
+
+**1. Comparisons.** For a prompt $x$, sample two responses and have a person pick the better one: $y_w$ (preferred, the "winner") and $y_l$ (the "loser").
+
+**2. A reward model.** Assume, following Bradley and Terry's 1952 model of paired comparisons, that each response has a hidden scalar quality $r(x, y)$ and that
+
+$$
+P(y_w \succ y_l \mid x) = \sigma\big(r(x, y_w) - r(x, y_l)\big), \qquad \sigma(z) = \frac{1}{1 + e^{-z}} .
+$$
+
+Train a network $r_\phi$ — usually the language model itself with a scalar output head — by maximising the likelihood of the observed choices, that is by minimising
+
+$$
+\mathcal{L}_{\text{RM}}(\phi) = -\,\mathbb{E}_{(x, y_w, y_l)}\left[\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big)\right].
+$$
+
+**3. Optimise the policy.** Now train the language model $\pi_\theta$ to produce responses the reward model likes, without drifting too far from the SFT model $\pi_{\text{ref}}$ it started from:
+
+$$
+\max_{\theta} \; \mathbb{E}_{x,\; y \sim \pi_\theta(\cdot \mid x)}\big[r_\phi(x, y)\big] \; - \; \beta \, \mathrm{KL}\big(\pi_\theta(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big).
+$$
+
+Why the KL penalty? The reward model is only a proxy for human judgement, trained on a limited set of comparisons. Optimise hard against it and the policy finds responses the reward model scores highly but people would not: padding, flattery, confident-sounding nonsense, odd tokens that exploit the reward model's blind spots. [Gao, Schulman and Hilton (2022)](https://arxiv.org/abs/2210.10760) measured this **reward-model overoptimisation** carefully: as the policy moves away from its starting point, the proxy reward keeps rising while the "true" reward (measured by a much larger reference reward model) rises, peaks and falls. The KL term keeps the policy in the region where the proxy is trustworthy. This is Goodhart's law in miniature, and <LessonLink slug="safety-and-alignment">AI safety and alignment</LessonLink> returns to it.
+
+**PPO, at the level of ideas.** The objective is optimised by policy-gradient reinforcement learning, classically with Proximal Policy Optimization ([Schulman et al., 2017](https://arxiv.org/abs/1707.06347)). Each generated response is an episode; its tokens are the actions. PPO estimates how much better than expected each token's outcome was (an **advantage**, computed with a learned **value** network as a baseline), raises the probability of tokens with positive advantage and lowers it for negative ones, and **clips** the update so the new policy's probability ratio to the old one stays within a small range — a cheap way to take safe, small steps. In practice this means four models in memory at once (policy, reference, reward model, value network), many sensitive hyperparameters, and a lot of engineering. That cost motivated the search for something simpler.
+
+</Section>
+
+<Section id="dpo" kind="computation" title="DPO: preference optimisation without a reward model">
+
+Direct Preference Optimization ([Rafailov et al., 2023](https://arxiv.org/abs/2305.18290)) starts from a neat observation: the KL-regularised objective above has a closed-form optimal policy.
+
+<Theorem name="Optimal policy of the KL-regularised objective">
+
+For a fixed prompt $x$, reward $r$ and $\beta \gt 0$, the distribution maximising $\mathbb{E}_{y \sim \pi}[r(x, y)] - \beta\,\mathrm{KL}(\pi \,\|\, \pi_{\text{ref}})$ is
+
+$$
+\pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)\, \exp\!\left(\frac{r(x, y)}{\beta}\right), \qquad Z(x) = \sum_{y} \pi_{\text{ref}}(y \mid x)\, \exp\!\left(\frac{r(x, y)}{\beta}\right).
+$$
+
+</Theorem>
+
+<Proof>
+
+Write the objective for any $\pi$ and divide by $-\beta$, turning maximisation into minimisation:
+
+$$
+\sum_y \pi(y)\left[\log \frac{\pi(y)}{\pi_{\text{ref}}(y)} - \frac{r(y)}{\beta}\right]
+= \sum_y \pi(y) \log \frac{\pi(y)}{\pi_{\text{ref}}(y)\, e^{r(y)/\beta} / Z} - \log Z
+= \mathrm{KL}(\pi \,\|\, \pi^*) - \log Z .
+$$
+
+$\log Z$ does not depend on $\pi$, and a KL divergence is non-negative and zero exactly when the two distributions are equal (<TopicLink id="math.applied.information-theory">Information theory</TopicLink>). So the minimum is reached at $\pi = \pi^*$.
+
+</Proof>
+
+Now turn the theorem around. Solving for the reward,
+
+$$
+r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x).
+$$
+
+Any policy *implies* a reward. Substitute this into the Bradley–Terry probability: the awkward normaliser $\beta \log Z(x)$ appears in both rewards and cancels in the difference. So we can fit the preference data directly in terms of the policy, skipping the reward model and the RL loop:
+
+<Definition term="DPO loss">
+
+With $\hat r_\theta(x, y) = \beta \log \dfrac{\pi_\theta(y \mid x)}{\pi_{\text{ref}}(y \mid x)}$, the **implicit reward**,
+
+$$
+\mathcal{L}_{\text{DPO}}(\theta) = -\,\mathbb{E}_{(x, y_w, y_l)}\left[\log \sigma\big(\hat r_\theta(x, y_w) - \hat r_\theta(x, y_l)\big)\right].
+$$
+
+</Definition>
+
+It is the reward-model loss, with the policy playing the reward model. Its gradient is illuminating:
+
+$$
+\nabla_\theta \mathcal{L}_{\text{DPO}} = -\beta\, \mathbb{E}\Big[\underbrace{\sigma\big(\hat r_\theta(x, y_l) - \hat r_\theta(x, y_w)\big)}_{\text{large when the model gets this pair wrong}} \big(\nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x)\big)\Big].
+$$
+
+Raise the log-probability of the preferred response, lower the rejected one, and weight each pair by how badly the current implicit reward misorders it. Here is DPO on a toy policy — three prompts, four candidate responses each, eight human preferences — with the gradient checked against finite differences:
+
+```python run
+import numpy as np
+
+def log_softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    return z - np.log(np.exp(z).sum(axis=-1, keepdims=True))
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+# A toy "policy": for each of 3 prompts, a distribution over 4 candidate responses.
+rng = np.random.default_rng(0)
+theta_ref = rng.normal(size=(3, 4))          # the SFT model, frozen as the reference
+theta = theta_ref.copy()                     # the policy we train, initialised from it
+# Human preferences: (prompt, chosen response, rejected response)
+prefs = [(0, 2, 0), (0, 2, 1), (0, 3, 1), (1, 0, 3), (1, 1, 3), (2, 3, 2), (2, 3, 0), (2, 1, 0)]
+beta = 0.1
+
+def dpo_loss_and_grad(theta):
+    logp, logp_ref = log_softmax(theta), log_softmax(theta_ref)
+    loss, grad = 0.0, np.zeros_like(theta)
+    for x, w, l in prefs:
+        margin = beta * ((logp[x, w] - logp_ref[x, w]) - (logp[x, l] - logp_ref[x, l]))
+        loss += -np.log(sigmoid(margin))
+        # d log pi(y|x) / d theta[x] = onehot(y) - pi(.|x); the pi terms cancel in the difference
+        g = np.zeros(4); g[w] += 1; g[l] -= 1
+        grad[x] += -(1 - sigmoid(margin)) * beta * g
+    return loss / len(prefs), grad / len(prefs)
+
+# Check the analytic gradient against finite differences.
+t = theta + 0.3 * rng.normal(size=theta.shape)
+_, g = dpo_loss_and_grad(t)
+eps, num = 1e-6, np.zeros_like(t)
+for i in np.ndindex(t.shape):
+    tp, tm = t.copy(), t.copy(); tp[i] += eps; tm[i] -= eps
+    num[i] = (dpo_loss_and_grad(tp)[0] - dpo_loss_and_grad(tm)[0]) / (2 * eps)
+print("gradient check, max difference:", f"{np.abs(num - g).max():.1e}")
+
+np.set_printoptions(precision=2, suppress=True)
+print("\nreference policy (rows = prompts, columns = responses):\n", np.exp(log_softmax(theta_ref)))
+for step in range(1, 501):
+    loss, grad = dpo_loss_and_grad(theta)
+    theta -= 5.0 * grad
+    if step in (40, 500):
+        print(f"\nafter {step} steps, DPO loss {loss:.3f}, policy:\n", np.exp(log_softmax(theta)))
+print("\nimplicit rewards beta*log(pi/pi_ref):\n", beta * (log_softmax(theta) - log_softmax(theta_ref)))
+```
+
+Study the output; it holds several of DPO's real-world lessons.
+
+- After 40 steps the policy respects the preferences: in prompt 0 response 2 dominates, and response 3 (preferred to 1) beats response 1.
+- After 500 steps the policy has **collapsed** onto single responses. The loss can be driven towards zero only by making the implicit reward margins huge, and nothing in the loss stops the policy from becoming deterministic. In practice people train DPO for one or two epochs, with a modest learning rate and a chosen $\beta$, and watch the KL from the reference.
+- Look at prompt 1, response 2. No preference ever mentioned it, yet its probability went from 0.44 to almost zero. DPO constrains only the *differences* between compared responses; probability flows to and from everything else as a side effect. This is one reason the choice of *which* pairs to collect matters so much.
+
+DPO and its many relatives (IPO, KTO, ORPO, SimPO and more) became popular because they are simple, stable and need only the policy and a frozen reference. A fair summary of the evidence as of 2026 is that offline DPO on a fixed dataset is a strong, cheap baseline, while **on-policy** methods — which keep sampling fresh responses from the current model and getting them judged — tend to do better at the frontier; many pipelines use DPO-style losses on freshly sampled, freshly labelled pairs in several rounds, which narrows the gap.
+
+</Section>
+
+<Section id="cai" kind="human" title="Constitutional AI and RL from AI feedback">
+
+Human preference labels are slow, expensive, inconsistent, and — for harmful content — unpleasant for the people who produce them. Anthropic's **Constitutional AI** ([Bai et al., 2022](https://arxiv.org/abs/2212.08073)) replaced most human harmlessness labels with feedback from a model guided by a short list of written principles, the **constitution**.
+
+It has two phases:
+
+1. **Supervised, by self-critique.** The model answers a potentially harmful prompt, is asked to critique its answer against a principle chosen from the constitution, and then to revise it. The model is fine-tuned on the revised answers.
+2. **RL from AI feedback (RLAIF).** The model compares pairs of its own responses according to the principles; those AI judgements train a preference model, which is then used for RL exactly as in RLHF.
+
+The paper reported a model that was both less harmful and less evasive than one trained with human harmlessness labels: it tended to explain its objections rather than simply refuse. Google researchers later compared RLAIF and RLHF directly ([Lee et al., 2023](https://arxiv.org/abs/2309.00267)) and found AI feedback roughly as effective on the tasks they studied.
+
+The broader idea — model-generated feedback steered by explicit, readable principles — is now everywhere in post-training. Its strengths are scale, consistency, and transparency: you can read and debate the principles. Its risks are real too. The judging model's own biases and blind spots are copied into the trained model; a policy can learn to please the judge rather than to be good (the same Goodhart problem, one level up); and *whose* principles are written down is a question of values, not engineering. Labs now publish longer documents describing intended model behaviour — model specifications and constitutions — which <LessonLink slug="safety-and-alignment">AI safety and alignment</LessonLink> discusses.
+
+</Section>
+
+<Section id="rlvr" kind="computation" title="Reinforcement learning with verifiable rewards">
+
+For some tasks you don't need anyone's opinion: the answer can be **checked**. A maths problem has a known final answer; code can be run against tests; a proof can be checked by a proof assistant; a formatted output can be validated. **Reinforcement learning with verifiable rewards (RLVR)** — the term was popularised by Ai2's [Tülu 3](https://arxiv.org/abs/2411.15124) — gives reward 1 for a verified-correct response and 0 otherwise, and lets the model learn from its own attempts.
+
+This is the main ingredient of **reasoning models**. OpenAI's o1 (September 2024) was the first widely known model trained with large-scale RL to produce long chains of thought before answering; OpenAI described it only at a high level. In January 2025, DeepSeek's R1 paper ([DeepSeek-AI, 2025](https://arxiv.org/abs/2501.12948)) published a recipe in detail: their R1-Zero model was trained with RL directly from the base model, with rule-based rewards only for correct answers and correct format, and *learned on its own* to produce long reasoning, check its work and backtrack — at the cost of poor readability, which the full R1 recipe fixed with a small "cold-start" SFT stage first. Labs across the field followed; <LessonLink slug="reasoning-and-agents">the next lesson</LessonLink> covers what these models do at inference time.
+
+### GRPO: advantages from a group
+
+R1 used **Group Relative Policy Optimization**, introduced in [DeepSeekMath](https://arxiv.org/abs/2402.03300). It drops PPO's value network. For each prompt it samples a **group** of $G$ responses, scores them $r_1, \ldots, r_G$, and uses each response's standing within its own group as the advantage:
+
+$$
+A_i = \frac{r_i - \operatorname{mean}(r_1, \ldots, r_G)}{\operatorname{std}(r_1, \ldots, r_G)} .
+$$
+
+Every token of response $i$ then gets advantage $A_i$ in a PPO-style clipped update with a KL penalty. Right answers in a group of mostly wrong ones get a big push; wrong answers among mostly right ones a big pull. If all $G$ responses get the same reward, every advantage is zero and the prompt teaches nothing.
+
+Here is the whole loop in miniature. The "policy" chooses among five ways of evaluating expressions such as $3 + 4 \times 2$; only one respects operator precedence, but the others are sometimes right by luck. The reward is simply whether the answer is correct:
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+OPS = {"+": lambda x, y: x + y, "*": lambda x, y: x * y}
+
+def make_problem():
+    a, b, c = (int(v) for v in rng.integers(1, 10, size=3))
+    return a, str(rng.choice(["+", "*"])), b, str(rng.choice(["+", "*"])), c
+
+def true_answer(p):
+    a, o1, b, o2, c = p
+    if o2 == "*" and o1 == "+":
+        return a + b * c                       # multiplication binds tighter
+    return OPS[o2](OPS[o1](a, b), c)
+
+# The "policy" chooses among five ways of answering; only the first is right in general.
+STRATEGIES = ["use precedence", "left to right", "add everything", "multiply everything", "say 10"]
+def answer(p, s):
+    a, o1, b, o2, c = p
+    return [true_answer(p), OPS[o2](OPS[o1](a, b), c), a + b + c, a * b * c, 10][s]
+
+def softmax(z):
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+theta = np.zeros(len(STRATEGIES))              # start uniform
+G, PROMPTS, LR = 8, 16, 0.5
+eval_set = [make_problem() for _ in range(500)]
+acc_by_strategy = np.array([np.mean([answer(p, s) == true_answer(p) for p in eval_set]) for s in range(5)])
+print("accuracy of each strategy:", ", ".join(f"{n} {a:.2f}" for n, a in zip(STRATEGIES, acc_by_strategy)))
+
+for it in range(61):
+    pi = softmax(theta)
+    grad, silent = np.zeros_like(theta), 0
+    for _ in range(PROMPTS):
+        p = make_problem()
+        samples = rng.choice(5, size=G, p=pi)                          # a group of G answers to one prompt
+        rewards = np.array([float(answer(p, s) == true_answer(p)) for s in samples])  # verifiable reward
+        if rewards.std() == 0:
+            silent += 1                                                # all right or all wrong: no signal
+            continue
+        adv = (rewards - rewards.mean()) / rewards.std()               # group-relative advantage
+        for s, A in zip(samples, adv):
+            grad += A * (np.eye(5)[s] - pi)                            # A * d log pi(s) / d theta
+    theta += LR * grad / (PROMPTS * G)
+    if it % 15 == 0:
+        print(f"iter {it:2d}: expected accuracy {softmax(theta) @ acc_by_strategy:.2f}, "
+              f"groups with no signal {silent}/{PROMPTS}, policy {np.round(softmax(theta), 2)}")
+```
+
+The policy converges on the precedence strategy, even though "left to right" is right three times in four and the reward never says *why* an answer was correct. Notice the last column: as the policy improves, more and more groups are all-correct and give no signal. Real RLVR pipelines face the same problem and respond by filtering for prompts of the right difficulty, which is why curating problems at the edge of the model's ability is a large part of the craft.
+
+Two honest caveats about RLVR as of 2026:
+
+- **Verifiers can be gamed.** A reward of "the tests pass" can be earned by special-casing the tests, or by editing them, and reasoning models trained this way have been observed doing exactly that in the labs' own reports. A reward of "the final answer matches" ignores whether the reasoning was sound. Reward design and monitoring are central (<LessonLink slug="safety-and-alignment">AI safety and alignment</LessonLink>).
+- **What RL adds is debated.** Some studies found that RL mostly makes models more reliably produce solutions they could already sample occasionally — improving pass@1 more than pass@k at large $k$ — while others report genuinely new capabilities emerging with enough RL compute. How far RL on verifiable tasks generalises to messier, unverifiable ones is one of the central open questions of the field.
+
+</Section>
+
+<Section id="lora" kind="computation" title="LoRA: fine-tuning a few parameters">
+
+Full fine-tuning updates every weight, and needs memory for gradients and optimiser states of every weight (16 bytes per parameter, <LessonLink slug="accelerators-and-parallelism">Accelerators</LessonLink>). For most adaptations — a company's style, a new domain, a specific output format — that is overkill.
+
+<Definition term="Low-Rank Adaptation (LoRA)">
+
+Freeze a pretrained weight matrix $W_0 \in \mathbb{R}^{d \times k}$ and learn an update of rank at most $r$, written as a product $\Delta W = BA$ with $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$, $r \ll \min(d, k)$:
+
+$$
+h = W_0 x + \frac{\alpha}{r} B A x .
+$$
+
+$A$ starts small and random, $B$ starts at zero (so training begins exactly at the pretrained model), and only $A$ and $B$ are trained: $r(d + k)$ parameters instead of $dk$.
+
+</Definition>
+
+[Hu et al. (2021)](https://arxiv.org/abs/2106.09685) found that on GPT-3 LoRA matched full fine-tuning on their tasks while training about ten thousand times fewer parameters. The bet behind it is that the *change* fine-tuning needs is approximately low-rank — supported by earlier work showing fine-tuning has a low [intrinsic dimension](https://arxiv.org/abs/2012.13255). The best rank-$r$ approximation of any matrix is its truncated singular value decomposition (the Eckart–Young theorem; see <TopicLink id="math.algebra.advanced-linear-algebra">Advanced linear algebra</TopicLink>), so we can test the bet:
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+d_out, d_in = 64, 64
+W0 = rng.normal(size=(d_out, d_in)) / np.sqrt(d_in)          # "pretrained" weights, frozen
+# The update that full fine-tuning would find: nearly low-rank (rank 4 plus a little noise).
+delta = 0.3 * rng.normal(size=(d_out, 4)) @ rng.normal(size=(4, d_in)) / np.sqrt(d_in) \
+        + 0.003 * rng.normal(size=(d_out, d_in))
+print("singular values of the ideal update:", np.round(np.linalg.svd(delta, compute_uv=False)[:8], 3))
+
+X = rng.normal(size=(1024, d_in))                             # fine-tuning inputs; targets are X @ (W0 + delta).T
+Sigma = X.T @ X / len(X)                                      # lets us compute the gradient cheaply
+
+def train_lora(r, steps=800, lr=0.02):
+    A = rng.normal(scale=0.01, size=(r, d_in))                # small random init
+    B = np.zeros((d_out, r))                                  # zero init: training starts exactly at W0
+    mA = vA = mB = vB = 0
+    for t in range(1, steps + 1):
+        # loss = mean squared error of X @ (W0 + B A).T against the targets; its gradient w.r.t. the
+        # weight is 2 (W0 + B A - W_target) Sigma, and W0 cancels against the target's W0:
+        gW = 2 * (B @ A - delta) @ Sigma
+        gB, gA = gW @ A.T, B.T @ gW                           # chain rule through W = W0 + B A
+        mA = 0.9 * mA + 0.1 * gA; vA = 0.999 * vA + 0.001 * gA**2   # Adam
+        mB = 0.9 * mB + 0.1 * gB; vB = 0.999 * vB + 0.001 * gB**2
+        c1, c2 = 1 - 0.9**t, 1 - 0.999**t
+        A -= lr * (mA / c1) / (np.sqrt(vA / c2) + 1e-8)
+        B -= lr * (mB / c1) / (np.sqrt(vB / c2) + 1e-8)
+    return B @ A
+
+U, S, Vt = np.linalg.svd(delta)
+print(f"\n{'rank':>4} {'trainable':>9} {'LoRA error':>11} {'best rank-r error':>18}")
+for r in [1, 2, 4, 8]:
+    learned = train_lora(r)
+    best = (U[:, :r] * S[:r]) @ Vt[:r]                        # Eckart-Young: truncated SVD is optimal
+    err = np.linalg.norm(learned - delta) / np.linalg.norm(delta)
+    best_err = np.linalg.norm(best - delta) / np.linalg.norm(delta)
+    print(f"{r:4d} {r * (d_out + d_in):9d} {err:11.3f} {best_err:18.3f}")
+print(f"full fine-tuning would train {d_out * d_in} parameters")
+```
+
+The singular values fall off a cliff after the fourth, and LoRA with rank 4 recovers the update almost perfectly with an eighth of the parameters; ranks 1 and 2 cannot, however long they train, because no rank-2 matrix is close. Gradient descent on the factored form finds the optimal low-rank answer here. Real fine-tuning updates are not exactly low-rank, so the practical question is always whether the rank is enough for *your* task.
+
+Why LoRA is everywhere:
+
+- **Memory.** Gradients and optimiser states exist only for the small factors. [QLoRA](https://arxiv.org/abs/2305.14314) went further by storing the frozen base model in 4 bits, fine-tuning a 65-billion-parameter model on a single 48 GB GPU.
+- **No inference cost.** After training, $BA$ can be merged into $W_0$.
+- **Many adapters, one model.** Or keep the adapters separate: one base model in memory can serve hundreds of customers' small LoRA adapters, swapped per request.
+
+The limits: on tasks that need a lot of new knowledge or skill — learning a new programming language well, large-scale RL — LoRA at small rank tends to learn less than full fine-tuning (though it also tends to forget less of what the base model knew). It is a tool for adaptation more than for teaching fundamentally new capabilities, and the frontier labs' main post-training runs update all the weights.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"RLHF teaches the model new facts."** Preference training mostly changes *which* of the model's existing behaviours it chooses. It can make a model more truthful by rewarding calibrated answers, but it cannot supply knowledge pretraining never gave it — and rewarding confident-sounding answers can make hallucination worse.
+
+</Misconception>
+
+<Misconception>
+
+**"DPO needs no reference model."** It needs no separate *reward* model and no RL loop, but the frozen reference policy $\pi_{\text{ref}}$ is in every term of the loss. Remove it and you lose the KL anchor the derivation rests on.
+
+</Misconception>
+
+<Misconception>
+
+**"Verifiable rewards can't be hacked."** The check is exact; what it checks may not be what you meant. Passing visible tests, matching a final number, or producing valid JSON can each be achieved in unintended ways.
+
+</Misconception>
+
+<Misconception>
+
+**"More SFT data is always better."** Low-quality or inconsistent demonstrations teach low-quality or inconsistent behaviour. Data curation — filtering, deduplication, checking — routinely matters more than volume.
+
+</Misconception>
+
+<Misconception>
+
+**"Post-training is just about safety, or just about making models polite."** It shapes nearly everything users experience — instruction following, formatting, reasoning, tool use, coding — and increasingly determines a model's capabilities, not only its manners.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

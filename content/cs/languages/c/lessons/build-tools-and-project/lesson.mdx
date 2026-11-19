@@ -1,0 +1,592 @@
+---
+title: "Build tools and a project: a word-frequency counter"
+subtitle: A hash table in idiomatic C, tested against a reference, split into a library and built with make and CMake, with notes on the tools professionals use and where to go next.
+minutes: 75
+objectives:
+  - Implement a hash table with separate chaining, FNV-1a hashing and resizing, with clear ownership
+  - Test a data structure differentially against a simple reference implementation
+  - Split a program into a library, an executable and a test, and build it incrementally with make
+  - Describe the same build with CMake, run its tests with CTest, and export compile_commands.json
+  - Name the formatters, linters, package managers and resources that working C programmers use
+prerequisites: [undefined-behaviour-and-testing]
+references:
+  - title: GNU make manual
+    url: https://www.gnu.org/software/make/manual/
+    note: Rules, automatic variables such as $@ and $^, pattern rules and generated dependencies.
+  - title: CMake documentation
+    url: https://cmake.org/cmake/help/latest/
+    note: The reference manual and the official tutorial for CMake projects and CTest.
+  - title: ClangFormat and clang-tidy
+    url: https://clang.llvm.org/docs/ClangFormat.html
+    note: The formatter most C projects use; clang-tidy's documentation is linked from the same site.
+  - title: FNV hash (IETF draft and history)
+    url: https://datatracker.ietf.org/doc/draft-eastlake-fnv/
+    note: The specification of the Fowler/Noll/Vo hash functions used in the project.
+  - title: Modern C
+    author: Jens Gustedt
+    url: https://gustedt.gitlabpages.inria.fr/modern-c/
+    note: A free book on contemporary C by a member of the standards committee, a natural next step after this course.
+---
+
+<Section id="motivation" kind="motivation" title="The final project">
+
+This lesson builds something real: **wordfreq**, a program that counts how often each word appears in a text and prints the most common ones. Its heart is a **hash table**, the data structure behind Python's dictionaries and almost every cache, symbol table and index you will meet. C has no hash table in its standard library, so C programmers write them, and writing one well exercises everything from this course: structs and pointers, dynamic memory and ownership, strings, testing and careful arithmetic.
+
+Then we do what professionals do with working code: test it against a simpler reference, split it into a reusable library with a header, and build it with the two tools you will meet in nearly every C project, **make** and **CMake**. The lesson ends with the wider toolbox and with suggestions for what to learn next.
+
+</Section>
+
+<Section id="computation" kind="computation" title="The program">
+
+```c check
+/* wordfreq: count the words in a text with a hash table, then print the most common. */
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- hash table: string keys, int counts, separate chaining ---------- */
+
+typedef struct Entry {
+    char *key;              /* owned copy of the word */
+    int count;
+    struct Entry *next;     /* next entry in the same bucket */
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;        /* always a power of two */
+    size_t size;            /* number of distinct keys */
+} Table;
+
+/* FNV-1a: a simple, well-known non-cryptographic string hash. */
+static uint64_t hash(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (; *s != '\0'; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int table_init(Table *t, size_t nbuckets) {
+    t->buckets = calloc(nbuckets, sizeof *t->buckets);
+    t->nbuckets = nbuckets;
+    t->size = 0;
+    return t->buckets ? 0 : -1;
+}
+
+static void table_free(Table *t) {
+    for (size_t i = 0; i < t->nbuckets; i++) {
+        Entry *e = t->buckets[i];
+        while (e != NULL) {
+            Entry *next = e->next;
+            free(e->key);
+            free(e);
+            e = next;
+        }
+    }
+    free(t->buckets);
+    *t = (Table){0};
+}
+
+/* Double the number of buckets and move every entry (no copying of keys). */
+static int table_grow(Table *t) {
+    size_t n = t->nbuckets * 2;
+    Entry **fresh = calloc(n, sizeof *fresh);
+    if (fresh == NULL) return -1;
+    for (size_t i = 0; i < t->nbuckets; i++) {
+        Entry *e = t->buckets[i];
+        while (e != NULL) {
+            Entry *next = e->next;
+            size_t j = hash(e->key) & (n - 1);
+            e->next = fresh[j];
+            fresh[j] = e;
+            e = next;
+        }
+    }
+    free(t->buckets);
+    t->buckets = fresh;
+    t->nbuckets = n;
+    return 0;
+}
+
+/* Add 1 to the count for key, inserting it if new. Returns 0, or -1 if out of memory. */
+static int table_increment(Table *t, const char *key) {
+    size_t i = hash(key) & (t->nbuckets - 1);
+    for (Entry *e = t->buckets[i]; e != NULL; e = e->next) {
+        if (strcmp(e->key, key) == 0) {
+            e->count++;
+            return 0;
+        }
+    }
+    if ((t->size + 1) * 4 > t->nbuckets * 3) {          /* keep the load factor <= 0.75 */
+        if (table_grow(t) != 0) return -1;
+        i = hash(key) & (t->nbuckets - 1);
+    }
+    Entry *e = malloc(sizeof *e);
+    size_t len = strlen(key);
+    char *copy = malloc(len + 1);
+    if (e == NULL || copy == NULL) {
+        free(e);
+        free(copy);
+        return -1;
+    }
+    memcpy(copy, key, len + 1);
+    *e = (Entry){.key = copy, .count = 1, .next = t->buckets[i]};
+    t->buckets[i] = e;
+    t->size++;
+    return 0;
+}
+
+/* ---------- the program ---------- */
+
+static int by_count_then_word(const void *a, const void *b) {
+    const Entry *x = *(Entry *const *)a, *y = *(Entry *const *)b;
+    if (x->count != y->count) return (y->count > x->count) - (y->count < x->count);
+    return strcmp(x->key, y->key);
+}
+
+static const char *TEXT =
+    "The river carries the rain to the sea, and the sea returns the rain to the hills.\n"
+    "The hills keep the river, and the river keeps the valley green.\n"
+    "In the valley the farmers wait for the rain; and the rain, when it comes,\n"
+    "finds the river waiting too.\n";
+
+int main(void) {
+    Table t;
+    if (table_init(&t, 8) != 0) return EXIT_FAILURE;
+
+    /* Split the text into lower-case words made of letters. */
+    char word[64];
+    size_t len = 0, total = 0;
+    for (const char *p = TEXT;; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalpha(c) && len + 1 < sizeof word) {
+            word[len++] = (char)tolower(c);
+        } else if (len > 0) {
+            word[len] = '\0';
+            if (table_increment(&t, word) != 0) { table_free(&t); return EXIT_FAILURE; }
+            total++;
+            len = 0;
+        }
+        if (c == '\0') break;
+    }
+
+    /* Collect pointers to the entries and sort them. */
+    Entry **all = malloc(t.size * sizeof *all);
+    if (all == NULL) { table_free(&t); return EXIT_FAILURE; }
+    size_t k = 0;
+    for (size_t i = 0; i < t.nbuckets; i++)
+        for (Entry *e = t.buckets[i]; e != NULL; e = e->next) all[k++] = e;
+    qsort(all, t.size, sizeof *all, by_count_then_word);
+
+    printf("%zu words, %zu distinct, %zu buckets\n", total, t.size, t.nbuckets);
+    for (size_t i = 0; i < 5 && i < t.size; i++) {
+        printf("%-8s %d\n", all[i]->key, all[i]->count);
+    }
+
+    free(all);
+    table_free(&t);
+    return 0;
+}
+```
+
+```text
+49 words, 23 distinct, 32 buckets
+the      15
+rain     4
+river    4
+and      3
+hills    2
+```
+
+We checked these counts independently with a few lines of Python, and ran the program under AddressSanitizer and UBSan, which reported nothing.
+
+### How the hash table works
+
+A hash table stores entries in an array of **buckets**. To find a key, it computes a **hash** of the key, a number that looks random but is always the same for the same string, and uses it to pick a bucket. Different keys can land in the same bucket (a **collision**), so each bucket holds a linked list of entries, a technique called **separate chaining**. As long as the lists stay short, lookups and insertions take constant time on average.
+
+The design decisions, one by one:
+
+- **The hash function.** FNV-1a mixes each byte into a 64-bit state with an XOR and a multiplication by a large prime. It is short, fast for short strings and good enough for a word counter. It is **not** suitable when an attacker chooses the keys, because they can engineer collisions and make every operation slow; servers use keyed hashes such as SipHash for that.
+- **Power-of-two bucket counts.** With `nbuckets` a power of two, `hash & (nbuckets - 1)` picks a bucket using the low bits, which is much cheaper than `%`. It relies on the hash mixing its low bits well, which FNV-1a does.
+- **Resizing.** When adding a key would push the **load factor** (keys per bucket) above 0.75, the table doubles its bucket array and moves every entry to its new bucket. The check `(size + 1) * 4 > nbuckets * 3` compares with integers only. Doubling keeps the average cost of insertion constant, for the same reason as the growable array in lesson 7. Here the table started with 8 buckets and grew twice, to 32.
+- **Ownership.** The table **owns** a copy of every key (`malloc` plus `memcpy`), so the caller's `word` buffer can be reused for the next word. `table_free` frees each key, each entry and the bucket array, in that order, and resets the struct to its all-zero empty state.
+- **Failure paths.** Every allocation is checked; if either of the two allocations for a new entry fails, both are released and the table is left unchanged. `free(NULL)` being a no-op makes that clean-up short.
+- **Sorting the results.** The program collects pointers to the entries (not copies) and sorts them with `qsort`, by count descending and then alphabetically, so that ties such as `rain` and `river` always appear in the same order. A deterministic output is a gift to anyone who tests or compares it.
+
+The word splitting is deliberately simple: a word is a run of ASCII letters, lowered. Real text needs more thought (apostrophes, hyphens, Unicode letters), which is exactly why the rule lives in one obvious place.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Testing against a reference">
+
+Hand-written test cases check the behaviours you thought of. **Differential testing** checks the ones you did not: run the clever implementation and a simple, obviously correct one on the same inputs, many of them, and compare. For a counter of 200 possible keys, the simple implementation is an array indexed by key number. The test below starts the table with a single bucket, so that it must resize many times, and feeds it 5000 pseudo-random keys from a fixed seed, so every run is the same:
+
+```c check
+/* Testing the hash table against a plain array of expected counts. */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- hash table: string keys, int counts, separate chaining ---------- */
+
+typedef struct Entry {
+    char *key;              /* owned copy of the word */
+    int count;
+    struct Entry *next;     /* next entry in the same bucket */
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;        /* always a power of two */
+    size_t size;            /* number of distinct keys */
+} Table;
+
+/* FNV-1a: a simple, well-known non-cryptographic string hash. */
+static uint64_t hash(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (; *s != '\0'; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int table_init(Table *t, size_t nbuckets) {
+    t->buckets = calloc(nbuckets, sizeof *t->buckets);
+    t->nbuckets = nbuckets;
+    t->size = 0;
+    return t->buckets ? 0 : -1;
+}
+
+static void table_free(Table *t) {
+    for (size_t i = 0; i < t->nbuckets; i++) {
+        Entry *e = t->buckets[i];
+        while (e != NULL) {
+            Entry *next = e->next;
+            free(e->key);
+            free(e);
+            e = next;
+        }
+    }
+    free(t->buckets);
+    *t = (Table){0};
+}
+
+/* Double the number of buckets and move every entry (no copying of keys). */
+static int table_grow(Table *t) {
+    size_t n = t->nbuckets * 2;
+    Entry **fresh = calloc(n, sizeof *fresh);
+    if (fresh == NULL) return -1;
+    for (size_t i = 0; i < t->nbuckets; i++) {
+        Entry *e = t->buckets[i];
+        while (e != NULL) {
+            Entry *next = e->next;
+            size_t j = hash(e->key) & (n - 1);
+            e->next = fresh[j];
+            fresh[j] = e;
+            e = next;
+        }
+    }
+    free(t->buckets);
+    t->buckets = fresh;
+    t->nbuckets = n;
+    return 0;
+}
+
+/* Add 1 to the count for key, inserting it if new. Returns 0, or -1 if out of memory. */
+static int table_increment(Table *t, const char *key) {
+    size_t i = hash(key) & (t->nbuckets - 1);
+    for (Entry *e = t->buckets[i]; e != NULL; e = e->next) {
+        if (strcmp(e->key, key) == 0) {
+            e->count++;
+            return 0;
+        }
+    }
+    if ((t->size + 1) * 4 > t->nbuckets * 3) {          /* keep the load factor <= 0.75 */
+        if (table_grow(t) != 0) return -1;
+        i = hash(key) & (t->nbuckets - 1);
+    }
+    Entry *e = malloc(sizeof *e);
+    size_t len = strlen(key);
+    char *copy = malloc(len + 1);
+    if (e == NULL || copy == NULL) {
+        free(e);
+        free(copy);
+        return -1;
+    }
+    memcpy(copy, key, len + 1);
+    *e = (Entry){.key = copy, .count = 1, .next = t->buckets[i]};
+    t->buckets[i] = e;
+    t->size++;
+    return 0;
+}
+
+static int table_get(const Table *t, const char *key) {
+    size_t i = hash(key) & (t->nbuckets - 1);
+    for (const Entry *e = t->buckets[i]; e != NULL; e = e->next) {
+        if (strcmp(e->key, key) == 0) return e->count;
+    }
+    return 0;
+}
+
+/* ---------- a differential test: compare the table with a plain array ---------- */
+
+int main(void) {
+    enum { DISTINCT = 200, INSERTS = 5000 };
+    int expected[DISTINCT] = {0};
+    Table t;
+    if (table_init(&t, 1) != 0) return EXIT_FAILURE;    /* start tiny to force many resizes */
+
+    uint32_t state = 2026;                               /* fixed seed: same run every time */
+    char key[16];
+    for (int n = 0; n < INSERTS; n++) {
+        state = state * 1664525u + 1013904223u;          /* a simple linear congruential generator */
+        int k = (int)((state >> 16) % DISTINCT);
+        snprintf(key, sizeof key, "key%d", k);
+        expected[k]++;
+        if (table_increment(&t, key) != 0) { table_free(&t); return EXIT_FAILURE; }
+    }
+
+    int mismatches = 0, present = 0;
+    for (int k = 0; k < DISTINCT; k++) {
+        snprintf(key, sizeof key, "key%d", k);
+        if (table_get(&t, key) != expected[k]) mismatches++;
+        if (expected[k] > 0) present++;
+    }
+    printf("%d insertions, %d distinct keys seen, table size %zu\n", INSERTS, present, t.size);
+    printf("mismatches: %d\n", mismatches);
+    printf("buckets: %zu, load factor %.2f\n", t.nbuckets, (double)t.size / (double)t.nbuckets);
+
+    size_t longest = 0;
+    for (size_t i = 0; i < t.nbuckets; i++) {
+        size_t chain = 0;
+        for (Entry *e = t.buckets[i]; e != NULL; e = e->next) chain++;
+        if (chain > longest) longest = chain;
+    }
+    printf("longest chain: %zu\n", longest);
+    int ok = mismatches == 0 && (size_t)present == t.size;
+    table_free(&t);
+    return ok ? 0 : 1;
+}
+```
+
+```text
+5000 insertions, 200 distinct keys seen, table size 200
+mismatches: 0
+buckets: 512, load factor 0.39
+longest chain: 2
+```
+
+Besides correctness, the test reports two health measures: the final load factor and the **longest chain**. A long chain would mean a weak hash or a bug in resizing; 2 is what you hope to see.
+
+An honest note: the first version of this test exited with status 1 even though every count matched. It compared `present` with `t.size` **after** calling `table_free`, which had reset the size to zero. The fix, computing the result before freeing, is in the code above. It is a small example of why tests must themselves be run and checked, and of how "use after free" thinking applies even when no memory error occurs.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="One program, several files">
+
+A hash table is reusable, so in a real project it becomes a small library with a header, separate from the program that uses it and from its tests:
+
+```text
+wordfreq/
+├── CMakeLists.txt
+├── Makefile
+├── src/
+│   ├── hashtable.h        the public interface
+│   ├── hashtable.c        the implementation
+│   └── wordfreq.c         the program (main)
+└── tests/
+    └── test_hashtable.c   unit tests, with their own main
+```
+
+The header declares the types and the four public functions, and documents the ownership rules once:
+
+```c
+#ifndef HASHTABLE_H
+#define HASHTABLE_H
+
+#include <stddef.h>
+
+/* A hash table from strings to int counts. All functions return 0 on
+   success and -1 if memory ran out. The table owns copies of its keys. */
+
+typedef struct Entry {
+    char *key;
+    int count;
+    struct Entry *next;
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;
+    size_t size;
+} Table;
+
+int table_init(Table *t, size_t nbuckets);   /* nbuckets: a power of two */
+void table_free(Table *t);
+int table_increment(Table *t, const char *key);
+int table_get(const Table *t, const char *key);   /* 0 if absent */
+
+#endif
+```
+
+`hash` and `table_grow` stay `static` inside `hashtable.c`: they are implementation details. (A stricter design would also hide the struct layouts behind an opaque type, at the cost of an allocation and accessor functions; for a small internal library, exposing them is a reasonable trade.)
+
+### make
+
+`make` reads a **Makefile** of rules: a **target**, the files it depends on, and the commands that rebuild it when any dependency is newer. Recipe lines must start with a tab character.
+
+```makefile
+CC      ?= cc
+CFLAGS  ?= -std=c17 -Wall -Wextra -Wpedantic -O2 -g
+CPPFLAGS += -Isrc -MMD -MP
+
+OBJS = src/hashtable.o src/wordfreq.o
+
+wordfreq: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_hashtable: src/hashtable.o tests/test_hashtable.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+.PHONY: test clean
+test: test_hashtable
+	./test_hashtable
+
+clean:
+	rm -f wordfreq test_hashtable src/*.o src/*.d tests/*.o tests/*.d
+
+-include $(OBJS:.o=.d) tests/test_hashtable.d
+```
+
+`$@` stands for the target and `$^` for all its dependencies; object files are built by make's built-in rule for `.c` files, using `CC`, `CPPFLAGS` and `CFLAGS`. The flags `-MMD -MP` make the compiler write a small `.d` file listing the headers each source file includes, and the `-include` line feeds those back to make, so changing `hashtable.h` rebuilds everything that includes it. Running it:
+
+```text
+$ make
+cc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -Isrc -MMD -MP  -c -o src/hashtable.o src/hashtable.c
+cc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -Isrc -MMD -MP  -c -o src/wordfreq.o src/wordfreq.c
+cc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -o wordfreq src/hashtable.o src/wordfreq.o
+$ make test
+cc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -Isrc -MMD -MP  -c -o tests/test_hashtable.o tests/test_hashtable.c
+cc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -o test_hashtable src/hashtable.o tests/test_hashtable.o
+./test_hashtable
+all tests passed
+```
+
+`make test` reused `src/hashtable.o`, already built for `wordfreq`, and compiled only the test file. After we then edited only `wordfreq.c`, `make` ran exactly two commands, recompiling that one file and relinking, and left `hashtable.o` alone. On a project of thousands of files, that difference is minutes against hours. The first target in the file, `wordfreq`, is the default when you type plain `make`; `.PHONY` marks `test` and `clean` as names of actions rather than files, so a stray file called `test` cannot confuse make.
+
+### CMake
+
+Hand-written Makefiles work well on one platform and become hard to maintain across compilers and operating systems. **CMake** is the most widely used C and C++ build generator: you describe targets and their relationships, and it generates the native build files (Makefiles, Ninja files or Visual Studio projects).
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(wordfreq LANGUAGES C)
+
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+add_library(hashtable src/hashtable.c)
+target_include_directories(hashtable PUBLIC src)
+target_compile_options(hashtable PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(wordfreq src/wordfreq.c)
+target_link_libraries(wordfreq PRIVATE hashtable)
+
+enable_testing()
+add_executable(test_hashtable tests/test_hashtable.c)
+target_link_libraries(test_hashtable PRIVATE hashtable)
+add_test(NAME hashtable COMMAND test_hashtable)
+```
+
+```text
+$ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+$ cmake --build build
+[ 33%] Linking C static library libhashtable.a
+[ 66%] Linking C executable wordfreq
+[100%] Linking C executable test_hashtable
+$ cd build && ctest
+1/1 Test #1: hashtable ........................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 1
+```
+
+(Output trimmed to the main lines.) The build happens in a separate `build` directory, so the source tree stays clean and several configurations (debug, release, sanitizers) can live side by side. `target_link_libraries(wordfreq PRIVATE hashtable)` also passes on the library's `PUBLIC` include directory, so `wordfreq.c` finds `hashtable.h` without extra flags. `CMAKE_EXPORT_COMPILE_COMMANDS` writes `compile_commands.json`, the file that editors, clangd and clang-tidy read to understand exactly how each file is compiled.
+
+</Section>
+
+<Section id="human" kind="human" title="The professional toolbox">
+
+Around the compiler and the build tool, most C teams use:
+
+- **A formatter**: `clang-format` with a checked-in `.clang-format` file, run automatically, so that nobody argues about braces in code review.
+- **Linters and analysers**: `clang-tidy`, GCC's `-fanalyzer`, cppcheck, and commercial tools for large or safety-critical code.
+- **Sanitizer and fuzzing builds** in continuous integration, as in lesson 9, on several compilers and platforms.
+- **Dependency management**: C has no single package manager. Projects use the system's packages (found with `pkg-config` or CMake's `find_package`), vendor the source of small libraries, or use vcpkg or Conan.
+- **Ninja**: a fast build executor that CMake can generate for (`cmake -G Ninja`), common in large projects.
+- **Meson**: an alternative to CMake with a cleaner language, used by projects such as GNOME and systemd.
+- **Debuggers and profilers**: gdb or lldb, `perf`, and Valgrind's Callgrind and Massif for where time and memory go.
+
+</Section>
+
+<Section id="reading" kind="reading" title="Where to go next">
+
+You now know the core of C and the practices that make it safe enough to ship. Directions worth exploring:
+
+- **Read real C.** SQLite, Redis, Lua and curl are all known for clear, well-commented C code. Pick a small module and read it with the source of a test beside it.
+- **Go deeper into the language.** Jens Gustedt's *Modern C* (free from its [official site](https://gustedt.gitlabpages.inria.fr/modern-c/)) covers C17 and C23 in depth, and [cppreference.com](https://en.cppreference.com/w/c) is the everyday reference. The standard itself is readable once you know the language; the committee publishes drafts on the [WG14 site](https://www.open-std.org/jtc1/sc22/wg14/).
+- **Systems programming.** The Linux system calls behind `stdio` (`open`, `read`, `write`, `mmap`), processes, signals and sockets are the next layer down. The [Assembly](/en/cs/languages/assembly/) course in this catalogue shows the machine underneath C.
+- **Embedded systems.** Microcontroller boards with official C toolchains let you write C that controls real hardware, where every byte and cycle counts.
+- **Security.** The [SEI CERT C Coding Standard](https://wiki.sei.cmu.edu/confluence/display/c/SEI+CERT+C+Coding+Standard) and fuzzing projects such as OSS-Fuzz show how C code is attacked and defended.
+- **Other systems languages.** C++, Rust and Zig all address C's weaknesses in different ways, and their courses in this catalogue will feel familiar after this one. Knowing C makes you better at all of them, because each still talks to the world through C's conventions.
+
+<Reflection title="Small tools, carefully made">
+
+C rewards a particular kind of character: patience with details, honesty about what you do not know, and care for the people who will run and maintain your code. A hash table that frees every key, a test that checks the case you hoped would never happen, a comment that says who owns a pointer: none of these will be noticed when they work. Many traditions, including the Christian one, have honoured that kind of faithful, unseen work as good in itself. It is also what makes software trustworthy.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Spaces instead of a tab in a Makefile.** Recipe lines must begin with a tab. Many editors silently convert tabs to spaces, and make then reports `missing separator`. Configure your editor to keep tabs in Makefiles.
+
+</Misconception>
+
+<Misconception>
+
+**Rebuilding everything by hand "to be safe".** If you find yourself running `make clean` after every header change, your dependencies are wrong. Generated dependencies (`-MMD -MP`) or CMake fix that properly.
+
+</Misconception>
+
+<Misconception>
+
+**Using a simple hash for keys that attackers control.** Collisions can be forced for FNV and similar hashes, turning every lookup into a linear scan and a server into a denial-of-service target. Use a keyed hash such as SipHash for untrusted keys.
+
+</Misconception>
+
+<Misconception>
+
+**Building inside the source tree with CMake.** Running `cmake .` in the source directory scatters generated files among your sources. Always use a separate build directory (`-B build`).
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GCC, make and CMake.
+
+<Exercises/>
+
+</Section>

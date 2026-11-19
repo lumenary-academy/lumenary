@@ -1,0 +1,404 @@
+---
+title: Strings and text
+subtitle: Strings as arrays of bytes ending in zero, the string.h toolkit and its traps, safe formatting and parsing, and UTF-8.
+minutes: 60
+objectives:
+  - Explain how C represents strings as zero-terminated char arrays, and the difference between strlen and sizeof
+  - Use strcmp, strchr, strstr, memcpy and snprintf correctly, and know which classic functions to avoid
+  - Classify and convert characters with ctype.h, casting to unsigned char as required
+  - Parse numbers from text with strtol and full error checking
+  - Distinguish bytes from characters in UTF-8 text
+prerequisites: [pointers-and-arrays]
+references:
+  - title: cppreference.com, Null-terminated byte strings
+    url: https://en.cppreference.com/w/c/string/byte
+    note: Every function in string.h and ctype.h, with the standard version that added it.
+  - title: cppreference.com, strtol
+    url: https://en.cppreference.com/w/c/string/byte/strtol
+    note: The exact rules for whitespace, signs, bases, the end pointer and ERANGE.
+  - title: UTF-8 Everywhere
+    url: https://utf8everywhere.org/
+    note: A manifesto, with practical advice, for using UTF-8 as the one text encoding in programs.
+  - title: SEI CERT C Coding Standard, Characters and Strings
+    url: https://wiki.sei.cmu.edu/confluence/display/c/SEI+CERT+C+Coding+Standard
+    note: Carnegie Mellon's secure-coding rules; the STR section covers the pitfalls in this lesson.
+---
+
+<Section id="motivation" kind="motivation" title="No string type">
+
+Most languages have a string type that knows its own length, grows when you append to it, and refuses to let you read past its end. C has none of that. In C, a **string** is a convention: a sequence of `char` values in consecutive memory, ending with a byte whose value is zero. Every string function in the standard library relies on that zero to know where the string stops.
+
+The convention is simple, fast and compact, and it made sense in 1972. It is also behind a long history of security holes, because nothing stops a program from writing a long string into a short array, or from losing the terminating zero. Professional C code handles text with a small set of safe habits: always know the size of every buffer, use functions that take that size, check every conversion, and remember that a byte is not a character. This lesson builds those habits.
+
+</Section>
+
+<Section id="history" kind="history" title="Why a zero at the end?">
+
+Zero-terminated strings were not invented by C. Assemblers of the time already had directives such as `.asciz` for them (you can still use it in the GNU assembler), and the PDP-11 made "loop until you load a zero byte" a cheap test. The alternative, used by Pascal and many later languages, stores the length in front of the characters. Ritchie chose the terminator partly to avoid limiting string lengths to whatever fitted in a length byte, and partly because it made strings and pointers fit together so neatly: any pointer into a string is itself a string, the rest of it.
+
+The cost became clear later. Finding a length means scanning the whole string, and every function that writes a string must be told, separately, how much room there is. When that size is wrong or missing, the result is a buffer overflow. In a 2011 article for ACM Queue titled "The Most Expensive One-byte Mistake", the FreeBSD developer Poul-Henning Kamp argued that this single design decision has cost the industry enormously in bugs, security fixes and slow code. Whether or not one agrees with his accounting, the lesson for today's C programmer is practical: keep sizes next to buffers, and let functions that know the size do the writing.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Strings are arrays">
+
+<Definition term="string">
+
+A **string** in C is a contiguous sequence of characters terminated by and including the first null character, `'\0'` (the byte with value zero). A pointer to its first character is how a string is passed around; its **length** is the number of characters before the null character.
+
+</Definition>
+
+A **string literal** such as `"Kigali"` is an array of 7 `char`s, the 6 letters and a final `'\0'`, stored in read-only memory for the life of the program. Two ways of using it look similar and behave very differently:
+
+```c
+char city[] = "Kigali";        /* an array of 7 chars, initialised by copying; you may modify it */
+const char *name = "Kigali";   /* a pointer to the literal itself; modifying it is undefined behaviour */
+```
+
+Write `const char *` for pointers to literals, and the compiler will stop accidental writes. This program shows the terminator at work:
+
+```c check
+#include <stdio.h>
+#include <string.h>
+
+/* Count characters up to the terminating zero byte. */
+size_t my_strlen(const char *s) {
+    const char *p = s;
+    while (*p != '\0') {
+        p++;
+    }
+    return (size_t)(p - s);
+}
+
+/* Reverse a string in place by swapping from both ends. */
+void reverse(char *s) {
+    size_t n = strlen(s);
+    if (n < 2) return;
+    for (size_t i = 0, j = n - 1; i < j; i++, j--) {
+        char tmp = s[i];
+        s[i] = s[j];
+        s[j] = tmp;
+    }
+}
+
+int main(void) {
+    char city[] = "Kigali";                 /* an array of 7 chars: 6 letters + '\0' */
+    printf("strlen = %zu, my_strlen = %zu, sizeof = %zu\n",
+           strlen(city), my_strlen(city), sizeof city);
+
+    reverse(city);                          /* allowed: city is our own array */
+    printf("reversed: %s\n", city);
+
+    char word[8] = {'a', 'b', 'c', '\0', 'x', 'y', 'z', '\0'};
+    printf("printf stops at the first zero: %s\n", word);
+    printf("the bytes after it are still there: %s\n", word + 4);
+    return 0;
+}
+```
+
+```text
+strlen = 6, my_strlen = 6, sizeof = 7
+reversed: ilagiK
+printf stops at the first zero: abc
+the bytes after it are still there: xyz
+```
+
+`strlen` counts characters before the zero; `sizeof` counts the bytes of the whole array, terminator included. `my_strlen` is essentially what the library does (real implementations read several bytes at a time, but the idea is the same), which means `strlen` takes time proportional to the length: calling it in a loop condition over the same string, `for (i = 0; i < strlen(s); i++)`, quietly turns a linear loop into a quadratic one. The `word` array shows that the "string" ends at the first zero, whatever follows.
+
+</Section>
+
+<Section id="computation" kind="computation" title="The string.h toolkit">
+
+`<string.h>` has two families of functions: `str…` functions, which work on zero-terminated strings, and `mem…` functions, which work on a given number of bytes and ignore zeros. The ones you will use most:
+
+| Function | Does |
+| --- | --- |
+| `strlen(s)` | length of `s` |
+| `strcmp(a, b)` | compare: negative, zero or positive, by byte values |
+| `strncmp(a, b, n)` | compare at most `n` characters |
+| `strchr(s, c)` / `strrchr(s, c)` | pointer to the first / last `c` in `s`, or `NULL` |
+| `strstr(s, sub)` | pointer to the first occurrence of `sub`, or `NULL` |
+| `memcpy(dst, src, n)` | copy `n` bytes (the regions must not overlap) |
+| `memmove(dst, src, n)` | copy `n` bytes, overlapping allowed |
+| `memset(p, byte, n)` | fill `n` bytes |
+| `memcmp(a, b, n)` | compare `n` bytes |
+
+And from `<stdio.h>`, the function that replaces most string building: `snprintf(buffer, size, format, …)`, which formats like `printf` but into a buffer, never writes more than `size` bytes (terminator included), and returns the length the complete result *would* have had.
+
+```c check
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    /* Comparing: never use == on strings; it compares addresses. */
+    printf("strcmp(\"apple\", \"banana\") < 0: %d\n", strcmp("apple", "banana") < 0);
+    printf("strcmp(\"Zebra\", \"apple\") < 0: %d\n", strcmp("Zebra", "apple") < 0);
+
+    /* Searching. */
+    const char *path = "/home/ana/notes/todo.txt";
+    const char *slash = strrchr(path, '/');      /* last '/' */
+    const char *dot = strchr(path, '.');         /* first '.' */
+    printf("file name: %s, extension: %s\n", slash + 1, dot + 1);
+    printf("contains \"notes\": %s\n", strstr(path, "notes") ? "yes" : "no");
+
+    /* Building strings safely: snprintf never writes past the buffer,
+       and returns the length the full result would have had. */
+    const char *cities[] = {"Lima", "Ouagadougou"};
+    for (int i = 0; i < 2; i++) {
+        char buf[20];
+        int needed = snprintf(buf, sizeof buf, "%s has %zu letters", cities[i], strlen(cities[i]));
+        printf("buffer holds \"%s\"", buf);
+        if (needed >= (int)sizeof buf) {
+            printf(" (truncated: needed %d, room for %zu)", needed, sizeof buf - 1);
+        }
+        printf("\n");
+    }
+
+    /* Copying bytes with a known length. */
+    char copy[6];
+    memcpy(copy, "Lagos", 6);                    /* 5 letters and the '\0' */
+    printf("copy: %s\n", copy);
+    return 0;
+}
+```
+
+```text
+strcmp("apple", "banana") < 0: 1
+strcmp("Zebra", "apple") < 0: 1
+file name: todo.txt, extension: txt
+contains "notes": yes
+buffer holds "Lima has 4 letters"
+buffer holds "Ouagadougou has 11 " (truncated: needed 26, room for 19)
+copy: Lagos
+```
+
+Notes on each part:
+
+- `strcmp` compares byte values, so every uppercase ASCII letter sorts before every lowercase one: "Zebra" comes before "apple". Sorting text for people needs locale-aware comparison (`strcoll`) or a library such as ICU.
+- `strchr` and `strstr` return pointers *into* the original string, so `slash + 1` is the file name without copying anything. That is efficient, and it also means the result is only valid as long as the original string is.
+- `snprintf`'s return value is how you detect truncation: if it is greater than or equal to the buffer size, the output was cut. Ignoring it is how silent data loss happens.
+- `memcpy` copies exactly the bytes you ask for, including the terminator if you count it.
+
+### Reading lines safely
+
+Our programs take no input, but real ones do, and `fgets` is the standard way to read a line of text into a fixed buffer:
+
+```c
+char line[256];
+while (fgets(line, sizeof line, stdin) != NULL) {
+    line[strcspn(line, "\n")] = '\0';     /* remove the newline, if there is one */
+    /* ... use line ... */
+}
+```
+
+`fgets` reads at most `sizeof line - 1` characters, always adds the terminator, and keeps the newline if the whole line fitted. `strcspn(line, "\n")` returns the index of the first newline (or the length, if there is none), so the next statement trims the line safely in both cases. If a line is longer than the buffer, the rest arrives on the next call; a program that must handle any length uses POSIX `getline`, which grows its buffer with `malloc`, or the growing buffer you will write in lesson 7.
+
+### Functions to avoid
+
+Several classic functions cannot be used safely, or are easy to misuse:
+
+- `gets` reads a line with no limit on its length. It was removed from the language in C11; never use it. Use `fgets`.
+- `strcpy` and `strcat` write without knowing the destination's size. Where you can, compute lengths and use `memcpy`, or build with `snprintf`.
+- `strncpy` sounds safe but does **not** add a terminator when the source is too long, and pads with zeros when it is short. It was designed for fixed-width fields, not strings.
+- `strtok` keeps hidden state between calls, so it cannot be used on two strings at once or from several threads. POSIX `strtok_r` takes the state as a parameter.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Characters, parsing and UTF-8">
+
+### Classifying characters
+
+`<ctype.h>` provides `isalpha`, `isdigit`, `isspace`, `isupper`, `toupper`, `tolower` and friends. They take an `int` that must be either `EOF` or a value representable as `unsigned char`. Since plain `char` is signed on x86-64, a byte above 127 becomes a negative number, and passing it directly is undefined behaviour. Always cast: `isalpha((unsigned char)c)`.
+
+```c check
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+
+/* Capitalise the first letter of every word, lower-case the rest. */
+void title_case(char *s) {
+    bool start_of_word = true;
+    for (; *s != '\0'; s++) {
+        unsigned char c = (unsigned char)*s;    /* ctype functions need unsigned char values */
+        if (isalpha(c)) {
+            *s = (char)(start_of_word ? toupper(c) : tolower(c));
+            start_of_word = false;
+        } else {
+            start_of_word = true;
+        }
+    }
+}
+
+int count_vowels(const char *s) {
+    int count = 0;
+    for (; *s != '\0'; s++) {
+        switch (tolower((unsigned char)*s)) {
+        case 'a': case 'e': case 'i': case 'o': case 'u':
+            count++;
+            break;
+        default:
+            break;
+        }
+    }
+    return count;
+}
+
+int main(void) {
+    char title[] = "the gOLDEN age of rADIO in buenos aires";
+    title_case(title);
+    printf("%s\n", title);
+    printf("vowels: %d\n", count_vowels(title));
+    return 0;
+}
+```
+
+```text
+The Golden Age Of Radio In Buenos Aires
+vowels: 16
+```
+
+`title_case` modifies the array in place, a common C style: the caller owns the memory, and the function transforms it. Note that a simple rule like "capitalise after a non-letter" gets names such as "O'Neil" right only by luck and "McDonald" wrong; real text is always harder than the first rule suggests.
+
+### Parsing numbers
+
+`atoi("12abc")` returns 12 and `atoi("hello")` returns 0, with no way to tell success from failure. Use `strtol` (and `strtoul`, `strtoll`, `strtod`), which reports where it stopped and sets `errno` to `ERANGE` on overflow:
+
+```c check
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Parse a whole string as a decimal int. Returns false on any problem. */
+bool parse_int(const char *text, int *out) {
+    char *end;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (end == text) return false;                 /* no digits at all */
+    if (*end != '\0') return false;                /* trailing junk */
+    if (errno == ERANGE || value < INT_MIN || value > INT_MAX) return false;
+    *out = (int)value;
+    return true;
+}
+
+int main(void) {
+    const char *inputs[] = {"42", "-17", "12abc", "", "99999999999999999999", "  7"};
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        int value;
+        if (parse_int(inputs[i], &value)) {
+            printf("\"%s\" -> %d\n", inputs[i], value);
+        } else {
+            printf("\"%s\" -> rejected\n", inputs[i]);
+        }
+    }
+    return 0;
+}
+```
+
+```text
+"42" -> 42
+"-17" -> -17
+"12abc" -> rejected
+"" -> rejected
+"99999999999999999999" -> rejected
+"  7" -> 7
+```
+
+All four checks matter: no digits at all (`end == text`), trailing characters (`*end != '\0'`), overflow of `long` (`errno == ERANGE`), and overflow of the narrower `int`. `errno` must be set to zero before the call, because `strtol` only ever sets it, never clears it. The last line shows a rule worth knowing: `strtol` skips leading whitespace but not trailing whitespace. Whether `"  7"` should be accepted is a decision for your program; the point is to make it deliberately.
+
+### Bytes are not characters
+
+Modern text is almost always **UTF-8**, which encodes each Unicode character in 1 to 4 bytes. ASCII characters are one byte; `ã` and `ü` are two; most Chinese and Japanese characters are three. C's string functions count and compare **bytes**. Counting characters takes a little knowledge of the encoding: continuation bytes always have the bit pattern `10xxxxxx`.
+
+```c check
+#include <stdio.h>
+#include <string.h>
+
+/* In UTF-8, every byte of the form 10xxxxxx continues a character;
+   every other byte starts one. */
+size_t utf8_length(const char *s) {
+    size_t count = 0;
+    for (; *s != '\0'; s++) {
+        if (((unsigned char)*s & 0xC0) != 0x80) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int main(void) {
+    const char *words[] = {"Lagos", "São Paulo", "Zürich", "東京", "Αθήνα"};
+    for (size_t i = 0; i < 5; i++) {
+        printf("%-10s bytes: %2zu, characters: %zu\n",
+               words[i], strlen(words[i]), utf8_length(words[i]));
+    }
+    return 0;
+}
+```
+
+```text
+Lagos      bytes:  5, characters: 5
+São Paulo bytes: 10, characters: 9
+Zürich    bytes:  7, characters: 6
+東京     bytes:  6, characters: 2
+Αθήνα bytes: 10, characters: 5
+```
+
+The output shows a second problem as well as the counts: the columns do not line up, because `%-10s` pads to 10 **bytes**, not 10 characters (and East Asian characters are usually drawn twice as wide). Even "characters" is not the whole story: one visible letter can be several Unicode code points, such as a letter followed by a combining accent. Serious text processing in C uses a library such as ICU or utf8proc rather than hand-written loops.
+
+</Section>
+
+<Section id="human" kind="human" title="Text handling in professional C">
+
+Teams that write a lot of C text processing tend to converge on the same practices:
+
+- **Carry lengths explicitly.** Many code bases use a small struct with a pointer and a length (often called a string view or slice) for text they did not allocate, and compute each length once. Redis's `sds` and Git's `strbuf` are well-known dynamic-string libraries built on this idea.
+- **Build with `snprintf`, check the result.** Or use a growing buffer (lesson 7 builds one) when the size is unknown.
+- **Validate at the boundary.** Text that comes from files, networks or users is checked once, as it enters the program: valid UTF-8, sensible length, expected characters. Inner code can then trust it.
+- **Prefer `fgets` and `getline` for input.** `fgets(buf, size, stream)` reads at most one line and never overflows; POSIX `getline` allocates as much as the line needs.
+- **Treat compiler warnings about formats as errors.** `-Wformat` and its stricter relatives catch mismatched `printf` arguments and, as GCC showed while this lesson was being written, even predictable truncation in `snprintf`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Comparing strings with `==`.** `if (name == "Ana")` compares two addresses, not the text, and is almost always false (or true by accident). Use `strcmp(name, "Ana") == 0`.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting space for the terminator.** A buffer for a 5-letter word needs 6 bytes. `char code[5] = "Lagos";` is accepted by C (not by C++) but leaves out the `'\0'`, so the array is not a string, and `printf("%s", code)` reads past its end.
+
+</Misconception>
+
+<Misconception>
+
+**Modifying a string literal.** `char *s = "hello"; s[0] = 'H';` is undefined behaviour and usually crashes, because literals live in read-only memory. Copy into an array first, and declare literal pointers `const char *` so the compiler stops you.
+
+</Misconception>
+
+<Misconception>
+
+**Assuming `strlen` counts letters.** It counts bytes. `strlen("Café")` is 5 in UTF-8.
+
+</Misconception>
+
+<Misconception>
+
+**Using `sizeof` on a pointer to get a buffer's size.** Inside a function that receives `char *buf`, `sizeof buf` is 8, the size of the pointer, so `snprintf(buf, sizeof buf, …)` silently limits every result to 7 characters. Pass the buffer's size as a separate parameter, and use `sizeof` only where the array itself is declared.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GCC.
+
+<Exercises/>
+
+</Section>

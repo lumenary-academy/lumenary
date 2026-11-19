@@ -1,0 +1,391 @@
+---
+title: Operating systems
+subtitle: "The program that runs all the other programs: the kernel, processes, virtual memory, scheduling, files and permissions, with Linux as the example."
+minutes: 65
+objectives:
+  - Explain the kernel's role, user and kernel mode, and what happens during a system call
+  - Distinguish a program from a process, and describe a process's address space and life cycle
+  - Translate virtual addresses through a page table and explain page faults, demand paging and the TLB
+  - Simulate first-come-first-served and round-robin scheduling and compare their response and turnaround times
+  - Use file descriptors, and explain inodes, directories and Unix permission bits
+prerequisites: [memory-hierarchy, logic-to-processor, bits-and-bytes, lists-stacks-queues]
+references:
+  - title: The Linux kernel documentation
+    url: https://docs.kernel.org/
+    note: The official documentation, including the memory-management and scheduler guides.
+  - title: Concepts overview (Linux memory management)
+    url: https://docs.kernel.org/admin-guide/mm/concepts.html
+  - title: Page tables (Linux kernel documentation)
+    url: https://docs.kernel.org/mm/page_tables.html
+  - title: EEVDF scheduler (Linux kernel documentation)
+    url: https://docs.kernel.org/scheduler/sched-eevdf.html
+  - title: CFS scheduler (Linux kernel documentation)
+    url: https://docs.kernel.org/scheduler/sched-design-CFS.html
+  - title: syscalls(2) and the other Linux manual pages
+    author: Michael Kerrisk (maintainer)
+    url: https://man7.org/linux/man-pages/man2/syscalls.2.html
+    note: The list of Linux system calls; the neighbouring pages document each one.
+  - title: Overview of the Linux virtual file system
+    url: https://docs.kernel.org/filesystems/vfs.html
+  - title: The UNIX time-sharing system
+    author: Dennis M. Ritchie and Ken Thompson
+    year: 1974
+    url: https://doi.org/10.1145/361011.361061
+    note: The paper that introduced Unix to the world; short and still readable.
+  - title: The Linux Kernel Archives
+    url: https://www.kernel.org/
+---
+
+<Section id="motivation" kind="motivation" title="Many programs, one machine">
+
+Right now your computer is running a browser, perhaps a music player, a chat program, a clock in the corner of the screen and a hundred background services, on a handful of processor cores and one shared memory. None of these programs was written with the others in mind. Each assumes it can use the processor whenever it likes, that its memory is its own, and that files it saves will still be there tomorrow. Some of them are buggy, and one of them might be malicious.
+
+The **operating system** makes this work. It plays two roles at once:
+
+- **Referee.** It decides which program runs on which core and for how long, keeps each program out of the others' memory, and checks every request to touch a file or a device against the rules.
+- **Illusionist.** It gives each program the illusion of a whole computer of its own: its own processor (really a slice of time on a shared one), its own large private memory (really pieces of shared physical memory, some of it possibly on disk), and a tidy tree of named files (really blocks scattered over a storage device).
+
+This lesson uses **Linux** as its running example. It runs most of the world's servers and supercomputers, all Android phones, and countless embedded devices, and its source and documentation are open for anyone to read at [kernel.org](https://www.kernel.org/). The ideas carry over to Windows, macOS and the rest with different names. Underneath, everything builds on the previous lessons: the processor's privilege modes, the memory hierarchy, and bits used as flags.
+
+</Section>
+
+<Section id="kernel" kind="definitions" title="The kernel and system calls">
+
+<Definition term="kernel, user mode, kernel mode">
+
+The **kernel** is the core of the operating system: the part that runs with full control of the hardware. Processors have (at least) two privilege levels. In **kernel mode** code may execute every instruction, touch all memory and talk to devices. In **user mode**, where ordinary programs run, privileged instructions are forbidden and memory access is limited to what the kernel has mapped for that program. On x86-64 these are rings 0 and 3; on Arm, exception levels EL1 and EL0; on RISC-V, supervisor and user mode.
+
+</Definition>
+
+A user program cannot read a file or send a network packet by itself, since that requires talking to devices. It must ask the kernel, through a **system call**.
+
+<Definition term="system call">
+
+A **system call** is a controlled entry into the kernel. The program places a call number and arguments in registers and executes a special trap instruction (`syscall` on x86-64, `svc` on Arm, `ecall` on RISC-V). The processor switches to kernel mode and jumps to a fixed kernel entry point, the kernel checks the request and performs it, and then returns to the instruction after the trap, back in user mode, with a result in a register.
+
+</Definition>
+
+The crucial word is *controlled*: the program chooses the request but not the code that handles it, so it cannot use the kernel's privileges for anything the kernel has not agreed to. Linux offers a few hundred system calls: `read`, `write`, `openat`, `close`, `mmap`, `fork`, `execve`, `exit`, `socket` and many more. You rarely call them directly. Python's `print` calls into the C library, which eventually issues `write(1, "hello\n", 6)`: write 6 bytes to file descriptor 1, standard output. On Linux, `strace python3 -c 'print("hello")'` shows every system call a program makes, and it is an excellent way to learn what a program actually does.
+
+The kernel is also entered without being asked. **Interrupts** from devices (a key was pressed, a network packet arrived, a disk read finished) and **exceptions** caused by the running instruction (division by zero, a page fault, an illegal instruction) both switch the processor into kernel mode and run a handler. A **timer interrupt**, many times per second, is what lets the kernel take the processor back from a program that would otherwise never give it up.
+
+Python's `os` module exposes many system calls almost directly, so we can watch the file interface at work. (In the browser this runs on Pyodide's in-memory file system, which imitates the same calls.)
+
+```python run
+import os, stat, tempfile
+
+with tempfile.TemporaryDirectory() as home:
+    path = os.path.join(home, "notes.txt")
+
+    # open(2): ask the kernel for a file descriptor, a small integer naming an open file.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    print("file descriptor:", fd)
+    written = os.write(fd, "Habari, dunia!\n".encode("utf-8"))   # write(2) takes bytes, not str
+    os.write(fd, b"second line\n")
+    os.close(fd)                                                  # close(2)
+    print("bytes written by the first write:", written)
+
+    fd = os.open(path, os.O_RDONLY)
+    print("read(2) of 6 bytes:", os.read(fd, 6))
+    print("read(2) continues where it left off:", os.read(fd, 9))
+    os.lseek(fd, 0, os.SEEK_SET)                                  # move the file offset back to 0
+    print("after lseek(2) to 0:", os.read(fd, 100))
+    os.close(fd)
+
+    # stat(2): the file's metadata, kept in its inode.
+    info = os.stat(path)
+    print("size:", info.st_size, "bytes; mode:", oct(info.st_mode & 0o777), stat.filemode(info.st_mode))
+    os.chmod(path, 0o600)                                         # chmod(2): only the owner may read and write
+    print("after chmod 600:", stat.filemode(os.stat(path).st_mode))
+    os.chmod(path, 0o755)
+    print("after chmod 755:", stat.filemode(os.stat(path).st_mode))
+    print("directory entries:", os.listdir(home))
+
+# Decoding permission bits by hand
+def describe(mode):
+    out = ""
+    for who in (6, 3, 0):                                         # owner, group, others: 3 bits each
+        bits = (mode >> who) & 0b111
+        out += ("r" if bits & 4 else "-") + ("w" if bits & 2 else "-") + ("x" if bits & 1 else "-")
+    return out
+
+for m in (0o644, 0o755, 0o600, 0o750, 0o777):
+    print(oct(m), describe(m))
+```
+
+The first file descriptor is 3 because every process starts with three already open: 0 is standard input, 1 standard output and 2 standard error. Notice that the kernel remembers a **file offset** for each open file, which is why the second `read` continued where the first stopped. We will come back to the permission bits at the end of the lesson.
+
+</Section>
+
+<Section id="processes" kind="human" title="Processes">
+
+<Definition term="process">
+
+A **process** is a program in execution: the program's code, plus everything that changes as it runs, namely its own **address space** (its view of memory), the contents of its registers including the program counter, its open file descriptors, its user identity and permissions, and bookkeeping such as its process ID. The kernel keeps all this in a per-process record (in Linux, a `task_struct`).
+
+</Definition>
+
+A program is a file on disk; a process is a running instance of it. Open three terminal windows and you have three processes running the same shell program, each with its own variables and history.
+
+**The address space.** Each process sees memory as one large range of addresses, laid out roughly like this, from low to high: the program's **code** (read-only and executable), its global **data**, the **heap** that grows upward as the program allocates objects, shared libraries and other memory-mapped files, and at the top the **stack** that grows downward with each function call (the call stack from <LessonLink slug="recursion">Recursion</LessonLink>). Two processes can both use address `0x10000000` and see completely different data, because each address space is private. How that works is the subject of the next section.
+
+**Creating processes on Unix** takes two system calls with an unusual division of labour. `fork()` creates a new process that is a near-exact copy of the caller, returning the child's ID to the parent and 0 to the child. The child then usually calls `execve()`, which replaces its program with a different one, keeping the process and its open files. The parent can `wait()` for the child to finish and collect its exit status. Your shell runs every command this way. Copying a whole address space on every `fork` sounds expensive, and would be, except for a trick described below: copy-on-write.
+
+**The life of a process.** A process is *running* on a core, *ready* to run and waiting for a turn, or *blocked* (sleeping) while it waits for something such as a disk read, a network packet or a key press. Most processes spend most of their lives blocked. When a process exits, it becomes a *zombie* until its parent collects its status. Switching a core from one process to another is a **context switch**: the kernel saves the registers of the old process, loads those of the new one, and switches the address space. It takes on the order of microseconds, plus the hidden cost of cold caches.
+
+Within one process there can be several **threads**: independent flows of execution, each with its own registers and stack, sharing the address space and files. Threads are cheaper to create and switch than processes, and they can share data directly, which is both their power and their danger, as <LessonLink slug="concurrency">Concurrency</LessonLink> explains.
+
+</Section>
+
+<Section id="virtual-memory" kind="computation" title="Virtual memory and paging">
+
+Every address your program uses is a **virtual address**. The hardware translates it to a **physical address** in RAM on every single memory access, using tables that the kernel controls.
+
+<Definition term="page, frame, page table">
+
+Virtual memory is divided into fixed-size **pages** (4 KiB on most x86-64 and Arm Linux systems; larger "huge pages" of 2 MiB or 1 GiB also exist), and physical memory into **frames** of the same size. For each process, a **page table** maps virtual page numbers to frame numbers, with permission bits (present, writable, executable, accessible from user mode). With 4 KiB pages the low 12 bits of an address are the **offset** within the page, unchanged by translation, and the high bits are the **virtual page number** (VPN).
+
+</Definition>
+
+A flat table with one entry per possible page would be enormous, so page tables are **trees**. Our simulation uses the classic 32-bit layout: 10 bits choose an entry in a top-level directory, the next 10 bits an entry in a second-level table, and 12 bits are the offset. x86-64 uses four levels of 9 bits each over a 48-bit address (or five levels for 57 bits): only the parts of the tree a process actually uses need to exist.
+
+Walking a four-level tree on every memory access would multiply the cost of memory by five, so processors cache recent translations in the **TLB** (translation lookaside buffer), a small, very fast cache of page-table entries. Because programs have locality (<LessonLink slug="memory-hierarchy">The memory hierarchy</LessonLink>), the TLB hits almost all the time.
+
+When a translation finds no valid entry, the processor raises a **page fault** and the kernel takes over. The fault might be an error (a bad pointer, or a write to a read-only page, which Linux reports to the program as a *segmentation fault*), but usually it is part of the plan:
+
+- **Demand paging.** The kernel gives a process address-space ranges without assigning frames. The first touch of each page faults, and only then does the kernel find a free frame, fill it (with zeros, or from the program file), map it, and resume the instruction.
+- **Copy-on-write.** After `fork`, parent and child share every frame, marked read-only. Only when one of them *writes* to a page does the fault handler copy that page. Since most children call `execve` at once, almost nothing is ever copied.
+- **Swapping.** When RAM runs short, the kernel writes rarely used pages to disk and reuses their frames; touching such a page later faults and reads it back. RAM thus acts as a cache for a larger virtual memory, with the eviction questions of the last lesson. If memory runs out entirely, Linux's out-of-memory killer ends a process to save the rest.
+
+```python run
+from collections import OrderedDict
+
+PAGE = 4096                                   # 4 KiB pages: the low 12 bits are the offset
+
+class PageFault(Exception):
+    pass
+
+class AddressSpace:
+    """A two-level page table for 32-bit virtual addresses: 10 bits | 10 bits | 12-bit offset."""
+    def __init__(self, free_frames, tlb_size=4):
+        self.directory = {}                   # top-level index -> second-level table
+        self.free = free_frames               # physical frames the kernel can hand out
+        self.tlb = OrderedDict()              # virtual page number -> (frame, writable), most recent last
+        self.tlb_size = tlb_size
+        self.stats = {"tlb hits": 0, "tlb misses": 0, "page faults": 0}
+
+    def map(self, vpn, writable=True):
+        """What the kernel does on a page fault: find a free frame and record it."""
+        frame = self.free.pop(0)
+        self.directory.setdefault(vpn >> 10, {})[vpn & 0x3FF] = (frame, writable)
+        self.stats["page faults"] += 1
+        return frame
+
+    def translate(self, vaddr, write=False):
+        vpn, offset = vaddr >> 12, vaddr & 0xFFF
+        if vpn in self.tlb:                   # fast path: a recent translation
+            self.stats["tlb hits"] += 1
+            self.tlb.move_to_end(vpn)
+            frame, writable = self.tlb[vpn]
+        else:                                 # slow path: walk the page table in memory
+            self.stats["tlb misses"] += 1
+            entry = self.directory.get(vpn >> 10, {}).get(vpn & 0x3FF)
+            if entry is None:                 # not mapped yet: demand paging allocates a frame
+                self.map(vpn)
+                entry = self.directory[vpn >> 10][vpn & 0x3FF]
+            frame, writable = entry
+            self.tlb[vpn] = entry
+            if len(self.tlb) > self.tlb_size:
+                self.tlb.popitem(last=False)
+        if write and not writable:
+            raise PageFault(f"write to read-only page at {vaddr:#010x}: segmentation fault")
+        return frame * PAGE + offset
+
+proc = AddressSpace(free_frames=[7, 3, 12, 5, 9, 20, 4, 15, 8, 30, 11, 2, 26, 18])
+proc.map(0x00400, writable=False)            # the program's code: one read-only page at 0x00400000
+
+for vaddr in [0x00400010, 0x00400ABC, 0x10000000, 0x10000008, 0x10001FF0, 0xBFFFF000]:
+    print(f"virtual {vaddr:#010x} -> physical {proc.translate(vaddr, write=vaddr >= 0x10000000):#07x}")
+
+for i in range(4096):                         # walk an array of 4096 eight-byte numbers: 32 KiB, 8 pages
+    proc.translate(0x10000000 + 8 * i)
+print(proc.stats)
+
+try:
+    proc.translate(0x00400010, write=True)    # e.g. a bug that writes through a pointer into the code
+except PageFault as e:
+    print("PageFault:", e)
+```
+
+Read the translations: the offset (the last three hex digits) passes through unchanged, and only the page number is replaced. Pages that are neighbours in virtual memory, `0x10000` and `0x10001`, landed in frames 3 and 12, far apart; the process never knows. Walking 32 KiB of array caused 4,096 translations but only a handful of TLB misses and page faults, one per new page: locality again.
+
+<Figure caption="Two processes, two private address spaces, one physical memory. Each process's page table maps its pages to frames anywhere in RAM. Both map a page of the shared C library to the same read-only frame, so it is stored once; their data pages map to different frames, so neither can see the other's.">
+<svg viewBox="0 0 440 230" role="img" aria-label="On the left, process A's virtual pages: code, library, data, stack. On the right, process B's virtual pages: code, library, data, stack. In the middle, a column of physical frames. Arrows map each virtual page to a frame; both library pages point to the same frame, and all the other pages point to different frames.">
+  <defs>
+    <marker id="os-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fontFamily="sans-serif" fontSize="11" fill="currentColor" textAnchor="middle">
+    <text x="60" y="18">process A</text>
+    <text x="220" y="18">physical memory</text>
+    <text x="380" y="18">process B</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="20" y="30" width="80" height="34" /><rect x="20" y="74" width="80" height="34" /><rect x="20" y="118" width="80" height="34" /><rect x="20" y="162" width="80" height="34" />
+    <rect x="340" y="30" width="80" height="34" /><rect x="340" y="74" width="80" height="34" /><rect x="340" y="118" width="80" height="34" /><rect x="340" y="162" width="80" height="34" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1">
+    <rect x="185" y="30" width="70" height="22" /><rect x="185" y="52" width="70" height="22" /><rect x="185" y="74" width="70" height="22" /><rect x="185" y="96" width="70" height="22" />
+    <rect x="185" y="118" width="70" height="22" /><rect x="185" y="140" width="70" height="22" /><rect x="185" y="162" width="70" height="22" /><rect x="185" y="184" width="70" height="22" />
+  </g>
+  <rect x="185" y="96" width="70" height="22" fill="var(--gold)" fillOpacity="0.5" stroke="currentColor" strokeWidth="1" />
+  <g fontFamily="sans-serif" fontSize="10" fill="currentColor" textAnchor="middle">
+    <text x="60" y="51">code</text><text x="60" y="95">C library</text><text x="60" y="139">data</text><text x="60" y="183">stack</text>
+    <text x="380" y="51">code</text><text x="380" y="95">C library</text><text x="380" y="139">data</text><text x="380" y="183">stack</text>
+    <text x="220" y="111">shared</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1" markerEnd="url(#os-arrow)">
+    <path d="M 100 47 L 183 151" />
+    <path d="M 100 91 L 183 107" />
+    <path d="M 100 135 L 183 41" />
+    <path d="M 100 179 L 183 195" />
+    <path d="M 340 47 L 257 63" />
+    <path d="M 340 91 L 257 107" />
+    <path d="M 340 135 L 257 173" />
+    <path d="M 340 179 L 257 85" />
+  </g>
+</svg>
+</Figure>
+
+Virtual memory thus delivers four things at once: **isolation** (a process can name only frames its page table maps), **protection** (read-only and no-execute bits), **sharing** (one copy of a library for every process that uses it), and **an illusion of more memory than exists** (demand paging and swapping).
+
+</Section>
+
+<Section id="scheduling" kind="examples" title="Scheduling: who runs next?">
+
+A machine with eight cores and three hundred ready threads must keep choosing which eight run. The part of the kernel that chooses is the **scheduler**, and there is no single right answer, because the goals conflict:
+
+- **Throughput**: finish as much work per second as possible (fewer context switches help).
+- **Turnaround time**: the time from a job's arrival to its completion.
+- **Response time**: the time from arrival until the job first runs, which is what a person at a keyboard notices.
+- **Fairness**: no job should wait for ever (**starvation**).
+
+**First come, first served** (FCFS) runs each job to completion in arrival order. It is simple and switches rarely, but one long job makes everyone behind it wait. **Shortest job first** minimises average turnaround when job lengths are known, which they usually are not, and can starve long jobs. **Round robin** is preemptive: each ready job runs for at most one **time slice** (quantum), and then the timer interrupt sends it to the back of the queue. **Priority scheduling** runs higher-priority jobs first; to prevent starvation, a waiting job's priority can be raised the longer it waits (**aging**).
+
+```python run
+from collections import deque
+
+# (name, arrival time, CPU time needed), in milliseconds
+jobs = [("backup", 0, 9), ("compiler", 1, 6), ("editor", 2, 2), ("shell", 3, 1), ("music", 4, 3)]
+
+def fcfs(jobs):
+    """First come, first served: run each job to completion in order of arrival."""
+    t, timeline = 0, []
+    for name, arrival, burst in sorted(jobs, key=lambda j: j[1]):
+        t = max(t, arrival)
+        timeline += [name] * burst
+        t += burst
+    return timeline
+
+def round_robin(jobs, quantum):
+    """Preemptive: each ready job runs for at most `quantum` ms, then goes to the back of the queue."""
+    pending = sorted(jobs, key=lambda j: j[1])
+    left = {name: burst for name, _, burst in jobs}
+    ready, timeline, t = deque(), [], 0
+    def admit(now):
+        while pending and pending[0][1] <= now:
+            ready.append(pending.pop(0)[0])
+    admit(0)
+    while ready or pending:
+        if not ready:                            # CPU idle until the next arrival
+            timeline.append(None); t += 1; admit(t); continue
+        name = ready.popleft()
+        for _ in range(min(quantum, left[name])):
+            timeline.append(name); t += 1; left[name] -= 1
+            admit(t)                             # jobs that arrive meanwhile join the queue
+        if left[name]:
+            ready.append(name)                   # used its whole slice: back of the queue
+    return timeline
+
+def report(label, timeline, jobs):
+    print(f"\n{label}")
+    print("  " + "".join((n or ".")[0] for n in timeline))
+    rows = []
+    for name, arrival, burst in jobs:
+        first = timeline.index(name)
+        finish = len(timeline) - timeline[::-1].index(name)
+        rows.append((first - arrival, finish - arrival))
+        print(f"  {name:8} arrives {arrival:2}  first runs {first:2}  finishes {finish:2}  "
+              f"response {first - arrival:2}  turnaround {finish - arrival:2}")
+    n = len(rows)
+    print(f"  average response {sum(r for r, _ in rows) / n:.1f} ms, average turnaround {sum(t for _, t in rows) / n:.1f} ms")
+    switches = sum(1 for a, b in zip(timeline, timeline[1:]) if a != b)
+    print(f"  context switches: {switches}")
+
+report("First come, first served", fcfs(jobs), jobs)
+report("Round robin, quantum 1 ms", round_robin(jobs, 1), jobs)
+report("Round robin, quantum 3 ms", round_robin(jobs, 3), jobs)
+```
+
+Each letter of the timeline is one millisecond of processor time. Under FCFS the one-millisecond `shell` command waits 14 ms behind the backup and the compiler. Round robin with a 1 ms quantum gets every job started within 3 ms, a great improvement in response time, at the cost of 18 context switches instead of 4. The 3 ms quantum sits in between. The quantum is a dial between responsiveness and overhead: too short and the machine spends its time switching; too long and round robin degenerates into FCFS.
+
+**What Linux does.** Real schedulers must also handle many cores, sleeping and waking tasks, and tasks that want the processor in short bursts (an editor) next to tasks that would use it for hours (a compression job). From 2007 Linux used the *Completely Fair Scheduler*, which tracks how much processor time each task has received, weighted by its priority (the `nice` value), and always runs the task that has had the least. Since version 6.6 (late 2023) it has been moving to **EEVDF** (Earliest Eligible Virtual Deadline First), which keeps the fair-share accounting and adds a virtual deadline to each task, so that latency-sensitive tasks with short time slices get to run sooner. Separate real-time policies (`SCHED_FIFO`, `SCHED_RR`) give strict priorities for audio, industrial control and the like. The kernel documentation in this lesson's references describes both designs.
+
+</Section>
+
+<Section id="files" kind="human" title="Files, file systems and permissions">
+
+To a program, a file is a named sequence of bytes that persists. To the storage device, there are only numbered blocks. The **file system** bridges the two.
+
+In the Unix tradition (ext4 and XFS on Linux), each file's metadata lives in an **inode**: its size, owner, permission bits, timestamps, and where its data blocks are. The inode does not contain the file's *name*. Names live in **directories**, which are special files mapping names to inode numbers. A **hard link** is simply a second name for the same inode, and a file's data is freed only when its last name is removed and no process has it open. A **symbolic link** is a tiny file containing a path to follow. Modern file systems **journal** their metadata updates (write the intention to a log first, then apply it), so that a crash in the middle of an update leaves the file system consistent.
+
+Above the individual file systems, Linux's **virtual file system** layer gives every kind of file the same interface: `open`, `read`, `write`, `close`. So the same calls read a disk file, a USB stick, a pipe between two processes, a network socket, a terminal, or the pseudo-files under `/proc` through which the kernel reports on itself (`cat /proc/cpuinfo`). "Everything is a file" is the Unix slogan for this design. Reads and writes go through the kernel's **page cache** in RAM, so a `write` usually returns before the data reaches the device; a program that must be sure its data survives a power cut calls `fsync`, as databases do (<LessonLink slug="databases">Databases</LessonLink>).
+
+### Permissions
+
+Every file has an owner and a group, and nine permission bits in three groups of three: read, write and execute for the **owner**, for members of the file's **group**, and for **others**. Written in octal, one digit per group, `0o644` is `rw-r--r--` (the owner may read and write; everyone else may only read) and `0o755` is `rwxr-xr-x` (typical for programs and directories). For a directory, "read" means listing its names, "write" means creating or removing entries, and "execute" means passing through it to reach what is inside. The kernel checks these bits on every `open`, using the identity of the process, not of the program.
+
+The user with ID 0, **root**, bypasses these checks, which is why services should not run as root, an instance of the **principle of least privilege**. Linux refines root's power into separate *capabilities*, and adds **namespaces** (giving a group of processes its own view of process IDs, file systems and network) and **cgroups** (limiting their CPU and memory). Containers, such as those Docker runs, are ordinary processes placed in their own namespaces and cgroups, not separate machines. <LessonLink slug="security">Security</LessonLink> builds on all of this.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The operating system is the desktop and the windows."** The graphical interface is one program among many. The operating system's core is the kernel, which has no user interface at all; servers run the same Linux kernel with no screen attached.
+
+</Misconception>
+
+<Misconception>
+
+**"A process is a program."** A program is a file; a process is one running instance of it, with its own memory, registers and open files. One program can be running as many processes at once.
+
+</Misconception>
+
+<Misconception>
+
+**"Virtual memory means swap space on disk."** Virtual memory is the address translation that every process uses all the time; swapping is one optional use of it. A Linux phone with swap turned off still uses virtual memory for every instruction.
+
+</Misconception>
+
+<Misconception>
+
+**"High memory use means trouble."** Linux deliberately fills spare RAM with the page cache, since unused RAM does nothing. That memory is handed back instantly when programs need it. Watch for swapping and for the out-of-memory killer, not for a small "free" number.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Early computers ran one job at a time, loaded by an operator. Batch systems in the 1950s automated the queue, and the *time-sharing* systems of the 1960s, such as CTSS and Multics at MIT, let many people use one machine interactively, which required protection, scheduling and file systems. The Atlas computer at Manchester (1962) introduced paged virtual memory. In 1969, at Bell Labs, Ken Thompson and Dennis Ritchie began Unix, a deliberately small system built around processes, a hierarchical file system and the idea that programs should be small tools combined through pipes; their 1974 paper is still worth reading. In 1991 Linus Torvalds, a student in Helsinki, announced a free Unix-like kernel as a hobby project. Linux grew, through the work of thousands of contributors and companies, into the kernel of most servers, all Android phones and the world's largest supercomputers.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

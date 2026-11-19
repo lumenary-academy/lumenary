@@ -1,0 +1,379 @@
+---
+title: Memory and addressing
+subtitle: Bytes at addresses, data directives, little-endian order, and the addressing modes that make arrays, tables and records cheap.
+minutes: 55
+objectives:
+  - Picture memory as numbered bytes and place data in it with .byte, .short, .long, .quad and .skip
+  - Predict how a multi-byte integer is laid out in little-endian order
+  - Read and write memory with the base + index × scale + displacement addressing form
+  - Use movzx and movsx to load small values into full registers, and size keywords such as BYTE PTR
+  - Use lea to compute addresses (and sometimes arithmetic) without touching memory
+prerequisites: [registers-and-arithmetic]
+references:
+  - title: Using as, Data directives (Pseudo Ops)
+    url: https://sourceware.org/binutils/docs/as/Pseudo-Ops.html
+    note: The full list of directives, including .byte, .short, .long, .quad, .skip and .balign.
+  - title: Intel 64 and IA-32 Architectures Software Developer's Manuals
+    author: Intel
+    url: https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+    note: Volume 1, chapter 3, "Operand addressing", is the official description of the addressing forms.
+  - title: Endianness (Wikipedia)
+    url: https://en.wikipedia.org/wiki/Endianness
+    note: Where the words "big-endian" and "little-endian" come from, and which systems use each.
+---
+
+<Section id="motivation" kind="motivation" title="Sixteen registers are not enough">
+
+Registers are fast but few. Everything else, every string, array, table, record and stack frame, lives in **memory**. In the last lesson you already stored a few bytes to memory to print them; this lesson makes memory a first-class tool.
+
+The good news is that x86-64 is very generous about memory. Almost any instruction can take one operand from memory, and the processor can compute an address from a base, an index scaled by 1, 2, 4 or 8, and a constant, all inside a single instruction. That one feature is why array indexing, table lookups and record fields compile to a single instruction on this architecture. Once you can read the addressing forms, a great deal of compiler output stops looking like noise.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Bytes, addresses and data directives">
+
+<Definition term="memory address">
+
+From a program's point of view, **memory** is one long row of bytes numbered from zero. A byte's number is its **address**. On x86-64 an address is a 64-bit number, so it fits in a general register, and "a pointer" is nothing more than a register or memory word holding an address.
+
+</Definition>
+
+The addresses a program sees are **virtual**: the operating system and the processor translate each one to a physical location in RAM, page by page, and give every process its own private view. You will meet the consequences in the system-calls lesson; for now, think of memory as one big array of bytes.
+
+### Placing data
+
+The assembler fills sections with bytes as it reads directives. These are the data directives you will use most, for the GNU assembler on x86-64:
+
+| Directive | Size of each value | Example |
+| --- | --- | --- |
+| `.byte` | 1 byte | `.byte 1, 2, 0xFF, 'A'` |
+| `.short` (or `.word`, `.2byte`) | 2 bytes | `.short 1795` |
+| `.long` (or `.int`, `.4byte`) | 4 bytes | `.long 100000` |
+| `.quad` (or `.8byte`) | 8 bytes | `.quad 12, 0, 7` |
+| `.ascii` / `.asciz` | 1 byte per character / plus a final 0 | `.asciz "Lagos"` |
+| `.skip n` (or `.zero n`) | `n` zero bytes | `.skip 64` |
+| `.balign n` | pad with zeros until the address is a multiple of `n` | `.balign 8` |
+
+Watch the names: on x86 the GNU assembler's `.word` means 2 bytes, a leftover from the 16-bit days, while Intel's manuals call 2 bytes a *word*, 4 bytes a *doubleword* and 8 bytes a *quadword*. Those names reappear as the size keywords `WORD PTR`, `DWORD PTR` and `QWORD PTR`.
+
+Which section the data goes in decides what the program may do with it: `.rodata` for constants (read-only), `.data` for variables with initial values, `.bss` for variables that start at zero (use `.skip` there, since `.bss` holds no actual bytes in the file).
+
+### Little-endian order
+
+When a value takes several bytes, which byte comes first? x86-64 is **little-endian**: the least significant byte is stored at the lowest address. The 4-byte number `0x000A6B6F` is stored as the bytes `6F 6B 0A 00`. You can see it by writing the bytes of an integer as if they were text:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+number: .long 0x000A6B6F        # one 4-byte integer
+
+        .text
+        .globl _start
+_start:
+        mov     eax, 1          # write the first 3 bytes of the integer as text
+        mov     edi, 1
+        lea     rsi, [rip + number]
+        mov     edx, 3
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+ok
+```
+
+0x6F is `o`, 0x6B is `k` and 0x0A is the newline: the bytes come out "backwards" compared with how we wrote the hexadecimal number. ARM64 and RISC-V Linux systems are little-endian too. Network protocols traditionally send integers **big-endian** (most significant byte first), which is why networking code is full of byte-swapping (on x86 the `bswap` instruction does it in one step).
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="The addressing form">
+
+Every memory operand on x86-64 is written in square brackets and has the general shape
+
+$$
+\text{address} = \text{base} + \text{index} \times \text{scale} + \text{displacement}
+$$
+
+where **base** and **index** are registers, **scale** is 1, 2, 4 or 8, and **displacement** is a signed 32-bit constant (often a label). Every part is optional, which gives the familiar special cases:
+
+| Written | Typical use |
+| --- | --- |
+| `[rbx]` | the value a pointer points to |
+| `[rbx + 16]` | a field 16 bytes into a record |
+| `[rbx + rcx*8]` | element `rcx` of an array of 8-byte values |
+| `[rbx + rcx*4 + 8]` | field at offset 8 of element `rcx`, in records of 4 bytes… or element `rcx + 2` of a 4-byte array |
+| `[rip + label]` | a global variable, addressed relative to the current instruction |
+
+The scale exists precisely because array elements have sizes 1, 2, 4 or 8: element `i` of an array of `quad`s is `i * 8` bytes after the start.
+
+### Why `rip + label`?
+
+Modern Linux executables and all shared libraries are usually built **position-independent**: the system may load them at a different address each run (address space layout randomisation, a security measure). An absolute address baked into an instruction would then be wrong. But the *distance* from an instruction to the data it uses never changes, so x86-64 offers **RIP-relative** addressing: `[rip + msg]` means "the address that is this many bytes from here". The assembler and linker work out the distance. Our small programs would run with absolute addresses too, because `ld` builds them at a fixed address by default, but writing `[rip + label]` everywhere is the habit that will keep working when you link with C in lesson 7.
+
+### Sizes
+
+A memory operand has no size of its own. Usually the register on the other side decides: `mov al, [rbx]` loads 1 byte, `mov rax, [rbx]` loads 8. When there is no register, as in `mov [rbx], 10`, the assembler cannot know whether you mean 1, 2, 4 or 8 bytes, and you must say so with `BYTE PTR`, `WORD PTR`, `DWORD PTR` or `QWORD PTR`.
+
+To load a small value into a full register, use the widening loads:
+
+- `movzx eax, BYTE PTR [rbx]` loads 1 byte and fills the rest of `eax` (and so `rax`) with zeros. Use it for unsigned values and characters.
+- `movsx eax, BYTE PTR [rbx]` copies the byte's sign bit into the rest: the byte `0xF0` becomes −16.
+- `movsxd rax, DWORD PTR [rbx]` sign-extends a 4-byte value to 8 bytes. (A plain `mov eax, [rbx]` already zero-extends 4 bytes, by the 32-bit rule from the last lesson.)
+
+### `lea`: compute, don't load
+
+`lea` ("load effective address") runs the address calculation and puts the **address itself** in the destination, without reading memory. `lea rsi, [rip + msg]` gives the address of `msg`. Because the address unit can add and scale, compilers also use `lea` as a quick calculator: `lea eax, [rdi + rdi*4]` computes `rdi × 5`, and `lea eax, [rdi + rsi + 7]` adds three things in one instruction, without changing any flags.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Arrays, tables and grids">
+
+### Summing an array
+
+Five days of rainfall in millimetres are stored as 8-byte integers. The program keeps the array's address in `rbx` and an index in `rcx`, and lets the processor do the `index × 8`:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .data
+rainfall:                           # millimetres of rain on five days
+        .quad   12, 0, 7, 23, 5
+
+        .section .bss
+out:    .skip 3
+
+        .text
+        .globl _start
+_start:
+        lea     rbx, [rip + rainfall]   # rbx = address of element 0
+        xor     eax, eax                # total = 0
+
+        mov     ecx, 0
+        add     rax, [rbx + rcx*8]      # element 0 is at rbx + 0
+        mov     ecx, 1
+        add     rax, [rbx + rcx*8]      # element 1 is at rbx + 8
+        mov     ecx, 2
+        add     rax, [rbx + rcx*8]
+        mov     ecx, 3
+        add     rax, [rbx + rcx*8]
+        mov     ecx, 4
+        add     rax, [rbx + rcx*8]      # element 4 is at rbx + 32
+
+        xor     edx, edx                # print the two-digit total
+        mov     ecx, 10
+        div     rcx
+        add     eax, '0'
+        add     edx, '0'
+        mov     [rip + out], al
+        mov     [rip + out + 1], dl
+        mov     BYTE PTR [rip + out + 2], 10
+
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + out]
+        mov     edx, 3
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+47
+```
+
+`add rax, [rbx + rcx*8]` reads 8 bytes from memory and adds them to `rax` in one instruction; the size comes from `rax`. Writing the same line five times with a changing `rcx` is clumsy, of course. In the next lesson a loop does it, and the instruction in the middle stays exactly the same.
+
+### A lookup table: printing hexadecimal
+
+Tables turn computation into indexing. To print a byte in hexadecimal we split it into two 4-bit halves ("nibbles") and use each as an index into a 16-character string:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+hexdigits:
+        .ascii  "0123456789abcdef"
+value:  .byte   0xC9                    # the byte we want to show in hexadecimal
+
+        .section .bss
+out:    .skip 5                         # "0x", two digits, newline
+
+        .text
+        .globl _start
+_start:
+        lea     rbx, [rip + hexdigits]
+        movzx   eax, BYTE PTR [rip + value]  # load one byte, zero-extended to 32 bits
+
+        mov     ecx, eax
+        shr     ecx, 4                  # high nibble: 0xC
+        and     eax, 0xF                # low nibble: 0x9
+
+        movzx   ecx, BYTE PTR [rbx + rcx]    # look up the character for each nibble
+        movzx   eax, BYTE PTR [rbx + rax]
+
+        mov     BYTE PTR [rip + out], '0'
+        mov     BYTE PTR [rip + out + 1], 'x'
+        mov     [rip + out + 2], cl
+        mov     [rip + out + 3], al
+        mov     BYTE PTR [rip + out + 4], 10
+
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + out]
+        mov     edx, 5
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+0xc9
+```
+
+Two details matter. `movzx` guarantees that all 64 bits of `rax` and `rcx` are clean before they are used as indexes; with a plain `mov al, …` the upper bits would be whatever was there before. And the table needs no arithmetic to separate digits from letters: `0xC` simply indexes the character `c`.
+
+<Example title="A two-dimensional grid with lea">
+
+A grid of 3 rows and 4 columns stored row after row ("row-major order", as in C) puts element `[row][col]` at `grid + row × 4 + col`. We use `lea` to find the start of a row and then a `[base + index]` load for the column:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+        # A 3-row, 4-column grid of letters, stored row after row.
+grid:   .ascii  "ABCD"
+        .ascii  "EFGH"
+        .ascii  "IJKL"
+        .equ    COLS, 4
+
+        .section .bss
+out:    .skip 3
+
+        .text
+        .globl _start
+_start:
+        lea     rbx, [rip + grid]
+
+        # grid[2][1]: address = grid + row*COLS + col
+        mov     edx, 2                  # row
+        mov     ecx, 1                  # column
+        lea     rsi, [rbx + rdx*COLS]   # start of row 2 (lea computes, it does not load)
+        movzx   eax, BYTE PTR [rsi + rcx]
+        mov     [rip + out], al
+
+        # grid[1][3]
+        mov     edx, 1
+        mov     ecx, 3
+        lea     rsi, [rbx + rdx*COLS]
+        movzx   eax, BYTE PTR [rsi + rcx]
+        mov     [rip + out + 1], al
+
+        mov     BYTE PTR [rip + out + 2], 10
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + out]
+        mov     edx, 3
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+JH
+```
+
+Row 2 starts at offset 8 (`IJKL`), and column 1 of it is `J`; row 1 starts at offset 4 (`EFGH`), and column 3 is `H`. Using the constant `COLS` as the scale works only because it is 4; a grid 5 columns wide would need an `imul` (or `lea rsi, [rdx + rdx*4]` to multiply by 5) before the load.
+
+</Example>
+
+### Records
+
+A record (a `struct` in C) is a group of fields at fixed offsets from its start. If a "station" record holds a 4-byte id at offset 0, a 2-byte altitude at offset 4 and a 1-byte flag at offset 6, padded to 8 bytes, then with `rbx` pointing at an array of stations and `rcx` holding an index:
+
+```asm
+        mov     eax, [rbx + rcx*8]                  # id of station rcx
+        movzx   edx, WORD PTR [rbx + rcx*8 + 4]     # its altitude
+        movzx   esi, BYTE PTR [rbx + rcx*8 + 6]     # its flag
+```
+
+The displacement is the field offset, and the scale is the record size. This is exactly what a C compiler emits for `stations[i].altitude`, which is why C structs are laid out with padding: keeping each field at an offset that is a multiple of its size (its **natural alignment**) lets one load fetch it efficiently. Use `.balign` in your own data for the same reason.
+
+</Section>
+
+<Section id="human" kind="human" title="Looking at memory in a debugger">
+
+Reading about memory is one thing; looking at it is better. The GNU debugger, `gdb`, can stop a program at any instruction and show you registers and bytes. Assemble with `-g` so that it can show your source lines:
+
+```bash
+as --64 -g -o rain.o rain.s && ld -o rain rain.o
+gdb -q ./rain
+```
+
+Inside `gdb`, `break _start` and `run` stop at the first instruction. Then `x` ("examine") shows memory: `x/5gd &rainfall` means five **g**iant (8-byte) values in **d**ecimal, and `x/8xb &rainfall` means eight bytes in he**x**. `stepi` runs one instruction, and `info registers rax rbx` shows registers. On the rainfall program, the two `x` commands, then `stepi 3` and `info registers rax rbx`, showed:
+
+```text
+0x402000:	12	0
+0x402010:	7	23
+0x402020:	5
+0x402000:	0x0c	0x00	0x00	0x00	0x00	0x00	0x00	0x00
+rax            0x0                 0
+rbx            0x402000            4202496
+```
+
+There is the array at address `0x402000`, there is the little-endian layout of the first element (12 is `0x0c` followed by seven zero bytes), and there is `rbx` holding the array's address, ready for `[rbx + rcx*8]`. Experienced programmers keep a debugger open while writing assembly and step through every new loop at least once. `layout asm` and `layout regs` turn `gdb` into a full-screen view of the code and registers, which makes this much more pleasant.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Confusing an address with the value stored there.** `lea rsi, [rip + msg]` puts the *address* of `msg` in `rsi`; `mov rsi, [rip + msg]` loads the 8 *bytes stored* at `msg` into `rsi`. A `write` system call needs the address, so passing the loaded bytes instead gives the kernel a nonsense pointer, and `write` fails with an error instead of printing.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting to scale the index.** `[rbx + rcx]` is element `rcx` only for 1-byte elements. For an array of `.quad`s it lands in the middle of an element unless you write `[rbx + rcx*8]`. If you want to step a pointer instead of an index, add the element size: `add rbx, 8`.
+
+</Misconception>
+
+<Misconception>
+
+**Assuming every multiplier is available as a scale.** The scale can only be 1, 2, 4 or 8. `[rbx + rcx*3]` is rejected by the assembler. Compilers get ×3, ×5 and ×9 with `lea` tricks such as `[rcx + rcx*2]`, and other factors with `imul`.
+
+</Misconception>
+
+<Misconception>
+
+**Reading a byte with `mov al, …` and then using `rax`.** The 8-bit load leaves bits 8–63 untouched, so `rax` is the byte *plus* whatever was there. Use `movzx` (or `movsx` for signed bytes) whenever the loaded value will be used at a wider size.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All answers about program output were checked by running the programs.
+
+<Exercises/>
+
+</Section>

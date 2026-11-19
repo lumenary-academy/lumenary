@@ -1,0 +1,464 @@
+---
+title: "Language models: tokens, pretraining and scaling"
+subtitle: From raw text to a trillion-token training run — tokenisation, next-token prediction, sampling, data, scaling laws and mixture-of-experts.
+minutes: 80
+objectives:
+  - Train a byte-pair-encoding tokenizer and explain why language models use subword tokens
+  - Define the next-token objective, cross-entropy loss and perplexity, and compute them
+  - Implement temperature, top-k and top-p sampling and predict their effect
+  - Describe how pretraining data is gathered, filtered and deduplicated, and state the main positions in the debate over licensing and consent
+  - Use a scaling law to choose a compute-optimal model size, and explain why labs often train smaller models for longer
+  - Summarise the emergent-abilities debate and how mixture-of-experts models separate total from active parameters
+prerequisites: [attention-and-transformers, deep-architectures]
+related: [math.applied.information-theory, math.prob.probability-theory, math.analysis.exponential-logarithmic-functions]
+references:
+  - title: "Neural Machine Translation of Rare Words with Subword Units"
+    author: Sennrich, Haddow, Birch
+    year: 2015
+    url: https://arxiv.org/abs/1508.07909
+    note: Byte-pair encoding for neural networks.
+  - title: "SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing"
+    author: Kudo, Richardson
+    year: 2018
+    url: https://arxiv.org/abs/1808.06226
+  - title: tiktoken
+    author: OpenAI
+    url: https://github.com/openai/tiktoken
+    note: A fast BPE tokenizer library with the tokenizers of OpenAI's models.
+  - title: "The Curious Case of Neural Text Degeneration"
+    author: Holtzman et al.
+    year: 2019
+    url: https://arxiv.org/abs/1904.09751
+    note: Introduces nucleus (top-p) sampling.
+  - title: "Scaling Laws for Neural Language Models"
+    author: Kaplan et al.
+    year: 2020
+    url: https://arxiv.org/abs/2001.08361
+  - title: "Training Compute-Optimal Large Language Models"
+    author: Hoffmann et al.
+    year: 2022
+    url: https://arxiv.org/abs/2203.15556
+    note: The Chinchilla paper.
+  - title: "Scaling Data-Constrained Language Models"
+    author: Muennighoff et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.16264
+  - title: "Will we run out of data?"
+    author: Villalobos et al.
+    year: 2022
+    url: https://arxiv.org/abs/2211.04325
+  - title: "Emergent Abilities of Large Language Models"
+    author: Wei et al.
+    year: 2022
+    url: https://arxiv.org/abs/2206.07682
+  - title: "Are Emergent Abilities of Large Language Models a Mirage?"
+    author: Schaeffer, Miranda, Koyejo
+    year: 2023
+    url: https://arxiv.org/abs/2304.15004
+  - title: "Deduplicating Training Data Makes Language Models Better"
+    author: Lee et al.
+    year: 2021
+    url: https://arxiv.org/abs/2107.06499
+  - title: "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale"
+    author: Penedo et al.
+    year: 2024
+    url: https://arxiv.org/abs/2406.17557
+    note: A thoroughly documented open web-data pipeline.
+  - title: "The Stack: 3 TB of source code with permissive licenses"
+    author: Kocetkov et al.
+    year: 2022
+    url: https://arxiv.org/abs/2211.15533
+  - title: "OLMo: Accelerating the Science of Language Models"
+    author: Groeneveld et al.
+    year: 2024
+    url: https://arxiv.org/abs/2402.00838
+    note: A fully open model, with its data, code and training logs.
+  - title: "The Llama 3 Herd of Models"
+    author: Llama Team, Meta
+    year: 2024
+    url: https://arxiv.org/abs/2407.21783
+  - title: "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer"
+    author: Shazeer et al.
+    year: 2017
+    url: https://arxiv.org/abs/1701.06538
+  - title: "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity"
+    author: Fedus, Zoph, Shazeer
+    year: 2021
+    url: https://arxiv.org/abs/2101.03961
+  - title: "Mixtral of Experts"
+    author: Jiang et al. (Mistral AI)
+    year: 2024
+    url: https://arxiv.org/abs/2401.04088
+  - title: "DeepSeek-V3 Technical Report"
+    author: DeepSeek-AI
+    year: 2024
+    url: https://arxiv.org/abs/2412.19437
+  - title: Common Crawl
+    url: https://commoncrawl.org
+    note: The open web crawl at the base of most pretraining corpora.
+---
+
+<Section id="motivation" kind="motivation" title="One objective, trillions of times">
+
+A **language model** assigns probabilities to text. By the chain rule of probability, the probability of a sequence of tokens $x_1, \ldots, x_T$ factorises into one prediction per position:
+
+$$
+p(x_1, \ldots, x_T) = \prod_{t=1}^{T} p(x_t \mid x_1, \ldots, x_{t-1}).
+$$
+
+So a model that can predict the next token, given everything before it, is a complete model of text. The decoder-only transformer of the <LessonLink slug="attention-and-transformers">previous lesson</LessonLink> computes exactly these conditional distributions, one per position, all at once.
+
+That is the whole pretraining objective. There is no list of tasks, no labels: just predict the next token, on trillions of tokens, with a model of tens or hundreds of billions of parameters. To get good at it, a model has to pick up spelling, grammar, facts about the world, the conventions of code, arithmetic, and some ability to follow an argument, because all of those make the next token more predictable. Turning such a model into a helpful assistant is the job of <LessonLink slug="post-training">post-training</LessonLink>; this lesson is about the base model.
+
+We will go through the pipeline in order: how text becomes tokens, how the model is scored and sampled, where the data comes from and the arguments about it, how labs decide how big to make the model and how long to train it, and one architectural idea — mixture-of-experts — that lets models grow without each token costing more.
+
+</Section>
+
+<Section id="tokens" kind="definitions" title="Tokens: the units a model reads">
+
+A model needs a finite vocabulary. There are three obvious choices, and two are bad:
+
+- **Words.** Too many (every name, typo, number and compound), and a word never seen in training is unrepresentable. Languages that build long words from many parts, such as Finnish, Turkish or Swahili, suffer most.
+- **Characters or bytes.** Every string is representable, but sequences become four or five times longer, and attention's cost grows with the square of length.
+- **Subwords.** Frequent words get one token; rare words are spelled with a few common pieces. This is what everyone uses.
+
+<Definition term="Byte-pair encoding (BPE)">
+
+Start with a vocabulary of single symbols (bytes, or characters) and a training corpus split into words. Repeat until the vocabulary reaches the target size: count every pair of adjacent symbols in the corpus, weighted by word frequency; add the most frequent pair to the vocabulary as a new symbol; replace every occurrence of that pair by the new symbol. The ordered list of merges *is* the tokenizer. To encode new text, split it into its base symbols and replay the merges in the order they were learned.
+
+</Definition>
+
+BPE was a data-compression algorithm from the 1990s; [Sennrich, Haddow and Birch (2015)](https://arxiv.org/abs/1508.07909) adapted it for neural translation. Here is a complete trainer:
+
+```python run
+from collections import Counter
+
+text = """
+the players played a game while the other players were playing outside
+she was walking and talking and he walked and talked and they talk and walk
+we are reading a book and they read and she reads and he was reading
+the singer was singing and the singers sang while the walkers walked
+"""
+word_freq = Counter(text.split())
+
+# Start from characters, with "_" marking the end of a word.
+vocab = {tuple(w) + ("_",): c for w, c in word_freq.items()}
+
+def pair_counts(vocab):
+    counts = Counter()
+    for symbols, freq in vocab.items():
+        for a, b in zip(symbols, symbols[1:]):
+            counts[a, b] += freq
+    return counts
+
+def apply_merge(symbols, pair):
+    a, b = pair
+    out, i = [], 0
+    while i < len(symbols):
+        if i + 1 < len(symbols) and symbols[i] == a and symbols[i + 1] == b:
+            out.append(a + b)
+            i += 2
+        else:
+            out.append(symbols[i])
+            i += 1
+    return tuple(out)
+
+def train_bpe(vocab, num_merges):
+    merges = []
+    for _ in range(num_merges):
+        counts = pair_counts(vocab)
+        if not counts:
+            break
+        best = min(counts, key=lambda p: (-counts[p], p))   # most frequent; ties broken alphabetically
+        merges.append(best)
+        vocab = {apply_merge(s, best): f for s, f in vocab.items()}
+    return merges, vocab
+
+def encode(word, merges):
+    symbols = tuple(word) + ("_",)
+    for pair in merges:                 # replay the merges in the order they were learned
+        symbols = apply_merge(symbols, pair)
+    return list(symbols)
+
+merges, final_vocab = train_bpe(vocab, 30)
+print("first 15 merges:", ["".join(p) for p in merges[:15]])
+print("tokens learned:", sorted({t for s in final_vocab for t in s if len(t) > 1}, key=len, reverse=True)[:12])
+for w in ["playing", "talkers", "replayed", "swimming"]:
+    print(f"{w:10s} -> {encode(w, merges)}")
+```
+
+From four sentences, BPE discovers "ing_", "ed_", "ers_", "play", "walk" and "talk" by counting alone. "Replayed" — never seen — comes out as `r e play ed_`, and "swimming" falls back to characters plus the familiar suffix. Nothing is ever out of vocabulary.
+
+Production tokenizers differ in details. **Byte-level BPE** (introduced with GPT-2) starts from the 256 possible bytes rather than characters, so any string in any script, or any binary junk, can be encoded. Text is first split by a regular expression so merges never cross, say, a space and a letter. Vocabularies have grown: about 50,000 tokens for GPT-2 and GPT-3, 128,000 for Llama 3, around 200,000 for OpenAI's recent tokenizers ([tiktoken](https://github.com/openai/tiktoken)) and around 256,000 for Google's Gemma family. Bigger vocabularies mean shorter sequences, especially for languages other than English, at the cost of a bigger embedding table. Alternatives exist — the unigram language-model tokenizer in [SentencePiece](https://arxiv.org/abs/1808.06226), and research on dropping tokenizers entirely in favour of bytes — but BPE remains the default.
+
+### Why tokens matter more than they seem
+
+- **Fairness and cost.** A tokenizer trained mostly on English text spends more tokens on the same sentence in, say, Amharic, Hindi or Burmese. Since API prices and context limits are counted in tokens, speakers of those languages pay more and fit less in context. Larger, more multilingual vocabularies have narrowed the gap but not closed it.
+- **Strange blind spots.** The model sees `strawberry` as perhaps two or three tokens, not ten letters, which is why counting letters in a word was long a famous failure. Digits are chunked in tokenizer-specific ways, which affects arithmetic; several model families now split numbers into single digits.
+
+</Section>
+
+<Section id="objective" kind="definitions" title="Next-token prediction, loss and perplexity">
+
+At each position the model outputs a vector of **logits** $z \in \mathbb{R}^V$, one score per vocabulary token, and a softmax turns them into a distribution $p_\theta(\cdot \mid x_{\lt t})$.
+
+<Definition term="Cross-entropy loss and perplexity">
+
+The loss at position $t$ is the negative log-probability the model gave to the token that actually came next, $\ell_t = -\log p_\theta(x_t \mid x_{\lt t})$. Training minimises the average over all positions of all training sequences. The **perplexity** of a model on a text is
+
+$$
+\operatorname{PPL} = \exp\!\left(\frac{1}{T}\sum_{t=1}^{T} \ell_t\right).
+$$
+
+</Definition>
+
+The loss is the cross-entropy between the true next-token distribution and the model's (<TopicLink id="math.applied.information-theory">Information theory</TopicLink>). Minimising it is the same as maximising the likelihood of the training data. Perplexity has a friendly reading: a perplexity of 4.7 means the model is, on average, as uncertain as if it were choosing uniformly among 4.7 tokens. A uniform guess over a vocabulary of $V$ tokens has perplexity exactly $V$.
+
+One caution: per-token loss depends on the tokenizer. A model with a bigger vocabulary predicts fewer, harder tokens. To compare models with different tokenizers, researchers normalise by something tokenizer-independent, such as **bits per byte** of the original text.
+
+### Sampling: turning distributions into text
+
+To generate, you feed in a prompt, get the distribution for the next token, choose one, append it, and repeat. *How* you choose matters a great deal:
+
+- **Greedy decoding** always takes the most likely token. It is deterministic and tends to fall into dull, repetitive loops.
+- **Temperature** $T$ divides the logits before the softmax: $\operatorname{softmax}(z / T)$. $T \lt 1$ sharpens the distribution towards the top choice; $T \gt 1$ flattens it; $T \to 0$ is greedy.
+- **Top-k** keeps only the $k$ most likely tokens and renormalises.
+- **Top-p** or **nucleus** sampling ([Holtzman et al.](https://arxiv.org/abs/1904.09751)) keeps the smallest set of most-likely tokens whose total probability reaches $p$. Unlike top-k it adapts: when the model is confident the nucleus is tiny; when many continuations are plausible it is wide.
+
+```python run
+import numpy as np
+
+def softmax(z):
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+# A toy model's scores for the token after "the cat ..."
+vocab = ["sat", "slept", "ran", "is", "purred", "the", "banana", "quantum"]
+logits = np.array([3.0, 2.2, 1.8, 1.5, 1.0, -0.5, -2.0, -3.0])
+p = softmax(logits)
+
+# Training signal: cross-entropy = -log(probability given to the token that actually came next).
+for actual in ["sat", "purred", "banana"]:
+    print(f"next token '{actual}': p = {p[vocab.index(actual)]:.3f}, loss = {-np.log(p[vocab.index(actual)]):.2f} nats")
+
+# Perplexity of a whole text = exp(mean cross-entropy per token).
+probs_of_actual_tokens = np.array([0.30, 0.05, 0.62, 0.11, 0.48, 0.20])
+ce = -np.log(probs_of_actual_tokens).mean()
+print(f"\nmean loss {ce:.3f} nats -> perplexity {np.exp(ce):.2f}")
+print(f"a uniform guess over {len(vocab)} tokens has perplexity {np.exp(-np.log(1 / len(vocab))):.0f}")
+
+def next_token_distribution(logits, temperature=1.0, top_k=None, top_p=None):
+    probs = softmax(logits / temperature)
+    order = np.argsort(-probs)                     # most likely first
+    keep = np.ones(len(probs), dtype=bool)
+    if top_k is not None:
+        keep[order[top_k:]] = False
+    if top_p is not None:
+        cum = np.cumsum(probs[order])
+        n_keep = int(np.searchsorted(cum, top_p) + 1)   # smallest prefix whose mass reaches top_p
+        keep[order[n_keep:]] = False
+    probs = np.where(keep, probs, 0.0)
+    return probs / probs.sum()
+
+print()
+for label, kw in [("T=1.0", {}), ("T=0.5", {"temperature": 0.5}), ("T=1.5", {"temperature": 1.5}),
+                  ("top-k=3", {"top_k": 3}), ("top-p=0.9", {"top_p": 0.9})]:
+    q = next_token_distribution(logits, **kw)
+    print(f"{label:10s}", "  ".join(f"{w}:{x:.2f}" for w, x in zip(vocab, q) if x > 0.005))
+
+rng = np.random.default_rng(42)
+draws = rng.choice(len(vocab), size=20, p=next_token_distribution(logits, top_p=0.9))
+print("\n20 samples with top-p=0.9:", " ".join(vocab[i] for i in draws))
+```
+
+A confidently wrong prediction ("banana" at 0.3%) costs almost 6 nats; the loss punishes overconfidence harshly, which is why trained models hedge. With high temperature, "banana" and "quantum" become live options; top-p removes that long tail of individually unlikely tokens, whose combined probability would otherwise produce nonsense every few dozen tokens. In practice, chat products use moderate temperatures with top-p, and reasoning or coding tasks often use lower temperatures — though, as <LessonLink slug="reasoning-and-agents">Reasoning models</LessonLink> shows, sampling many diverse answers can be valuable too.
+
+</Section>
+
+<Section id="data" kind="human" title="Pretraining data: where it comes from and the arguments about it">
+
+As of 2026, open-weight frontier-class models report pretraining on roughly 10 to 40 trillion tokens: Meta's [Llama 3](https://arxiv.org/abs/2407.21783) used over 15 trillion, [DeepSeek-V3](https://arxiv.org/abs/2412.19437) 14.8 trillion. Closed labs disclose less. The ingredients are broadly similar across labs:
+
+- **The web.** Most corpora start from [Common Crawl](https://commoncrawl.org), a nonprofit that has archived billions of web pages since 2008, plus labs' own crawlers.
+- **Code**, from public repositories; for example [The Stack](https://arxiv.org/abs/2211.15533) gathered permissively licensed code and let developers opt out.
+- **Books, scientific papers, encyclopaedias, patents, forums, maths**, and text in many languages.
+- **Synthetic data**: text generated by earlier models — rewritten web pages, textbooks, worked problems, code with tests. Its share has grown quickly since 2024 and it is especially important in later training stages.
+
+### The pipeline
+
+Raw web data is mostly unusable: menus, boilerplate, spam, duplicates, machine-generated junk. A modern pipeline, as documented openly by [FineWeb](https://arxiv.org/abs/2406.17557) and the fully open [OLMo](https://arxiv.org/abs/2402.00838) project, roughly does:
+
+1. **Extract** text from HTML and identify its language.
+2. **Filter for quality** with heuristics (length, symbol ratios, repeated lines) and with trained classifiers. FineWeb-Edu, for example, trained a classifier on a large model's ratings of how educational each page is, and found that training on the top-rated slice improved benchmark scores markedly.
+3. **Deduplicate**, exactly and approximately. The web is extraordinarily repetitive, and [Lee et al. (2021)](https://arxiv.org/abs/2107.06499) showed that removing near-duplicates makes models train more efficiently and regurgitate less of their training text. Near-duplicate detection at the scale of billions of documents uses hashing tricks such as MinHash, which estimates how much two documents overlap from a few hash values, a sketch in the same family as the Bloom filters and HyperLogLog of <LessonLink slug="randomized-algorithms">Randomness in algorithms</LessonLink>.
+4. **Remove** personal information where detectable, malware, and, by each lab's policy, toxic or illegal content.
+5. **Decontaminate**: remove copies of evaluation benchmarks, so test scores mean something (<LessonLink slug="evaluation">Evaluating models</LessonLink>).
+6. **Mix**: choose how much of each source to use, and in what order. Many labs end pretraining with an "annealing" phase on the highest-quality data while the learning rate decays.
+
+Data work is unglamorous and, by most practitioners' accounts, where a large share of a model's quality comes from.
+
+### Licensing and consent: a live debate
+
+Much of the web and many books are copyrighted, and most of their authors were never asked whether their work could be used to train AI. Reasonable people disagree sharply about what follows, and the law is unsettled. Fairly stated, the main positions are:
+
+- **For training as permissible use.** Training extracts statistical patterns rather than storing copies; it is analogous to a person reading widely and learning to write; the resulting models are highly transformative and broadly useful; and requiring permission from every rights-holder would make it impossible to build capable models except for the few companies able to pay for huge licensed archives.
+- **For consent and compensation.** Creators' work is taken at industrial scale, without permission or payment, to build commercial products that may compete with those same creators; models can sometimes reproduce passages, images or styles closely; and opt-out schemes put the burden on creators who often don't know they exist.
+
+Where things stood as of 2026, in outline: in the United States the question turns on *fair use*, and in 2025 courts issued the first rulings on training with books, finding fair use on the records before them while leaving open important questions such as how training copies were obtained and harm to markets; at least one case ended in a large class settlement, and many suits by authors, artists, news organisations and music publishers continue. The European Union's 2019 copyright directive permits text-and-data mining unless rights-holders opt out in machine-readable form, and its AI Act requires providers of general-purpose models to publish a summary of their training content and to have a copyright policy. Japan's copyright law includes a broad exception for data analysis. Meanwhile many websites added restrictions on AI crawlers to their `robots.txt` files, and several labs signed licensing deals with publishers. Expect this area to change; when it matters, read the current law and rulings for your jurisdiction rather than a summary like this one.
+
+There are related, less contested questions too: the privacy of personal data scraped from the web, the consent of people whose writing in smaller languages makes up much of the available text, and the working conditions of the people who label and filter data.
+
+</Section>
+
+<Section id="scaling" kind="computation" title="Scaling laws and compute-optimal training">
+
+Give a lab a budget of $C$ floating-point operations. Since training costs about $C \approx 6ND$ FLOPs for $N$ parameters and $D$ tokens (<LessonLink slug="attention-and-transformers">previous lesson</LessonLink>), it must choose: a big model on few tokens, or a small model on many? Scaling laws turn this into arithmetic.
+
+**Kaplan et al. (2020).** A team at OpenAI trained hundreds of models across seven orders of magnitude and found that test loss falls as a smooth **power law** in model size, data and compute — a straight line on log–log axes — whenever the other factors are not the bottleneck ([Kaplan et al.](https://arxiv.org/abs/2001.08361)). Their fitted allocation said most extra compute should go into a bigger model: $N_{\text{opt}} \propto C^{0.73}$. GPT-3 (175 billion parameters, 300 billion tokens) was sized in that spirit.
+
+**Hoffmann et al. (2022), "Chinchilla".** A team at DeepMind redid the analysis with a crucial change: each run's learning-rate schedule was matched to its length. (A run cut short partway through a schedule designed for a longer run looks worse than it should, which had biased the earlier fits towards big models trained briefly.) Three different estimation methods all pointed the same way: parameters and tokens should grow roughly in proportion, $N_{\text{opt}} \propto C^{0.5}$ and $D_{\text{opt}} \propto C^{0.5}$, which works out to roughly **20 tokens per parameter** ([Hoffmann et al.](https://arxiv.org/abs/2203.15556)). To prove it, they trained Chinchilla — 70 billion parameters on 1.4 trillion tokens — with about the same compute as their earlier Gopher (280 billion parameters on 300 billion tokens). Chinchilla won across the board.
+
+One of their methods fits a formula for the loss directly:
+
+$$
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}} .
+$$
+
+$E$ is the irreducible loss (the entropy of text itself), and the other two terms are the penalties for a finite model and finite data. Minimising $L$ subject to $6ND = C$ gives the compute-optimal allocation:
+
+```python run
+import numpy as np
+
+# Parametric loss fit from Hoffmann et al. (2022), "Approach 3":  L(N, D) = E + A / N^alpha + B / D^beta
+E, A, B, alpha, beta = 1.69, 406.4, 410.7, 0.34, 0.28
+
+def loss(N, D):
+    return E + A / N**alpha + B / D**beta
+
+def compute_optimal(C):
+    """Best model size N for a compute budget C, with D = C / (6N) tokens."""
+    Ns = np.logspace(7, 13, 20001)          # try 10 million to 10 trillion parameters
+    Ds = C / (6 * Ns)
+    i = np.argmin(loss(Ns, Ds))
+    return Ns[i], Ds[i], loss(Ns[i], Ds[i])
+
+print(f"{'compute':>9} {'params':>9} {'tokens':>9} {'tokens/param':>13} {'loss':>6}")
+for C in [1e20, 1e22, 1e24, 1e26]:
+    N, D, L = compute_optimal(C)
+    print(f"{C:9.0e} {N:9.2e} {D:9.2e} {D / N:13.1f} {L:6.3f}")
+
+# Same compute, two allocations: a Gopher-like 280B model on 300B tokens
+# versus a Chinchilla-like 70B model on 1.4T tokens.
+for name, N, D in [("280B params, 0.3T tokens", 280e9, 0.3e12), ("70B params, 1.4T tokens", 70e9, 1.4e12)]:
+    print(f"\n{name}: compute {6 * N * D:.2e} FLOPs, predicted loss {loss(N, D):.3f}")
+
+# Beyond compute-optimal: an 8B model trained on 15T tokens, as small open models now are.
+N, D = 8e9, 15e12
+print(f"\n8B params on 15T tokens: {D / N:.0f} tokens/param, predicted loss {loss(N, D):.3f}")
+```
+
+Read the output with three caveats, which are themselves part of the lesson:
+
+1. **The robust finding is the shape**: both $N$ and $D$ must grow together as compute grows. The exact ratio is less certain. With this particular fit the optimal ratio drifts from about 40 to 150 tokens per parameter, whereas the paper's other two methods gave roughly 20 throughout. A 2024 replication attempt by researchers at [Epoch AI](https://epoch.ai) re-fitted the published data and argued that the third method's reported constants were imprecise. The "20 tokens per parameter" rule of thumb is best treated as an order of magnitude.
+2. **The losses are predictions for one data set and tokenizer.** Don't compare them with other models' reported losses.
+3. **"Compute-optimal" means optimal for *training* compute.** It ignores what the model costs to *use*.
+
+That third point changed practice. A model trained once is served billions of times, and serving cost scales with parameter count (<LessonLink slug="inference-at-scale">Serving models</LessonLink>). So labs now routinely train smaller models far beyond the Chinchilla point: Llama 3's 8-billion-parameter model saw over 15 trillion tokens, nearly 2,000 per parameter. The last line of the output shows why this is reasonable: the 8B model, with a bit more compute than Chinchilla, reaches a predicted loss close to it at a ninth of the size.
+
+**Running out of data.** Overtraining small models consumes tokens fast. [Villalobos et al.](https://arxiv.org/abs/2211.04325) projected that frontier runs could exhaust the stock of high-quality public human text around the end of this decade. Repeating data helps for a while — [Muennighoff et al.](https://arxiv.org/abs/2305.16264) found up to about four passes over the same data nearly as good as fresh data — and synthetic data and reinforcement learning (<LessonLink slug="post-training">Post-training</LessonLink>) are the main bets beyond that. How far they stretch is one of the open questions of the field.
+
+</Section>
+
+<Section id="emergence" kind="human" title="Emergence: smooth loss, sudden skills?">
+
+Loss falls smoothly with scale. Do *abilities* also arrive smoothly? In 2022, [Wei et al.](https://arxiv.org/abs/2206.07682) collected tasks — multi-digit arithmetic, some word puzzles, certain reasoning benchmarks — where small models scored at chance and then, past some scale, performance shot up. They called these **emergent abilities**, and the term caught on, carrying an unsettling implication: if capabilities appear abruptly, they are hard to forecast.
+
+In 2023, [Schaeffer, Miranda and Koyejo](https://arxiv.org/abs/2304.15004) argued that much of the abruptness is created by the *metric*. Exact-match accuracy gives no credit for an answer that is nearly right. Measured with continuous metrics, such as the probability assigned to the correct answer or a per-token score, the same models often improve smoothly.
+
+A one-line model shows how both can be true. Suppose a task needs ten steps, each done correctly with probability $p$ that improves smoothly with scale, and the answer counts only if all ten are right. Then
+
+| per-step accuracy $p$ | 0.5 | 0.7 | 0.8 | 0.9 | 0.95 | 0.99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| task accuracy $p^{10}$ | 0.001 | 0.03 | 0.11 | 0.35 | 0.60 | 0.90 |
+
+Smooth progress in each step looks like a sudden jump on the task.
+
+The current consensus, as far as there is one: the underlying per-token improvements are smooth and predictable; task-level performance can still show sharp transitions, and those matter in practice (a model that can do a task 60% of the time is useful in ways a model at 3% is not). Forecasting *which* tasks will cross *which* thresholds at what scale remains an active and only partly solved research problem — one that matters for safety planning (<LessonLink slug="safety-and-alignment">AI safety and alignment</LessonLink>).
+
+</Section>
+
+<Section id="moe" kind="definitions" title="Mixture-of-experts: more parameters, same cost per token">
+
+In a dense transformer every parameter is used for every token. A **mixture-of-experts (MoE)** layer replaces the single MLP with many smaller MLPs, the **experts**, and a small **router** that sends each token to only a few of them.
+
+<Definition term="Mixture-of-experts layer">
+
+Given $E$ expert networks $f_1, \ldots, f_E$ and a router matrix $W_r$, a token's hidden vector $h$ gets router scores $s = \operatorname{softmax}(W_r h)$. Choose the $k$ experts with the highest scores, $S = \operatorname{top-}k(s)$, renormalise their scores to gates $g_i = s_i / \sum_{j \in S} s_j$, and output
+
+$$
+\operatorname{MoE}(h) = \sum_{i \in S} g_i \, f_i(h).
+$$
+
+The model's **total parameters** include every expert; its **active parameters** per token include only the $k$ chosen ones.
+
+</Definition>
+
+The idea is old; [Shazeer et al. (2017)](https://arxiv.org/abs/1701.06538) made it work at scale in neural networks, and the [Switch Transformer](https://arxiv.org/abs/2101.03961) simplified it to a single expert per token. Since 2024 it has become mainstream in open models: [Mixtral 8x7B](https://arxiv.org/abs/2401.04088) has about 47 billion total parameters but about 13 billion active (2 of 8 experts per token); [DeepSeek-V3](https://arxiv.org/abs/2412.19437) has 671 billion total and 37 billion active, using many small "fine-grained" experts plus an always-on shared expert; Meta's Llama 4, Alibaba's larger Qwen3 models, Moonshot's Kimi K2 and OpenAI's open-weight gpt-oss models are also MoE. Closed labs mostly don't publish their architectures, though MoE is widely believed to be common there too.
+
+Why it works: at a fixed compute per token, an MoE model has far more parameters in which to store knowledge and patterns, and empirically reaches a given loss with substantially less training compute than a dense model.
+
+What it costs:
+
+- **Memory.** All experts must sit in accelerator memory even though each token uses few of them. A 671-billion-parameter model needs hundreds of gigabytes for weights alone.
+- **Load balancing.** If the router sends most tokens to a few favourite experts, those become a bottleneck and the rest are wasted. Classic MoEs add an auxiliary loss that rewards spreading tokens evenly; DeepSeek-V3 instead adjusts a per-expert bias on the router scores to steer load without an extra loss term.
+- **Communication.** Experts are spread across many chips, so every MoE layer involves sending tokens to wherever their experts live and back (*expert parallelism*, <LessonLink slug="accelerators-and-parallelism">next lesson</LessonLink>).
+- **Training instability**, which took several years of engineering to tame.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The model reads words (or letters)."** It reads tokens, chunks chosen by a compression algorithm. Many odd failures — miscounted letters, inconsistent arithmetic, trouble with rhymes — come from this.
+
+</Misconception>
+
+<Misconception>
+
+**"Lower perplexity means a better chatbot."** Perplexity measures how well a base model predicts held-out text in a given tokenization. It is not comparable across tokenizers, and after post-training it says little about helpfulness, which is evaluated quite differently (<LessonLink slug="evaluation">Evaluating models</LessonLink>).
+
+</Misconception>
+
+<Misconception>
+
+**"Chinchilla says you should always train on 20 tokens per parameter."** It says that is roughly optimal *for training compute alone*, within the regime they studied. If you will serve the model heavily, training a smaller model for much longer is usually the better deal.
+
+</Misconception>
+
+<Misconception>
+
+**"Scaling laws are laws of nature."** They are empirical fits that have held remarkably well over many orders of magnitude, for a given architecture, data distribution and training recipe. Change any of those and the constants change. They predict loss, not specific abilities.
+
+</Misconception>
+
+<Misconception>
+
+**"A 671B-parameter MoE costs as much per token as a 671B dense model."** Its compute per token is set by its active parameters (37B in that case). Its *memory* footprint, though, is set by its total parameters.
+
+</Misconception>
+
+<Misconception>
+
+**"Temperature 0 makes a model deterministic."** It makes the *sampling rule* deterministic. In real serving systems, the logits themselves can differ slightly from run to run because batching changes the order of floating-point additions, so outputs can still vary.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

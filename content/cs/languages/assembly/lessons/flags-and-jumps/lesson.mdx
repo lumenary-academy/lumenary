@@ -1,0 +1,409 @@
+---
+title: Flags, compares and jumps
+subtitle: How the processor remembers what the last calculation looked like, and how if, while and for become compare-and-jump.
+minutes: 60
+objectives:
+  - Explain what the zero, sign, carry and overflow flags record, and which instructions set them
+  - Use cmp and test with conditional jumps, choosing signed or unsigned conditions correctly
+  - Translate if/else, while, do-while and for loops into labels and jumps
+  - Print any unsigned 64-bit number in decimal with a division loop
+  - Use cmov to choose a value without branching, and say when that helps
+prerequisites: [memory-and-addressing]
+related: [math.number.divisibility-gcd]
+references:
+  - title: Intel 64 and IA-32 Architectures Software Developer's Manuals
+    author: Intel
+    url: https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+    note: Volume 1 describes the EFLAGS register; Volume 2's Jcc and CMOVcc pages list every condition code.
+  - title: x86 and amd64 instruction reference, Jcc
+    author: Félix Cloutier
+    url: https://www.felixcloutier.com/x86/jcc
+    note: Every conditional jump, the flags it tests, and its aliases.
+  - title: Using as, Symbol names and local labels
+    url: https://sourceware.org/binutils/docs/as/Symbol-Names.html
+    note: The rules for .L labels and numeric local labels such as 1b and 1f.
+---
+
+<Section id="motivation" kind="motivation" title="Programs that decide">
+
+So far every program has run straight from its first instruction to its last. Real programs make decisions and repeat work: "if the number is odd…", "while there are digits left…". In a high-level language those are `if`, `while` and `for`. A processor has none of them. It has something simpler and more general: after most arithmetic it records a few facts about the result in **flags**, and **conditional jump** instructions continue at a different address depending on those flags.
+
+That is all control flow is at the machine level: compare, then jump or fall through. In this lesson you will build every loop and decision you know from that one pattern, and you will finally write the routine the earlier lessons were missing: a loop that prints any number in decimal.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The flags">
+
+<Definition term="flags register">
+
+The **flags register** (`rflags`) is a register of individual bits that most arithmetic and logic instructions update to describe their result. The four that matter for decisions are:
+
+| Flag | Name | Set to 1 when |
+| --- | --- | --- |
+| ZF | zero flag | the result was zero |
+| SF | sign flag | the result's top bit was 1 (negative, read as signed) |
+| CF | carry flag | an unsigned result did not fit: a carry out of the top bit, or a borrow in subtraction |
+| OF | overflow flag | a signed result did not fit, for example adding two large positives gave a negative |
+
+</Definition>
+
+`add`, `sub`, `inc`, `dec`, `neg`, `and`, `or`, `xor` and the shifts all set flags (with small exceptions: `inc` and `dec` leave CF alone). `mov` and `lea` **never** change flags, which is handy: you can prepare registers between a comparison and the jump that uses it.
+
+Two instructions exist only to set flags:
+
+- `cmp a, b` computes `a − b`, sets the flags exactly as `sub` would, and throws the result away.
+- `test a, b` computes `a AND b`, sets ZF and SF from it, clears CF and OF, and throws the result away. `test eax, eax` is the idiomatic "is `eax` zero (or negative)?"; `test al, 1` asks "is the lowest bit set?", that is, "is it odd?".
+
+### Conditional jumps
+
+A **conditional jump** `jcc label` goes to `label` if its condition holds, and otherwise falls through to the next instruction. `jmp label` always jumps. After `cmp a, b`:
+
+| Meaning | Signed numbers | Unsigned numbers |
+| --- | --- | --- |
+| a = b | `je` (= `jz`) | `je` (= `jz`) |
+| a ≠ b | `jne` (= `jnz`) | `jne` (= `jnz`) |
+| a less than b | `jl` | `jb` ("below") |
+| a less than or equal to b | `jle` | `jbe` |
+| a greater than b | `jg` | `ja` ("above") |
+| a greater than or equal to b | `jge` | `jae` |
+
+There are also jumps on single flags: `js`/`jns` (sign), `jc`/`jnc` (carry), `jo`/`jno` (overflow). The same condition suffixes appear in `cmovcc` (conditional move) and `setcc` (set a byte to 0 or 1), as in `cmovl` or `setb`.
+
+The most important thing in the table is the difference between the middle column and the right one. The processor does not know whether your bits mean a signed or an unsigned number: `cmp` sets all four flags, and **you** choose the interpretation by choosing the jump. `jl` reads SF and OF; `jb` reads CF.
+
+### Labels for jumps
+
+A jump needs a label to go to. Labels that start with `.L` are **local**: the assembler uses them and then leaves them out of the object file's symbol table, so they do not clutter a debugger or clash with other files. The GNU assembler also accepts numeric labels such as `1:`, referred to as `1b` (the nearest `1:` backwards) or `1f` (forwards), handy for tiny loops. This course uses descriptive `.L` names.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Every loop is a jump backwards">
+
+Here is how the familiar structures become jumps. `cond` stands for a `cmp` or `test` followed by the right jump.
+
+**if / else**: jump *over* the "then" part when the condition is false.
+
+```asm
+        cmp     rax, rbx
+        jge     .Lelse          # if !(rax < rbx) skip the then-part
+        # ... then-part ...
+        jmp     .Lend
+.Lelse:
+        # ... else-part ...
+.Lend:
+```
+
+**while**: test at the top, jump back at the bottom.
+
+```asm
+.Ltop:
+        cmp     rcx, 10
+        jae     .Lend           # while (rcx < 10)
+        # ... body ...
+        inc     rcx
+        jmp     .Ltop
+.Lend:
+```
+
+**do-while**: the body runs at least once, and a single conditional jump at the bottom repeats it. Compilers prefer this shape, often turning a `while` into an `if` around a `do-while`, because the loop then costs one jump per iteration instead of two.
+
+A **for** loop is a `while` loop with the counter's start before it and its step at the end of the body.
+
+When you translate a condition, you usually jump on its *opposite*: "if less, do this" becomes "if greater or equal, skip this". Getting that inversion wrong, especially mixing `jl` and `jle`, is the most common source of off-by-one errors in assembly.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Loops that print">
+
+### A countdown
+
+This loop counts from 5 down to 1. `dec` subtracts one and sets ZF when the result is zero, so the loop needs no separate `cmp`:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+liftoff:
+        .ascii  "Liftoff!\n"
+        .equ    liftoff_len, . - liftoff
+
+        .section .bss
+out:    .skip 2                     # one digit and a space
+
+        .text
+        .globl _start
+_start:
+        mov     ebx, 5              # the counter lives in rbx: syscall does not change it
+
+.Lcount:
+        lea     eax, [rbx + '0']    # the digit character for the counter
+        mov     [rip + out], al
+        mov     BYTE PTR [rip + out + 1], ' '
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + out]
+        mov     edx, 2
+        syscall
+
+        dec     ebx                 # counter - 1, and set ZF if it reached 0
+        jnz     .Lcount             # jump back while the counter is not zero
+
+        mov     eax, 1
+        mov     edi, 1
+        lea     rsi, [rip + liftoff]
+        mov     edx, liftoff_len
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+5 4 3 2 1 Liftoff!
+```
+
+Why `rbx` rather than the traditional counter `rcx`? Because the `syscall` instruction itself overwrites `rcx` (with the return address) and `r11` (with the saved flags), and the kernel puts its result in `rax`. A counter in `rcx` would be destroyed on the first pass. Knowing which registers survive which operation is a large part of assembly programming, and lesson 5 makes it systematic.
+
+### Printing any number
+
+Now the routine every later lesson relies on. To print an unsigned number, divide it by 10 repeatedly: each remainder is the next digit from the **right**. So we fill a buffer from its end towards its start, and when the quotient reaches zero, the digits are in the right order. Here it prints the sum 1 + 2 + … + 100:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .bss
+buf:    .skip 21                    # up to 20 digits for a 64-bit number, plus a newline
+
+        .text
+        .globl _start
+_start:
+        # Sum the numbers 1 to 100.
+        xor     eax, eax            # total = 0
+        mov     ecx, 1              # i = 1
+.Lsum:
+        add     rax, rcx            # total += i
+        inc     rcx
+        cmp     rcx, 100
+        jbe     .Lsum               # repeat while i <= 100 (unsigned)
+
+        # Convert rax to decimal, writing digits from right to left.
+        lea     rdi, [rip + buf + 20]   # rdi = position of the final newline
+        mov     BYTE PTR [rdi], 10
+        mov     rsi, rdi            # rsi = start of the text so far
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx                 # rax = rax / 10, rdx = last digit
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl           # store the digit just before the previous one
+        test    rax, rax
+        jnz     .Ldigit             # until no digits remain
+
+        lea     rdx, [rdi + 1]
+        sub     rdx, rsi            # length = one past the newline - start
+        mov     eax, 1              # write(1, rsi, rdx)
+        mov     edi, 1
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+5050
+```
+
+Three design decisions are worth noticing. The digit loop is a **do-while**: it always produces at least one digit, so zero prints as `0` rather than as nothing. The buffer has room for 20 digits because the largest unsigned 64-bit number, 18446744073709551615, has 20. And the length is computed from two pointers, so the routine never needs to count digits. The sum loop also shows the unsigned condition `jbe` used on a counter; for a counter that can never be negative, signed or unsigned give the same answer, and compilers tend to use the unsigned forms for sizes and indexes.
+
+<Example title="The Collatz sequence">
+
+Start with a positive whole number. If it is even, halve it; if it is odd, triple it and add one. Repeat until you reach 1. Nobody has proved that every starting number reaches 1 (this is the famous Collatz conjecture), but every number ever tried does. Starting from 27 takes a surprisingly long time. This program counts the steps, combining a `while` loop with an `if`/`else` inside:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .bss
+buf:    .skip 21
+
+        .text
+        .globl _start
+_start:
+        mov     eax, 27             # n
+        xor     ebx, ebx            # steps = 0
+
+.Lwhile:
+        cmp     rax, 1
+        je      .Ldone              # while n != 1
+
+        test    al, 1               # is the lowest bit set? (is n odd?)
+        jnz     .Lodd
+        shr     rax, 1              # even: n = n / 2
+        jmp     .Lnext
+.Lodd:
+        lea     rax, [rax + rax*2 + 1]  # odd: n = 3n + 1, in one instruction
+.Lnext:
+        inc     rbx                 # steps += 1
+        jmp     .Lwhile
+
+.Ldone:
+        mov     rax, rbx            # print the number of steps
+        lea     rdi, [rip + buf + 20]
+        mov     BYTE PTR [rdi], 10
+        mov     rsi, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+
+        lea     rdx, [rdi + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+111
+```
+
+Notice `lea rax, [rax + rax*2 + 1]` computing 3n + 1 in a single instruction, and `test al, 1` checking oddness without a division. Both are tricks you will see in compiler output.
+
+</Example>
+
+</Section>
+
+<Section id="examples" kind="examples" title="Signed, unsigned, and choosing without jumping">
+
+The same 64 bits can be compared two ways. All ones is −1 as a signed number and 18446744073709551615 as an unsigned one, so it is *less* than 1 by `jl` and *greater* than 1 by `ja`. The program below shows both. The first comparison also avoids a jump entirely with `cmovl`, "move if less": it prepares both possible messages, then lets the flags pick one.
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+s_less: .ascii  "signed:   -1 is less than 1\n"
+        .equ    s_less_len, . - s_less
+u_more: .ascii  "unsigned: -1 is greater than 1\n"
+        .equ    u_more_len, . - u_more
+other:  .ascii  "surprise\n"
+        .equ    other_len, . - other
+
+        .text
+        .globl _start
+_start:
+        mov     rbx, -1             # all ones: -1 signed, 18446744073709551615 unsigned
+        mov     r12, 1
+
+        # Signed comparison.
+        lea     rsi, [rip + other]
+        mov     edx, other_len
+        lea     rax, [rip + s_less]
+        mov     ecx, s_less_len
+        cmp     rbx, r12
+        cmovl   rsi, rax            # if less (signed), choose the s_less message
+        cmovl   edx, ecx
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+
+        # Unsigned comparison of the very same bits.
+        lea     rsi, [rip + other]
+        mov     edx, other_len
+        cmp     rbx, r12
+        jbe     .Lprint             # below or equal (unsigned)? keep "surprise"
+        lea     rsi, [rip + u_more]
+        mov     edx, u_more_len
+.Lprint:
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+```
+
+It prints:
+
+```text
+signed:   -1 is less than 1
+unsigned: -1 is greater than 1
+```
+
+### Why avoid a jump?
+
+Modern processors do not wait to find out which way a branch goes. They **predict** it and run ahead speculatively; a correct guess costs almost nothing, a wrong one throws away work, typically 15 to 20 cycles on current x86 cores. Loops are easy to predict (they nearly always jump back). Data-dependent decisions on random data, such as "is this pixel brighter than the threshold?", are not. For those, `cmov` and `setcc` turn the decision into data flow: no prediction, no penalty, at the price of always computing both choices. Compilers make this trade-off for you when they can, and you will see `cmov` often in optimised code. It is not automatically faster: when a branch is predictable, the branch usually wins.
+
+### Detecting overflow
+
+The flags also let you notice arithmetic that went wrong. After `add rax, rbx`, `jc` jumps if the unsigned sum did not fit and `jo` jumps if the signed sum did not fit. Languages that check arithmetic, such as Rust in debug builds or Swift, compile `a + b` to an `add` followed by exactly such a jump to an error handler.
+
+</Section>
+
+<Section id="history" kind="history" title="Jumps, goto, and structure">
+
+Every high-level language started from this lesson's picture. Early languages such as FORTRAN (1957) offered little more than a numbered `GO TO` and a conditional jump, and programs written that way could jump anywhere, in any direction, often enough that nobody could follow them. In 1968 Edsger Dijkstra published a short letter in *Communications of the ACM*, printed under the title "Go To Statement Considered Harmful", arguing that a program's text should show the shape of its execution. The **structured programming** movement that followed gave us the `if`, `while` and `for` that every mainstream language has today, and that compilers translate back into jumps.
+
+Assembly has only jumps, so the discipline is up to you. Programmers who write maintainable assembly impose structure by convention:
+
+- Every loop and decision has **one entry and one exit**, like its high-level equivalent.
+- Labels say what they mean: `.Lwhile`, `.Lodd`, `.Ldone`, not `.L1`, `.L2`.
+- A comment above each block states the high-level shape, such as `# while n != 1` or `# if odd: n = 3n + 1`.
+- Jumps backwards are loops; jumps forwards skip code. Anything else deserves a comment explaining why.
+
+The compiler output you will read in lesson 7 does not follow these rules: it numbers its labels (`.L3`, `.L7`) and rearranges blocks for speed. That is fine for machine-generated code that nobody maintains by hand. When you write assembly for people, write it as if `if` and `while` existed.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Using a signed jump for unsigned values, or the reverse.** Sizes, lengths, addresses and character codes are unsigned: compare them with `jb`, `ja`, `jbe`, `jae`. Use `jl`, `jg` and friends only for values that can be negative. With small positive numbers both give the same answer, which is exactly why the bug hides until a large or negative value arrives.
+
+</Misconception>
+
+<Misconception>
+
+**Letting an instruction change the flags between `cmp` and the jump.** `cmp rax, 5`, then `add rbx, 1`, then `jl …` tests the flags from the `add`, not from the `cmp`. Keep the comparison next to its jump, or put only flag-neutral instructions (`mov`, `lea`) between them.
+
+</Misconception>
+
+<Misconception>
+
+**Using the `loop` instruction because it sounds right.** x86 has a `loop` instruction that decrements `rcx` and jumps if it is not zero. On many Intel processors it is several times slower than `dec` plus `jnz`, and mainstream compilers do not emit it. It also ties your counter to `rcx`, the register `syscall` destroys.
+
+</Misconception>
+
+<Misconception>
+
+**Assuming every operand order reads naturally.** `cmp rax, rbx` followed by `jl` jumps when `rax < rbx`: read the comparison as "rax compared with rbx". In AT&T syntax the operands are reversed (`cmp %rbx, %rax`), which trips people who switch between the two.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs and register values below were checked by running the code.
+
+<Exercises/>
+
+</Section>

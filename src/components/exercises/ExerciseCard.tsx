@@ -6,7 +6,7 @@ import { useI18n } from "@/i18n/client";
 import { recordAttempt } from "@/lib/progress";
 import { runPython } from "@/lib/python-sandbox";
 import { CodeEditor } from "@/components/python/CodeEditor";
-import { parseInteger, parseSet, setKey, setsEqual, normalizeElement } from "./parse";
+import { checkText, normalizeText, parseInteger, parseSet, setKey, setsEqual, normalizeElement } from "./parse";
 import type { RenderedExercise } from "./types";
 
 type Verdict = { ok: boolean; html?: string; text?: string } | null;
@@ -50,6 +50,7 @@ export function ExerciseCard({ exercise, index }: { exercise: RenderedExercise; 
         {exercise.type === "integer" && <IntegerBody exercise={exercise} onResult={report} />}
         {exercise.type === "set" && <SetBody exercise={exercise} onResult={report} />}
         {exercise.type === "python" && <PythonBody exercise={exercise} onResult={report} />}
+        {exercise.type === "text" && <TextBody exercise={exercise} onResult={report} />}
 
         <div aria-live="polite">
           {verdict && (
@@ -205,6 +206,36 @@ function SetBody({ exercise, onResult }: { exercise: Extract<RenderedExercise, {
         </button>
       </div>
       <p className="text-xs text-muted">{t("exercise.setHelp")}</p>
+    </form>
+  );
+}
+
+function TextBody({ exercise, onResult }: { exercise: Extract<RenderedExercise, { type: "text" }>; onResult: OnResult }) {
+  const { t } = useI18n();
+  const [value, setValue] = useState("");
+  const id = useId();
+  const check = () => {
+    const verdict = checkText(value, exercise.answers);
+    if (verdict === "right") return onResult(true);
+    if (verdict === "accents") return onResult(false, { text: t("exercise.accents") });
+    const fb = exercise.feedback.find((f) => normalizeText(f.match) === normalizeText(value));
+    onResult(false, fb ? { html: fb.html } : undefined);
+  };
+  return (
+    <form
+      className="flex flex-wrap items-end gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        check();
+      }}
+    >
+      <label htmlFor={id} className="sr-only">
+        {t("exercise.answerPlaceholder")}
+      </label>
+      <input id={id} className="input max-w-md flex-1" lang={exercise.lang} autoCapitalize="off" autoCorrect="off" spellCheck={false} placeholder={t("exercise.textPlaceholder")} value={value} onChange={(e) => setValue(e.target.value)} />
+      <button type="submit" className="btn btn-primary btn-sm" disabled={!value.trim()}>
+        {t("exercise.check")}
+      </button>
     </form>
   );
 }

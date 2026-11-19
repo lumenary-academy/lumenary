@@ -1,0 +1,393 @@
+---
+title: Testing, profiling and tooling
+subtitle: go test with table-driven tests, examples, benchmarks and fuzzing; and gofmt, go vet, pprof and the rest of the professional toolkit.
+minutes: 60
+objectives:
+  - Write table-driven tests with subtests and run them with go test
+  - Write example tests that double as documentation, and measure coverage
+  - Benchmark code with b.Loop, read ns/op and allocs/op, and reduce allocations
+  - Explain fuzz testing and write a fuzz target with properties to check
+  - Use gofmt, go vet, staticcheck, govulncheck, the race detector, pprof and log/slog as part of daily work
+prerequisites: [concurrency]
+related: [math.prob.statistics-intro]
+references:
+  - title: The testing package
+    url: https://pkg.go.dev/testing
+  - title: "Go Fuzzing"
+    url: https://go.dev/doc/security/fuzz/
+  - title: "Go blog: Profiling Go Programs"
+    url: https://go.dev/blog/pprof
+  - title: Diagnostics
+    url: https://go.dev/doc/diagnostics
+    note: The Go team's overview of profiling, tracing and debugging tools.
+  - title: Go Modules Reference
+    url: https://go.dev/ref/mod
+  - title: govulncheck
+    url: https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck
+  - title: Staticcheck
+    url: https://staticcheck.dev/
+---
+
+<Section id="motivation" kind="motivation" title="Tools included">
+
+Most languages leave testing, benchmarking, formatting and profiling to third-party tools, each with its own configuration. Go puts them in the standard distribution. `go test` runs unit tests, examples, benchmarks and fuzz tests; `gofmt` formats; `go vet` finds suspicious code; `pprof` profiles CPU and memory; the race detector finds data races. The `testing` package needs no assertion library and no test runner, and every Go project lays out its tests the same way.
+
+The practical effect is that testing is not a separate skill in Go; it's part of writing the code. A new Go programmer can open any open-source repository, run `go test ./...`, and expect it to work. This lesson covers the testing tools in depth, then the rest of the toolkit that Go teams use daily. Because every program in this course must be a single file with a `main` function, the runnable examples here call test-like code from `main`; the real `_test.go` files are shown alongside, with the output they actually produced.
+
+</Section>
+
+<Section id="tests" kind="definitions" title="Tests and table-driven tests">
+
+<Definition term="Go test">
+
+A **test** is a function `func TestXxx(t *testing.T)` in a file whose name ends in `_test.go`, in the same package as the code under test. `go test` compiles the package with its test files and runs every test. A test fails if it calls `t.Error`/`t.Errorf` (record a failure and continue) or `t.Fatal`/`t.Fatalf` (record and stop this test). `t.Run(name, func(t *testing.T) {...})` starts a **subtest** with its own name and result.
+
+</Definition>
+
+Suppose package `slug` has a function `Make` that turns a title into a URL slug. Its test file, `slug_test.go`, uses the most common Go testing idiom, a **table-driven test**: a slice of cases, and one loop that runs each as a subtest.
+
+```go
+func TestMake(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{"simple", "Hello World", "hello-world"},
+		{"punctuation", "Go: fast, simple & fun!", "go-fast-simple-fun"},
+		{"edges", "  --Already-Slugged--  ", "already-slugged"},
+		{"accents kept", "Café São Paulo", "café-são-paulo"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Make(tt.in); got != tt.want {
+				t.Errorf("Make(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+```
+
+Running `go test -v` in the package directory printed:
+
+```text
+=== RUN   TestMake
+=== RUN   TestMake/simple
+=== RUN   TestMake/punctuation
+=== RUN   TestMake/edges
+=== RUN   TestMake/accents_kept
+=== RUN   TestMake/empty
+--- PASS: TestMake (0.00s)
+    --- PASS: TestMake/simple (0.00s)
+    --- PASS: TestMake/punctuation (0.00s)
+    --- PASS: TestMake/edges (0.00s)
+    --- PASS: TestMake/accents_kept (0.00s)
+    --- PASS: TestMake/empty (0.00s)
+```
+
+Here is the same function and table, run from `main` so the course's test suite can execute it:
+
+```go check
+package main
+
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
+
+// Make turns a title into a URL slug: lower case, letters and digits, hyphens between words.
+func Make(title string) string {
+	var b strings.Builder
+	b.Grow(len(title))
+	pendingHyphen := false
+	for _, r := range title {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			if pendingHyphen && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingHyphen = false
+			b.WriteRune(unicode.ToLower(r))
+		default:
+			pendingHyphen = true
+		}
+	}
+	return b.String()
+}
+
+func main() {
+	// A table-driven test, run from main. In a real package this table
+	// would live in slug_test.go inside func TestMake(t *testing.T).
+	tests := []struct {
+		name, in, want string
+	}{
+		{"simple", "Hello World", "hello-world"},
+		{"punctuation", "Go: fast, simple & fun!", "go-fast-simple-fun"},
+		{"edges", "  --Already-Slugged--  ", "already-slugged"},
+		{"accents kept", "Café São Paulo", "café-são-paulo"},
+		{"digits", "Top 10 Recipes of 2026", "top-10-recipes-of-2026"},
+		{"empty", "", ""},
+	}
+	failed := 0
+	for _, tt := range tests {
+		got := Make(tt.in)
+		status := "PASS"
+		if got != tt.want {
+			status = "FAIL"
+			failed++
+		}
+		fmt.Printf("--- %s: %s: Make(%q) = %q\n", status, tt.name, tt.in, got)
+	}
+	fmt.Printf("%d tests, %d failed\n", len(tests), failed)
+}
+```
+
+```text
+--- PASS: simple: Make("Hello World") = "hello-world"
+--- PASS: punctuation: Make("Go: fast, simple & fun!") = "go-fast-simple-fun"
+--- PASS: edges: Make("  --Already-Slugged--  ") = "already-slugged"
+--- PASS: accents kept: Make("Café São Paulo") = "café-são-paulo"
+--- PASS: digits: Make("Top 10 Recipes of 2026") = "top-10-recipes-of-2026"
+--- PASS: empty: Make("") = ""
+6 tests, 0 failed
+```
+
+Why tables? Adding a case is one line. Every case is checked the same way, with a failure message that shows the input, the result and the expectation (Go style puts "got" before "want"). And subtests can be run on their own: `go test -run 'TestMake/edges'` runs just one case, which is how you iterate on a bug. Other things worth knowing:
+
+- `t.Helper()` in a helper function makes failures report the caller's line rather than the helper's.
+- `t.Parallel()` lets a test run alongside other parallel tests, which speeds up large suites.
+- `t.Cleanup(f)` registers clean-up; `t.TempDir()` gives a fresh directory that is deleted afterwards; `t.Context()` (Go 1.24) gives a context cancelled when the test ends.
+- Test files can use `package slug` (white-box: see unexported names) or `package slug_test` (black-box: only the public API, as users see it). Many packages have both.
+- There are no assertion functions in the standard library. Plain `if` statements with descriptive messages are the convention; some teams add a small library such as `go-cmp` for comparing structures and printing diffs.
+
+</Section>
+
+<Section id="examples-coverage" kind="examples" title="Examples and coverage">
+
+An **example** is a function named `ExampleXxx` in a test file, ending with an `// Output:` comment. `go test` runs it and fails if the printed output differs, and `go doc` and pkg.go.dev show it in the documentation, so documentation examples can never silently go stale:
+
+```go
+func ExampleMake() {
+	fmt.Println(Make("Ten Tips for Writing Go"))
+	// Output: ten-tips-for-writing-go
+}
+```
+
+`go test -cover` reports the fraction of statements the tests executed; for the slug package it printed `coverage: 100.0% of statements`. `go test -coverprofile=c.out` followed by `go tool cover -html=c.out` shows, line by line, what was and wasn't run. Coverage tells you what is *untested*; it can't tell you that the tested code is right, so treat it as a guide to blind spots, not a score to maximise.
+
+</Section>
+
+<Section id="benchmarks" kind="examples" title="Benchmarks and allocations">
+
+A **benchmark** is `func BenchmarkXxx(b *testing.B)` with a loop that `go test -bench` runs as many times as needed for a stable measurement. Since Go 1.24 the loop is written `for b.Loop() { ... }`, which handles timing and keeps the compiler from optimising the measured code away:
+
+```go
+func BenchmarkMake(b *testing.B) {
+	title := strings.Repeat("A Long Title, With Punctuation! ", 10)
+	for b.Loop() {
+		Make(title)
+	}
+}
+```
+
+`go test -run '^$' -bench . -benchmem` (no tests, all benchmarks, with memory statistics) printed this line on one laptop:
+
+```text
+BenchmarkMake-20    	  229234	      6076 ns/op	    1016 B/op	       7 allocs/op
+```
+
+Read it as: 229,234 iterations; about 6 microseconds per call; 1,016 bytes allocated in 7 allocations per call. (The `-20` is `GOMAXPROCS`. Your numbers will differ with your machine.) Seven allocations come from the `strings.Builder` growing its buffer step by step. Adding `b.Grow(len(title))` at the start of `Make`, since a slug is never longer than its title, gave:
+
+```text
+BenchmarkMake-20    	  248878	      4827 ns/op	     320 B/op	       1 allocs/op
+```
+
+Allocation counts, unlike timings, are deterministic, so they can be checked anywhere. `testing.AllocsPerRun` measures them even outside a test:
+
+```go check
+package main
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"unicode"
+)
+
+func makeSlug(title string, presize bool) string {
+	var b strings.Builder
+	if presize {
+		b.Grow(len(title))
+	}
+	pendingHyphen := false
+	for _, r := range title {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			if pendingHyphen && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingHyphen = false
+			b.WriteRune(unicode.ToLower(r))
+		} else {
+			pendingHyphen = true
+		}
+	}
+	return b.String()
+}
+
+func main() {
+	title := strings.Repeat("A Long Title, With Punctuation! ", 10)
+
+	// testing.AllocsPerRun measures heap allocations per call, outside a test.
+	growing := testing.AllocsPerRun(100, func() { makeSlug(title, false) })
+	presized := testing.AllocsPerRun(100, func() { makeSlug(title, true) })
+	fmt.Printf("allocations per call: %.0f without Grow, %.0f with Grow\n", growing, presized)
+	fmt.Println(makeSlug(title, true) == makeSlug(title, false))
+}
+```
+
+```text
+allocations per call: 7 without Grow, 1 with Grow
+true
+```
+
+The workflow (measure, change one thing, measure again, keep the change only if the numbers improve) is how performance work is done in Go. To compare runs statistically rather than by eye, run each benchmark several times (`-count=10`) and compare the results with the `benchstat` tool, which reports whether a difference is larger than the noise.
+
+</Section>
+
+<Section id="fuzzing" kind="definitions" title="Fuzzing">
+
+<Definition term="fuzz test">
+
+A **fuzz test**, `func FuzzXxx(f *testing.F)`, checks a property of a function on inputs generated automatically. `f.Add` supplies seed inputs; `f.Fuzz(func(t *testing.T, in string) {...})` is the target. Under plain `go test`, only the seeds run; under `go test -fuzz FuzzXxx`, the fuzzer mutates inputs, guided by code coverage, looking for one that makes the target fail, and saves any failing input in `testdata/fuzz` so it becomes a permanent regression test.
+
+</Definition>
+
+Fuzzing works best with **properties** that must hold for every input, rather than expected outputs:
+
+```go
+func FuzzMake(f *testing.F) {
+	f.Add("Hello World")
+	f.Add("¿Qué tal?")
+	f.Fuzz(func(t *testing.T, in string) {
+		out := Make(in)
+		if strings.Contains(out, "--") || strings.HasPrefix(out, "-") || strings.HasSuffix(out, "-") {
+			t.Errorf("Make(%q) = %q has a stray hyphen", in, out)
+		}
+		if utf8.ValidString(in) && !utf8.ValidString(out) {
+			t.Errorf("Make(%q) produced invalid UTF-8", in)
+		}
+	})
+}
+```
+
+A three-second run (`go test -run '^$' -fuzz FuzzMake -fuzztime 3s`) tried about 114,000 generated inputs and found no failure. Fuzzing is particularly valuable for parsers, decoders and anything that handles untrusted input, where it routinely finds crashes and edge cases that nobody thought to write a test for. Go has had built-in fuzzing since Go 1.18.
+
+</Section>
+
+<Section id="boundaries" kind="examples" title="Testing code that touches the outside world">
+
+Pure functions like `Make` are easy to test. Real programs read files, call HTTP services, query databases and wait on clocks. The Go standard library includes tools for testing each of these without mocks scattered everywhere:
+
+- **HTTP.** `net/http/httptest` provides `NewRecorder`, which captures what a handler writes so you can call the handler directly, and `NewServer`, which starts a real server on a local port for testing clients. Lesson 10's project is tested this way.
+- **Files.** `t.TempDir()` gives each test its own directory, deleted afterwards. For code that only reads, accept an `fs.FS` instead of opening paths directly; tests can then pass a `testing/fstest.MapFS`, an in-memory file system built from a map literal.
+- **Time.** Code that sleeps or uses timeouts is slow and flaky to test with a real clock. The `testing/synctest` package (Go 1.25) runs a test in a "bubble" with a fake clock that jumps forward instantly whenever every goroutine in the bubble is waiting, so a test of a 30-second timeout takes microseconds.
+- **Golden files.** For functions that produce large outputs (a rendered report, generated code), store the expected output in `testdata/` and compare against it; a `-update` flag that rewrites the files makes intended changes easy to review in version control. The `go` tool ignores directories named `testdata`, so they are the conventional place for fixtures.
+- **Integration tests.** Tests that need a real database or network service are often placed in files with a build constraint such as `//go:build integration` at the top, so they run only with `go test -tags integration ./...`, or they call `t.Skip` when the service isn't available. `testing.Short()` lets slow tests skip themselves under `go test -short`.
+
+The common thread is designing code so that its dependencies come in as small interfaces or values (an `io.Reader`, an `fs.FS`, an `http.Client`, a `context.Context`) rather than being reached for globally. That design choice, more than any testing library, is what makes Go code easy to test.
+
+</Section>
+
+<Section id="toolkit" kind="human" title="The rest of the professional toolkit">
+
+**Formatting and static analysis.** `gofmt -l .` lists unformatted files, and CI usually fails if there are any. `goimports` (from `golang.org/x/tools`) does the same and also fixes import lists. `go vet ./...` runs the compiler team's checks for likely bugs: mismatched `Printf` verbs, copied locks, unreachable code, a forgotten `cancel` from `context.WithTimeout`. **Staticcheck** adds many more checks and is widely used; **golangci-lint** bundles dozens of linters behind one configuration file.
+
+**Security.** **govulncheck** compares your module's dependencies, and the functions you actually call, against the Go vulnerability database, so it reports only vulnerabilities that can affect your program. Run it in CI.
+
+**Modules.** `go get example.com/lib@v1.4.0` adds or upgrades a dependency; `go mod tidy` adds what imports need and removes what they don't; `go.sum` records cryptographic hashes of every dependency, checked against a public checksum database so that a tampered module is rejected. Since Go 1.24, development tools can be recorded in `go.mod` with `go get -tool` and run with `go tool`, so everyone on a team uses the same version of a linter or code generator. `go work` sets up a **workspace** for developing several modules together.
+
+**Profiling.** `go test -cpuprofile cpu.out -bench .` or importing `net/http/pprof` in a server collects profiles, and `go tool pprof` explores them as tables, call graphs or flame graphs (`go tool pprof -http=:8081 cpu.out` opens a browser view). CPU profiles show where time goes; heap profiles show who allocates; goroutine and block profiles show what is waiting. `go tool trace` records scheduler-level events. Profile-guided optimisation (PGO) lets you feed a production CPU profile back into the compiler, which then inlines and devirtualises the hot paths; Go's documentation reports typical gains of a few percent.
+
+**Race detection.** `go test -race ./...` in CI catches data races (lesson 8) that tests happen to trigger.
+
+**Logging.** The standard library's `log/slog` (Go 1.21) writes **structured** logs: key-value pairs that log systems can index and query, instead of free-form text to be parsed with regular expressions.
+
+```go check
+package main
+
+import (
+	"errors"
+	"log/slog"
+	"os"
+	"time"
+)
+
+func main() {
+	// A structured logger writing JSON lines. The time attribute is dropped
+	// here only so that the output is the same on every run.
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
+	}))
+
+	logger.Info("server starting", "addr", ":8080", "workers", 4)
+
+	// With returns a logger that adds fields to every record: here, a request ID.
+	reqLog := logger.With("request_id", "r-7f3a")
+	reqLog.Debug("cache lookup", "key", "user:42", "hit", false)
+	reqLog.Warn("slow query", "table", "orders", "took", 1500*time.Millisecond)
+	reqLog.Error("payment failed", "err", errors.New("card declined"), slog.Group("order", "id", 981, "total_cents", 4599))
+}
+```
+
+```text
+{"level":"INFO","msg":"server starting","addr":":8080","workers":4}
+{"level":"DEBUG","msg":"cache lookup","request_id":"r-7f3a","key":"user:42","hit":false}
+{"level":"WARN","msg":"slow query","request_id":"r-7f3a","table":"orders","took":1500000000}
+{"level":"ERROR","msg":"payment failed","request_id":"r-7f3a","err":"card declined","order":{"id":981,"total_cents":4599}}
+```
+
+Each record is one JSON object; `With` attaches the request ID to every record from that request; `slog.Group` nests related fields; and a `time.Duration` is logged in nanoseconds. In production you keep the timestamp, of course; it is removed here only so the output is the same every time.
+
+A typical CI pipeline for a Go service runs, on every pull request: `gofmt -l`, `go vet ./...`, `staticcheck ./...` (or golangci-lint), `go test -race ./...`, and `govulncheck ./...`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Go needs a testing framework."** The standard `testing` package, table-driven tests and plain `if` statements cover the needs of most projects, including large ones. Add libraries for specific needs (structural diffs, mocks for complex interfaces), not by default.
+
+</Misconception>
+
+<Misconception>
+
+**"100% coverage means the code is correct."** The slug tests reach 100% coverage, yet a missing case (what about an apostrophe in "don't"?) could still hide a behaviour nobody decided on. Coverage measures what ran, not what was checked.
+
+</Misconception>
+
+<Misconception>
+
+**"Benchmark timings from one run tell the truth."** Timings vary with CPU frequency, other processes and memory layout. Repeat runs with `-count`, compare with benchstat, and trust allocation counts, which are stable, more than single timings.
+
+</Misconception>
+
+<Misconception>
+
+**"Mocks for everything make good tests."** Go favours testing against real implementations where possible (an in-memory database, `httptest`, `t.TempDir`, `testing/fstest.MapFS`) and small interfaces where a fake is needed. Heavily mocked tests tend to check the implementation's call sequence rather than its behaviour.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

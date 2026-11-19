@@ -1,0 +1,365 @@
+---
+title: Structs, enums and unions
+subtitle: Grouping data into records, naming choices with enumerations, sharing storage with tagged unions, and what padding does to memory layout.
+minutes: 55
+objectives:
+  - Define structs, initialise them with designated initialisers, and access fields with . and ->
+  - Decide when to pass structs by value and when by pointer
+  - Sort arrays of structs with qsort and multi-field comparators
+  - Model "one of several kinds" with enums and tagged unions
+  - Predict struct sizes from alignment and padding, and use offsetof
+prerequisites: [strings]
+references:
+  - title: cppreference.com, Struct declaration
+    url: https://en.cppreference.com/w/c/language/struct
+    note: Structs, flexible array members, anonymous members and layout rules.
+  - title: cppreference.com, Struct and union initialization
+    url: https://en.cppreference.com/w/c/language/struct_initialization
+    note: Designated initialisers, nested initialisers and what happens to fields you leave out.
+  - title: cppreference.com, Objects and alignment
+    url: https://en.cppreference.com/w/c/language/object
+    note: Object representation, alignment requirements and alignof.
+---
+
+<Section id="motivation" kind="motivation" title="Data with shape">
+
+Real programs deal with things that have several attributes: a rectangle has two corners, an item in a shop has a name, an aisle and a stock level, a network packet has a header with a dozen fields. In C, a **struct** groups such values under one name, as a record whose fields sit at fixed places in memory. There are no classes, methods or inheritance; there is data, and functions that take pointers to it. That turns out to be enough to build operating systems, databases and game engines, and the habits of designing good structs are much of what experienced C programmers mean by "good design".
+
+Two companions complete the picture. An **enum** gives names to a fixed set of integer choices. A **union** lets several types share the same storage, and combined with an enum that says which one is in use, it becomes a **tagged union**: C's way of saying "this value is one of several kinds". This lesson covers all three, and ends with how the compiler lays structs out in memory, which matters for performance, for file formats and for talking to hardware.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Structs">
+
+<Definition term="struct">
+
+A **structure** (`struct`) type is a sequence of named **members** (fields), possibly of different types, stored in memory in the order they are declared, with possible padding between them. Members are accessed with `.` on a struct and with `->` on a pointer to a struct: `p->x` means `(*p).x`.
+
+</Definition>
+
+```c check
+#include <stdbool.h>
+#include <stdio.h>
+
+struct point {
+    double x;
+    double y;
+};
+
+struct rect {
+    struct point min;     /* bottom-left corner */
+    struct point max;     /* top-right corner */
+};
+
+double area(struct rect r) {                     /* r is a copy of the caller's struct */
+    return (r.max.x - r.min.x) * (r.max.y - r.min.y);
+}
+
+bool contains(const struct rect *r, struct point p) {   /* pointer: no copy, read-only */
+    return p.x >= r->min.x && p.x <= r->max.x &&
+           p.y >= r->min.y && p.y <= r->max.y;
+}
+
+void move_by(struct rect *r, double dx, double dy) {      /* pointer: can modify */
+    r->min.x += dx;
+    r->max.x += dx;
+    r->min.y += dy;
+    r->max.y += dy;
+}
+
+int main(void) {
+    struct rect garden = {
+        .min = {.x = 0, .y = 0},       /* designated initialisers name each field */
+        .max = {.x = 4, .y = 3},
+    };
+    struct point well = {2.5, 1.0};    /* or give the fields in order */
+
+    printf("area: %.1f\n", area(garden));
+    printf("well inside: %s\n", contains(&garden, well) ? "yes" : "no");
+
+    move_by(&garden, 5, 0);
+    printf("after moving, min.x = %.1f, well inside: %s\n",
+           garden.min.x, contains(&garden, well) ? "yes" : "no");
+
+    struct rect copy = garden;         /* assignment copies every field */
+    copy.max.y = 100;
+    printf("original max.y = %.1f, copy max.y = %.1f\n", garden.max.y, copy.max.y);
+    return 0;
+}
+```
+
+```text
+area: 12.0
+well inside: yes
+after moving, min.x = 5.0, well inside: no
+original max.y = 3.0, copy max.y = 100.0
+```
+
+The program shows the three ways functions take structs:
+
+- **By value** (`area(struct rect r)`): the function gets a copy. Fine for small structs; for large ones, copying costs time and stack space.
+- **By pointer to const** (`contains(const struct rect *r, …)`): no copy, read-only. The usual choice for anything bigger than a few words.
+- **By pointer** (`move_by(struct rect *r, …)`): the function can modify the caller's struct.
+
+Structs can be assigned and returned as wholes (assignment copies every field), but they cannot be compared with `==`; compare fields, or write an `equal` function. Returning a small struct by value is a clean way to return several results at once, such as a quotient and a remainder (the standard library's `div` does exactly this). **Designated initialisers** (`.min = {.x = 0, .y = 0}`), added in C99, name each field, so the code stays correct if fields are reordered, and any field you leave out is set to zero. `struct rect zeroed = {0};` is the standard idiom for "everything zero"; C23 also allows `= {}`.
+
+### typedef
+
+Writing `struct` before every use of a type is legal and some code bases (including the Linux kernel) prefer it, because it reminds the reader that a value is a struct. Others give the struct a shorter name with `typedef`, as in the next program: `typedef struct { … } Item;` lets you write `Item` alone. Both styles are common; pick one per project.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Arrays of structs">
+
+An array of structs is the C version of a table: one struct per row. `qsort` sorts it with a comparator that receives pointers to two rows. A comparator that sorts by several fields compares the first, and only if it is equal moves on to the next:
+
+```c check
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    const char *name;
+    const char *aisle;
+    int stock;
+} Item;
+
+static int by_aisle_then_stock(const void *a, const void *b) {
+    const Item *x = a, *y = b;
+    int c = strcmp(x->aisle, y->aisle);
+    if (c != 0) return c;
+    return (y->stock > x->stock) - (y->stock < x->stock);   /* most stock first */
+}
+
+int main(void) {
+    Item shop[] = {
+        {"mint tea", "drinks", 40},
+        {"lentils", "grains", 12},
+        {"coffee", "drinks", 25},
+        {"basmati rice", "grains", 30},
+        {"mango juice", "drinks", 8},
+    };
+    size_t n = sizeof shop / sizeof shop[0];
+
+    qsort(shop, n, sizeof shop[0], by_aisle_then_stock);
+
+    for (size_t i = 0; i < n; i++) {
+        printf("%-7s %-13s %3d\n", shop[i].aisle, shop[i].name, shop[i].stock);
+    }
+
+    Item *low = NULL;                       /* find the item with the least stock */
+    for (size_t i = 0; i < n; i++) {
+        if (low == NULL || shop[i].stock < low->stock) low = &shop[i];
+    }
+    printf("reorder first: %s\n", low->name);
+    return 0;
+}
+```
+
+```text
+drinks  mint tea       40
+drinks  coffee         25
+drinks  mango juice     8
+grains  basmati rice   30
+grains  lentils        12
+reorder first: mango juice
+```
+
+Three details are worth copying into your own code. The comparator converts its `const void *` parameters to `const Item *` without a cast (C converts `void *` implicitly). The stock comparison avoids subtraction, as in lesson 4. And the search for the lowest stock keeps a **pointer** to the best row so far, `Item *low`, rather than copying rows: the result points into the array, so it would see later changes to that row, and it would dangle if the array went away.
+
+Note also that `name` and `aisle` are `const char *`, pointers to string literals. The struct does not contain the text, only its address. That is fine for constants, but if the text came from a buffer that is later reused, every struct would see the change. Deciding whether a struct **owns** its strings (and must copy and later free them) or merely **borrows** them is one of the central design questions in C, and lesson 7 returns to it.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Enums and tagged unions">
+
+### Enumerations
+
+`enum shape_kind { CIRCLE, RECTANGLE, TRIANGLE };` defines three named integer constants, numbered 0, 1 and 2 unless you say otherwise. You can give values explicitly, and later names continue counting from the last explicit value: in `enum { LOW = 1, MEDIUM, HIGH = 10, MAX }`, `MEDIUM` is 2 and `MAX` is 11. An `enum` variable is really an integer, and C will let you store any int in it, so enums document intent more than they enforce it. Their great practical benefit shows up in `switch`: when a `switch` on an enum misses a case and has no `default`, GCC's `-Wall` warns (`enumeration value 'TRIANGLE' not handled in switch`), so adding a new kind tells you every place that must handle it.
+
+### Tagged unions
+
+A **union** looks like a struct, but all its members start at the same address and share the same bytes; its size is that of its largest member. Only one member is meaningful at a time. On its own a union is risky, because nothing records which member was last written. Pairing it with an enum **tag** fixes that:
+
+```c check
+#include <math.h>
+#include <stdio.h>
+
+enum shape_kind { CIRCLE, RECTANGLE, TRIANGLE };
+
+/* A tagged union: 'kind' says which member of the union is valid. */
+struct shape {
+    enum shape_kind kind;
+    union {
+        struct { double radius; } circle;
+        struct { double width, height; } rectangle;
+        struct { double a, b, c; } triangle;      /* side lengths */
+    } as;
+};
+
+static const double PI = 3.141592653589793;
+
+double shape_area(const struct shape *s) {
+    switch (s->kind) {
+    case CIRCLE:
+        return PI * s->as.circle.radius * s->as.circle.radius;
+    case RECTANGLE:
+        return s->as.rectangle.width * s->as.rectangle.height;
+    case TRIANGLE: {
+        double a = s->as.triangle.a, b = s->as.triangle.b, c = s->as.triangle.c;
+        double p = (a + b + c) / 2;                     /* Heron's formula */
+        return sqrt(p * (p - a) * (p - b) * (p - c));
+    }
+    }
+    return 0;   /* not reached if kind is valid */
+}
+
+const char *kind_name(enum shape_kind k) {
+    switch (k) {
+    case CIRCLE:    return "circle";
+    case RECTANGLE: return "rectangle";
+    case TRIANGLE:  return "triangle";
+    }
+    return "unknown";
+}
+
+int main(void) {
+    struct shape shapes[] = {
+        {.kind = CIRCLE, .as.circle = {.radius = 1.0}},
+        {.kind = RECTANGLE, .as.rectangle = {.width = 3.0, .height = 2.5}},
+        {.kind = TRIANGLE, .as.triangle = {.a = 3, .b = 4, .c = 5}},
+    };
+    for (size_t i = 0; i < 3; i++) {
+        printf("%-9s area %.4f\n", kind_name(shapes[i].kind), shape_area(&shapes[i]));
+    }
+    printf("CIRCLE = %d, RECTANGLE = %d, TRIANGLE = %d\n", CIRCLE, RECTANGLE, TRIANGLE);
+    printf("sizeof(struct shape) = %zu\n", sizeof(struct shape));
+    return 0;
+}
+```
+
+```text
+circle    area 3.1416
+rectangle area 7.5000
+triangle  area 6.0000
+CIRCLE = 0, RECTANGLE = 1, TRIANGLE = 2
+sizeof(struct shape) = 32
+```
+
+The struct is 32 bytes: 8 for the tag (4 for the enum, padded to 8 so the doubles are aligned) and 24 for the union, the size of its largest member, the triangle's three doubles. A circle uses only 8 of those 24 bytes, the price of a fixed size. The designated initialisers can reach inside the union (`.as.circle = {.radius = 1.0}`), and `shape_area` switches on the tag and reads only the matching member.
+
+This pattern is everywhere in C: tokens in a compiler (a number, a name, a string), values in a scripting language's interpreter, messages in a protocol, nodes in a syntax tree. Languages such as Rust, Swift and OCaml build it in as "sum types" or "enums with data", with the compiler checking that you handle every case and never read the wrong member. In C, the discipline is yours: always set the tag when you set the member, and always check the tag before you read.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Layout, alignment and padding">
+
+Each type has an **alignment**: the address of a value of that type must be a multiple of it. On x86-64, `char` has alignment 1, `int32_t` 4, `double` and pointers 8. To keep every member aligned, the compiler inserts unused **padding** bytes between members and at the end of a struct (so that arrays of the struct stay aligned too). `offsetof`, from `<stddef.h>`, reveals the layout:
+
+```c check
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+struct loose {
+    char tag;        /* 1 byte */
+    int32_t count;   /* 4 bytes, must start at a multiple of 4 */
+    char flag;       /* 1 byte */
+};
+
+struct tight {
+    int32_t count;
+    char tag;
+    char flag;
+};
+
+int main(void) {
+    printf("loose: size %zu, offsets tag %zu, count %zu, flag %zu\n",
+           sizeof(struct loose), offsetof(struct loose, tag),
+           offsetof(struct loose, count), offsetof(struct loose, flag));
+    printf("tight: size %zu, offsets count %zu, tag %zu, flag %zu\n",
+           sizeof(struct tight), offsetof(struct tight, count),
+           offsetof(struct tight, tag), offsetof(struct tight, flag));
+
+    struct loose many[1000];
+    printf("1000 loose structs: %zu bytes; 1000 tight: %zu bytes\n",
+           sizeof many, 1000 * sizeof(struct tight));
+    return 0;
+}
+```
+
+```text
+loose: size 12, offsets tag 0, count 4, flag 8
+tight: size 8, offsets count 0, tag 4, flag 5
+1000 loose structs: 12000 bytes; 1000 tight: 8000 bytes
+```
+
+In `struct loose`, three bytes of padding follow `tag` so that `count` starts at offset 4, and three more follow `flag` so the size is a multiple of 4. Putting the widest members first, as in `struct tight`, removes the padding and saves a third of the memory. The order of members is part of a struct's meaning in C (the compiler may not reorder them), so reordering is your decision, and for large arrays of structs it can make a measurable difference to memory use and cache behaviour.
+
+### Bit-fields and flexible array members
+
+Two more struct features appear in systems code. A **bit-field** gives a member an exact width in bits:
+
+```c
+struct pixel_flags {
+    unsigned visible : 1;
+    unsigned layer   : 3;    /* values 0 to 7 */
+    unsigned opacity : 4;    /* values 0 to 15 */
+};
+```
+
+The three fields share a single `unsigned int`, which is compact and convenient. But the order of bits within the storage unit, and whether fields may cross unit boundaries, are left to the implementation, so bit-fields are a poor fit for file formats and hardware registers that must match an exact layout. For those, professionals usually use a plain `uint32_t` with explicit shifts and masks, as in lesson 2.
+
+A **flexible array member** is a last member declared with empty brackets, such as `char text[];` at the end of a struct. It has no size of its own: you allocate the struct together with as many elements as you need in one block, so a record and its variable-length data live side by side in memory. You will see it used with `malloc` in the next lesson. (Before C99 programmers faked this with a one-element array; new code should use the real feature, which compilers and sanitizers understand.)
+
+Layout matters at boundaries too. Never write a struct's raw bytes to a file or a network and expect another program, compiler or processor to read them back: padding, alignment, the sizes of types and byte order can all differ. Serialise field by field, with fixed-width types and a stated byte order.
+
+</Section>
+
+<Section id="human" kind="human" title="Designing data in C">
+
+Experienced C programmers often say that they design the data first and the code follows. A few principles from that tradition:
+
+- **Make invalid states hard to represent.** A tagged union cannot be both a circle and a rectangle; a struct with a `bool is_circle` and all fields side by side can be inconsistent.
+- **Hide what callers should not touch.** A header can declare `struct parser;` without its fields (an **opaque type**), and offer functions that take `struct parser *`. Callers cannot depend on the layout, so it can change freely. The standard library's `FILE` works this way.
+- **Group by use.** Fields used together in hot loops belong together, and rarely used ones can move to a separate struct, so that the hot data fits in fewer cache lines.
+- **Pair every type with its functions.** For a struct that holds resources, provide `thing_init` and `thing_destroy` (or `thing_new` and `thing_free`) side by side, and make every other function take a `struct thing *` as its first parameter. It is object-oriented design without the language feature, and it makes ownership and cleanup obvious at every call site.
+- **Zero means empty.** Designing structs so that all-zero bytes form a valid, empty value (an empty list, a zero count, a null pointer) makes `= {0}` and `calloc` produce ready-to-use objects.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Comparing structs with `memcmp`.** Padding bytes have unspecified contents, so two structs with equal fields can differ in their padding. Compare field by field.
+
+</Misconception>
+
+<Misconception>
+
+**Using `.` on a pointer, or `->` on a struct.** `p.x` where `p` is a pointer is a compile error; GCC suggests `->`. Remember: `->` follows a pointer, `.` does not.
+
+</Misconception>
+
+<Misconception>
+
+**Returning a pointer to a struct's member after the struct is gone.** The same lifetime rules as for any variable apply: a pointer to a field of a local struct dangles once the function returns.
+
+</Misconception>
+
+<Misconception>
+
+**Reading a union member other than the one last written, and expecting a conversion.** Writing `u.f = 1.0f` and reading `u.i` gives the bit pattern of the float, not 1. C allows this "type punning" through unions, and it has uses, but it is not a conversion. For converting values, assign or cast; for inspecting bytes, `memcpy` into an integer.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All sizes and outputs below were checked by compiling and running the code with GCC on x86-64 Linux.
+
+<Exercises/>
+
+</Section>

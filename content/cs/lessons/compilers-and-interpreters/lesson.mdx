@@ -1,0 +1,542 @@
+---
+title: Languages, interpreters and compilers
+subtitle: From characters to tokens to trees to running code, by building a small language end to end.
+minutes: 80
+objectives:
+  - Describe the stages that turn source text into execution — lexing, parsing, analysis, interpretation or code generation
+  - Write a grammar with precedence and associativity, and a recursive-descent parser for it
+  - Build an abstract syntax tree, evaluate it with a tree-walking interpreter, and compile it to stack-machine code
+  - Inspect Python's own front end and bytecode with the ast and dis modules
+  - Explain at the level of ideas what JIT compilers and LLVM do, and why
+prerequisites: [recursion, lists-stacks-queues, trees, logic-to-processor]
+related: [math.comp.lambda-calculus, math.comp.computability]
+references:
+  - title: Crafting Interpreters
+    author: Robert Nystrom
+    url: https://craftinginterpreters.com/
+    note: A free book that builds a tree-walking interpreter and then a bytecode virtual machine for a full language. The natural next step after this lesson.
+  - title: "Python: ast — Abstract Syntax Trees"
+    url: https://docs.python.org/3/library/ast.html
+  - title: "Python: dis — Disassembler for Python bytecode"
+    url: https://docs.python.org/3/library/dis.html
+    note: Lists every bytecode instruction for the running Python version; instructions change between versions.
+  - title: "PEP 617 — New PEG parser for CPython"
+    url: https://peps.python.org/pep-0617/
+  - title: "PEP 659 — Specializing Adaptive Interpreter"
+    url: https://peps.python.org/pep-0659/
+  - title: "PEP 744 — JIT Compilation"
+    url: https://peps.python.org/pep-0744/
+    note: The design of CPython's experimental copy-and-patch JIT.
+  - title: The LLVM Compiler Infrastructure
+    url: https://llvm.org/
+    note: Home of LLVM, with its language reference and the Kaleidoscope tutorial, which builds a small language with an LLVM back end.
+  - title: "LLVM Tutorial: Kaleidoscope"
+    url: https://llvm.org/docs/tutorial/
+---
+
+<Section id="motivation" kind="motivation" title="Why build a language?">
+
+Every program you have written in this course was turned from text into action by other programs: a parser read it, a compiler translated it, an interpreter or a processor carried it out. Most engineers never write a general-purpose compiler, but nearly every engineer ends up writing *a* language processor: a configuration format with expressions in it, a search query syntax, a template language, a rules engine for a pricing team, a migration tool that rewrites code. And the tools you use daily — formatters, linters, type checkers, test frameworks, IDEs — are all built on the same machinery: they parse code into trees and walk those trees.
+
+Knowing how that machinery works pays off in three ways. You will write small languages correctly instead of with a tangle of regular expressions. You will understand *why* code is fast or slow: why a Python loop costs what it costs, what a JIT is doing during "warm-up", why a C compiler can delete a check you thought you needed. And you will be able to read the error messages, bytecode and intermediate representations that tools show you when things go wrong.
+
+In this lesson we build **Calc**, a tiny calculator language with variables, from scratch: a lexer, a parser, a tree-walking interpreter, a compiler to a stack machine, and the virtual machine that runs it. Then we look at how Python does the same job, and at the industrial techniques — JIT compilation and LLVM — that make languages fast.
+
+</Section>
+
+<Section id="pipeline" kind="intuition" title="The pipeline">
+
+A language implementation is a pipeline of translations, each from a less structured representation to a more structured one:
+
+<Figure caption="The stages of a language implementation. An interpreter executes the tree or the bytecode; a compiler keeps translating, down to machine code.">
+
+<svg viewBox="0 0 620 170" role="img" aria-label="Pipeline: source text to lexer to tokens to parser to syntax tree, then either an interpreter or a compiler producing bytecode or machine code" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+  <defs>
+    <marker id="cmp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="5" y="20" width="95" height="40" rx="6"/>
+    <rect x="160" y="20" width="95" height="40" rx="6"/>
+    <rect x="315" y="20" width="95" height="40" rx="6"/>
+    <rect x="470" y="20" width="140" height="40" rx="6"/>
+    <rect x="315" y="110" width="95" height="40" rx="6"/>
+    <rect x="470" y="110" width="140" height="40" rx="6"/>
+  </g>
+  <g stroke="currentColor" stroke-width="1.5" marker-end="url(#cmp-arrow)">
+    <line x1="100" y1="40" x2="158" y2="40"/>
+    <line x1="255" y1="40" x2="313" y2="40"/>
+    <line x1="410" y1="40" x2="468" y2="40"/>
+    <line x1="362" y1="60" x2="362" y2="108"/>
+    <line x1="410" y1="130" x2="468" y2="130"/>
+  </g>
+  <g fill="currentColor" text-anchor="middle">
+    <text x="52" y="44">source text</text>
+    <text x="207" y="44">tokens</text>
+    <text x="362" y="44">syntax tree</text>
+    <text x="540" y="44">interpret the tree</text>
+    <text x="362" y="134">bytecode / IR</text>
+    <text x="540" y="128">run on a VM, or</text>
+    <text x="540" y="143">emit machine code</text>
+    <text x="129" y="32" font-size="10">lex</text>
+    <text x="284" y="32" font-size="10">parse</text>
+    <text x="439" y="32" font-size="10">walk</text>
+    <text x="388" y="88" font-size="10">compile</text>
+  </g>
+</svg>
+
+</Figure>
+
+- **Lexing** (scanning) groups characters into **tokens**: `rate`, `=`, `1.5`. It discards whitespace and comments and records positions for error messages.
+- **Parsing** checks that the tokens follow the language's grammar and builds a tree that makes the structure explicit: in `2 * (rate + 3)`, the addition is *inside* the multiplication.
+- **Semantic analysis** checks what the grammar cannot: that names are defined, that types fit (the subject of <LessonLink slug="types-and-functional-programming">Types and functional programming</LessonLink>).
+- Then either an **interpreter** executes the tree (or a lower-level form of it) directly, or a **compiler** translates it into another language — bytecode for a virtual machine, or machine code for the processor you met in <LessonLink slug="logic-to-processor">From logic to a processor</LessonLink>.
+
+Note what the picture does *not* say: "compiled language" and "interpreted language". Those are properties of *implementations*, not languages. CPython compiles Python to bytecode and interprets the bytecode; PyPy compiles hot Python loops to machine code while the program runs; the JVM interprets Java bytecode at first and compiles the hot parts. Most real systems mix both.
+
+</Section>
+
+<Section id="grammars" kind="definitions" title="Grammars, precedence and associativity">
+
+<Definition term="Context-free grammar">
+
+A **context-free grammar** is a set of rules, each rewriting a *nonterminal* (a named syntactic category such as `expr`) into a sequence of nonterminals and *terminals* (tokens). A string belongs to the language if it can be derived from the start symbol. The derivation, drawn as a tree, is the **parse tree**; a grammar is **ambiguous** if some string has two different parse trees.
+
+</Definition>
+
+The grammar `expr := expr "-" expr | NUMBER` is ambiguous: `10 - 4 - 3` could mean `(10 - 4) - 3 = 3` or `10 - (4 - 3) = 9`. Real grammars remove the ambiguity by **layering**: one rule per precedence level, lowest precedence at the top, so that tighter-binding operators sit deeper in the tree. Here is Calc's grammar, in the extended notation where `*` means "zero or more" and `?` means "optional":
+
+```text
+program   := statement (";" statement)*
+statement := NAME "=" expr | expr
+expr      := term (("+" | "-") term)*          lowest precedence, left-associative
+term      := unary (("*" | "/") unary)*
+unary     := "-" unary | power
+power     := atom ("^" unary)?                 highest precedence, right-associative
+atom      := NUMBER | NAME | "(" expr ")"
+```
+
+Two design decisions are hidden in it:
+
+- **Associativity.** `expr` repeats `term` in a loop, so a chain of minus signs groups to the left: `10 - 4 - 3` is `(10 - 4) - 3`. `power` instead puts a *recursive* reference on its right, so `2 ^ 3 ^ 2` groups to the right, `2 ^ (3 ^ 2) = 512`, matching mathematical convention.
+- **Unary minus binds looser than `^`.** `-2 ^ 2` is `-(2 ^ 2) = -4`, as in mathematics and in Python's `-2 ** 2`.
+
+Tokens themselves are described by **regular expressions** — numbers, names, operators — because they never nest. Nesting (balanced parentheses) is exactly what regular expressions cannot recognise and context-free grammars can; that boundary is one rung of the Chomsky hierarchy of languages, a theme of <TopicLink id="math.comp.computability">Computability</TopicLink>.
+
+</Section>
+
+<Section id="calc" kind="computation" title="Building Calc, end to end">
+
+Here is the whole implementation: a lexer, an abstract syntax tree, a recursive-descent parser, a tree-walking interpreter, a compiler to stack-machine code, and the virtual machine that runs that code. Run it, then read the walkthrough below.
+
+```python run
+import operator
+import re
+from dataclasses import dataclass
+
+# ---------------- 1. Lexer: characters -> tokens ----------------
+TOKEN_RE = re.compile(r"""
+    (?P<NUMBER> \d+(?:\.\d+)? )
+  | (?P<NAME>   [A-Za-z_]\w*  )
+  | (?P<OP>     [-+*/^()=;]   )
+  | (?P<SKIP>   \s+           )
+  | (?P<ERROR>  .             )
+""", re.VERBOSE)
+
+@dataclass
+class Token:
+    kind: str    # NUMBER, NAME, OP or EOF
+    text: str
+    pos: int     # offset in the source, for error messages
+
+def tokenize(src):
+    tokens = []
+    for m in TOKEN_RE.finditer(src):
+        if m.lastgroup == "SKIP":
+            continue
+        if m.lastgroup == "ERROR":
+            raise SyntaxError(f"unexpected character {m.group()!r} at {m.start()}")
+        tokens.append(Token(m.lastgroup, m.group(), m.start()))
+    return tokens + [Token("EOF", "", len(src))]
+
+# ---------------- 2. Abstract syntax tree ----------------
+@dataclass
+class Num:
+    value: float
+
+@dataclass
+class Var:
+    name: str
+
+@dataclass
+class Neg:
+    operand: object
+
+@dataclass
+class BinOp:
+    op: str
+    left: object
+    right: object
+
+@dataclass
+class Assign:
+    name: str
+    value: object
+
+# ---------------- 3. Parser: tokens -> AST, by recursive descent ----------------
+class Parser:
+    def __init__(self, tokens):
+        self.tokens, self.i = tokens, 0
+
+    def peek(self, ahead=0):
+        return self.tokens[min(self.i + ahead, len(self.tokens) - 1)]
+
+    def take(self, text=None):
+        tok = self.peek()
+        if text is not None and tok.text != text:
+            raise SyntaxError(f"expected {text!r} at {tok.pos}, found {tok.text or 'end of input'!r}")
+        self.i += 1
+        return tok
+
+    def program(self):                      # statement (";" statement)*
+        statements = [self.statement()]
+        while self.peek().text == ";":
+            self.take(";")
+            statements.append(self.statement())
+        if self.peek().kind != "EOF":
+            raise SyntaxError(f"unexpected {self.peek().text!r} at {self.peek().pos}")
+        return statements
+
+    def statement(self):                    # NAME "=" expr | expr
+        if self.peek().kind == "NAME" and self.peek(1).text == "=":
+            name = self.take().text
+            self.take("=")
+            return Assign(name, self.expr())
+        return self.expr()
+
+    def expr(self):                         # a loop makes - and + left-associative
+        node = self.term()
+        while self.peek().text in ("+", "-"):
+            op = self.take().text
+            node = BinOp(op, node, self.term())
+        return node
+
+    def term(self):
+        node = self.unary()
+        while self.peek().text in ("*", "/"):
+            op = self.take().text
+            node = BinOp(op, node, self.unary())
+        return node
+
+    def unary(self):
+        if self.peek().text == "-":
+            self.take("-")
+            return Neg(self.unary())
+        return self.power()
+
+    def power(self):                        # recursion on the right: right-associative
+        base = self.atom()
+        if self.peek().text == "^":
+            self.take("^")
+            return BinOp("^", base, self.unary())
+        return base
+
+    def atom(self):
+        tok = self.take()
+        if tok.kind == "NUMBER":
+            return Num(float(tok.text))
+        if tok.kind == "NAME":
+            return Var(tok.text)
+        if tok.text == "(":
+            node = self.expr()
+            self.take(")")
+            return node
+        raise SyntaxError(f"unexpected {tok.text or 'end of input'!r} at {tok.pos}")
+
+def parse(src):
+    return Parser(tokenize(src)).program()
+
+def show(node):
+    """Print an AST compactly, operator first: (* 2 (+ rate 3))."""
+    if isinstance(node, Num):
+        return f"{node.value:g}"
+    if isinstance(node, Var):
+        return node.name
+    if isinstance(node, Neg):
+        return f"(neg {show(node.operand)})"
+    if isinstance(node, BinOp):
+        return f"({node.op} {show(node.left)} {show(node.right)})"
+    return f"(= {node.name} {show(node.value)})"
+
+# ---------------- 4. Tree-walking interpreter ----------------
+OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul,
+       "/": operator.truediv, "^": operator.pow}
+
+def evaluate(node, env):
+    match node:
+        case Num(value):
+            return value
+        case Var(name):
+            if name not in env:
+                raise NameError(f"undefined variable {name!r}")
+            return env[name]
+        case Neg(operand):
+            return -evaluate(operand, env)
+        case BinOp(op, left, right):
+            return OPS[op](evaluate(left, env), evaluate(right, env))
+        case Assign(name, value):
+            env[name] = evaluate(value, env)
+            return env[name]
+
+def interpret(src, env=None):
+    env = {} if env is None else env
+    result = None
+    for statement in parse(src):
+        result = evaluate(statement, env)
+    return result
+
+# ---------------- 5. Compiler: AST -> stack-machine code ----------------
+def compile_node(node, code):
+    match node:
+        case Num(value):
+            code.append(("PUSH", value))
+        case Var(name):
+            code.append(("LOAD", name))
+        case Neg(operand):
+            compile_node(operand, code)
+            code.append(("NEG",))
+        case BinOp(op, left, right):       # post-order: both operands, then the operator
+            compile_node(left, code)
+            compile_node(right, code)
+            code.append((op,))
+        case Assign(name, value):
+            compile_node(value, code)
+            code.append(("STORE", name))    # STORE leaves the value on the stack
+    return code
+
+def compile_program(src):
+    code = []
+    for i, statement in enumerate(parse(src)):
+        if i:
+            code.append(("POP",))          # discard the previous statement's value
+        compile_node(statement, code)
+    return code
+
+# ---------------- 6. Virtual machine ----------------
+def execute(code, env=None):
+    env = {} if env is None else env
+    stack = []
+    for instr in code:
+        op = instr[0]
+        if op == "PUSH":
+            stack.append(instr[1])
+        elif op == "LOAD":
+            stack.append(env[instr[1]])
+        elif op == "STORE":
+            env[instr[1]] = stack[-1]
+        elif op == "POP":
+            stack.pop()
+        elif op == "NEG":
+            stack.append(-stack.pop())
+        else:                              # a binary operator: + - * / ^
+            right, left = stack.pop(), stack.pop()
+            stack.append(OPS[op](left, right))
+    return stack[-1]
+
+# ---------------- Try it ----------------
+source = "rate = 1.5; 2 * (rate + 3) ^ 2"
+print("tokens:", [t.text for t in tokenize(source)][:-1])
+for statement in parse(source):
+    print("AST:   ", show(statement))
+print("interpreted:", interpret(source))
+code = compile_program(source)
+print("bytecode:", "  ".join(" ".join(map(str, instr)) for instr in code))
+print("on the VM:  ", execute(code))
+print()
+
+for src in ["10 - 4 - 3", "2 ^ 3 ^ 2", "-2 ^ 2", "(1 + 2) * -3", "x = 4; y = x * x; y / 8"]:
+    by_tree, by_vm = interpret(src), execute(compile_program(src))
+    assert by_tree == by_vm, src
+    print(f"{src:24} = {by_tree:g}")
+
+for bad in ["2 * (3 + ", "4 $ 2", "1 + y"]:
+    try:
+        interpret(bad)
+    except (SyntaxError, NameError) as err:
+        print(f"{bad!r:12} -> {type(err).__name__}: {err}")
+```
+
+### Lexing
+
+The lexer is one regular expression with a **named group** per token kind, tried in order at each position. Order matters: `NUMBER` before `NAME`, and the catch-all `ERROR` last, so that an unexpected character such as `$` produces an error with its position instead of being silently skipped. Regular-expression engines take the longest match for each alternative, so `rate` becomes one `NAME` rather than four letters — the *maximal munch* rule every lexer follows. A sentinel `EOF` token at the end saves the parser from checking bounds.
+
+### Recursive descent
+
+A **recursive-descent parser** has one method per grammar rule, and each method's body mirrors its rule: a `*` becomes a `while` loop, an alternative becomes an `if`, a reference to another rule becomes a call. The call stack of the parser *is* the parse tree being explored, which is why the technique pairs so naturally with <LessonLink slug="recursion">recursion</LessonLink>. The parser looks only at the next token (`peek()`), except in `statement`, which peeks two tokens ahead to tell `x = …` from an expression that starts with `x`.
+
+One trap: a rule like `expr := expr "-" term` (**left recursion**) makes `expr()` call itself before consuming any token, and recurses forever. The standard fix is the one used here — rewrite the left recursion as a loop that builds the tree leftwards. Hand-written recursive descent with good error messages is what many production compilers use, including GCC's and Clang's C++ front ends; others use **parser generators** such as Bison or ANTLR, which build a parser from a grammar file. CPython switched from an LL(1) generator to a **PEG** (parsing expression grammar) parser in Python 3.9 ([PEP 617](https://peps.python.org/pep-0617/)), partly to express rules the old one could not.
+
+### Abstract versus concrete syntax
+
+The tree the parser returns is an **abstract syntax tree** (AST): it keeps the meaning and drops the punctuation. Parentheses do not appear in it at all — they only shaped the tree — and `x = 4` is one `Assign` node, not three tokens. The AST is the data structure every later stage works on, which is why the stages are so cleanly separable.
+
+### A tree-walking interpreter
+
+`evaluate` is a **recursive function over the tree**: evaluate the children, combine the results. The environment `env` maps variable names to values; assignments write to it. Structural pattern matching (`match … case BinOp(op, left, right)`) unpacks each node type cleanly. Tree-walking interpreters are simple, easy to extend and good enough for configuration languages and many DSLs. Their cost is constant overhead per node: a pointer chase, a type dispatch and a function call for every `+`.
+
+### Compiling to a stack machine
+
+A **stack machine** keeps its intermediate values on a stack: `PUSH` and `LOAD` put a value on top, and an operator pops its operands and pushes its result. Compiling an expression for it is a **post-order traversal** of the AST — emit code for the left subtree, then the right, then the operator — which is exactly reverse Polish notation. For `2 * (rate + 3) ^ 2` with `rate = 1.5`:
+
+| Instruction | Stack afterwards (top on the right) |
+| --- | --- |
+| `PUSH 2` | 2 |
+| `LOAD rate` | 2, 1.5 |
+| `PUSH 3` | 2, 1.5, 3 |
+| `+` | 2, 4.5 |
+| `PUSH 2` | 2, 4.5, 2 |
+| `^` | 2, 20.25 |
+| `*` | 40.5 |
+
+Why compile at all, if the interpreter already works? The bytecode is a flat list, so executing it is a tight loop with no recursion and no tree to chase; it can be saved and loaded without re-parsing; and it is a convenient place to optimise. Stack machines also make code generation trivial, which is why the JVM, CPython, .NET's CIL and WebAssembly all use one. The alternative, a **register machine** (Lua's VM, and every real processor), needs fewer instructions per expression but a smarter compiler to allocate registers.
+
+</Section>
+
+<Section id="python-front-end" kind="examples" title="Python's own front end: the ast module">
+
+CPython follows the same pipeline: tokenizer, PEG parser, AST, then a compiler that emits bytecode for its virtual machine. The `ast` module exposes the middle of it, so you can parse Python into the same trees the interpreter uses, inspect them, transform them and compile them back:
+
+```python run
+import ast
+
+tree = ast.parse("total = price * (1 + tax_rate)")
+print(ast.dump(tree.body[0], indent=2))
+
+class NameCollector(ast.NodeVisitor):
+    """Walks the tree, recording which names are read and which are written."""
+    def __init__(self):
+        self.reads, self.writes = set(), set()
+
+    def visit_Name(self, node):
+        (self.writes if isinstance(node.ctx, ast.Store) else self.reads).add(node.id)
+
+collector = NameCollector()
+collector.visit(tree)
+print("reads:", sorted(collector.reads), " writes:", sorted(collector.writes))
+
+class DoubleTheNumbers(ast.NodeTransformer):
+    """Rewrites the tree: every numeric literal is replaced by twice its value."""
+    def visit_Constant(self, node):
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return ast.copy_location(ast.Constant(node.value * 2), node)
+        return node
+
+tree = ast.fix_missing_locations(DoubleTheNumbers().visit(ast.parse("result = 3 * 7 + 1")))
+print("transformed source:", ast.unparse(tree))
+namespace = {}
+exec(compile(tree, "<transformed>", "exec"), namespace)
+print("result =", namespace["result"])
+```
+
+The output of `ast.dump` differs slightly between Python versions, but the shape is the one you built for Calc: a `BinOp` with `left`, `op` and `right`. This is how real tools work. Linters such as Ruff and Pylint walk the AST looking for patterns; pytest rewrites the AST of your `assert` statements so that a failure can report the values of each sub-expression; coverage tools and code-modification scripts ("codemods") do the same. If you ever need to evaluate arithmetic typed by a user, parsing it with `ast` and walking the tree yourself — accepting only the node types you allow — is the safe way; calling `eval` on the string is not, because `eval` runs *any* Python. One of the exercises asks you to build that safe evaluator.
+
+</Section>
+
+<Section id="bytecode" kind="examples" title="Bytecode: the dis module">
+
+After the AST, CPython builds a control-flow graph, runs a few optimisations, and emits **bytecode**: compact instructions for a stack-based virtual machine, stored in a function's `__code__` object. The `dis` module disassembles it:
+
+```python run
+import dis
+
+def area(width, height):
+    border = 2 * 3            # folded to 6 at compile time
+    return (width + border) * (height + border)
+
+dis.dis(area)
+code = area.__code__
+print("constants:      ", code.co_consts)
+print("local variables:", code.co_varnames)
+print("max stack depth:", code.co_stacksize)
+```
+
+You will recognise the shape: `LOAD_FAST` pushes a local variable, an add or multiply instruction pops two values and pushes one, `RETURN_VALUE` pops the result. `co_stacksize` is the deepest the value stack ever gets — computed by the compiler, just as you could compute it for Calc's bytecode. Notice too that `2 * 3` never reaches the bytecode: the compiler **folded** the constant expression to `6`.
+
+Exact instructions change with every Python release. Up to 3.10 each operator had its own instruction (`BINARY_ADD`, `BINARY_MULTIPLY`); from 3.11 there is a single `BINARY_OP` with an argument, plus a `RESUME` instruction at the start of each function; 3.13 fuses two consecutive loads into one `LOAD_FAST_LOAD_FAST` *superinstruction*, saving a dispatch. Python 3.11 also made the interpreter **adaptive** ([PEP 659](https://peps.python.org/pep-0659/)): after an instruction has run a few times, the VM replaces it with a *specialised* version for the types it has seen, such as an add for two floats, guarded by a cheap check that falls back to the general version if the types change. That is the first step towards the subject of the next section. Because bytecode is version-specific, the `.pyc` files Python caches in `__pycache__` carry a version "magic number" and are never shared between versions.
+
+</Section>
+
+<Section id="jit-and-llvm" kind="human" title="Going faster: JIT compilers and LLVM">
+
+An interpreter, however tight its loop, pays for **dispatch** — decoding each instruction and jumping to its handler — and for **genericity**: CPython's add instruction must work for integers, floats, strings and user classes, so it checks types every time. Compiling ahead of time to machine code removes the dispatch, but for a dynamic language the compiler cannot know the types in advance.
+
+A **just-in-time (JIT) compiler** resolves that by compiling *while the program runs*, using what it has observed:
+
+1. Start in an interpreter, **profiling**: count how often each function or loop runs and which types flow through it.
+2. When code becomes **hot**, compile it to machine code **speculatively**, specialised for the observed case ("`x` has always been a float").
+3. Protect each assumption with a **guard**. If a guard fails — a string finally arrives — **deoptimise**: jump back to the interpreter at the equivalent point and carry on correctly.
+
+Production JITs are **tiered**: Java's HotSpot VM interprets, then compiles hot methods quickly with light optimisation, then recompiles the hottest ones with heavy optimisation; V8 runs JavaScript through an interpreter and several compiler tiers in the same way. PyPy and LuaJIT are **tracing** JITs: they record the actual path taken through a hot loop and compile that trace. CPython 3.13 added an experimental, off-by-default JIT built by a technique called *copy-and-patch*, which stitches together precompiled machine-code templates ([PEP 744](https://peps.python.org/pep-0744/)). The costs of JITs are real: warm-up time before code is fast, memory for compiled code, and performance that is harder to predict — which is why benchmarks of JIT-compiled languages must run long enough to measure the steady state.
+
+### LLVM: a shared back end
+
+Writing a high-quality optimiser and code generator for every processor is enormous work, so modern compilers share one. **LLVM** defines an **intermediate representation** (IR): a typed, assembly-like language for an idealised machine with unlimited registers, in **static single assignment** (SSA) form, where every value is assigned exactly once. Front ends translate their languages into IR; LLVM's optimisation passes (inlining, constant propagation, loop transformations, vectorisation) improve it; back ends turn it into machine code for x86-64, ARM, RISC-V, WebAssembly and more. Here is what a front end might emit for the body of `area` above, specialised to 32-bit integers:
+
+```text
+define i32 @area(i32 %width, i32 %height) {
+entry:
+  %w = add i32 %width, 6
+  %h = add i32 %height, 6
+  %result = mul i32 %w, %h
+  ret i32 %result
+}
+```
+
+Clang (C, C++), Rust, Swift, Julia and Zig all use LLVM back ends, and many JITs use it as their top tier. This is the same separation you saw in Calc — front end, IR, back end — at industrial scale: $M$ languages and $N$ processors need $M + N$ components instead of $M \times N$ compilers.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Python is interpreted, so it is not compiled."** CPython compiles every module to bytecode before running it; you can see the result with `dis` and in `__pycache__`. What it does not do (by default) is compile to *machine code*. "Interpreted" and "compiled" describe implementations and stages, not languages.
+
+</Misconception>
+
+<Misconception>
+
+**"Compiled code is always faster than a JIT."** A JIT can specialise for the inputs actually seen — inlining the one implementation of an interface method that is ever called, for instance — which an ahead-of-time compiler cannot know. Ahead-of-time compilation wins on start-up time, predictability and memory. Which is faster depends on the workload; measure.
+
+</Misconception>
+
+<Misconception>
+
+**"`eval(user_input)` is a quick calculator."** `eval` executes arbitrary Python: an expression can import modules, read files and run programs. Restricting its globals does not make it safe. Parse the input yourself (as Calc does) or walk an `ast` tree and allow only the node types you intend.
+
+</Misconception>
+
+<Misconception>
+
+**"The parser understands the program."** A parser only checks *form*. `1 + y` parses perfectly in Calc and fails only when evaluated, because `y` is undefined; checking names and types is a separate stage, and much of what makes a compiler helpful lives there.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+In 1952 Grace Hopper's A-0 system translated symbolic code into machine instructions, and she spent the following decade arguing, against much scepticism, that programs should be written in something closer to English; her work led to FLOW-MATIC and then COBOL. In 1957 John Backus's team at IBM delivered the first FORTRAN compiler, whose real achievement was showing that compiled code could compete with hand-written assembly, which made high-level languages acceptable to the people paying for machine time. In 1960 John McCarthy described Lisp, including an `eval` function written in Lisp itself — an interpreter for the language in the language — an idea that runs through the history of programming languages.
+
+Parsing theory matured in the 1960s, from Backus–Naur Form for describing ALGOL 60 to Donald Knuth's LR parsing (1965), the basis of parser generators like yacc. The techniques of modern JITs grew out of research on Smalltalk and on the Self language at Stanford and Sun in the late 1980s and 1990s, which went on to shape Java's HotSpot VM. LLVM began as a research project of Chris Lattner and Vikram Adve at the University of Illinois, published in 2004, and became the back end of much of the industry.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises build parts of Calc again, a piece at a time, so you can test each one in isolation.
+
+<Exercises/>
+
+</Section>

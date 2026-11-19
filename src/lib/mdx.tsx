@@ -11,12 +11,29 @@ import { rehypeKatexHtml } from "./rehype-katex-html";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type MdxComponents = Record<string, ComponentType<any>>;
 
+interface HastNode {
+  type: string;
+  tagName?: string;
+  data?: { meta?: string | null };
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+}
+
+/** Keep a fenced code block's meta string (```python run) as `data-meta`, which MDX would otherwise drop. */
+export function rehypeCodeMeta() {
+  const walk = (node: HastNode) => {
+    if (node.type === "element" && node.tagName === "code" && node.data?.meta) node.properties = { ...node.properties, dataMeta: node.data.meta };
+    node.children?.forEach(walk);
+  };
+  return walk;
+}
+
 /** Compile and render an MDX document on the server (at build time for the static export). */
 export async function renderMdx(source: string, components: MdxComponents) {
   const { default: Content } = await evaluate(source, {
     ...runtime,
     remarkPlugins: [remarkGfm, remarkMath],
-    rehypePlugins: [[rehypeKatex, katexOptions], rehypeKatexHtml],
+    rehypePlugins: [[rehypeKatex, katexOptions], rehypeKatexHtml, rehypeCodeMeta],
     development: false,
   });
   return <Content components={components} />;

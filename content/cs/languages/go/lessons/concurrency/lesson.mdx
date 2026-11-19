@@ -1,0 +1,382 @@
+---
+title: Goroutines, channels, select and context
+subtitle: Go's model of concurrency, its standard patterns, and the tools that keep concurrent code correct.
+minutes: 65
+objectives:
+  - Start goroutines and wait for them with sync.WaitGroup
+  - Communicate with unbuffered and buffered channels, close them, and range over them
+  - Build pipelines and worker pools, and choose between channels and mutexes
+  - Use select for timeouts, cancellation and non-blocking operations
+  - Propagate deadlines and cancellation with context, and find data races with the race detector
+prerequisites: [generics-and-iterators]
+related: [math.comp.formal-methods]
+references:
+  - title: The Go Memory Model
+    url: https://go.dev/ref/mem
+    note: The precise rules for when one goroutine's writes are visible to another.
+  - title: "Go blog: Go Concurrency Patterns: Pipelines and cancellation"
+    url: https://go.dev/blog/pipelines
+  - title: "Go blog: Go Concurrency Patterns: Context"
+    url: https://go.dev/blog/context
+  - title: Data Race Detector
+    url: https://go.dev/doc/articles/race_detector
+  - title: The sync package
+    url: https://pkg.go.dev/sync
+  - title: The context package
+    url: https://pkg.go.dev/context
+  - title: "Communicating Sequential Processes"
+    author: C. A. R. Hoare
+    year: 1978
+    url: https://doi.org/10.1145/359576.359585
+    note: The paper behind channels.
+---
+
+<Section id="motivation" kind="motivation" title="Doing many things at once">
+
+A web server may have ten thousand clients connected at the same moment. A data pipeline reads from one source while it parses, transforms and writes elsewhere. A command-line tool fetches twenty files and would rather not wait for them one after another. Programs like these need **concurrency**: structuring a program as several activities that make progress independently.
+
+Most languages offer threads managed by the operating system, which are heavyweight (each needs a sizeable stack and a kernel structure) and are usually coordinated with locks, which are easy to get wrong. Go was designed around a different model. A **goroutine** is a function running concurrently with others, managed by the Go runtime rather than the operating system; it starts with a stack of a few kilobytes, so a program can run hundreds of thousands of them. The runtime multiplexes goroutines onto a handful of operating-system threads, one per CPU core by default, and switches between them when they block.
+
+To coordinate, Go favours **channels**: typed conduits through which one goroutine sends values and another receives them. The idea comes from Tony Hoare's 1978 paper on communicating sequential processes, and Go's documentation sums up the attitude in a phrase you will hear often: *do not communicate by sharing memory; instead, share memory by communicating*. Locks are still available in the `sync` package and are the right tool for some jobs; part of becoming fluent in Go is knowing which to reach for.
+
+</Section>
+
+<Section id="goroutines" kind="definitions" title="Goroutines and WaitGroups">
+
+<Definition term="goroutine">
+
+The statement `go f(x)` starts `f(x)` running in a new **goroutine** and continues immediately, without waiting for it. When `main` returns, the program ends, whether or not other goroutines have finished. A **`sync.WaitGroup`** waits for a collection of goroutines: since Go 1.25, `wg.Go(f)` starts `f` in a goroutine and tracks it, and `wg.Wait()` blocks until all tracked goroutines have returned.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+// fetch pretends to download a page; each call takes a different time.
+func fetch(url string) string {
+	time.Sleep(time.Duration(5*len(url)) * time.Millisecond)
+	return strings.ToUpper(url)
+}
+
+func main() {
+	urls := []string{"a.example", "bb.example", "ccc.example", "dddd.example"}
+
+	// Start one goroutine per URL; each writes only its own slot of results.
+	results := make([]string, len(urls))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, u := range urls {
+		wg.Go(func() { // Go 1.25+: Add(1), go func, and Done in one call
+			results[i] = fetch(u)
+		})
+	}
+	wg.Wait() // block until every goroutine has finished
+	elapsed := time.Since(start)
+	fmt.Println(results)
+	fmt.Println("concurrent:", elapsed < 150*time.Millisecond) // about 60 ms, not the 210 ms sum
+
+	// An unbuffered channel hands a value from one goroutine to another.
+	done := make(chan string)
+	go func() {
+		done <- "background work finished" // blocks until main receives
+	}()
+	fmt.Println(<-done)
+}
+```
+
+```text
+[A.EXAMPLE BB.EXAMPLE CCC.EXAMPLE DDDD.EXAMPLE]
+concurrent: true
+background work finished
+```
+
+The four simulated downloads take 45 to 60 milliseconds each, about 210 in total, but because they run concurrently the whole batch takes about as long as the slowest one. Each goroutine writes to its own element of `results`, so no two goroutines touch the same memory and no lock is needed; this "one slot per worker" pattern is the simplest safe way to collect results. Before Go 1.25 the same code needed `wg.Add(1)` before each `go` statement and `defer wg.Done()` inside the goroutine, and you will see that form in most existing code.
+
+The closure passed to `wg.Go` uses the loop variables `i` and `u`. Since Go 1.22 each iteration has its own copies, so each goroutine sees its own URL.
+
+The second half shows a **channel** handing a single value from a background goroutine to `main`. `make(chan string)` creates an **unbuffered** channel: a send blocks until another goroutine receives, and a receive blocks until another goroutine sends, so the two goroutines meet at that point. If nobody ever receives, the sender blocks forever; if every goroutine is blocked like that, the runtime stops the program with "fatal error: all goroutines are asleep - deadlock!".
+
+</Section>
+
+<Section id="channels" kind="examples" title="Channels, pipelines and worker pools">
+
+<Definition term="channel">
+
+A **channel** `chan T` carries values of type `T`. `ch <- v` sends, `v := <-ch` receives, and `v, ok := <-ch` also reports whether the channel is still open. `make(chan T, n)` creates a **buffered** channel that holds up to `n` values before sends block. `close(ch)` signals that no more values will be sent; receivers then drain the remaining values and get zero values with `ok == false`, and `for v := range ch` ends. Direction types `chan<- T` (send-only) and `<-chan T` (receive-only) restrict how a function may use a channel.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"fmt"
+	"slices"
+)
+
+// generate sends the numbers on a channel and closes it when done.
+func generate(nums ...int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for _, n := range nums {
+			out <- n
+		}
+	}()
+	return out
+}
+
+// square is a pipeline stage: it reads from one channel and writes to another.
+func square(in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in { // the loop ends when in is closed
+			out <- n * n
+		}
+	}()
+	return out
+}
+
+type job struct{ id, size int }
+type result struct{ id, checksum int }
+
+func worker(jobs <-chan job, results chan<- result) {
+	for j := range jobs {
+		sum := 0
+		for i := range j.size {
+			sum += i % 7
+		}
+		results <- result{j.id, sum}
+	}
+}
+
+func main() {
+	total := 0
+	for sq := range square(generate(1, 2, 3, 4)) {
+		total += sq
+	}
+	fmt.Println("sum of squares:", total)
+
+	// A worker pool: a fixed number of goroutines share a queue of jobs.
+	jobs := make(chan job, 10) // buffered: sends don't block until 10 are waiting
+	results := make(chan result, 10)
+	for range 3 {
+		go worker(jobs, results)
+	}
+	for id := range 6 {
+		jobs <- job{id: id, size: 1000 * (id + 1)}
+	}
+	close(jobs) // no more jobs: workers' range loops will end
+
+	var got []result
+	for range 6 {
+		got = append(got, <-results)
+	}
+	slices.SortFunc(got, func(a, b result) int { return a.id - b.id }) // arrival order varies
+	fmt.Println(got)
+}
+```
+
+```text
+sum of squares: 30
+[{0 2997} {1 5995} {2 8994} {3 11994} {4 14995} {5 17997}]
+```
+
+Two of the most useful concurrency patterns in Go are here:
+
+- **A pipeline.** `generate` and `square` each start a goroutine and return a receive-only channel. Stages connect like pipes in a shell: values flow through as soon as each is ready, and every stage closes its output when its input is exhausted, which ends the `range` loop downstream. The rule that makes this work: **the sender closes the channel**, never the receiver, and only when it will send nothing more.
+- **A worker pool.** Three `worker` goroutines take jobs from one channel and put results on another. The number of workers bounds how much runs at once, whatever the number of jobs, which protects a database or an API from being flooded. Results arrive in whatever order the workers finish, so the program sorts them before printing.
+
+The buffered channels let `main` queue all six jobs without waiting for a worker to take each one. Buffers are not a performance knob to turn up blindly; a buffer that hides a slow consumer only delays the moment the system backs up. Use unbuffered channels by default and a buffer when you know why.
+
+</Section>
+
+<Section id="select-context" kind="examples" title="select, mutexes and context">
+
+<Definition term="select and context">
+
+A **`select`** statement waits on several channel operations at once and runs the first that can proceed (choosing at random if several can); a `default` case runs immediately if none is ready. A **`context.Context`** carries a deadline, a cancellation signal and request-scoped values across API boundaries; its `Done()` channel is closed when the work should stop, and `Err()` then says why.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// slowLookup takes `delay` to answer, unless the context is cancelled first.
+func slowLookup(ctx context.Context, name string, delay time.Duration) (string, error) {
+	select {
+	case <-time.After(delay):
+		return "address of " + name, nil
+	case <-ctx.Done():
+		return "", ctx.Err() // context.DeadlineExceeded or context.Canceled
+	}
+}
+
+// Counter is safe for concurrent use: the mutex guards the map.
+type Counter struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (c *Counter) Inc(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts[key]++
+}
+
+func main() {
+	// select waits on several channel operations and takes whichever is ready first.
+	fast := make(chan string, 1)
+	fast <- "cached answer"
+	select {
+	case v := <-fast:
+		fmt.Println("got", v)
+	case <-time.After(time.Second):
+		fmt.Println("timed out")
+	}
+
+	// A non-blocking check: default runs if nothing is ready.
+	select {
+	case v := <-fast:
+		fmt.Println("got", v)
+	default:
+		fmt.Println("nothing waiting")
+	}
+
+	// Deadlines with context: the caller decides how long it is willing to wait.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if v, err := slowLookup(ctx, "kigali.example", 5*time.Millisecond); err == nil {
+		fmt.Println(v)
+	}
+	_, err := slowLookup(ctx, "faraway.example", 2*time.Second)
+	fmt.Println(err, errors.Is(err, context.DeadlineExceeded))
+
+	// Shared state behind a mutex, updated by 50 goroutines.
+	c := Counter{counts: map[string]int{}}
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			if i%2 == 0 {
+				c.Inc("even")
+			} else {
+				c.Inc("odd")
+			}
+		})
+	}
+	wg.Wait()
+	fmt.Println(c.counts)
+}
+```
+
+```text
+got cached answer
+nothing waiting
+address of kigali.example
+context deadline exceeded true
+map[even:25 odd:25]
+```
+
+- The first `select` races a channel that already holds a value against a one-second timer; the value wins. `time.After` returns a channel that receives once after the duration, a convenient way to put a time limit on any wait.
+- The second `select` has a `default` case, which makes it **non-blocking**: the channel is now empty, so `default` runs at once.
+- **`context.WithTimeout`** creates a context that is cancelled automatically after 50 milliseconds. `slowLookup` waits on either its own work or `ctx.Done()`, whichever comes first. The quick lookup finishes; the slow one is abandoned when the deadline passes, and the error `context.DeadlineExceeded` explains why. `defer cancel()` releases the context's resources as soon as the function is done, and `go vet` warns if you forget it.
+- **`sync.Mutex`** protects the `Counter`'s map, which fifty goroutines update. Maps are not safe for concurrent writes; without the lock the program could crash with "concurrent map writes" or lose updates. `Lock` and a deferred `Unlock` around every access is the idiom, and keeping the mutex next to the data it guards, in the same struct, makes the relationship obvious.
+
+In real services, every function that does I/O or may take a while takes a `ctx context.Context` as its **first parameter**, and passes it on to everything it calls. When a user closes their browser tab, the HTTP server cancels the request's context, and every database query and outgoing call made on its behalf stops promptly instead of finishing work nobody will read.
+
+</Section>
+
+<Section id="scheduler" kind="computation" title="How the runtime schedules goroutines">
+
+Under the hood, the Go scheduler juggles three kinds of things: **goroutines** (G), operating-system **threads** (M, for "machine") and **processors** (P), which are permissions to run Go code. There are `GOMAXPROCS` processors, by default one per available CPU core; since Go 1.25 the default also respects a container's CPU limit, which matters on Kubernetes. Each processor has a queue of runnable goroutines and a thread to run them on. When a processor's queue empties, it **steals** half the work from another processor's queue, which keeps all cores busy without a central bottleneck.
+
+When a goroutine blocks on a channel, a lock or a timer, the scheduler simply parks it and runs another; no operating-system thread is wasted. When it blocks in a system call, such as a slow file read, the runtime hands the processor to another thread so other goroutines keep running. Network I/O never blocks a thread at all: the runtime uses the operating system's event notification (epoll on Linux, kqueue on macOS) and wakes the goroutine when data arrives. That is how one Go server handles tens of thousands of connections with straightforward blocking-style code, one goroutine per connection, without callbacks.
+
+Since Go 1.14 the runtime can also **preempt** a goroutine that runs a long loop without making any calls, so one busy goroutine cannot starve the others. Switching between goroutines costs on the order of a hundred nanoseconds, far less than an operating-system thread switch, which is why patterns that start a goroutine per request or per item are practical in Go.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Choosing tools, and keeping concurrent code correct">
+
+Go gives you both channels and locks; experienced Go programmers choose by the shape of the problem:
+
+| Situation | Usually best |
+| --- | --- |
+| Passing ownership of data from one goroutine to another, or a stream of work | channels |
+| Fan-out to a fixed number of workers; pipelines | channels |
+| Waiting for a group of goroutines to finish | `sync.WaitGroup` (or `errgroup.Group` when they can fail) |
+| Protecting a shared map, cache or counter | `sync.Mutex` / `sync.RWMutex`, or `sync/atomic` for a single number |
+| Doing something exactly once (lazy initialisation) | `sync.Once`, `sync.OnceValue` |
+| Timeouts, cancellation, deadlines across calls | `context.Context` with `select` |
+
+The `golang.org/x/sync/errgroup` package is worth knowing early: `g.Go(func() error {...})` starts goroutines like a WaitGroup, `g.Wait()` returns the first error any of them returned, and `errgroup.WithContext` cancels the others when one fails. It is the standard way to run a set of fallible tasks in parallel.
+
+**The race detector.** A *data race* happens when two goroutines access the same variable at the same time and at least one access is a write. Races cause wrong answers that appear rarely and vanish under a debugger. Go ships a race detector: run your tests or program with `-race` (for example `go test -race ./...`), and it reports every race that actually happens during the run. For a counter incremented by two goroutines without a lock, the report starts like this (abridged):
+
+```text
+==================
+WARNING: DATA RACE
+Read at 0x00c00011e028 by goroutine 9:
+  main.main.func1()
+...
+Previous write at 0x00c00011e028 by goroutine 8:
+  main.main.func1()
+...
+Found 1 data race(s)
+```
+
+The race detector slows a program down several times, so teams run it in CI on their test suites rather than in production. All the programs in this lesson run cleanly under it.
+
+**Avoiding leaks.** A goroutine blocked forever on a channel nobody will use again is a *goroutine leak*: it holds its memory until the program exits. Every goroutine you start should have a clear way to finish: its input channel gets closed, its context gets cancelled, or its work simply ends. Since Go 1.25 the `testing/synctest` package helps test such code with a fake clock, so tests of timeouts run instantly.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Concurrency means parallelism."** Concurrency is about structure: independent activities that *may* overlap. Parallelism is about execution: actually running at the same instant on several cores. Go programs are concurrent by design and run in parallel when the hardware allows; a concurrent program on one core still benefits whenever goroutines wait for I/O.
+
+</Misconception>
+
+<Misconception>
+
+**"Goroutines are free, so start as many as you like."** They are cheap, not free. Starting one per incoming item with no bound can exhaust memory or overwhelm a downstream service. Bound concurrency with a worker pool, a buffered channel used as a semaphore, or `errgroup`'s `SetLimit`.
+
+</Misconception>
+
+<Misconception>
+
+**"The receiver should close the channel when it's done reading."** Only the sender knows when no more values will come, and sending on a closed channel panics. Senders close; receivers stop reading. Many channels never need closing at all; closing is a signal, not a clean-up requirement.
+
+</Misconception>
+
+<Misconception>
+
+**"Channels are always better than mutexes in Go."** The proverb favours communication for coordinating goroutines, but a mutex around a small piece of shared state is simpler and faster than a goroutine that owns the state and answers requests over channels. Use whichever makes the code clearer.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

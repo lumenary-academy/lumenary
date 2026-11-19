@@ -1,0 +1,365 @@
+---
+title: Undefined behaviour, sanitizers and testing
+subtitle: What the C standard leaves undefined, how optimising compilers exploit it, and the checks, tools and tests that keep real C code correct.
+minutes: 70
+objectives:
+  - Distinguish undefined, unspecified and implementation-defined behaviour, and list the common kinds of undefined behaviour
+  - Explain, with compiler output, how optimisers use the assumption that undefined behaviour never happens
+  - Check integer arithmetic for overflow before it happens, portably and with builtins or C23's ckd_add
+  - Find undefined behaviour with UBSan and AddressSanitizer, and state preconditions with assert
+  - Write unit tests in plain C, and describe the test frameworks, fuzzers and analysers professionals use
+prerequisites: [preprocessor-and-standard-library]
+references:
+  - title: What Every C Programmer Should Know About Undefined Behavior
+    author: Chris Lattner
+    year: 2011
+    url: https://blog.llvm.org/2011/05/what-every-c-programmer-should-know.html
+    note: A three-part series from the LLVM project on why compilers exploit undefined behaviour, with examples.
+  - title: UndefinedBehaviorSanitizer (Clang documentation)
+    url: https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+    note: Every check UBSan can perform, and how to enable them.
+  - title: cppreference.com, Undefined behavior
+    url: https://en.cppreference.com/w/c/language/behavior
+    note: The definitions of undefined, unspecified and implementation-defined behaviour, with examples.
+  - title: libFuzzer
+    url: https://llvm.org/docs/LibFuzzer.html
+    note: Coverage-guided fuzzing built into Clang, often combined with the sanitizers.
+  - title: SEI CERT C Coding Standard
+    url: https://wiki.sei.cmu.edu/confluence/display/c/SEI+CERT+C+Coding+Standard
+    note: Rules and recommendations for avoiding undefined behaviour and other insecure patterns.
+---
+
+<Section id="motivation" kind="motivation" title="When the rules run out">
+
+Most languages define what every program does, even a buggy one: index past the end of a Python list and you get an `IndexError`; overflow a Java `int` and it wraps. C is different. For a list of situations, the C standard says only that the behaviour is **undefined**, and imposes no requirements at all. Reading past the end of an array, overflowing a signed integer, dereferencing a null pointer, using freed memory: in each case, the program may crash, may produce garbage, may appear to work perfectly, or may do something that looks impossible.
+
+Why would a language do this? Partly history: C had to run on machines that handled such cases differently, and defining one behaviour would have made it slow on the others. Partly performance: because compilers may assume undefined behaviour never happens, they can optimise more aggressively. That second reason has teeth. Modern compilers really do use the assumption, and they delete code that a programmer thought was a safety check. This lesson shows that happening, then shows the professional answer: write code that never relies on undefined behaviour, and use sanitizers and tests to catch the cases you missed.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Three kinds of unpredictability">
+
+<Definition term="undefined behaviour">
+
+**Undefined behaviour** is behaviour for which the C standard imposes no requirements. A program whose execution reaches undefined behaviour has no meaning in C: anything the implementation does, before or after that point, is permitted.
+
+</Definition>
+
+Two milder categories are often confused with it:
+
+| Category | Meaning | Example |
+| --- | --- | --- |
+| **Implementation-defined** | the implementation chooses and documents one behaviour | the size of `int`; whether plain `char` is signed |
+| **Unspecified** | one of several allowed behaviours, not necessarily documented | the order in which a function's arguments are evaluated |
+| **Undefined** | no requirements at all | signed overflow, out-of-bounds access, null dereference |
+
+Programs may rely on implementation-defined behaviour (and should document it); they should not depend on unspecified orders; and they must never execute undefined behaviour. The most common kinds you will meet:
+
+- signed integer overflow (`INT_MAX + 1`);
+- array access out of bounds, even just reading;
+- dereferencing a null, dangling or misaligned pointer;
+- using memory after `free`, or freeing it twice;
+- reading an uninitialised local variable;
+- shifting by a negative amount or by at least the type's width (`1 << 32` for a 32-bit `int`);
+- modifying a string literal;
+- modifying a variable twice, or reading and modifying it, without an ordering between them (`i = i++ + 1`);
+- accessing an object through a pointer of an incompatible type (the **strict aliasing** rule);
+- a data race between threads.
+
+Notice how ordinary these are. They are not exotic tricks; they are everyday mistakes.
+
+</Section>
+
+<Section id="computation" kind="computation" title="How the optimiser uses it">
+
+Here is a function a careful programmer might write to detect overflow:
+
+```c
+bool will_overflow(int x) {
+    return x + 1 < x;          /* "if adding 1 made it smaller, it overflowed" */
+}
+```
+
+On the hardware, `INT_MAX + 1` wraps to `INT_MIN`, so the test would seem to work. But signed overflow is undefined, so the compiler may assume `x + 1` never overflows, and then `x + 1 < x` is always false. GCC 11 compiled the function, at `-O2`, to:
+
+```asm
+will_overflow:
+	xor	eax, eax
+	ret
+```
+
+That is "return 0", whatever `x` is. Called with `INT_MAX`, the program printed `0` with GCC at both `-O0` and `-O2`, and with Clang 14 at `-O2`. Compiled with `-fsanitize=undefined`, it printed a diagnostic instead of silently giving an answer:
+
+```text
+ub1.c:6:14: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+```
+
+The second classic example removes a null check. The function below dereferences `p` and only then checks it:
+
+```c
+int first_or_default(const int *p) {
+    int value = *p;              /* p is dereferenced here... */
+    if (p == NULL) {             /* ...so the compiler may assume it is not NULL */
+        return -1;
+    }
+    return value;
+}
+```
+
+At `-O0` GCC kept the comparison. At `-O2` the whole function became two instructions, a load and a return: since dereferencing `NULL` is undefined, `p` "cannot" be `NULL` after the first line, so the check is dead code. In 2009 exactly this pattern in the Linux kernel's network tunnelling driver turned a harmless-looking bug into an exploitable vulnerability, and the kernel has been built with `-fno-delete-null-pointer-checks` ever since. The fix in your own code is simple: check *before* you dereference.
+
+The lesson from both examples: you cannot reason about undefined behaviour by asking "what does the machine do?". The compiler reasons about your program as if undefined behaviour cannot happen, and its conclusions can reach backwards and forwards through the code.
+
+### Checking arithmetic correctly
+
+The cure for overflow bugs is to test **before** the operation, using values that cannot overflow:
+
+```c check
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/* Portable C17: test whether a + b fits *before* computing it. */
+bool add_ok(int a, int b, int *out) {
+    if ((b > 0 && a > INT_MAX - b) || (b < 0 && a < INT_MIN - b)) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+int main(void) {
+    int pairs[][2] = {{2000000000, 100000000}, {2000000000, 200000000}, {-2000000000, -200000000}};
+    for (int i = 0; i < 3; i++) {
+        int a = pairs[i][0], b = pairs[i][1], sum;
+        if (add_ok(a, b, &sum)) printf("%d + %d = %d\n", a, b, sum);
+        else printf("%d + %d would overflow\n", a, b);
+    }
+
+    /* GCC and Clang builtins do the same job and compile to an add and a flag test.
+       (C23 standardises this as ckd_add and ckd_mul in <stdckdint.h>.) */
+    size_t count = SIZE_MAX / 4, bytes;
+    if (__builtin_mul_overflow(count, sizeof(int32_t) * 2, &bytes)) {
+        printf("allocation size for %zu pairs would overflow\n", count);
+    }
+    int64_t big;
+    if (!__builtin_add_overflow(INT32_MAX, 1, &big)) {
+        printf("in 64 bits, INT32_MAX + 1 = %lld\n", (long long)big);
+    }
+    return 0;
+}
+```
+
+```text
+2000000000 + 100000000 = 2100000000
+2000000000 + 200000000 would overflow
+-2000000000 + -200000000 would overflow
+allocation size for 4611686018427387903 pairs would overflow
+in 64 bits, INT32_MAX + 1 = 2147483648
+```
+
+`add_ok` rearranges `a + b > INT_MAX` into `a > INT_MAX - b`, which is safe to compute when `b` is positive (and the mirror image when it is negative). GCC and Clang also offer `__builtin_add_overflow`, `__builtin_sub_overflow` and `__builtin_mul_overflow`, which compute the mathematically exact result, store it truncated in the output, and return whether it fitted; they compile to an ordinary instruction plus a test of the processor's overflow flag. C23 standardises the same idea as `ckd_add`, `ckd_sub` and `ckd_mul` in `<stdckdint.h>`, supported by GCC 14 and recent Clang releases. The `mul` check is especially important for allocation sizes: `malloc(count * size)` with an overflowing product allocates a tiny block, and the code that follows writes far beyond it.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Three more you will meet">
+
+**Uninitialised variables.** A local variable without an initialiser holds whatever was in that stack slot, and reading it is undefined. GCC catches the simple cases: for a loop that accumulated into an uninitialised `int total`, `-Wall` at `-O1` reported `'total' is used uninitialized [-Wuninitialized]`. It cannot catch them all (whether a variable is set may depend on a path through several functions), which is why the habit is to initialise every variable where it is declared, and why Clang's MemorySanitizer exists.
+
+**Strict aliasing.** The compiler may assume that pointers to different types (say, `float *` and `uint32_t *`) never point at the same memory, and reorder or cache loads accordingly. Reading a `float`'s bits through a `uint32_t *` cast therefore breaks the rules. The portable way to inspect or reinterpret bytes is `memcpy`:
+
+```c
+float f = 1.0f;
+uint32_t bits;
+memcpy(&bits, &f, sizeof bits);      /* bits == 0x3F800000 */
+```
+
+That looks expensive, but optimising compilers recognise the pattern: in our GCC 11 build at `-O2`, no call to `memcpy` remained, just a register move. (Access through `char *` or `unsigned char *` is always allowed, which is how `memcpy` itself can work.)
+
+**Bad shifts.** Shifting by a negative amount, or by as many bits as the type has or more, is undefined: `1 << 32` with a 32-bit `int` is not 0. Shifting a 1 into the sign bit of a signed `int`, as in `1 << 31`, is also undefined, because the result, 2³¹, does not fit in an `int`. Do bit manipulation on unsigned types (`1u << 31`, `UINT64_C(1) << 40`) and check shift counts that come from data.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Assertions and tests">
+
+### assert
+
+`assert(condition)` from `<assert.h>` checks a condition at run time and, if it is false, prints the condition, the file, the line and the function, then aborts. Use it to state **preconditions and invariants**: facts that must be true if the program is correct. It is documentation that checks itself.
+
+```c check
+#include <assert.h>
+#include <stddef.h>
+#include <stdio.h>
+
+/* Average of a non-empty array. Precondition: values != NULL and count > 0. */
+double average(const double *values, size_t count) {
+    assert(values != NULL);
+    assert(count > 0 && "average of an empty array is undefined");
+    double total = 0;
+    for (size_t i = 0; i < count; i++) total += values[i];
+    return total / (double)count;
+}
+
+int main(void) {
+    double marks[] = {14.5, 17.0, 12.5};
+    printf("average: %.2f\n", average(marks, 3));
+#ifdef NDEBUG
+    printf("built with NDEBUG: the asserts were compiled out\n");
+#else
+    printf("asserts are active in this build\n");
+#endif
+    return 0;
+}
+```
+
+```text
+average: 14.67
+asserts are active in this build
+```
+
+When we changed the call to `average(marks, 0)`, the program stopped with:
+
+```text
+cfail: cfail.c:8: average: Assertion `count > 0 && "average of an empty array is undefined"' failed.
+```
+
+The `&& "message"` trick puts an explanation into the printed condition at no cost (a string literal is always true). Defining `NDEBUG`, as release builds often do with `-DNDEBUG`, removes all `assert` calls, so an assertion must never contain code with side effects, and must never replace error handling for things that can legitimately go wrong, such as a missing file or invalid user input. Those need real checks that stay in every build.
+
+### Unit tests in plain C
+
+A unit test calls a function with chosen inputs and compares the results with expected values. You do not need a framework to start: a macro that records failures and reports the expression and line is enough.
+
+```c check
+#include <ctype.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ---- the code under test ---- */
+
+int median3(int a, int b, int c) {
+    if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+    if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+    return c;
+}
+
+size_t count_words(const char *s) {
+    size_t words = 0;
+    int in_word = 0;
+    for (; *s != '\0'; s++) {
+        if (isspace((unsigned char)*s)) {
+            in_word = 0;
+        } else if (!in_word) {
+            in_word = 1;
+            words++;
+        }
+    }
+    return words;
+}
+
+/* ---- a tiny test framework: two macros and two counters ---- */
+
+static int tests_run = 0, tests_failed = 0;
+
+#define CHECK_EQ(actual, expected)                                          \
+    do {                                                                    \
+        long long a_ = (long long)(actual), e_ = (long long)(expected);     \
+        tests_run++;                                                        \
+        if (a_ != e_) {                                                     \
+            tests_failed++;                                                 \
+            printf("FAIL %s:%d: %s is %lld, expected %lld\n",               \
+                   __func__, __LINE__, #actual, a_, e_);                    \
+        }                                                                   \
+    } while (0)
+
+static void test_median3(void) {
+    CHECK_EQ(median3(1, 2, 3), 2);
+    CHECK_EQ(median3(3, 2, 1), 2);
+    CHECK_EQ(median3(2, 3, 1), 2);
+    CHECK_EQ(median3(5, 5, 1), 5);       /* duplicates */
+    CHECK_EQ(median3(-4, 0, -9), -4);    /* negatives */
+}
+
+static void test_count_words(void) {
+    CHECK_EQ(count_words(""), 0);                     /* empty input */
+    CHECK_EQ(count_words("   "), 0);                  /* only spaces */
+    CHECK_EQ(count_words("one"), 1);
+    CHECK_EQ(count_words("  two   words "), 2);       /* extra spaces */
+    CHECK_EQ(count_words("tabs\tand\nnewlines"), 3);  /* other whitespace */
+}
+
+int main(void) {
+    test_median3();
+    test_count_words();
+    printf("%d tests, %d failed\n", tests_run, tests_failed);
+    return tests_failed == 0 ? 0 : 1;    /* the exit status is what CI looks at */
+}
+```
+
+```text
+10 tests, 0 failed
+```
+
+The program exits with status 0 only if every check passed, which is what build systems and continuous-integration services look at. To see the harness earn its keep, we broke `count_words` so that it treated only the space character as whitespace. The output became:
+
+```text
+FAIL test_count_words:56: count_words("tabs\tand\nnewlines") is 1, expected 3
+10 tests, 1 failed
+```
+
+and the exit status became 1. Good tests look like these: each covers one behaviour, and together they include the **edge cases** (empty input, only separators, duplicates, negative numbers, other whitespace) where bugs live. The `do { … } while (0)` wrapper makes the multi-statement macro behave like a single statement, so it is safe after an `if` without braces, a standard idiom for macros of this kind.
+
+</Section>
+
+<Section id="human" kind="human" title="The professional toolbox">
+
+No single tool catches everything, so teams combine several, cheapest first:
+
+- **Warnings as errors.** `-Wall -Wextra -Werror` in continuous integration, often with more (`-Wshadow`, `-Wconversion`, `-Wformat=2`), built with both GCC and Clang.
+- **Sanitizers in every test run.** `-fsanitize=address,undefined` for most tests; `-fsanitize=thread` for multithreaded code; `-fsanitize=memory` (Clang) for reads of uninitialised memory. A test suite that passes under sanitizers has been checked for whole classes of undefined behaviour along every path it exercises.
+- **A test framework.** Our two macros grow up into libraries such as Unity (popular in embedded work), CMocka (with mocking for C), Criterion and Check. CMake's CTest (next lesson) runs test programs and collects the results.
+- **Fuzzing.** A fuzzer such as libFuzzer or AFL++ generates millions of inputs, guided by which code they reach, and reports any input that crashes or trips a sanitizer. Google's OSS-Fuzz project runs fuzzers continuously for many hundreds of open-source projects, a large share of them written in C and C++. Anything that parses untrusted input deserves a fuzzer.
+- **Static analysis.** GCC's `-fanalyzer`, the Clang static analyser, clang-tidy, cppcheck and commercial tools look for bugs along paths that tests never run.
+- **Coding standards.** Guidelines such as SEI CERT C and MISRA C (required in much automotive and safety-critical work) forbid the constructs most likely to cause undefined behaviour.
+
+And beneath all the tools, one habit: when a C program behaves impossibly, suspect undefined behaviour first, and reach for a sanitizer before a debugger.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"Undefined behaviour means the program might crash."** It might, but crashing is the *best* case. More often the program keeps running with corrupted data, or the compiler removes code you relied on. "Seems to work" proves nothing.
+
+</Misconception>
+
+<Misconception>
+
+**"I know what my machine does, so it is fine."** The compiler does not translate C operation by operation into what the machine would do; it transforms your program under the assumption that undefined behaviour never happens. A newer compiler version or a different optimisation level can change the result of the same source.
+
+</Misconception>
+
+<Misconception>
+
+**"`-O0` is safe."** Turning optimisation off makes some undefined behaviour more predictable, but not defined: our overflow check was folded away even at `-O0`. The only safe program is one without undefined behaviour.
+
+</Misconception>
+
+<Misconception>
+
+**"Unsigned overflow is undefined too."** It is not: unsigned arithmetic wraps by definition. But mixing signed and unsigned values, or converting an out-of-range value to a signed type, brings back surprises, so checks are still wise.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs, compiler listings and sanitizer messages below come from running the code with GCC 11 (and Clang 14 where stated).
+
+<Exercises/>
+
+</Section>

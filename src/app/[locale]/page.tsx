@@ -8,8 +8,12 @@ import { href } from "@/lib/href";
 /** Lumenary Prep is its own site. */
 const PREP_URL = "https://prep.lumenary.academy";
 
-/** Lumenary Scientia's subjects: mathematics is open, the rest are pending. */
-const PENDING_SCIENCES = ["computerScience", "electricalEngineering", "physics", "chemistry", "biology", "otherSciences"];
+/** Lumenary Scientia's subjects: mathematics and computer science are open, the rest are pending. */
+const OPEN_SCIENCES = [
+  { key: "mathematics", path: "math" },
+  { key: "computerScience", path: "cs" },
+];
+const PENDING_SCIENCES = ["electricalEngineering", "physics", "chemistry", "biology", "otherSciences"];
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
   return { description: (await getT(await resolveLocale(params)))("divisions.lead") };
@@ -74,11 +78,13 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 <div>
                   <p className="text-xs font-semibold text-muted">{t("divisions.available")}</p>
                   <ul className="mt-1.5 flex flex-wrap gap-1.5">
-                    <li>
-                      <Link href={href(locale, "math")} className="chip border-gold/50 bg-gold-soft text-gold-ink hover:border-gold">
-                        {t("divisions.mathematics")}
-                      </Link>
-                    </li>
+                    {OPEN_SCIENCES.map((s) => (
+                      <li key={s.key}>
+                        <Link href={href(locale, s.path)} className="chip border-gold/50 bg-gold-soft text-gold-ink hover:border-gold">
+                          {t(`divisions.${s.key}`)}
+                        </Link>
+                      </li>
+                    ))}
                   </ul>
                 </div>
                 <div>
@@ -100,10 +106,10 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               accent="bg-sky"
               name="Lumenary Lingua"
               what={t("divisions.linguaWhat")}
-              badge={t("divisions.pending")}
+              badge={t("divisions.available")}
               text={t("divisions.linguaText")}
               action={
-                <Link href={href(locale, "divisions")} className="btn btn-ghost">
+                <Link href={href(locale, "lingua")} className="btn btn-primary">
                   {t("divisions.linguaCta")} {arrow}
                 </Link>
               }

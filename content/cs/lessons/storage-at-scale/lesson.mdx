@@ -1,0 +1,482 @@
+---
+title: Storage at scale
+subtitle: How data is laid out on disk, split across machines, copied for safety, and moved when the cluster changes.
+minutes: 80
+objectives:
+  - Compare B-trees and LSM-trees by their write, read and space amplification
+  - Explain how a write-ahead log makes a storage engine crash-safe
+  - Partition data by key range or by hash, and recognise hot spots
+  - Implement consistent hashing with virtual nodes and measure how few keys move when servers join
+  - Choose between local and global secondary indexes, and combine partitioning with replication
+  - Say when object storage is the right home for data, and how to choose a database for a workload
+prerequisites: [databases, hash-tables, replication-and-consensus]
+related: [math.prob.probability-theory]
+references:
+  - title: "The Log-Structured Merge-Tree (LSM-Tree)"
+    author: Patrick O'Neil, Edward Cheng, Dieter Gawlick and Elizabeth O'Neil
+    year: 1996
+    url: https://doi.org/10.1007/s002360050048
+  - title: "Bigtable: A Distributed Storage System for Structured Data"
+    author: Chang et al.
+    year: 2006
+    url: https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/
+    note: Memtables, SSTables, tablets split by key range, and a master elected through Chubby.
+  - title: The Google File System
+    author: Ghemawat, Gobioff and Leung
+    year: 2003
+    url: https://research.google/pubs/the-google-file-system/
+  - title: "Dynamo: Amazon's Highly Available Key-value Store"
+    author: DeCandia et al.
+    year: 2007
+    url: https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+    note: Consistent hashing with virtual nodes and preference lists, in production.
+  - title: "Consistent Hashing and Random Trees"
+    author: David Karger et al.
+    year: 1997
+    url: https://doi.org/10.1145/258533.258660
+  - title: A Fast, Minimal Memory, Consistent Hash Algorithm
+    author: John Lamping and Eric Veach
+    year: 2014
+    url: https://arxiv.org/abs/1406.2294
+    note: Jump consistent hash, from Google.
+  - title: RocksDB wiki — Compaction
+    url: https://github.com/facebook/rocksdb/wiki/Compaction
+    note: Leveled and tiered compaction and their amplification trade-offs, from the engine's maintainers.
+  - title: "PostgreSQL: Write-Ahead Logging"
+    url: https://www.postgresql.org/docs/current/wal-intro.html
+  - title: "f4: Facebook's Warm BLOB Storage System"
+    year: 2014
+    url: https://www.usenix.org/conference/osdi14/technical-sessions/presentation/muralidhar
+    note: Moving rarely read photos from replication to erasure coding.
+  - title: "Using Global Secondary Indexes in DynamoDB"
+    url: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html
+  - title: Designing Data-Intensive Applications
+    author: Martin Kleppmann
+    url: https://dataintensive.net/
+    note: The standard book-length treatment of storage engines, replication and partitioning.
+---
+
+<Section id="motivation" kind="motivation" title="When one disk is not enough">
+
+A photo-sharing app launched in São Paulo begins on one PostgreSQL server, and for a long time that is exactly right — <LessonLink slug="databases">Databases</LessonLink> argued that most products never need more. Then it succeeds. The table of photos passes two billion rows, uploads arrive at 20,000 per second at the evening peak, and users in Jakarta and Johannesburg want answers in tens of milliseconds. Now three questions that one machine never had to ask become urgent:
+
+1. **How should each machine lay data out on its own disk** so that a flood of writes does not drown it?
+2. **How should the data be split across machines**, so that each holds a fair share and finds any key quickly?
+3. **How do the pieces stay safe and movable** as machines fail and new ones are added?
+
+This lesson answers them in that order, then steps back to object storage and to the senior-engineer question of which database to choose. It builds on the replication of <LessonLink slug="replication-and-consensus">Replication and consensus</LessonLink>: here we add partitioning, and see how the two combine.
+
+</Section>
+
+<Section id="engines" kind="intuition" title="Two ways to organise a disk: B-trees and LSM-trees">
+
+<LessonLink slug="databases">Databases</LessonLink> introduced the **B-tree**: fixed-size pages (often 4–16 KiB) arranged in a shallow, wide tree, updated **in place**. To change one row, the engine reads the page that holds it, modifies it in memory, and eventually writes the whole page back. Reads are excellent — three or four page reads find any key among billions, and the upper levels sit in memory.
+
+The **log-structured merge-tree** (LSM-tree), described by O'Neil and colleagues in 1996 and made famous by Google's Bigtable, takes the opposite stance: *never update in place; only append and merge*.
+
+1. A write goes to a log on disk (for crash safety) and into a sorted in-memory table, the **memtable**.
+2. When the memtable fills, it is written out in one sequential sweep as an immutable sorted file — Bigtable's name, an **SSTable** (sorted string table), stuck.
+3. A read checks the memtable, then the SSTables from newest to oldest, stopping at the first hit. Each SSTable has a small index of its key ranges and a **Bloom filter** — a compact bit array that answers "definitely not here" or "possibly here" — so most files that lack the key are skipped without touching the disk.
+4. In the background, **compaction** merges SSTables into larger ones, keeping only the newest version of each key and eventually discarding deletions, which are written as markers called **tombstones**.
+
+Two compaction styles dominate. **Size-tiered** compaction waits until several files of similar size exist and merges them into one bigger file. **Leveled** compaction keeps levels that grow by a fixed factor (often 10) and arranges that within each level below the first, files cover disjoint key ranges, so a read checks at most one file per level. LevelDB and RocksDB, Cassandra, ScyllaDB, HBase and Bigtable are LSM-based; PostgreSQL, MySQL's InnoDB, SQLite and most relational engines use B-trees.
+
+<Figure caption="An LSM-tree. Writes go to the log and the memtable; full memtables become sorted files; compaction merges files into larger ones further down.">
+
+<svg viewBox="0 0 520 210" role="img" aria-label="Boxes in a column: a write enters a memtable in memory and a log on disk. Below the memory line, level 0 holds three small sorted files, level 1 holds four medium files, and level 2 holds one wide file. Arrows labelled flush and compact point downwards.">
+  <text x="10" y="22" fontSize="13" fill="currentColor">write</text>
+  <line x1="50" y1="18" x2="95" y2="18" stroke="currentColor" strokeWidth="1.5" />
+  <rect x="100" y="5" width="120" height="28" rx="4" fill="none" stroke="var(--gold)" strokeWidth="2" />
+  <text x="160" y="24" fontSize="13" textAnchor="middle" fill="currentColor">memtable</text>
+  <rect x="300" y="5" width="150" height="28" rx="4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3" />
+  <text x="375" y="24" fontSize="13" textAnchor="middle" fill="currentColor">write-ahead log</text>
+  <line x1="220" y1="19" x2="298" y2="19" stroke="currentColor" strokeWidth="1" />
+  <line x1="0" y1="48" x2="520" y2="48" stroke="currentColor" strokeWidth="1" strokeDasharray="2 4" />
+  <text x="470" y="44" fontSize="11" fill="currentColor">memory</text>
+  <text x="470" y="62" fontSize="11" fill="currentColor">disk</text>
+  <text x="232" y="70" fontSize="12" fill="currentColor">flush</text>
+  <line x1="160" y1="33" x2="160" y2="78" stroke="currentColor" strokeWidth="1.5" />
+  <text x="10" y="98" fontSize="13" fill="currentColor">L0</text>
+  <rect x="60" y="82" width="60" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <rect x="130" y="82" width="60" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <rect x="200" y="82" width="60" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <text x="282" y="128" fontSize="12" fill="currentColor">compact</text>
+  <line x1="160" y1="106" x2="160" y2="128" stroke="currentColor" strokeWidth="1.5" />
+  <text x="10" y="148" fontSize="13" fill="currentColor">L1</text>
+  <rect x="60" y="132" width="90" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <rect x="155" y="132" width="90" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <rect x="250" y="132" width="90" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <rect x="345" y="132" width="90" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+  <line x1="160" y1="156" x2="160" y2="176" stroke="currentColor" strokeWidth="1.5" />
+  <text x="10" y="196" fontSize="13" fill="currentColor">L2</text>
+  <rect x="60" y="180" width="440" height="24" rx="3" fill="none" stroke="var(--sky)" strokeWidth="2" />
+</svg>
+
+</Figure>
+
+</Section>
+
+<Section id="amplification" kind="computation" title="Amplification: the three costs of a storage engine">
+
+No engine is best at everything; each pays somewhere. Three ratios make the payments visible.
+
+<Definition term="Write, read and space amplification">
+
+- **Write amplification**: bytes the engine writes to storage, divided by bytes the application asked to write.
+- **Read amplification**: storage reads (or files consulted) per logical read.
+- **Space amplification**: bytes occupied on storage, divided by the bytes of live data.
+
+</Definition>
+
+A B-tree that changes a 100-byte row writes back a whole 8 KiB page, plus a log record: its write amplification for small random updates can be large, softened by batching many changes to the same page before writing. An LSM-tree writes each byte once to the log and once on flush, then again every time compaction rewrites it — in leveled compaction, roughly once per level times the size ratio in the worst case, though real figures depend heavily on workload. In exchange, its writes are **sequential**, which suits both spinning disks and the internal structure of SSDs, and it never rewrites a page to change a few bytes. Its reads may consult several files, and its space includes stale versions not yet compacted away.
+
+| | B-tree | LSM, leveled | LSM, size-tiered |
+| --- | --- | --- | --- |
+| Write amplification | moderate to high for random small updates | moderate | lowest |
+| Read amplification | lowest: one path down the tree | low: about one file per level | highest: many overlapping files |
+| Space amplification | some free space inside pages | low | can briefly double during big merges |
+| Typical fit | read-heavy, transactional, range queries | balanced, read-sensitive key–value | write-heavy ingest, time series |
+
+These are tendencies, not laws; a well-tuned engine of either kind can beat a badly tuned one of the other. The **RUM conjecture** (Athanassoulis and colleagues, 2016) puts it sharply: an access method can minimise at most two of read, update and memory (space) overhead at once. The block below builds a small size-tiered LSM-tree, checks it against a plain dictionary, and measures all three amplifications on a workload of updates and deletes.
+
+```python run
+import random
+
+TOMBSTONE = None                       # a delete is a write of this marker
+
+def size(run):
+    return sum(len(k) + len(v or "") for k, v in run)
+
+class TinyLSM:
+    """An LSM-tree with size-tiered compaction. tiers[i] holds sorted runs, newest first."""
+
+    def __init__(self, memtable_limit=100, fanout=4):
+        self.mem, self.tiers = {}, []
+        self.limit, self.fanout = memtable_limit, fanout
+        self.user_bytes = self.disk_bytes = 0
+
+    def put(self, key, value):
+        n = len(key) + len(value or "")
+        self.user_bytes += n
+        self.disk_bytes += n           # the write-ahead log
+        self.mem[key] = value
+        if len(self.mem) >= self.limit:
+            self.flush()
+
+    def delete(self, key):
+        self.put(key, TOMBSTONE)
+
+    def flush(self):
+        run = sorted(self.mem.items())
+        self.mem = {}
+        self.add_run(0, run)
+
+    def add_run(self, tier, run):
+        self.disk_bytes += size(run)   # writing a sorted run to disk
+        while len(self.tiers) <= tier:
+            self.tiers.append([])
+        self.tiers[tier].insert(0, run)
+        if len(self.tiers[tier]) == self.fanout:
+            runs, self.tiers[tier] = self.tiers[tier], []
+            merged = {}
+            for r in reversed(runs):   # oldest first, so newer values overwrite older ones
+                merged.update(r)
+            last = all(not t for t in self.tiers[tier + 1:])
+            if last:                   # nothing older exists: tombstones can finally go
+                merged = {k: v for k, v in merged.items() if v is not TOMBSTONE}
+            self.add_run(tier + 1, sorted(merged.items()))
+
+    def get(self, key):
+        """Returns (value, number of sorted runs searched)."""
+        if key in self.mem:
+            return self.mem[key], 0
+        searched = 0
+        for tier in self.tiers:
+            for run in tier:           # newest first
+                searched += 1
+                for k, v in run:       # (a real store binary-searches a block index)
+                    if k == key:
+                        return v, searched
+        return TOMBSTONE, searched
+
+    def disk_size(self):
+        return sum(size(r) for t in self.tiers for r in t)
+
+rng = random.Random(1)
+db = TinyLSM()
+truth = {}
+keys = [f"user:{i:05d}" for i in range(3000)]
+for step in range(30000):
+    k = rng.choice(keys)
+    if rng.random() < 0.05:
+        db.delete(k); truth.pop(k, None)
+    else:
+        v = "".join(rng.choice("abcdefgh") for _ in range(20))
+        db.put(k, v); truth[k] = v
+
+assert all(db.get(k)[0] == truth.get(k) for k in keys)   # the LSM agrees with a plain dict
+live = sum(len(k) + len(v) for k, v in truth.items())
+print("runs per tier (tier 0 = newest):", [len(t) for t in db.tiers])
+print(f"write amplification: {db.disk_bytes / db.user_bytes:.1f}  (bytes written to disk per byte the user wrote)")
+print(f"space amplification: {(db.disk_size() + size(db.mem.items())) / live:.2f}  (bytes stored per live byte)")
+probes = [db.get(k)[1] for k in keys]
+print(f"read amplification:  {sum(probes) / len(probes):.1f} runs searched per lookup on average, worst {max(probes)}")
+```
+
+Change `fanout` or `memtable_limit` and rerun. A larger fanout merges less often (lower write amplification) but leaves more files to search (higher read amplification): the trade-off in miniature. Real engines add the Bloom filters and block indexes that this toy leaves out, which is why their read amplification in *disk reads* is far lower than "files consulted" here.
+
+</Section>
+
+<Section id="wal" kind="computation" title="The write-ahead log">
+
+Both engine families rely on the same discipline for crash safety.
+
+<Definition term="Write-ahead log (WAL)">
+
+Before changing any data structure, append a record describing the change to a sequential log on durable storage, and force it there (with `fsync` or equivalent). After a crash, replay the log to redo every change that may not have reached the main structures.
+
+</Definition>
+
+The log is append-only, so writing it is fast and a crash can damage only its tail. Each record carries a length and a checksum, so recovery can recognise a **torn write** — a record only partly on disk — and stop there. Because replay may repeat work, records must be safe to apply twice (or carry sequence numbers so repeats are skipped). Periodic **checkpoints** flush the main structures and let old log segments be deleted. And because `fsync` is slow, databases use **group commit**: one flush covers the log records of many concurrent transactions.
+
+```python run
+import json
+import zlib
+
+class TinyKV:
+    """A key-value store whose only durable state is an append-only log (a list of bytes here)."""
+
+    def __init__(self, disk):
+        self.disk = disk            # survives "crashes": imagine a file that is fsync'd
+        self.table = {}             # lost on a crash: lives in memory
+        self.recover()
+
+    def put(self, key, value):
+        body = json.dumps([key, value]).encode()
+        record = len(body).to_bytes(4, "big") + zlib.crc32(body).to_bytes(4, "big") + body
+        self.disk.extend(record)    # 1. append the intent to the log (and fsync)
+        self.table[key] = value     # 2. only then change the in-memory structure
+
+    def recover(self):
+        pos, good = 0, 0
+        while pos + 8 <= len(self.disk):
+            size = int.from_bytes(self.disk[pos:pos + 4], "big")
+            crc = int.from_bytes(self.disk[pos + 4:pos + 8], "big")
+            body = bytes(self.disk[pos + 8:pos + 8 + size])
+            if len(body) < size or zlib.crc32(body) != crc:
+                break               # a torn final write: stop here
+            key, value = json.loads(body)
+            self.table[key] = value
+            pos += 8 + size
+            good += 1
+        del self.disk[pos:]         # cut off the partial record so new appends start clean
+        print(f"recovered {good} records; table = {self.table}")
+
+disk = bytearray()
+kv = TinyKV(disk)
+kv.put("Lagos", 3)
+kv.put("Lima", 7)
+kv.put("Lagos", 4)
+
+# Crash in the middle of writing a fourth record: only part of it reaches the disk.
+body = json.dumps(["Oslo", 1]).encode()
+torn = len(body).to_bytes(4, "big") + zlib.crc32(body).to_bytes(4, "big") + body
+disk.extend(torn[:11])
+print("crash! the disk holds", len(disk), "bytes")
+
+kv = TinyKV(disk)          # restart: memory is gone, the log is replayed
+kv.put("Oslo", 1)          # the client retries; the log is whole again
+kv = TinyKV(disk)
+```
+
+The WAL is also the natural thing to replicate. PostgreSQL's streaming replication ships WAL records to followers; a Raft log is a WAL agreed by consensus; and, as <LessonLink slug="data-processing">Batch and stream processing</LessonLink> will show, Kafka turns the same idea into the backbone of whole data platforms.
+
+</Section>
+
+<Section id="partitioning" kind="definitions" title="Partitioning by key range and by hash">
+
+When data or traffic outgrows one machine, we split it into **partitions** (also called shards, tablets, regions, vnodes or ranges, depending on the system), each owned by one machine at a time — before replication, which we add later. A good scheme spreads data and load evenly and lets any client find the partition for a key quickly. There are two basic ways.
+
+**By key range.** Sort the keys and cut the sorted order into contiguous ranges: `a`–`f` on one server, `g`–`m` on the next. Range scans stay efficient, because neighbouring keys live together. Bigtable, HBase, Spanner and CockroachDB work this way, splitting a range automatically when it grows too large (Bigtable's tablets are around 100–200 MB by default). The danger is **hot spots**: if the key is a timestamp, every new write lands in the last range, and one server takes the whole write load while the others idle. A standard remedy is to prefix the key with something that spreads writes, such as the sensor id, so the key becomes `(sensor, time)`.
+
+**By hash of key.** Apply a hash function to the key and assign partitions by hash value. A good hash scatters even sequential keys uniformly, so load spreads evenly. The cost is that range scans over the original keys now touch every partition. Many systems compromise with a **compound key**: Cassandra hashes the first part (the partition key) to choose a node and keeps rows sorted by the remaining columns within it, so "all readings for sensor 42, between 9:00 and 10:00" is one efficient query on one node.
+
+Neither scheme cures a single overwhelmingly popular key — a celebrity's profile, a viral post. If one key receives a large share of all requests, its partition is hot whatever the hashing. Applications handle that explicitly: caching that key, or splitting it into sub-keys (`post123#0` … `post123#9`) that are written at random and read together.
+
+The obvious way to map a hash to $N$ servers is `hash(key) % N`. It balances well, until $N$ changes. Going from 10 servers to 11, a key stays put only if its hash leaves the same remainder modulo 10 and modulo 11, which is true for about one key in eleven — so about 91% of all data moves. That is the problem consistent hashing solves.
+
+</Section>
+
+<Section id="consistent-hashing" kind="computation" title="Consistent hashing with virtual nodes">
+
+<Definition term="Consistent hashing">
+
+Map both servers and keys onto the same circle of hash values (say $0$ to $2^{64} - 1$, wrapping around). Each key belongs to the first server found by moving clockwise from the key's position.
+
+</Definition>
+
+When a server joins, it takes over only the arc between its position and its predecessor's: the keys that move are exactly the ones the new server now owns, about $1/(N+1)$ of them, all coming from its clockwise neighbour. When a server leaves, only its own keys move, to its successor. Karger and colleagues introduced the idea in 1997 for web caching; Amazon's Dynamo made it a staple of distributed databases.
+
+With one position per server, though, the arcs are very uneven — random points on a circle leave some gaps several times larger than others — and a departing server dumps its entire load on one neighbour. The fix is **virtual nodes**: give each physical server many positions (`node-A#0`, `node-A#1`, …). Each server then owns many small arcs scattered round the circle, its total share concentrates near the average, and when it leaves, its arcs fall to many different neighbours. Virtual nodes also handle unequal machines: a server with twice the disk gets twice the virtual nodes.
+
+```python run
+import bisect
+import hashlib
+
+def h(text):
+    """A stable 64-bit hash (Python's built-in hash() changes between runs for strings)."""
+    return int.from_bytes(hashlib.md5(text.encode()).digest()[:8], "big")
+
+class Ring:
+    def __init__(self, nodes, vnodes):
+        self.vnodes = vnodes
+        self.points = []                      # sorted list of (position, node)
+        for node in nodes:
+            self.add(node)
+
+    def add(self, node):
+        for i in range(self.vnodes):
+            bisect.insort(self.points, (h(f"{node}#{i}"), node))
+
+    def remove(self, node):
+        self.points = [p for p in self.points if p[1] != node]
+
+    def owner(self, key):
+        i = bisect.bisect_right(self.points, (h(key), ""))
+        return self.points[i % len(self.points)][1]   # first point clockwise, wrapping around
+
+keys = [f"order-{i}" for i in range(60000)]
+nodes = [f"node-{c}" for c in "ABCDEFGHIJ"]           # ten servers
+
+def loads(assign):
+    counts = {}
+    for k in keys:
+        owner = assign(k)
+        counts[owner] = counts.get(owner, 0) + 1
+    return counts
+
+print("How even is the load? (ideal: every node holds 10% of the keys)")
+for v in (1, 10, 100, 500):
+    ring = Ring(nodes, v)
+    c = loads(ring.owner)
+    print(f"  {v:3d} virtual nodes each: busiest {max(c.values()) / len(keys):5.1%}, quietest {min(c.values()) / len(keys):5.1%}")
+
+print()
+print("Add an eleventh server. What fraction of keys must move?")
+before_mod = {k: nodes[h(k) % 10] for k in keys}
+after_mod = {k: (nodes + ["node-K"])[h(k) % 11] for k in keys}
+moved = sum(before_mod[k] != after_mod[k] for k in keys) / len(keys)
+print(f"  hash mod N:                {moved:5.1%}")
+
+ring = Ring(nodes, 100)
+before = {k: ring.owner(k) for k in keys}
+ring.add("node-K")
+after = {k: ring.owner(k) for k in keys}
+moved_keys = [k for k in keys if before[k] != after[k]]
+print(f"  consistent hashing:        {len(moved_keys) / len(keys):5.1%}  (ideal 1/11 = {1 / 11:.1%})")
+print("  every moved key went to the new server:", all(after[k] == "node-K" for k in moved_keys))
+```
+
+Two details matter in real systems. First, the hash must be **stable across processes and runs**: Python's `hash()` of a string is randomised per process, which is why the code uses MD5 (here purely for spreading, not security). Second, **replication** fits naturally: Dynamo stores each key on the first $N$ *distinct physical* servers clockwise from it, its **preference list**, skipping further virtual nodes of servers already chosen.
+
+Alternatives exist with different trade-offs. **Rendezvous hashing** scores every server against the key and picks the highest score. **Jump consistent hash** (Lamping and Veach, Google) needs no ring at all and is very fast, but only supports adding and removing servers at the end of a numbered list. Many systems sidestep the problem with a fixed number of partitions, as we see next.
+
+</Section>
+
+<Section id="rebalancing" kind="human" title="Rebalancing and request routing">
+
+Clusters change: machines fail, capacity is added, load shifts. **Rebalancing** moves partitions so that load stays even, ideally while the database keeps serving and while moving as little data as possible. Three strategies are common.
+
+- **Many fixed partitions.** Create far more partitions than nodes — say 1,000 partitions on 10 nodes — and move whole partitions when nodes join or leave. Keys never change partition; only partition-to-node assignments change. Elasticsearch's shards and Couchbase's vBuckets work this way. The drawback is choosing the number up front: too few and partitions grow huge; too many and per-partition overhead dominates.
+- **Dynamic splitting.** Split a key range when it grows past a size threshold (or gets too hot) and merge small neighbours; move ranges between nodes as needed. Bigtable, HBase, Spanner and CockroachDB do this, and it adapts naturally to data whose size is unknown in advance.
+- **Partitions proportional to nodes.** Each node owns a fixed number of virtual-node positions on a ring, as in Cassandra; adding a node steals a few arcs from many others.
+
+Moving data is expensive and risky — it competes with live traffic for disk and network — so production systems throttle it, and many require an operator (or a cautious automated controller) to approve large moves. Fully automatic rebalancing combined with automatic failure detection can turn one overloaded node into a cascade: it looks dead, its partitions move, the moves overload others.
+
+Clients also need to find the right node. Either any node accepts a request and forwards it (Cassandra's nodes learn the ring by **gossip**); or a **routing tier** knows the partition map and forwards requests; or the **client library** caches the map and contacts the owner directly. In each case the authoritative map — which partitions exist and who owns them — is precisely the small, critical metadata that lives in a consensus system such as etcd, ZooKeeper or Chubby.
+
+</Section>
+
+<Section id="secondary-indexes" kind="intuition" title="Secondary indexes">
+
+Partitioning by the primary key makes "get order 9154" fast. But the application also asks "all orders for customer Aiyana" and "all orders containing product 77". A secondary index maps those other attributes to primary keys, and it has to be partitioned too. There are two choices.
+
+- **Local (document-partitioned) indexes.** Each partition indexes only its own rows. Writes are cheap — the row and its index entry live on the same node and change together. Reads by the secondary attribute must ask **every** partition and merge the answers (**scatter/gather**), so their latency is set by the slowest partition. MongoDB, Cassandra and Elasticsearch use local indexes.
+- **Global (term-partitioned) indexes.** The index is itself partitioned by the indexed value: all entries for customer Aiyana live on one index partition, wherever her orders are. Reads by customer go to one place. But a single write may now touch several partitions — the row's and each index entry's — so either the write becomes a distributed transaction or the index is updated asynchronously and is briefly stale. DynamoDB's global secondary indexes, for example, are updated asynchronously and are eventually consistent.
+
+The choice follows the workload: frequent reads by the secondary attribute favour a global index; write-heavy data rarely queried that way favours a local one.
+
+</Section>
+
+<Section id="replication-plus-partitioning" kind="human" title="Replication plus partitioning">
+
+Real systems do both: data is partitioned, and each partition is replicated. A node therefore holds several partitions, playing a different role for each — leader for some, follower for others. With a Raft or Paxos group per partition (CockroachDB, TiKV, Spanner, DynamoDB), a three-node cluster might look like this:
+
+| | Node 1 | Node 2 | Node 3 |
+| --- | --- | --- | --- |
+| Partition A | **leader** | follower | follower |
+| Partition B | follower | **leader** | follower |
+| Partition C | follower | follower | **leader** |
+
+Spreading leaderships spreads write load. When node 1 dies, partition A elects a new leader from nodes 2 and 3 within a few seconds, and partitions B and C continue untouched. In a Dynamo-style leaderless store, the same idea appears as the preference list: each key's $N$ replicas are consecutive distinct servers on the ring. Either way, replicas of the same partition should sit in different **failure domains** — racks, zones, regions — so a single power or network failure cannot take out a majority.
+
+</Section>
+
+<Section id="object-storage" kind="human" title="Object storage">
+
+Photos, videos, backups, machine-learning datasets and analytics files are not rows. They are **objects**: blobs from a few bytes to many terabytes, written whole, read whole or in byte ranges, and rarely modified. **Object stores** such as Amazon S3, Google Cloud Storage and Azure Blob Storage keep them in a flat namespace of buckets and keys (`photos/2026/11/19/IMG_0042.jpg`), where the slashes are a naming convention rather than real directories.
+
+Inside, an object store separates a **metadata service** (a large partitioned, replicated key–value store mapping names to locations) from **data servers** holding the bytes. Durability comes from replication or, increasingly, from **erasure coding**: split an object into $k$ data fragments, compute $m$ parity fragments, and store all $k + m$ on different machines; any $k$ of them reconstruct the object. A $(10, 4)$ Reed–Solomon code stores 1.4 bytes per byte and survives the loss of any four fragments, where three-way replication stores 3 bytes per byte and survives two. The price is CPU and extra network reads when reconstructing. Meta's f4 paper describes moving rarely read photos from replication to erasure coding for exactly this saving.
+
+Object stores are very cheap per byte, enormously scalable and very durable, with throughput that grows with parallelism, but per-request latency is tens of milliseconds and objects cannot be updated in small pieces. S3 has provided strong read-after-write consistency since December 2020. The pattern at scale is: **metadata in a database, bytes in object storage, hot objects behind a CDN.** Analytics "data lakes" store columnar files (Parquet, for instance) in object storage and query them with engines like Spark or BigQuery.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Choosing a database">
+
+There is no best database, only a best fit for a workload, a team and a budget. <LessonLink slug="databases">Databases</LessonLink> listed the families; at scale, the senior engineer's questions are:
+
+1. **What are the access patterns?** Point lookups by key, range scans, ad-hoc analytical queries, full-text search, graph traversals? Write them down before choosing anything.
+2. **How big, how fast, how spiky?** Data volume in a year, peak reads and writes per second, read/write ratio. If it fits on one large machine with replicas — and that is a lot of data today — a relational database is usually the simplest correct answer.
+3. **What consistency do you need?** Money, inventory and uniqueness constraints want linearizable, transactional storage; counters, feeds and caches often tolerate eventual consistency.
+4. **What latency, and where?** Users on several continents push towards multi-region replication, and towards accepting either cross-region write latency or weaker consistency.
+5. **Who will run it?** A managed service (Cloud Spanner, DynamoDB, Bigtable, Aurora, Cosmos DB) trades money and some flexibility for not being paged at 3 a.m. Operational familiarity is a legitimate reason to choose.
+6. **What will change?** Schemas evolve, and new queries appear. Stores that require access patterns fixed in advance make later questions expensive.
+
+A rough map, with the honest caveat that the boundaries blur every year: **PostgreSQL or MySQL** for most transactional applications; **distributed SQL** (Spanner, CockroachDB, YugabyteDB) when you need relational transactions beyond one machine; **wide-column LSM stores** (Bigtable, Cassandra, HBase) for enormous write-heavy datasets with key-based access; **managed key–value stores** (DynamoDB) for predictable key-based access at any scale; **object storage** for blobs and data lakes; a **search engine** for text; and a **cache** in front of whichever you choose. Most large systems use several, connected by change streams — which is where the next lesson begins.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"LSM-trees are faster than B-trees."** They are usually better at sustained random writes, at the cost of reads and of background compaction that competes with foreground traffic. For read-heavy transactional workloads B-trees often win. Measure with your workload.
+
+</Misconception>
+
+<Misconception>
+
+**"Consistent hashing balances load."** It balances *keys*, roughly, and only with many virtual nodes. It does nothing for a single hot key or for keys of very different sizes, and it does not move load away from a slow machine.
+
+</Misconception>
+
+<Misconception>
+
+**"Hash partitioning is always better because it is even."** It destroys range scans. Time-series, logs and anything queried by key range usually want range partitioning with a key design that avoids hot spots.
+
+</Misconception>
+
+<Misconception>
+
+**"Sharding is how you scale a database."** It is one way, and the most expensive to undo. Indexes, caching, read replicas, archiving old data and a bigger machine come first; shard when the numbers say you must.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

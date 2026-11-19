@@ -1,0 +1,535 @@
+---
+title: Training in practice
+subtitle: Optimisers, schedules, regularisation, normalisation, evaluation and debugging — the craft that turns a network that could learn into one that does.
+minutes: 90
+objectives:
+  - Explain mini-batch stochastic gradient descent and implement momentum, Adam and AdamW
+  - Design a learning-rate schedule with warmup and cosine decay
+  - Apply weight decay, dropout, early stopping and data augmentation, and recognise when they help
+  - Explain what batch and layer normalisation do and where each is used
+  - Evaluate classifiers with precision, recall and ROC curves rather than accuracy alone
+  - Debug training systematically, starting by overfitting one batch, and make experiments reproducible
+prerequisites: [neural-networks, learning-from-data]
+related: [math.applied.optimisation, math.prob.statistics, math.comp.computational-reproducibility]
+references:
+  - title: "Adam: A Method for Stochastic Optimization"
+    author: Diederik Kingma and Jimmy Ba
+    year: 2014
+    url: https://arxiv.org/abs/1412.6980
+  - title: Decoupled Weight Decay Regularization
+    author: Ilya Loshchilov and Frank Hutter
+    year: 2017
+    url: https://arxiv.org/abs/1711.05101
+    note: The AdamW paper.
+  - title: "SGDR: Stochastic Gradient Descent with Warm Restarts"
+    author: Ilya Loshchilov and Frank Hutter
+    year: 2016
+    url: https://arxiv.org/abs/1608.03983
+    note: The origin of cosine learning-rate schedules.
+  - title: "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour"
+    author: Goyal et al.
+    year: 2017
+    url: https://arxiv.org/abs/1706.02677
+    note: Learning-rate warmup and scaling the learning rate with batch size.
+  - title: "Dropout: A Simple Way to Prevent Neural Networks from Overfitting"
+    author: Srivastava et al.
+    year: 2014
+    url: https://jmlr.org/papers/v15/srivastava14a.html
+  - title: "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift"
+    author: Sergey Ioffe and Christian Szegedy
+    year: 2015
+    url: https://arxiv.org/abs/1502.03167
+  - title: How Does Batch Normalization Help Optimization?
+    author: Santurkar, Tsipras, Ilyas and Madry
+    year: 2018
+    url: https://arxiv.org/abs/1805.11604
+  - title: Layer Normalization
+    author: Jimmy Ba, Jamie Kiros and Geoffrey Hinton
+    year: 2016
+    url: https://arxiv.org/abs/1607.06450
+  - title: Root Mean Square Layer Normalization
+    author: Biao Zhang and Rico Sennrich
+    year: 2019
+    url: https://arxiv.org/abs/1910.07467
+  - title: An introduction to ROC analysis
+    author: Tom Fawcett
+    year: 2006
+    url: https://doi.org/10.1016/j.patrec.2005.10.010
+  - title: A Recipe for Training Neural Networks
+    author: Andrej Karpathy
+    year: 2019
+    url: https://karpathy.github.io/2019/04/25/recipe/
+  - title: Deep Learning Tuning Playbook
+    author: Google Research
+    url: https://github.com/google-research/tuning_playbook
+    note: A practitioners' guide to tuning, from Google researchers.
+  - title: PyTorch
+    url: https://pytorch.org/
+  - title: "PyTorch: Reproducibility"
+    url: https://pytorch.org/docs/stable/notes/randomness.html
+  - title: JAX documentation
+    url: https://docs.jax.dev/
+---
+
+<Section id="motivation" kind="motivation" title="Same model, different results">
+
+Give two people the same network architecture and the same data, and one may get a model that works while the other gets a loss that plateaus, explodes or quietly overfits. The difference lies in dozens of choices the previous lessons glossed over: how big a batch, which optimiser, what learning rate and how it changes, how to keep the network from memorising, how to tell whether it is any good, and how to find out what is wrong when it is not. This lesson is about that craft.
+
+Everything is again built in numpy, so nothing is magic. At the end we look at how PyTorch and JAX package the same ideas. The lesson closes the foundations of this level; <LessonLink slug="deep-architectures">Deep architectures</LessonLink> and <LessonLink slug="attention-and-transformers">Attention and transformers</LessonLink> build on every piece of it.
+
+</Section>
+
+<Section id="sgd" kind="definitions" title="Mini-batch stochastic gradient descent">
+
+The training loss is an average over $n$ examples, $L(\theta) = \frac1n \sum_i \ell_i(\theta)$. Computing its exact gradient means a pass over the whole dataset for every single step — impossible when $n$ is a billion.
+
+<Definition term="Mini-batch stochastic gradient descent (SGD)">
+
+At each step, draw a random **mini-batch** $B$ of $b$ examples and update with the gradient of their average loss:
+
+$$\theta \leftarrow \theta - \eta\, \hat g, \qquad \hat g = \frac{1}{b} \sum_{i \in B} \nabla \ell_i(\theta).$$
+
+One pass through the data, usually in a freshly shuffled order, is an **epoch**, taking about $n / b$ steps.
+
+</Definition>
+
+Because the batch is random, $\hat g$ is an **unbiased** estimate of the full gradient: its expectation is exactly $\nabla L(\theta)$. Its variance falls in proportion to $1/b$, so a batch four times larger halves the standard deviation of the gradient noise — while costing four times as much computation. Small batches therefore buy many cheap, noisy steps; large batches fewer, accurate, expensive ones. Accelerators process a batch in parallel, so in practice the batch is made as large as hardware efficiency rewards, and the learning rate is adjusted with it: Goyal and colleagues at Facebook (2017) trained an ImageNet model with batches of 8,192 images by scaling the learning rate linearly with batch size and warming it up gently. The noise is not purely a cost, either: it jostles the parameters out of sharp, narrow minima, and seems to help generalisation.
+
+</Section>
+
+<Section id="optimisers" kind="computation" title="Momentum, Adam and AdamW">
+
+Plain gradient descent struggles in **ravines**, where the loss curves steeply in one direction and gently in another. A step size safe for the steep direction crawls along the gentle one, and a larger step oscillates across the ravine and diverges. You saw this as the condition number in <LessonLink slug="learning-from-data">Learning from data</LessonLink>.
+
+**Momentum** keeps a running, decaying sum of past gradients — a velocity — and steps along it:
+
+$$\mathbf{v} \leftarrow \beta \mathbf{v} + \hat g, \qquad \theta \leftarrow \theta - \eta \mathbf{v}, \qquad \beta \approx 0.9 .$$
+
+Gradient components that point the same way step after step accumulate; components that flip sign cancel. Like a heavy ball rolling down the valley floor, it speeds up along the ravine and damps the oscillation across it.
+
+**Adam** (Kingma and Ba, 2014) adds a per-parameter step size. It tracks an exponential average of the gradient $\mathbf{m}$ and of its elementwise square $\mathbf{s}$:
+
+$$\mathbf{m} \leftarrow \beta_1 \mathbf{m} + (1 - \beta_1)\hat g, \qquad \mathbf{s} \leftarrow \beta_2 \mathbf{s} + (1 - \beta_2)\hat g^{\,2},$$
+
+$$\hat{\mathbf{m}} = \frac{\mathbf{m}}{1 - \beta_1^t}, \qquad \hat{\mathbf{s}} = \frac{\mathbf{s}}{1 - \beta_2^t}, \qquad \theta \leftarrow \theta - \eta\, \frac{\hat{\mathbf{m}}}{\sqrt{\hat{\mathbf{s}}} + \epsilon}.$$
+
+Dividing by $\sqrt{\hat{\mathbf{s}}}$ normalises each parameter's step by the typical size of its gradient, so parameters with tiny gradients still move and parameters with huge ones do not overshoot; the step is roughly $\eta$ in size whatever the gradient's scale. The **bias correction** at step $t$ undoes the fact that $\mathbf{m}$ and $\mathbf{s}$ start at zero. The paper's defaults, $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\epsilon = 10^{-8}$, are still widely used.
+
+**Weight decay** shrinks every weight a little at each step. With plain SGD, that is the same as adding an L2 penalty $\frac{\lambda}{2}\lVert\theta\rVert^2$ to the loss. With Adam it is not: a penalty's gradient $\lambda\theta$ gets divided by $\sqrt{\hat{\mathbf{s}}}$ like everything else, so weights with large gradients are barely regularised. Loshchilov and Hutter's **AdamW** decouples the two, applying the decay directly:
+
+$$\theta \leftarrow \theta - \eta\left(\frac{\hat{\mathbf{m}}}{\sqrt{\hat{\mathbf{s}}} + \epsilon} + \lambda\theta\right).$$
+
+AdamW has become the default optimiser for training transformers. The block below compares the three optimisers on a ravine whose curvature differs by a factor of 100 between its two directions.
+
+```python run
+import numpy as np
+
+# A long, narrow valley: f(x, y) = (x^2 + 100 y^2) / 2. Curvature is 100 times larger along y.
+H = np.diag([1.0, 100.0])
+f = lambda p: 0.5 * p @ H @ p
+grad = lambda p: H @ p
+start = np.array([10.0, 1.0])
+
+def gd(lr):
+    p = start.copy()
+    while True:
+        yield p
+        p = p - lr * grad(p)
+
+def momentum(lr, beta=0.9):
+    p, v = start.copy(), np.zeros(2)
+    while True:
+        yield p
+        v = beta * v + grad(p)                       # a running, decaying sum of gradients
+        p = p - lr * v
+
+def adam(lr, b1=0.9, b2=0.999, eps=1e-8):
+    p, m, s = start.copy(), np.zeros(2), np.zeros(2)
+    t = 0
+    while True:
+        yield p
+        t += 1
+        g = grad(p)
+        m = b1 * m + (1 - b1) * g                    # first moment: the average direction
+        s = b2 * s + (1 - b2) * g * g                # second moment: the average squared size
+        m_hat, s_hat = m / (1 - b1 ** t), s / (1 - b2 ** t)    # correct the bias from starting at 0
+        p = p - lr * m_hat / (np.sqrt(s_hat) + eps)  # per-coordinate step sizes
+
+def steps_to(opt, tol=1e-6, limit=20000):
+    for step, p in enumerate(opt):
+        if not np.isfinite(f(p)) or f(p) > 1e12:
+            return "diverges"
+        if f(p) < tol:
+            return f"{step} steps"
+        if step == limit:
+            return f"not there after {limit}"
+
+print("steps until f < 1e-6, starting from (10, 1)")
+for lr in (0.001, 0.01, 0.019, 0.021):
+    print(f"  gradient descent, lr {lr:<6}: {steps_to(gd(lr))}")
+for lr in (0.001, 0.01):
+    print(f"  momentum 0.9,     lr {lr:<6}: {steps_to(momentum(lr))}")
+for lr in (0.01, 0.1, 0.5):
+    print(f"  Adam,             lr {lr:<6}: {steps_to(adam(lr))}")
+```
+
+Plain gradient descent diverges just above a learning rate of 0.02 (the stability limit $2/100$), and at its best needs hundreds of steps. Momentum gets there several times faster at the same learning rate. Adam is insensitive to the curvature ratio — but notice that with a small learning rate it is *slower*, because its steps are roughly $\eta$ long and the starting point is 10 units away. No optimiser removes the need to tune the learning rate.
+
+</Section>
+
+<Section id="schedules" kind="intuition" title="Learning-rate schedules">
+
+The learning rate is usually the single most important hyperparameter, and the best value changes during training. Early on, parameters are far from good values and large steps make fast progress; later, large steps bounce around a minimum, and smaller ones settle into it. A **schedule** changes $\eta$ with the step number $t$.
+
+- **Step decay** divides the rate by, say, 10 at a few fixed epochs. Simple and still common in vision.
+- **Cosine decay** (from Loshchilov and Hutter's SGDR paper) glides smoothly from the peak $\eta_{\max}$ to a floor $\eta_{\min}$ over $T$ steps: $\eta_t = \eta_{\min} + \tfrac12(\eta_{\max} - \eta_{\min})\big(1 + \cos(\pi t / T)\big)$.
+- **Warmup** raises the rate linearly from near zero over the first few hundred or thousand steps. At the very start, Adam's second-moment estimates rest on a handful of gradients and the network's activations can be badly scaled, so full-size steps can throw training into a bad region from which it never recovers. Warmup avoids that.
+
+**Linear warmup followed by cosine decay** is the standard recipe for transformers, and the training loop below uses it.
+
+</Section>
+
+<Section id="regularisation" kind="human" title="Regularisation">
+
+A network with more parameters than training examples can memorise its training set. **Regularisation** is anything that makes it prefer simpler explanations that generalise.
+
+- **Weight decay** (above) keeps weights small, which limits how sharply the function can bend.
+- **Dropout** (Srivastava and colleagues, 2014): during training, set each hidden activation to zero with probability $p$, independently at every step. No unit can rely on any particular other unit being present, which discourages fragile co-adaptations; the network behaves a little like an average over many thinned sub-networks. In the usual **inverted** form, surviving activations are multiplied by $1/(1-p)$ during training so that their expected value is unchanged, and at evaluation time dropout is simply switched off.
+- **Early stopping**: watch the validation loss during training, keep a copy of the parameters at its best, and stop once it has not improved for a set number of epochs (the **patience**). It costs nothing and is almost always worth doing.
+- **Data augmentation**: enlarge the training set with transformations that preserve the label — crops, flips, small rotations and colour changes for photographs; noise and time shifts for audio; paraphrases or back-translation for text. The transformation must truly preserve the label: flipping a photograph of a cat is fine, flipping a handwritten "6" upside down makes a "9", and flipping a chest X-ray puts the heart on the wrong side.
+
+The block below trains a three-layer network with mini-batches, AdamW, warmup and cosine decay, on a small three-class dataset in which a fifth of the training labels are wrong — as labels in real datasets often are. One run has no regularisation; the other uses dropout, weight decay and early stopping.
+
+```python run
+import numpy as np
+
+def spirals(n_per_class, rng, noise):
+    """Three interleaved spiral arms in the plane, blurred so that the arms overlap a little."""
+    X, y = [], []
+    for k in range(3):
+        r = np.linspace(0.1, 1.0, n_per_class)
+        t = np.linspace(k * 4.2, (k + 1) * 4.2, n_per_class) + rng.normal(0, noise, n_per_class)
+        X.append(np.column_stack([r * np.sin(t), r * np.cos(t)]))
+        y.append(np.full(n_per_class, k))
+    return np.vstack(X), np.concatenate(y)
+
+def lr_at(step, total, warmup, peak, floor):
+    """Linear warmup to `peak`, then cosine decay to `floor`."""
+    if step < warmup:
+        return peak * (step + 1) / warmup
+    progress = (step - warmup) / max(1, total - warmup)
+    return floor + 0.5 * (peak - floor) * (1 + np.cos(np.pi * progress))
+
+def train(seed, dropout, weight_decay, patience, epochs=300, batch=32, width=128):
+    rng = np.random.default_rng(seed)
+    X, y = spirals(40, rng, noise=0.3)               # 120 training examples: easy to memorise
+    Xv, yv = spirals(200, rng, noise=0.3)            # 600 validation examples
+    wrong = rng.random(len(y)) < 0.2                 # 20% of the training labels are mistakes,
+    y = np.where(wrong, (y + rng.integers(1, 3, len(y))) % 3, y)   # as in much real data
+    sizes = [2, width, width, 3]
+    P = {}
+    for i in range(3):                               # He initialisation
+        P[f"W{i}"] = rng.normal(0, np.sqrt(2 / sizes[i]), (sizes[i], sizes[i + 1]))
+        P[f"b{i}"] = np.zeros(sizes[i + 1])
+    M = {k: np.zeros_like(v) for k, v in P.items()}  # AdamW's moment estimates
+    V = {k: np.zeros_like(v) for k, v in P.items()}
+
+    def forward(X, training):
+        hs, zs, masks = [X], [], []
+        for i in range(2):
+            z = hs[-1] @ P[f"W{i}"] + P[f"b{i}"]
+            mask = np.ones_like(z)
+            if training and dropout > 0:             # inverted dropout: scale up the survivors now
+                mask = (rng.random(z.shape) >= dropout) / (1 - dropout)
+            zs.append(z); masks.append(mask)
+            hs.append(np.maximum(z, 0) * mask)
+        return hs[-1] @ P["W2"] + P["b2"], hs, zs, masks
+
+    def evaluate(X, y):
+        logits = forward(X, training=False)[0]
+        logits = logits - logits.max(axis=1, keepdims=True)
+        logp = logits - np.log(np.exp(logits).sum(axis=1, keepdims=True))
+        return -logp[np.arange(len(y)), y].mean(), np.mean(logits.argmax(axis=1) == y)
+
+    total = epochs * int(np.ceil(len(y) / batch))
+    step, best, history = 0, (np.inf, 0, None), []
+    for epoch in range(1, epochs + 1):
+        order = rng.permutation(len(y))              # reshuffle every epoch
+        for s in range(0, len(y), batch):
+            idx = order[s:s + batch]
+            logits, hs, zs, masks = forward(X[idx], training=True)
+            p = np.exp(logits - logits.max(axis=1, keepdims=True))
+            p /= p.sum(axis=1, keepdims=True)
+            g = p
+            g[np.arange(len(idx)), y[idx]] -= 1
+            g /= len(idx)                            # d loss / d logits for softmax + cross-entropy
+            G = {"W2": hs[2].T @ g, "b2": g.sum(axis=0)}
+            for i in (1, 0):                         # backpropagate through the hidden layers
+                g = (g @ P[f"W{i + 1}"].T) * masks[i] * (zs[i] > 0)
+                G[f"W{i}"], G[f"b{i}"] = hs[i].T @ g, g.sum(axis=0)
+            step += 1
+            lr = lr_at(step, total, warmup=40, peak=1e-2, floor=1e-5)
+            for k in P:                              # AdamW: Adam step plus decoupled weight decay
+                M[k] = 0.9 * M[k] + 0.1 * G[k]
+                V[k] = 0.999 * V[k] + 0.001 * G[k] ** 2
+                m_hat, v_hat = M[k] / (1 - 0.9 ** step), V[k] / (1 - 0.999 ** step)
+                P[k] -= lr * (m_hat / (np.sqrt(v_hat) + 1e-8) + weight_decay * P[k])
+        (tl, ta), (vl, va) = evaluate(X, y), evaluate(Xv, yv)
+        history.append((epoch, tl, ta, vl, va))
+        if vl < best[0]:
+            best = (vl, epoch, va)
+        elif patience and epoch - best[1] >= patience:
+            break                                    # early stopping: no improvement for a while
+    return history, best
+
+for name, kwargs in [("no regularisation", dict(dropout=0.0, weight_decay=0.0, patience=None)),
+                     ("dropout 0.3, weight decay 0.1, early stopping (patience 40)",
+                      dict(dropout=0.3, weight_decay=0.1, patience=40))]:
+    history, (best_loss, best_epoch, best_acc) = train(seed=0, **kwargs)
+    print(name)
+    print("  epoch  train loss  train acc   val loss  val acc")
+    for epoch, tl, ta, vl, va in history:
+        if epoch % 50 == 0 or epoch == history[-1][0]:
+            print(f"  {epoch:5d} {tl:11.3f} {ta:9.1%} {vl:10.3f} {va:8.1%}")
+    print(f"  best validation loss {best_loss:.3f} (accuracy {best_acc:.1%}) at epoch {best_epoch}\n")
+```
+
+The unregularised network reaches its best validation loss after about fifty epochs; after that it starts memorising the mislabelled examples — training accuracy climbs towards 100%, which is only possible by learning the wrong labels — and validation accuracy falls by about eight points. The regularised run learns more slowly, cannot memorise as easily, and early stopping keeps the parameters from its best epoch. Notice that early stopping alone would also have rescued the first run, had it been watching: on noisy data, it is the cheapest protection there is.
+
+</Section>
+
+<Section id="normalisation" kind="intuition" title="Normalisation layers">
+
+Deep networks train much more easily when the inputs to each layer are kept at a steady scale. **Normalisation layers** enforce this explicitly.
+
+**Batch normalisation** (Ioffe and Szegedy, 2015) normalises each feature over the examples in the mini-batch — subtract the batch mean, divide by the batch standard deviation — then applies a learned scale $\gamma$ and shift $\beta$, so the network can undo the normalisation if that helps:
+
+$$\hat z = \frac{z - \mu_B}{\sqrt{\sigma_B^2 + \epsilon}}, \qquad \text{output} = \gamma \hat z + \beta .$$
+
+At evaluation time there may be no batch, so batch norm uses running averages of $\mu$ and $\sigma$ collected during training — a classic source of bugs when a model is left in the wrong mode. It works poorly with very small batches and couples examples in a batch together.
+
+**Layer normalisation** (Ba, Kiros and Hinton, 2016) normalises over the features of each example separately, so it behaves identically in training and evaluation and does not depend on the batch at all. It is the standard choice in transformers. **RMSNorm** (Zhang and Sennrich, 2019) drops the mean subtraction and only divides by the root mean square; it is cheaper and is used in many recent large language models.
+
+Why do these layers help so much? The original batch-norm paper argued that they reduce "internal covariate shift" — the drift of each layer's input distribution as earlier layers change. Later work, notably Santurkar and colleagues (2018), found that explanation unconvincing and argued that normalisation mainly makes the loss surface smoother, allowing larger learning rates. The practical effect is not in doubt; the full explanation is still debated.
+
+</Section>
+
+<Section id="metrics" kind="computation" title="Evaluation metrics">
+
+Accuracy — the fraction of correct predictions — is easy to understand and often misleading. If 1% of transactions are fraudulent, a model that never flags anything is 99% accurate. For classification, start with the **confusion matrix**, which counts true positives (TP), false positives (FP), false negatives (FN) and true negatives (TN), and derive:
+
+- **Precision** $= \text{TP} / (\text{TP} + \text{FP})$: of the transactions flagged, how many were fraud?
+- **Recall** (true-positive rate, sensitivity) $= \text{TP} / (\text{TP} + \text{FN})$: of the fraud, how much was flagged?
+- **F1** $= 2 \cdot \text{precision} \cdot \text{recall} / (\text{precision} + \text{recall})$, their harmonic mean, a single number that is high only when both are.
+
+Most classifiers output a score, and the **threshold** at which a score counts as positive trades precision against recall. The **ROC curve** plots the true-positive rate against the **false-positive rate** $\text{FP} / (\text{FP} + \text{TN})$ as the threshold sweeps from high to low. Its area, the **AUC**, has a clean meaning: the probability that a randomly chosen positive example scores higher than a randomly chosen negative one. An AUC of 0.5 is chance; 1.0 is perfect ranking.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(42)
+# A fraud detector's scores on 10,000 transactions, of which 1% are fraudulent.
+n_pos, n_neg = 100, 9900
+scores = np.concatenate([rng.normal(2.0, 1.0, n_pos),      # fraud tends to score higher...
+                         rng.normal(0.0, 1.0, n_neg)])     # ...but the two groups overlap
+labels = np.concatenate([np.ones(n_pos), np.zeros(n_neg)])
+
+def confusion(threshold):
+    pred = scores >= threshold
+    tp = int(np.sum(pred & (labels == 1))); fp = int(np.sum(pred & (labels == 0)))
+    fn = int(np.sum(~pred & (labels == 1))); tn = int(np.sum(~pred & (labels == 0)))
+    return tp, fp, fn, tn
+
+print("A model that flags nothing is 99% accurate — and useless.\n")
+print("threshold    TP    FP    FN     TN   accuracy  precision  recall    F1")
+for t in (4.0, 3.0, 2.5, 2.0, 1.5, 1.0):
+    tp, fp, fn, tn = confusion(t)
+    acc = (tp + tn) / len(labels)
+    prec = tp / (tp + fp) if tp + fp else float("nan")
+    rec = tp / (tp + fn)
+    f1 = 2 * prec * rec / (prec + rec) if tp else 0.0
+    print(f"{t:9.1f} {tp:5d} {fp:5d} {fn:5d} {tn:6d} {acc:9.1%} {prec:10.1%} {rec:7.1%} {f1:6.2f}")
+
+# ROC: true-positive rate against false-positive rate as the threshold sweeps from high to low.
+order = np.argsort(-scores)
+tpr = np.concatenate([[0], np.cumsum(labels[order]) / n_pos])
+fpr = np.concatenate([[0], np.cumsum(1 - labels[order]) / n_neg])
+auc = np.sum((fpr[1:] - fpr[:-1]) * (tpr[1:] + tpr[:-1]) / 2)        # trapezoid rule
+# AUC equals the probability that a random positive outscores a random negative:
+pos, neg = scores[labels == 1], scores[labels == 0]
+pairwise = np.mean(pos[:, None] > neg[None, :])
+print(f"\nROC AUC by the trapezoid rule: {auc:.4f};  P(random fraud outscores random normal): {pairwise:.4f}")
+for target in (0.01, 0.05, 0.20):
+    i = np.searchsorted(fpr, target, side="right") - 1
+    print(f"  accepting a false-positive rate of {target:4.0%} catches {tpr[i]:5.1%} of fraud")
+```
+
+Which threshold is right depends on the costs, not on the model: a missed fraud and a blocked honest customer cost different amounts, and a cancer screen tolerates many false alarms to miss few cancers. With severe imbalance, the **precision–recall curve** is often more informative than ROC, because a false-positive *rate* of 1% sounds small even when, as here, it means far more false alarms than frauds caught. Choose the metric that matches the decision the model supports, before looking at the results.
+
+</Section>
+
+<Section id="debugging" kind="computation" title="Debugging training">
+
+Neural networks fail silently. A bug rarely raises an exception; it just makes the model a bit worse, and a bit worse is hard to notice. Experienced practitioners therefore follow a defensive routine (Karpathy's "recipe" and Google's tuning playbook, linked below, describe it at length):
+
+1. **Look at the data.** Print examples and labels; check that they match, that preprocessing did what you think, and how the classes are balanced.
+2. **Check the loss at initialisation.** With $K$ balanced classes and small output weights, the cross-entropy should start near $\ln K$. Far higher means the outputs start overconfident.
+3. **Overfit one small batch.** A correct model and optimiser can drive the loss on a handful of examples to nearly zero. If they cannot, there is a bug — in the model, the loss, the gradients or the update — and no amount of tuning will fix it.
+4. **Start simple, then add.** A small model, no regularisation, a known-good optimiser; then add one thing at a time, checking each helps.
+5. **Read the curves.** A loss that explodes or becomes `nan` usually means the learning rate is too high or a computation is numerically unstable. A loss that plateaus immediately suggests a learning rate too low, dead units or a bug. Training loss falling while validation loss rises is overfitting. Very noisy curves suggest a batch too small or a rate too high.
+
+```python run
+import numpy as np
+
+def make_net(seed, n_in=20, width=64, n_out=10):
+    rng = np.random.default_rng(seed)
+    return {"W1": rng.normal(0, np.sqrt(2 / n_in), (n_in, width)), "b1": np.zeros(width),
+            "W2": rng.normal(0, 0.01, (width, n_out)), "b2": np.zeros(n_out)}
+
+def step(P, X, y, lr, bug=False):
+    Z = X @ P["W1"] + P["b1"]; A = np.maximum(Z, 0)
+    logits = A @ P["W2"] + P["b2"]
+    logits = logits - logits.max(axis=1, keepdims=True)
+    logp = logits - np.log(np.exp(logits).sum(axis=1, keepdims=True))
+    loss = -np.mean(logp[np.arange(len(y)), y])
+    p = np.exp(logp)
+    g = p.copy()
+    if not bug:                                   # the bug: forgetting to subtract the one-hot label
+        g[np.arange(len(y)), y] -= 1
+    g /= len(y)
+    dZ = (g @ P["W2"].T) * (Z > 0)
+    G = {"W2": A.T @ g, "b2": g.sum(0), "W1": X.T @ dZ, "b1": dZ.sum(0)}
+    for k in P:
+        P[k] -= lr * G[k]
+    return loss
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(8, 20)); y = rng.integers(0, 10, 8)     # ONE small batch, random labels
+
+# Check 1: the loss at initialisation. With tiny output weights all 10 classes are equally
+# likely, so the loss should be close to ln(10).
+print(f"loss at initialisation: {step(make_net(seed=1), X, y, lr=0.0):.3f}   (ln 10 = {np.log(10):.3f})")
+
+# Check 2: can the model memorise one batch? A correct model and optimiser drive the loss
+# towards zero; a bug often shows up as a loss that refuses to fall.
+for bug in (False, True):
+    P = make_net(seed=1)
+    losses = [step(P, X, y, lr=0.5, bug=bug) for _ in range(300)]
+    print(f"{'with a gradient bug' if bug else 'correct code':20s} loss after 0/100/300 steps: "
+          f"{losses[0]:.3g} / {losses[99]:.3g} / {losses[-1]:.3g}")
+
+# Check 3: reproducibility. The same seed gives bit-identical training...
+a, b = make_net(seed=7), make_net(seed=7)
+for _ in range(50):
+    step(a, X, y, 0.1); step(b, X, y, 0.1)
+print("same seed, same result:", all(np.array_equal(a[k], b[k]) for k in a))
+
+# ...but floating-point addition is not associative, so changing the ORDER of a sum
+# (as parallel hardware may do from run to run) changes the last bits of the result.
+v = np.random.default_rng(3).normal(size=100_000).astype(np.float32)
+s1 = np.float32(0)
+for x in v[:2000]:
+    s1 += x
+s2 = np.float32(0)
+for x in v[:2000][::-1]:
+    s2 += x
+print(f"the same 2000 numbers summed forwards and backwards: {float(s1):.6f} vs {float(s2):.6f}")
+print("(0.1 + 0.2) + 0.3 == 0.1 + (0.2 + 0.3):", (0.1 + 0.2) + 0.3 == 0.1 + (0.2 + 0.3))
+```
+
+The bug in the block — forgetting to subtract the true label in the softmax gradient — is a one-character mistake that sends the loss to astronomical values within a hundred steps. Overfitting one batch exposes it in seconds.
+
+</Section>
+
+<Section id="reproducibility" kind="human" title="Reproducibility and seeds">
+
+Training involves randomness at every stage: initialisation, data shuffling, dropout masks, augmentation. Fix the **seeds** of every random number generator you use (Python's, numpy's, the framework's), and the same code on the same machine reproduces the same run — as the last block showed. That is what lets you check that a change, and not luck, caused an improvement.
+
+Seeds are not the whole story. On GPUs, many operations sum numbers in parallel in an order that can vary from run to run, and because floating-point addition is not associative, the last bits of results differ; over thousands of steps those differences grow. Different library versions and hardware change results too. Frameworks offer deterministic modes at some cost in speed. Good practice:
+
+- Log everything needed to rerun an experiment: code version, configuration, library versions, seeds, data version.
+- Run important comparisons with **several seeds** and report the mean and spread. A one-point improvement that is smaller than the seed-to-seed variation is not an improvement.
+- Save checkpoints, so a long run can be resumed and inspected.
+
+</Section>
+
+<Section id="frameworks" kind="human" title="From numpy to PyTorch and JAX">
+
+You have now written, by hand, everything a training framework does: forward passes, backpropagation, optimisers, schedules, dropout, evaluation. Real work uses a framework, because it supplies automatic differentiation over tensors, fast kernels for GPUs and TPUs, distributed training, data loading and well-tested implementations of every layer and optimiser. As of 2026 the two most widely used in research are:
+
+- **PyTorch**, originally from Meta: you write ordinary Python that runs eagerly, operation by operation, while autograd records the graph — the design of this lesson's `Var` class, scaled up to tensors. It dominates published research and is widely used in industry.
+- **JAX**, from Google: a numpy-like library of pure functions with composable transformations — `jax.grad` differentiates a function, `jax.jit` compiles it with the XLA compiler, `jax.vmap` vectorises it. It is used heavily inside Google DeepMind and for large-scale training on TPUs, with optimisers from the Optax library.
+
+Here is the shape of the regularised training loop above in PyTorch, for comparison (not runnable here; it needs PyTorch installed, and `train_loader`, `X_val`, `y_val`, `epochs` and `total_steps` defined):
+
+```python
+import math
+import torch
+from torch import nn
+
+torch.manual_seed(0)
+model = nn.Sequential(
+    nn.Linear(2, 128), nn.ReLU(), nn.Dropout(0.3),
+    nn.Linear(128, 128), nn.ReLU(), nn.Dropout(0.3),
+    nn.Linear(128, 3),
+)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.1)
+
+def schedule(step, warmup=40):                      # a multiplier on the peak learning rate
+    if step < warmup:
+        return (step + 1) / warmup
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+sched = torch.optim.lr_scheduler.LambdaLR(opt, schedule)
+
+for epoch in range(epochs):
+    model.train()                                   # dropout on
+    for xb, yb in train_loader:
+        loss = nn.functional.cross_entropy(model(xb), yb)
+        opt.zero_grad()
+        loss.backward()                             # backpropagation
+        opt.step()
+        sched.step()
+    model.eval()                                    # dropout off
+    with torch.no_grad():
+        val_loss = nn.functional.cross_entropy(model(X_val), y_val).item()
+```
+
+Every line maps onto something you have built. Which framework to learn first matters less than understanding what they do — and you now do. Choose by what your course, team or the code you want to build on uses.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Adam works out of the box, so the learning rate doesn't matter."** Adam is less sensitive to gradient scale, not to the learning rate. It remains the first hyperparameter to tune.
+
+</Misconception>
+
+<Misconception>
+
+**"Dropout should stay on when evaluating, to be consistent."** With inverted dropout, training already rescales the surviving activations; at evaluation time dropout must be off, or predictions become noisy and systematically worse. Forgetting `model.eval()` is a classic bug.
+
+</Misconception>
+
+<Misconception>
+
+**"The model with higher accuracy is the better model."** On imbalanced data, accuracy can reward doing nothing. Compare models on the metric that reflects the real costs of each kind of mistake.
+
+</Misconception>
+
+<Misconception>
+
+**"My new method beat the baseline in one run, so it works."** Seed-to-seed variation can be as large as the improvement. Repeat with several seeds before believing a small gain.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

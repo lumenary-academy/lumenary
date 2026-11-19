@@ -54,6 +54,9 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/[locale]/educators/`, `…/worksheets/[slug]/`, `…/overview/` | Educator resources and evaluation package |
 | `/[locale]/languages/` | Language and country registries |
 | `/[locale]/verification/` | Verification report |
+| `/en/cs/`, `/en/cs/[slug]/` | Lumenary CS: the course page and its lessons (English only) |
+| `/[locale]/lingua/` | Lumenary Lingua's courses |
+| `/[course locale]/lingua/[course]/`, `…/[slug]/` | A Lingua course and its lessons, generated only in the locale it is taught in |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
 
 ## Lesson architecture
@@ -70,7 +73,7 @@ Exercises live in `exercises.json` (types: `choice`, `integer`, `set`, `python`)
 
 ## Extending to other subjects
 
-Topic ids are namespaced (`math.*`) and subjects/levels are data. A new subject adds its own graph file and content directory, reusing the lesson components, verification pipeline and i18n machinery.
+Topic ids are namespaced (`math.*`) and subjects/levels are data. Subjects other than mathematics are **courses** (`src/lib/courses.ts`): a syllabus and lesson directories under `content/cs/` or `content/lingua/<id>/`, rendered by `src/components/course/CoursePages.tsx` with the same lesson components, plus highlighted and runnable code blocks (`CodeBlock`) and browser speech for language learners (`Say`). Their code is run by `compute/verify_courses.py`, which writes `content/verification/course-code-report.json`. See [courses.md](courses.md).
 
 ## Page weight
 

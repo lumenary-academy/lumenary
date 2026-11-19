@@ -5,12 +5,17 @@ const LESSON_PAGES = /^(math\/lessons|practice|educators\/worksheets)\/([^/#]+)/
 /** Detail pages of the labs, which are generated in English only (code and reports are language-neutral). */
 const ENGLISH_ONLY = /^(lab|formal)\/[^/#]+/;
 const translated = contentLocales.lessons as Record<string, string[]>;
+/** Courses outside Lumenary Math ("cs", "lingua/spanish"): each is generated only in the locale it is taught in. */
+const courses = (contentLocales as { courses?: Record<string, string> }).courses ?? {};
+const COURSE = /^(cs|lingua\/[^/#]+)(\/|$)/;
 
 /** The locale in which a page is actually generated: the requested one, or English as a fallback. */
 export function pageLocale(locale: string, path: string): string {
   if (locale === "en") return locale;
   const p = path.replace(/^\/+/, "");
   if (ENGLISH_ONLY.test(p)) return "en";
+  const c = p.match(COURSE);
+  if (c && courses[c[1]]) return courses[c[1]];
   const m = p.match(LESSON_PAGES);
   if (m && !(translated[m[2]] ?? []).includes(locale)) return "en";
   return locale;

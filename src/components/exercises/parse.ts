@@ -59,3 +59,33 @@ export function setsEqual(a: Set<string>, b: Set<string>): boolean {
 export function setKey(s: Set<string>): string {
   return [...s].sort().join(",");
 }
+
+/**
+ * Canonical form of a typed phrase: case, spacing, quotes and the punctuation around a sentence
+ * (¿ ¡ . ! ? …) don't count; accents and inner punctuation do.
+ */
+export function normalizeText(input: string): string {
+  return input
+    .normalize("NFC")
+    .replace(/[’‘`´]/g, "'")
+    .replace(/[“”«»]/g, '"')
+    .trim()
+    .replace(/^[¿¡"'\s]+|[.!?…"'\s]+$/g, "")
+    .replace(/\s+([,;:])/g, "$1")
+    .replace(/\s+/g, " ")
+    .toLocaleLowerCase();
+}
+
+/** The phrase without its accents (ñ and ü included), to tell a learner the accents are the only slip. */
+export function stripAccents(input: string): string {
+  return input.normalize("NFD").replace(/\p{M}/gu, "").normalize("NFC");
+}
+
+/** "right", "accents" (right but for accents) or "wrong". */
+export function checkText(input: string, answers: readonly string[]): "right" | "accents" | "wrong" {
+  const got = normalizeText(input);
+  if (!got) return "wrong";
+  const wanted = answers.map(normalizeText);
+  if (wanted.includes(got)) return "right";
+  return wanted.map(stripAccents).includes(stripAccents(got)) ? "accents" : "wrong";
+}
