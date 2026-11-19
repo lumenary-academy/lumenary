@@ -1,0 +1,390 @@
+---
+title: Processes, jobs and an automation project
+subtitle: Background jobs, waiting and parallelism, signals and graceful shutdown, job control at the prompt, and a complete, safe automation script, scheduled to run on its own.
+minutes: 65
+objectives:
+  - Explain processes, PIDs, subshells and how Bash starts commands
+  - Run commands in the background, wait for them, collect their statuses, and limit parallelism
+  - Send and handle signals, and write scripts that shut down gracefully
+  - Use job control at the interactive prompt (Ctrl-Z, bg, fg, jobs) and keep jobs running after logout
+  - Build, test and schedule a complete automation script with options, logging, locking, a dry-run mode and parallel work
+prerequisites: [safe-scripts]
+references:
+  - title: "Bash Reference Manual: Job Control"
+    url: https://www.gnu.org/software/bash/manual/html_node/Job-Control.html
+  - title: "Bash Reference Manual: Signals"
+    url: https://www.gnu.org/software/bash/manual/html_node/Signals.html
+  - title: "ProcessManagement (Greg's Wiki)"
+    url: https://mywiki.wooledge.org/ProcessManagement
+    note: A thorough community guide to background processes, waiting and signals in Bash.
+  - title: The Linux Command Line
+    author: William Shotts
+    url: https://linuxcommand.org/tlcl.php
+    note: A free book that covers the shell and the command-line tools in depth.
+  - title: BashPitfalls
+    url: https://mywiki.wooledge.org/BashPitfalls
+---
+
+<Section id="motivation" kind="motivation" title="Scripts that run without you">
+
+The scripts that matter most are the ones that run when nobody is watching: the nightly backup, the log rotation, the job that renews certificates, the step in a deployment pipeline. Such scripts must cope with things an interactive user handles by instinct. They may need to run several tasks at once and wait for all of them. They may be stopped half-way by a system shutdown or an operator. Two copies may be started at the same time by an overeager scheduler. And when something goes wrong, the only evidence is what they logged and the exit status they returned.
+
+This final lesson covers the shell's view of **processes**: starting them in the background, waiting for them, sending and handling **signals**, and the interactive **job control** that lets you juggle tasks at the prompt. Then it brings the whole course together in a complete automation script, written to the standard of the previous lessons, and shows how to schedule it.
+
+</Section>
+
+<Section id="processes" kind="definitions" title="Processes and subshells">
+
+<Definition term="Process">
+
+A running program, with its own memory, open files, current directory and environment, identified by a number, its **PID**. Every process except the very first has a **parent** that started it; the shell is the parent of the commands you run.
+
+</Definition>
+
+<Definition term="Subshell">
+
+A copy of the shell running in a child process. Bash creates one for `( ... )`, for each part of a pipeline, for command substitution `$( ... )` and for background jobs. Changes made in a subshell (variables, `cd`, options) do not affect the parent.
+
+</Definition>
+
+To run an external program, Bash asks the operating system to duplicate the shell process (`fork`) and then replace the copy with the program (`exec`), then waits for it to finish and collects its exit status. Builtins and functions run inside the shell itself, without a new process, which is why they are so much faster in a loop. `$$` is the PID of the main shell (even inside subshells), `$BASHPID` is the PID of the current (sub)shell, and `$!` is the PID of the most recent background job. The `exec` builtin, given a command, replaces the shell with it, which is the usual last line of container entry-point scripts (`exec "$@"`), so the real program receives signals directly.
+
+</Section>
+
+<Section id="background" kind="computation" title="Background jobs, wait and parallelism">
+
+Putting `&` after a command starts it in the background: the shell does not wait, and moves on to the next line immediately. `wait` then waits for background jobs: `wait "$pid"` for one, returning its exit status, or plain `wait` for all of them.
+
+```bash check
+#!/usr/bin/env bash
+export LC_ALL=C
+job() {                                   # a stand-in for real work: sleep, report, succeed or fail
+    sleep "$2"
+    echo "  $1 finished after $2s"
+    [[ $1 != broken* ]]
+}
+
+start=$EPOCHREALTIME                      # Bash 5.0+: the time in seconds, with microseconds
+job alpha 0.3 &                           # & runs a command in the background
+job beta 0.1 &
+job broken-gamma 0.2 &
+broken=$!                                 # $! is the PID of the most recent background job
+wait "$broken"                            # wait for one job and collect its status
+echo "  broken-gamma's status: $?"
+wait                                      # wait for all remaining jobs
+awk -v a="$start" -v b="$EPOCHREALTIME" 'BEGIN { print "faster than 0.6s in sequence:", (b - a < 0.55 ? "yes" : "no") }'
+
+printf '%s\n' 1 2 3 4 5 6 | xargs -P 3 -I{} sh -c 'sleep 0.1; echo "item {} done"' | sort | paste -sd,
+( echo "a subshell has its own PID: $([[ $BASHPID != "$$" ]] && echo yes)" )
+```
+
+```text
+  beta finished after 0.1s
+  broken-gamma finished after 0.2s
+  broken-gamma's status: 1
+  alpha finished after 0.3s
+faster than 0.6s in sequence: yes
+item 1 done,item 2 done,item 3 done,item 4 done,item 5 done,item 6 done
+a subshell has its own PID: yes
+```
+
+The three jobs ran at the same time and finished in order of their durations, so the whole batch took about as long as the slowest job, not the sum. Collecting each important job's status with `wait "$pid"` matters: a plain `wait` with no arguments returns 0 even when jobs failed. (Bash 4.3 added `wait -n`, which waits for whichever job finishes next, useful for keeping a fixed number of jobs running.)
+
+For running the same command over many inputs with a limit on how many run at once, `xargs -P N` is the simplest tool: it keeps N processes busy until the input is used up. The output of parallel jobs arrives in whatever order they finish, which is why the example sorts it. GNU `parallel` is a more powerful alternative where it is installed.
+
+</Section>
+
+<Section id="signals" kind="examples" title="Signals and graceful shutdown">
+
+A **signal** is a small asynchronous message sent to a process, usually to ask it to stop. The ones you will meet:
+
+| Signal | Number | Usual meaning |
+| --- | --- | --- |
+| `HUP` | 1 | the terminal closed; for daemons, often "reload your configuration" |
+| `INT` | 2 | interrupt: what Ctrl-C sends |
+| `TERM` | 15 | please terminate: the default of `kill`, and what service managers send first |
+| `KILL` | 9 | terminate immediately; cannot be caught or ignored |
+| `STOP`, `TSTP` | 19, 20 (on Linux) | pause (`TSTP` is what Ctrl-Z sends) |
+| `CONT` | 18 (on Linux) | continue after a pause |
+
+`kill -TERM "$pid"` sends a signal; `trap 'commands' TERM` makes a script run `commands` when it receives one, instead of dying on the spot. The polite pattern is to set a flag in the trap and let the main loop finish its current unit of work and exit cleanly, so that nothing is left half-written:
+
+```bash check
+#!/usr/bin/env bash
+cat > worker.sh <<'WORKER'
+#!/usr/bin/env bash
+stop=0
+trap 'echo "worker: TERM received, finishing the current item"; stop=1' TERM
+for item in 1 2 3 4 5 6 7 8; do
+    if (( stop )); then
+        echo "worker: stopped cleanly after item $(( item - 1 ))"
+        exit 0
+    fi
+    [[ $item == 4 ]] && touch started-4         # let the demonstration know where we are
+    sleep 0.3                                   # "process" the item
+done
+echo "worker: finished every item"
+WORKER
+
+bash worker.sh &
+pid=$!
+until [[ -e started-4 ]]; do sleep 0.01; done  # wait until the worker is busy with item 4
+kill -TERM "$pid"                               # ask it politely to stop
+wait "$pid"
+echo "worker exit status: $?"
+
+sleep 10 &
+kill -KILL $!                                    # no trap can catch KILL
+wait $! 2>/dev/null
+echo "killed sleep's status: $? (128 + 9)"
+```
+
+```text
+worker: TERM received, finishing the current item
+worker: stopped cleanly after item 4
+worker exit status: 0
+killed sleep's status: 137 (128 + 9)
+```
+
+The worker received `TERM` while it was processing item 4, finished that item, and stopped with status 0 before starting item 5. Notice the timing: Bash runs a trap only after the current foreground command (here `sleep`) completes, so a script blocked in a long command responds slowly. Long-running scripts therefore often run their waiting command in the background and use `wait`, which a signal *does* interrupt. A process killed by a signal it did not handle has the exit status 128 plus the signal's number: 137 for `KILL`, 143 for `TERM`, 130 for Ctrl-C. Process supervisors (systemd, Docker, Kubernetes) send `TERM` first and `KILL` only after a grace period, which is exactly the window a well-written script uses to clean up.
+
+</Section>
+
+<Section id="job-control" kind="human" title="Job control at the prompt">
+
+In an interactive shell, background commands become **jobs** you can manage. A typical session:
+
+```text
+long-build.sh         # start something slow in the foreground... and regret it
+                      # press Ctrl-Z: the job is suspended and the prompt comes back
+bg                    # resume the stopped job in the background
+jobs                  # list this shell's jobs and their states
+fg %1                 # bring job number 1 back to the foreground
+```
+
+`kill %1` sends a signal to job 1. When you log out, the shell sends `HUP` to its jobs, which normally ends them. To keep a job running after you disconnect, start it with `nohup command &` (which ignores `HUP` and writes output to `nohup.out`), or detach an already-running job with `disown`. For anything long-running on a remote server, most people use a terminal multiplexer such as **tmux** or **screen**, which keeps a whole session alive between connections, and for anything permanent, a proper service.
+
+Job control is turned off in scripts by default, which is why `fg` and `bg` belong at the prompt, while scripts use `&`, `$!` and `wait`.
+
+</Section>
+
+<Section id="project" kind="examples" title="Project: an archiving script">
+
+Here is a complete automation script of the kind that runs on servers every night. Applications write one log file per day, named `app-YYYY-MM-DD.log`. The script compresses every log except the newest (which may still be written to), using several parallel jobs, and then deletes old compressed archives beyond a retention limit. It has long options, a `--dry-run` mode, a `--verbose` mode that logs to stderr, validation with clear errors and exit status 2 for misuse, a lock so that two runs cannot overlap, and a trap that always releases the lock. It handles a directory name containing a space, and it passes ShellCheck.
+
+The check writes the script to a file and then runs it the way a user would, against a sample directory:
+
+```bash check
+#!/usr/bin/env bash
+# Write the project script to a file, then run it the way a user would.
+cat > archive-logs.sh <<'SCRIPT'
+#!/usr/bin/env bash
+# archive-logs: compress old application logs and keep only the newest archives.
+set -euo pipefail
+
+readonly PROG=${0##*/}
+dir=. keep=3 jobs=2 dry_run=false verbose=false
+
+usage() {
+    cat <<USAGE
+Usage: $PROG [--dir DIR] [--keep N] [--jobs N] [--dry-run] [--verbose]
+Compress every app-*.log in DIR except the newest, using N parallel jobs,
+then delete all but the newest N compressed archives (default: 3).
+USAGE
+}
+
+log()  { if $verbose; then printf '%s: %s\n' "$PROG" "$*" >&2; fi; }
+die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 2; }
+run()  { if $dry_run; then printf 'would run: %s\n' "$*"; else "$@"; fi; }
+
+parse_args() {
+    while (( $# > 0 )); do
+        case $1 in
+            --dir)        dir=${2:?--dir needs a value}; shift 2 ;;
+            --keep)       keep=${2:?--keep needs a value}; shift 2 ;;
+            --jobs)       jobs=${2:?--jobs needs a value}; shift 2 ;;
+            --dry-run)    dry_run=true; shift ;;
+            -v|--verbose) verbose=true; shift ;;
+            -h|--help)    usage; exit 0 ;;
+            *)            die "unknown option '$1' (try --help)" ;;
+        esac
+    done
+    [[ -d $dir ]] || die "not a directory: $dir"
+    [[ $keep =~ ^[0-9]+$ ]] || die "--keep needs a whole number, not '$keep'"
+    [[ $jobs =~ ^[1-9][0-9]*$ ]] || die "--jobs needs a positive whole number, not '$jobs'"
+}
+
+take_lock() {
+    lock="$dir/.archive-logs.lock"
+    mkdir -- "$lock" 2>/dev/null || die "another run is in progress ($lock exists)"
+    trap 'rmdir -- "$lock"' EXIT              # release the lock however we exit
+    log "lock taken"
+}
+
+compress_old_logs() {
+    local logs=("$dir"/app-*.log)              # dated names: oldest first, newest last
+    [[ -e ${logs[0]} ]] || { echo "no logs to compress"; return 0; }
+    local old=("${logs[@]:0:${#logs[@]}-1}")   # all but the newest, which may still be written to
+    if (( ${#old[@]} == 0 )); then echo "only the current log exists"; return 0; fi
+    log "compressing ${#old[@]} file(s) with $jobs job(s)"
+    if $dry_run; then
+        printf 'would compress: %s\n' "${old[@]##*/}"
+        return 0
+    fi
+    printf '%s\0' "${old[@]}" | xargs -0 -n 1 -P "$jobs" gzip --
+    echo "compressed ${#old[@]} log(s)"
+}
+
+prune_archives() {
+    local archives=("$dir"/app-*.log.gz)
+    [[ -e ${archives[0]} ]] || return 0
+    local count=${#archives[@]}
+    (( count > keep )) || { echo "kept all $count archive(s)"; return 0; }
+    run rm -- "${archives[@]:0:count-keep}"
+    echo "deleted $(( count - keep )) old archive(s), kept $keep"
+}
+
+main() {
+    parse_args "$@"
+    take_lock
+    compress_old_logs
+    prune_archives
+}
+
+main "$@"
+SCRIPT
+
+export LC_ALL=C
+mkdir -p "app logs"
+for day in 01 02 03 04 05 06; do
+    printf 'log line for 2026-11-%s\n' "$day" > "app logs/app-2026-11-$day.log"
+done
+touch "app logs/app-2026-10-30.log.gz" "app logs/app-2026-10-31.log.gz"   # older archives
+
+step() {
+    printf '\n$ bash archive-logs.sh'; printf ' %q' "$@"; echo
+    bash archive-logs.sh "$@" 2>&1                # 2>&1: show the error messages too
+    echo "(exit status $?)"
+}
+step --dir "app logs" --dry-run
+step --dir "app logs" --keep 4 --jobs 3 --verbose
+ls "app logs"
+step --dir "app logs" --keep 4             # running again changes nothing
+step --dir "app logs" --keep many
+mkdir "app logs/.archive-logs.lock"           # pretend another run is in progress
+step --dir "app logs"
+```
+
+```text
+
+$ bash archive-logs.sh --dir app\ logs --dry-run
+would compress: app-2026-11-01.log
+would compress: app-2026-11-02.log
+would compress: app-2026-11-03.log
+would compress: app-2026-11-04.log
+would compress: app-2026-11-05.log
+kept all 2 archive(s)
+(exit status 0)
+
+$ bash archive-logs.sh --dir app\ logs --keep 4 --jobs 3 --verbose
+archive-logs.sh: lock taken
+archive-logs.sh: compressing 5 file(s) with 3 job(s)
+compressed 5 log(s)
+deleted 3 old archive(s), kept 4
+(exit status 0)
+app-2026-11-02.log.gz
+app-2026-11-03.log.gz
+app-2026-11-04.log.gz
+app-2026-11-05.log.gz
+app-2026-11-06.log
+
+$ bash archive-logs.sh --dir app\ logs --keep 4
+only the current log exists
+kept all 4 archive(s)
+(exit status 0)
+
+$ bash archive-logs.sh --dir app\ logs --keep many
+archive-logs.sh: error: --keep needs a whole number, not 'many'
+(exit status 2)
+
+$ bash archive-logs.sh --dir app\ logs
+archive-logs.sh: error: another run is in progress (app logs/.archive-logs.lock exists)
+(exit status 2)
+```
+
+What to look for in the code, lesson by lesson:
+
+- **Structure** (lesson 5): settings with defaults at the top, small functions, `main "$@"` on the last line, `usage` from a here-document. Long options are parsed with a `while`/`case`/`shift` loop, and `${2:?}` catches an option given without its value.
+- **Safety** (lesson 7): strict mode; every expansion quoted; `--` before file names; inputs validated before anything is changed; a `die` function for errors with a clear message and status.
+- **Locking**: `mkdir` either creates the directory or fails, atomically, so it works as a lock even when two copies start at the same instant. The `EXIT` trap removes it however the script ends. (On Linux, `flock` from util-linux is a common alternative.) The last run shows the lock refusing a second copy.
+- **Parallelism** (this lesson): `xargs -0 -n 1 -P "$jobs" gzip --` compresses several files at once, with NUL separators so that any file name is safe.
+- **Arrays and expansions** (lessons 2 and 5): globs into arrays, slices to choose all-but-the-newest and all-but-the-last-N.
+- **Idempotence**: the third run found nothing to do and changed nothing. A script that is safe to run twice is a script you can retry after a failure without fear.
+- **Dry run**: `--dry-run` reported what it would do and touched nothing, which is how you try a destructive script on production data.
+
+### Scheduling it
+
+To run the script every night, install it (for example as `/usr/local/bin/archive-logs`) and schedule it. The traditional tool is **cron**; a line in a crontab (edited with `crontab -e`) gives minute, hour, day of month, month and day of week, then the command:
+
+```text
+# m  h  dom mon dow  command
+ 15  3   *   *   *   /usr/local/bin/archive-logs --dir /var/log/myapp --keep 14 >>/var/log/archive-logs.log 2>&1
+```
+
+Remember that cron runs commands with a minimal environment (a short `PATH`, no `~/.bashrc`), which is the source of most "it works when I run it by hand" mysteries: use absolute paths and set what you need in the script. On modern Linux systems, **systemd timers** are a popular alternative, with logging to the journal, dependencies and catch-up after downtime built in. In CI systems and container platforms, the same script would run as a scheduled job there. Wherever it runs, its exit status is what tells the scheduler whether it succeeded.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know Bash well enough to read almost any script you will meet and to write ones that others can trust. To keep improving:
+
+- Read the [Bash Reference Manual](https://www.gnu.org/software/bash/manual/) once from start to finish. It is long, but you now have the background to follow it, and you will discover features you did not know you needed.
+- Keep [BashFAQ](https://mywiki.wooledge.org/BashFAQ) and [BashPitfalls](https://mywiki.wooledge.org/BashPitfalls) at hand, and look up every ShellCheck warning you do not understand on [shellcheck.net](https://www.shellcheck.net/).
+- Learn the tools around the shell properly: `find`, `rsync`, `ssh`, `curl`, `jq`, `tmux`, `git`, and your system's service manager. *The Linux Command Line* by William Shotts, [free online](https://linuxcommand.org/tlcl.php), covers many of them.
+- Read the shell scripts in projects you use (installers, build scripts, CI configurations) and look for the habits from this course, or their absence.
+- Learn when to stop: for anything with real data structures or complex logic, write the core in Python or another general-purpose language, and keep the shell for what it is best at, which is gluing programs together.
+
+<Reflection title="Small tools, faithfully made">
+
+The tools you have used in this course, from `grep` to `sort`, were written decades ago by people who could not have imagined how they would be used today, and they still work because each was made to do one job carefully and to cooperate with others. There is a quiet lesson in that for any craft: work done faithfully in small things becomes something others can build on for a long time. A script with clear names, honest error messages and a safe default is a small gift to the colleague who will run it at three in the morning.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`wait` with no arguments tells me whether my jobs succeeded."** It returns 0 once all jobs have finished, whatever their statuses. Keep each PID from `$!` and `wait` for each one to collect its status.
+
+</Misconception>
+
+<Misconception>
+
+**"`kill` kills."** By default it sends `TERM`, a request that a program may handle, delay or ignore. Reach for `kill -KILL` (`-9`) only when a process refuses to stop, because it gives the process no chance to clean up.
+
+</Misconception>
+
+<Misconception>
+
+**"A cron job behaves like the same command typed in my terminal."** Cron uses a minimal environment, no terminal and often a different shell (`/bin/sh`). Use absolute paths, a Bash shebang, explicit settings, and redirect output to a log you will actually read.
+
+</Misconception>
+
+<Misconception>
+
+**"Running things in parallel always makes a script faster."** Only when the work is independent and the machine (or the remote service) has capacity to spare. Ten parallel copies of a disk-bound job can be slower than one, and a hundred parallel requests can get you blocked. Limit parallelism with `xargs -P` and measure.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The last exercises refer to the project script; read it again before answering.
+
+<Exercises/>
+
+</Section>

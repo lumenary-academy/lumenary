@@ -1,0 +1,411 @@
+---
+title: Futures, streams and isolates
+subtitle: How one thread stays responsive with an event loop, async and await, streams of events, and isolates for real parallelism.
+minutes: 65
+objectives:
+  - Explain Dart's event loop and predict the order of synchronous code, microtasks and events
+  - Write async functions that return futures, and combine them with await, Future.wait and timeouts
+  - Handle errors in asynchronous code with try, catch and await
+  - Produce and consume streams with async*, yield, await for and StreamController
+  - Use Isolate.run for CPU-heavy work, and explain why isolates share no memory
+prerequisites: [records-patterns-sealed]
+references:
+  - title: Asynchronous programming with futures, async and await
+    url: https://dart.dev/libraries/async/async-await
+  - title: Asynchronous programming with streams
+    url: https://dart.dev/libraries/async/using-streams
+  - title: Concurrency in Dart
+    url: https://dart.dev/language/concurrency
+    note: The event loop, isolates, and how they relate.
+  - title: Isolates
+    url: https://dart.dev/language/isolates
+  - title: Futures and error handling
+    url: https://dart.dev/libraries/async/futures-error-handling
+---
+
+<Section id="motivation" kind="motivation" title="Never block the event loop">
+
+A phone app draws its screen around 60 or more times a second. If the code that draws it stops for half a second to wait for the network, the app freezes, and users notice at once. Dart's answer is unusual: by default, all your code runs on **one thread** per isolate, and that thread must never wait. Instead of blocking, code that needs a slow result asks for a **future**, a promise of a value later, and lets the thread get on with other work. When the value is ready, the code continues where it left off.
+
+This model has a great advantage: since only one piece of your code runs at a time inside an isolate, there are no data races, no locks and no torn reads, the bugs that make multithreaded programs in many languages so hard. For the cases where you really need several cores, for heavy computation, Dart offers **isolates**: separate workers that share no memory and talk by sending messages.
+
+This lesson covers the event loop, futures with `async` and `await`, streams of events, and isolates.
+
+</Section>
+
+<Section id="event-loop" kind="intuition" title="The event loop">
+
+Each isolate has an **event loop** and two queues. The **event queue** holds outside events (timers firing, input and output completing, user taps) and futures scheduled to run later. The **microtask queue** holds very short tasks that must run as soon as the current code finishes, before the next event, such as the continuation of a future that has already completed. The loop is simple: run the current synchronous code to the end; then run *every* microtask; then take *one* event, run it, and repeat.
+
+```dart check
+import 'dart:async';
+
+void main() {
+  print('1. main starts');
+
+  Future(() => print('7. a future (event queue)'));
+  Future.delayed(
+    Duration.zero,
+    () => print('8. a zero-delay timer (event queue)'),
+  );
+  scheduleMicrotask(() => print('4. a microtask'));
+  Future.value(
+    'done',
+  ).then((v) => print('5. then on a completed future ($v): also a microtask'));
+
+  printLater();
+  print('3. main ends; the event loop takes over');
+}
+
+Future<void> printLater() async {
+  print('2. an async function runs synchronously until its first await');
+  await null;
+  print('6. ...and resumes later, in a microtask');
+}
+```
+
+```text
+1. main starts
+2. an async function runs synchronously until its first await
+3. main ends; the event loop takes over
+4. a microtask
+5. then on a completed future (done): also a microtask
+6. ...and resumes later, in a microtask
+7. a future (event queue)
+8. a zero-delay timer (event queue)
+```
+
+The numbers in the messages give the order in which they printed. All the synchronous code of `main` runs first, including the start of `printLater`: an `async` function runs synchronously until its first `await`, and only then returns a future to its caller. When `main` ends, the loop runs the microtasks in the order they were scheduled, including the rest of `printLater`, and only then the two events. You will rarely schedule microtasks yourself, but knowing this order explains many puzzles: why a value set "later" is not visible yet, and why a long synchronous loop freezes everything, since no event can run until it finishes.
+
+</Section>
+
+<Section id="futures" kind="examples" title="Futures, async and await">
+
+<Definition term="future">
+
+A `Future` of some type `T` represents a value of type `T`, or an error, that will be available at some time in the future. An **`async`** function always returns a future. Inside it, **`await`** suspends the function until a future completes, then continues with its value, or throws its error.
+
+</Definition>
+
+```dart check
+// A pretend network call: it completes after a delay.
+Future<int> fetchTemperature(String city) async {
+  await Future.delayed(const Duration(milliseconds: 100));
+  const readings = {'Cusco': 14, 'Dakar': 29, 'Tromsø': -3};
+  final value = readings[city];
+  if (value == null) throw StateError('no station in $city');
+  return value;
+}
+
+Future<void> main() async {
+  final watch = Stopwatch()..start();
+
+  // One after another: each await waits for the previous call.
+  final a = await fetchTemperature('Cusco');
+  final b = await fetchTemperature('Dakar');
+  final sequential = watch.elapsedMilliseconds;
+  print('sequential: $a $b');
+
+  // Start both, then wait for both: they run concurrently.
+  watch.reset();
+  final both = await Future.wait([
+    fetchTemperature('Cusco'),
+    fetchTemperature('Dakar'),
+  ]);
+  final concurrent = watch.elapsedMilliseconds;
+  print('Future.wait: $both');
+  print('concurrent was faster: ${concurrent < sequential}');
+
+  // Records of futures can be awaited together too (Dart 3.0), keeping each type.
+  final (cusco, tromso) = await (
+    fetchTemperature('Cusco'),
+    fetchTemperature('Tromsø'),
+  ).wait;
+  print('difference: ${cusco - tromso}');
+
+  // Errors thrown in an async function come back through await, into try/catch.
+  try {
+    await fetchTemperature('Atlantis');
+  } on StateError catch (e) {
+    print('failed: ${e.message}');
+  }
+
+  // A timeout turns a slow future into a TimeoutException.
+  final slow = Future.delayed(const Duration(milliseconds: 400), () => 'late');
+  final result = await slow.timeout(
+    const Duration(milliseconds: 50),
+    onTimeout: () => 'gave up waiting',
+  );
+  print(result);
+}
+```
+
+```text
+sequential: 14 29
+Future.wait: [14, 29]
+concurrent was faster: true
+difference: 17
+failed: no station in Atlantis
+gave up waiting
+```
+
+- `fetchTemperature` is declared `async` and returns a future of `int`; its body reads like ordinary code. `Future.delayed` stands in for a network call.
+- `main` itself is `async`, so the program waits for everything before exiting.
+- **Sequential awaits** take about 200 milliseconds, because the second call starts only after the first has finished. **`Future.wait`** starts both before waiting, so they overlap and take about 100. Waiting on a record of futures with `.wait` (Dart 3.0) does the same while keeping each result's own type, which a list of futures cannot.
+- **Errors** thrown in an `async` function travel through the future, and `await` rethrows them, so ordinary `try` and `catch` work.
+- **`timeout`** gives up on a slow future after a deadline, here returning a fallback value with `onTimeout`; without it, a `TimeoutException` is thrown. Note that the slow operation is not cancelled, merely ignored: Dart futures cannot be cancelled from outside.
+
+Before `async` and `await` were added in Dart 1.9, futures were combined with `then` callbacks, and you will still see `future.then((value) => ...)` in older code. It is equivalent, but `await` keeps error handling and control flow readable.
+
+One mistake catches everyone once: calling an `async` function without `await`. The call starts the work but nothing waits for it, and if it fails, nobody hears. The `unawaited_futures` and `discarded_futures` lints flag this, and when you really mean "fire and forget", wrapping the call in `unawaited(...)` from `dart:async` documents the intention.
+
+</Section>
+
+<Section id="streams" kind="examples" title="Streams">
+
+A future delivers one value; a **stream** delivers a sequence of values over time: the bytes of a download, keystrokes, location updates, messages from a server. Streams have the same vocabulary as iterables, but every step is asynchronous.
+
+```dart check
+import 'dart:async';
+
+// An async* function produces a stream; yield emits each value.
+Stream<int> countdown(int from) async* {
+  for (var i = from; i > 0; i--) {
+    await Future.delayed(const Duration(milliseconds: 20));
+    yield i;
+  }
+}
+
+// Readings from a sensor that sometimes fails.
+Stream<double> readings() async* {
+  yield 21.5;
+  yield 22.0;
+  throw StateError('sensor unplugged');
+}
+
+Future<void> main() async {
+  // await for consumes a stream, one event at a time.
+  await for (final n in countdown(3)) {
+    print('T-minus $n');
+  }
+
+  // Streams have the same vocabulary as iterables, but asynchronous.
+  final evens = await countdown(10)
+      .where((n) => n.isEven)
+      .map((n) => n * n)
+      .toList();
+  print(evens);
+
+  // Errors arrive through the stream; try/catch around await for handles them.
+  try {
+    await for (final r in readings()) {
+      print('reading $r');
+    }
+  } on StateError catch (e) {
+    print('stream failed: ${e.message}');
+  }
+
+  // A StreamController lets ordinary code push events. A broadcast stream
+  // can have several listeners.
+  final controller = StreamController<String>.broadcast();
+  final log = <String>[];
+  controller.stream.listen((e) => log.add('A got $e'));
+  controller.stream
+      .where((e) => e.startsWith('b'))
+      .listen((e) => log.add('B got $e'));
+  controller
+    ..add('apple')
+    ..add('banana');
+  await controller.close();
+  print(log);
+}
+```
+
+```text
+T-minus 3
+T-minus 2
+T-minus 1
+[100, 64, 36, 16, 4]
+reading 21.5
+reading 22.0
+stream failed: sensor unplugged
+[A got apple, A got banana, B got banana]
+```
+
+- An **`async*`** function returns a stream, and **`yield`** emits each value. Like a generator, it runs only while someone listens.
+- **`await for`** consumes a stream one event at a time, pausing the loop between events. It ends when the stream is done.
+- `where`, `map`, `take`, `toList` and friends transform streams just as they do iterables. `toList` on a stream returns a future of the list.
+- An error in the stream ends an `await for` loop with an exception, which `try` and `catch` handle.
+- A **`StreamController`** lets ordinary code push events into a stream with `add`, which is how you adapt callback-based APIs. A plain stream can have one listener; a **broadcast** stream, like this one, can have several, and each receives events from the moment it starts listening. Closing the controller ends the stream.
+
+When you listen with `listen` instead of `await for`, you get a `StreamSubscription`, which you can `pause`, `resume` and `cancel`. Cancelling subscriptions when they are no longer needed, for example when a Flutter screen is closed, is the stream equivalent of freeing memory, and forgetting it is a classic source of leaks.
+
+</Section>
+
+<Section id="isolates" kind="examples" title="Isolates: parallelism without shared memory">
+
+Asynchrony keeps one thread responsive while it waits; it does not make computation faster. Counting primes, decoding a large image or parsing a big JSON file keeps the thread busy, and while it is busy, the event loop is stuck. For that, Dart has **isolates**.
+
+<Definition term="isolate">
+
+An **isolate** is an independent worker with its own memory, its own event loop and its own thread of execution. Isolates do not share objects; they communicate by **sending messages**, which are copied (or, for some data, transferred) from one isolate to another.
+
+</Definition>
+
+```dart check
+import 'dart:isolate';
+
+// A deliberately slow, CPU-bound task: count the primes below n.
+int countPrimes(int n) {
+  var count = 0;
+  for (var i = 2; i < n; i++) {
+    var isPrime = true;
+    for (var d = 2; d * d <= i; d++) {
+      if (i % d == 0) {
+        isPrime = false;
+        break;
+      }
+    }
+    if (isPrime) count++;
+  }
+  return count;
+}
+
+Future<void> main() async {
+  // Isolate.run executes the function in a new isolate (on another core)
+  // and returns its result as a Future. The main isolate stays free.
+  final results = await Future.wait([
+    Isolate.run(() => countPrimes(200000)),
+    Isolate.run(() => countPrimes(300000)),
+  ]);
+  print('primes below 200000: ${results[0]}');
+  print('primes below 300000: ${results[1]}');
+
+  // Isolates share no memory: the worker gets a copy of the list, not the list.
+  final numbers = [1, 2, 3];
+  final doubledElsewhere = await Isolate.run(() {
+    numbers.add(4); // changes the copy inside the worker isolate
+    return numbers.map((n) => n * 2).toList();
+  });
+  print('$doubledElsewhere $numbers');
+}
+```
+
+```text
+primes below 200000: 17984
+primes below 300000: 25997
+[2, 4, 6, 8] [1, 2, 3]
+```
+
+**`Isolate.run`** (Dart 2.19) is the easy way in: it starts a new isolate, runs the function there, sends back the result, and shuts the isolate down. The two prime counts run in parallel on two cores while the main isolate stays free to handle events; in a Flutter app, the UI would keep animating. Flutter's `compute` function does the same job.
+
+The second call shows what "no shared memory" means. The closure refers to `numbers`, but the worker receives a *copy* of everything the closure captures, so its `add(4)` changed the copy, and the original list in the main isolate is still `[1, 2, 3]`. This is why Dart needs no locks: two isolates simply cannot touch the same object. The cost is copying, so send compact data, and keep long-lived workers (built with `Isolate.spawn` and ports) for repeated tasks to avoid the start-up cost each time. On the web, `Isolate.run` is not supported: Flutter's `compute` falls back to running the function on the main thread there, and browsers offer web workers for parallel work instead.
+
+</Section>
+
+<Section id="ports" kind="examples" title="Long-lived isolates and ports">
+
+`Isolate.run` starts a fresh isolate for each job. When a worker should stay alive and handle many requests, for example a background parser fed by a stream of messages, you spawn it once and talk to it through **ports**. A `ReceivePort` is an inbox (and a stream of the messages that arrive); its `sendPort` is the address others use to send to it.
+
+```dart check
+import 'dart:async';
+import 'dart:isolate';
+
+// The worker: receives requests, replies with results, stops on 'stop'.
+void worker(SendPort toMain) {
+  final inbox = ReceivePort();
+  toMain.send(inbox.sendPort); // first message: how to reach me
+  inbox.listen((message) {
+    if (message == 'stop') {
+      inbox.close();
+      return;
+    }
+    final (int id, String text) = message as (int, String);
+    toMain.send((id, text.split(' ').length));
+  });
+}
+
+Future<void> main() async {
+  final fromWorker = ReceivePort();
+  await Isolate.spawn(worker, fromWorker.sendPort);
+  final events = StreamIterator(fromWorker);
+
+  await events.moveNext();
+  final toWorker = events.current as SendPort;
+
+  const texts = [
+    'the river is wide',
+    'mvua inanyesha',
+    'a stitch in time saves nine',
+  ];
+  for (final (i, text) in texts.indexed) {
+    toWorker.send((i, text));
+  }
+  for (var n = 0; n < texts.length; n++) {
+    await events.moveNext();
+    final (int id, int words) = events.current as (int, int);
+    print('text $id has $words words');
+  }
+
+  toWorker.send('stop');
+  fromWorker.close();
+}
+```
+
+```text
+text 0 has 4 words
+text 1 has 2 words
+text 2 has 6 words
+```
+
+The handshake is the part to study. The main isolate creates an inbox and passes its `SendPort` to `Isolate.spawn`. The worker creates its own inbox and sends *its* `SendPort` back as its first message; from then on, each side can send to the other. Messages here are records, `(id, text)` one way and `(id, wordCount)` the other, and both sides take them apart with patterns. Records, lists, maps, strings and numbers can all be sent. A `StreamIterator` lets the main isolate read replies one at a time with `await`, and the `'stop'` message lets the worker close its port, which ends its event loop and lets it exit. Real code adds error handling (`Isolate.spawn` can report errors through an `onError` port) and usually wraps this plumbing in a small class with an `async` method per request.
+
+</Section>
+
+<Section id="professional" kind="human" title="Asynchronous code in professional Dart">
+
+In a Flutter app, the rule "never block the event loop" shapes the architecture. Widgets never wait; they display the *current* state and rebuild when a future completes or a stream emits, through `FutureBuilder`, `StreamBuilder` or, more often, a state-management layer that exposes state as streams or notifiers. Network and database calls return futures; anything that can take more than a few milliseconds of CPU, like decoding a large JSON response, goes to an isolate.
+
+On servers and command-line tools, `main` is usually `async`, and the same rules apply: one isolate handles many requests concurrently because each request spends most of its time waiting. Teams enable the lints that catch forgotten futures, write `async` tests (`package:test` lets a test function return a future and has matchers such as `completion` and `emitsInOrder` for futures and streams), and use `package:fake_async` to test timers without real waiting. The low-level tool for adapting callback APIs to futures is the `Completer`, which lets code complete a future by hand; reach for it only when no higher-level API fits.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`async` makes a function run in the background."** An `async` function runs on the same thread, synchronously, until its first `await`. Asynchrony is about not *waiting*; it does not move computation elsewhere. For heavy computation, use an isolate.
+
+</Misconception>
+
+<Misconception>
+
+**"`Future.wait` runs the futures in parallel threads."** The operations overlap their waiting (for timers, network, disk), which is what makes it faster. Any Dart code they run still takes turns on the one thread of the isolate.
+
+</Misconception>
+
+<Misconception>
+
+**"`timeout` cancels the slow operation."** It stops *waiting* for it. The underlying work carries on, and its result is ignored. Real cancellation needs cooperation from the operation, for example through a cancellable API or a stream subscription you `cancel`.
+
+</Misconception>
+
+<Misconception>
+
+**"If nobody awaits a failing future, its error just disappears."** An error in a future that has no handler is an *uncaught* asynchronous error: it is reported to the isolate's error handler and, in a command-line program, can crash it, often far from the line that caused it. Await your futures, or attach an error handler to the ones you deliberately leave running.
+
+</Misconception>
+
+<Misconception>
+
+**"Isolates are threads, so I need locks."** Isolates share no mutable memory, so there is nothing to lock. They exchange copies of messages.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

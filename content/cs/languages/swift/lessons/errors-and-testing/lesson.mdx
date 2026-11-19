@@ -1,0 +1,357 @@
+---
+title: Errors and testing
+subtitle: Throwing, catching and typed throws; when to trap instead; and proving your code works with Swift Testing.
+minutes: 60
+objectives:
+  - Define errors as enums conforming to Error, and throw, propagate and catch them
+  - Use try, try? and try!, and explain what each says to a reader
+  - Use typed throws (Swift 6.0), Result and defer
+  - Distinguish recoverable errors from programmer mistakes, and use precondition and fatalError for the second kind
+  - Write and run tests with Swift Testing's @Test, #expect, #require and parameterized arguments
+prerequisites: [protocols-and-generics]
+references:
+  - title: "The Swift Programming Language: Error Handling"
+    url: https://docs.swift.org/swift-book/documentation/the-swift-programming-language/
+  - title: Error handling rationale and proposal
+    url: https://github.com/swiftlang/swift/blob/main/docs/ErrorHandlingRationale.md
+    note: The design document behind Swift's error model, comparing it with exceptions in other languages.
+  - title: "SE-0413: Typed throws"
+    url: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0413-typed-throws.md
+    note: Includes guidance on when typed throws are and are not a good idea.
+  - title: Swift Testing documentation
+    url: https://developer.apple.com/documentation/testing
+  - title: swift-testing on GitHub
+    url: https://github.com/swiftlang/swift-testing
+    note: The open-source testing library that ships with the toolchain.
+---
+
+<Section id="motivation" kind="motivation" title="When things go wrong, say why">
+
+An optional can say "there is no answer", but not why. When a bank transfer fails, the caller needs to know whether the amount was invalid, the account was frozen, or the money was not there, because each calls for a different message, retry or log entry. That is what **errors** are for.
+
+Swift's error handling looks like exceptions in Java or Python (`throw`, `catch`), but it was designed to avoid their best-known problem: in those languages, any call might throw, and nothing at the call site tells you which ones do. In Swift, a function that can fail says `throws` in its signature, and **every call to it must be marked with `try`**. When you read a function, you can see each point where control might leave early. And throwing is cheap: an error is returned through an ordinary, efficient return path, not by expensive stack unwinding.
+
+The second half of the lesson is about catching your own mistakes before users do: **tests**. Swift's toolchain includes Swift Testing, a modern testing library, and professional Swift code is expected to come with tests run by `swift test` or Xcode on every change.
+
+</Section>
+
+<Section id="throwing" kind="examples" title="Throwing and catching">
+
+<Definition term="error">
+
+An **error** in Swift is any value whose type conforms to the `Error` protocol, which has no requirements. Errors are usually enums, one case per way of failing, with associated values carrying the details. A function marked `throws` may **throw** an error instead of returning, and its caller must use **`try`** and either handle the error with `do`/`catch` or be marked `throws` itself, so that the error **propagates** further up.
+
+</Definition>
+
+```swift check
+enum TransferError: Error {
+    case invalidAmount
+    case insufficientFunds(shortBy: Int)
+    case accountFrozen(owner: String)
+}
+
+struct Account {
+    let owner: String
+    var balance: Int
+    var isFrozen = false
+}
+
+func transfer(_ amount: Int, from source: inout Account, to target: inout Account) throws {
+    guard amount > 0 else { throw TransferError.invalidAmount }
+    guard !source.isFrozen else { throw TransferError.accountFrozen(owner: source.owner) }
+    guard source.balance >= amount else {
+        throw TransferError.insufficientFunds(shortBy: amount - source.balance)
+    }
+    source.balance -= amount
+    target.balance += amount
+}
+
+var amina = Account(owner: "Amina", balance: 500)
+var jorge = Account(owner: "Jorge", balance: 100)
+
+for amount in [200, -5, 450] {
+    do {
+        try transfer(amount, from: &amina, to: &jorge)
+        print("Moved \(amount): Amina \(amina.balance), Jorge \(jorge.balance)")
+    } catch TransferError.insufficientFunds(let shortBy) {
+        print("Cannot move \(amount): short by \(shortBy)")
+    } catch {
+        print("Cannot move \(amount): \(error)")
+    }
+}
+
+jorge.isFrozen = true
+// try? turns any error into nil, when you only care whether it worked.
+let worked: Void? = try? transfer(10, from: &jorge, to: &amina)
+print(worked == nil ? "Frozen account: transfer refused" : "Transfer done")
+```
+
+```text
+Moved 200: Amina 300, Jorge 300
+Cannot move -5: invalidAmount
+Cannot move 450: short by 150
+Frozen account: transfer refused
+```
+
+The `do` block runs the risky code. If `transfer` throws, the rest of the `do` block is skipped and the `catch` clauses are tried in order, like `switch` cases: the first one uses a pattern to catch only `insufficientFunds` and unpack its associated value; the last one, with no pattern, catches everything else and provides an implicit constant called `error`. Notice that the failed transfers did not change any balance. The function checks everything with `guard` before modifying anything, a good habit: either an operation succeeds completely or it leaves things as they were.
+
+Three spellings of `try` say three different things:
+
+| Form | Meaning | Use when |
+| --- | --- | --- |
+| `try f()` | if `f` throws, propagate the error or jump to `catch` | the normal case |
+| `try? f()` | if `f` throws, the result is `nil` (the error itself is discarded) | you only care whether it worked |
+| `try! f()` | if `f` throws, the program traps | failure is impossible unless the program has a bug |
+
+`try!` is the error-handling cousin of the force unwrap, with the same advice: rarely, and never on input from outside the program. `try?` is convenient but throws away the reason; use it only when you really would ignore the reason anyway.
+
+</Section>
+
+<Section id="typed" kind="examples" title="Typed throws, Result and defer">
+
+A plain `throws` function can throw any `Error`, so a `catch` without a pattern receives an `any Error`. Since **Swift 6.0** you can declare the one error type a function throws, written `throws(AgeError)`. This is called **typed throws**.
+
+```swift check
+enum AgeError: Error {
+    case notANumber(String)
+    case outOfRange(Int)
+}
+
+// Typed throws (Swift 6.0): this function can throw only AgeError.
+func parseAge(_ text: String) throws(AgeError) -> Int {
+    guard let n = Int(text) else { throw .notANumber(text) }
+    guard (0...150).contains(n) else { throw .outOfRange(n) }
+    return n
+}
+
+for input in ["42", "abc", "200"] {
+    do {
+        let age = try parseAge(input)
+        print("\(input): age \(age)")
+    } catch {
+        // error has type AgeError here, so this switch is exhaustive.
+        switch error {
+        case .notANumber(let text): print("\(input): '\(text)' is not a number")
+        case .outOfRange(let n): print("\(input): \(n) is out of range")
+        }
+    }
+}
+
+// Result stores success or failure as a value, to handle later.
+let results = ["7", "-1"].map { text in Result { try parseAge(text) } }
+for r in results {
+    switch r {
+    case .success(let age): print("ok:", age)
+    case .failure(let error): print("failed:", error)
+    }
+}
+
+// defer runs when the scope ends, however it ends; several run in reverse order.
+func process() throws(AgeError) -> Int {
+    print("open file")
+    defer { print("close file") }
+    defer { print("flush buffer") }
+    return try parseAge("31") + parseAge("x")
+}
+do {
+    print(try process())
+} catch {
+    print("process failed with", error)
+}
+```
+
+```text
+42: age 42
+abc: 'abc' is not a number
+200: 200 is out of range
+ok: 7
+failed: outOfRange(-1)
+open file
+flush buffer
+close file
+process failed with notANumber("x")
+```
+
+Inside `parseAge`, `throw .notANumber(text)` needs no type name: the compiler knows the error must be an `AgeError`. In the loop, every throwing call in the `do` block throws `AgeError`, so the compiler infers that `error` in the `catch` block is an `AgeError`, and the `switch` can be exhaustive with no `default`. With untyped `throws`, the same `catch` would receive an `any Error`, and you would need a pattern or a cast to learn more.
+
+Should every function use typed throws, then? The Swift community's guidance, written into the proposal itself, is *no*. Untyped `throws` remains the right default for most code, especially public APIs, because a function's list of possible failures tends to grow over time, and a typed signature makes every new kind of error a breaking change for callers. Typed throws shine where the set of errors is truly fixed and closed, inside a module, in generic code that should pass along whatever its closures throw, and in embedded Swift, where avoiding the `any Error` box matters.
+
+**`Result`** is an enum with two cases, `.success(value)` and `.failure(error)`. It turns a throwing call into a value you can store, put in an array, or pass to another function, as the `map` does; `Result { try ... }` catches the error into the value. Before `async`/`await` arrived, `Result` was the standard way to deliver errors to completion handlers. Today it is mostly used to store outcomes for later.
+
+**`defer`** schedules code to run when the current scope exits, whether it exits normally, by `return`, or by a thrown error. Several `defer` blocks run in reverse order, like a stack, which matches how resources are usually acquired and released. In `process()`, the second `parseAge` call throws, yet both deferred blocks still run before the error reaches the `catch`. Use `defer` to put cleanup right next to the setup it undoes. Note also that one `try` covers the whole expression `parseAge("31") + parseAge("x")`.
+
+</Section>
+
+<Section id="rethrows" kind="examples" title="Errors through higher-order functions">
+
+What should a function do when it takes a closure that might throw? `map`, `filter` and friends face this question constantly. Swift's answer is **`rethrows`**: the function throws only if the closure it was given throws. Callers passing a non-throwing closure need no `try` at all.
+
+```swift check
+enum NetworkError: Error {
+    case timeout(attempt: Int)
+}
+
+struct BadNumber: Error {
+    let text: String
+}
+
+/// Calls `operation` up to `attempts` times, passing the attempt number.
+/// It throws only if the operation does: `rethrows`.
+func retry<T>(attempts: Int, _ operation: (Int) throws -> T) rethrows -> T {
+    for attempt in 1..<attempts {
+        do {
+            return try operation(attempt)
+        } catch {
+            print("  attempt \(attempt) failed: \(error)")
+        }
+    }
+    return try operation(attempts)   // the last attempt's error propagates
+}
+
+// A pretend server that answers on the third try.
+func fetchGreeting(attempt: Int) throws -> String {
+    if attempt < 3 { throw NetworkError.timeout(attempt: attempt) }
+    return "Sannu!"
+}
+
+do {
+    print("Fetching with 5 attempts:")
+    print(try retry(attempts: 5, fetchGreeting))
+    print("Fetching with 2 attempts:")
+    print(try retry(attempts: 2, fetchGreeting))
+} catch {
+    print("gave up: \(error)")
+}
+
+// With a closure that cannot throw, no try is needed at all.
+let doubled = retry(attempts: 3) { attempt in attempt * 2 }
+print(doubled)
+
+// map rethrows too: a throwing closure makes the whole call need try.
+let parsed = try ["4", "8", "15"].map { text in
+    guard let n = Int(text) else { throw BadNumber(text: text) }
+    return n
+}
+print(parsed)
+```
+
+```text
+Fetching with 5 attempts:
+  attempt 1 failed: timeout(attempt: 1)
+  attempt 2 failed: timeout(attempt: 2)
+Sannu!
+Fetching with 2 attempts:
+  attempt 1 failed: timeout(attempt: 1)
+gave up: timeout(attempt: 2)
+2
+[4, 8, 15]
+```
+
+`retry` is generic over the result type and passes each attempt number to the operation. It catches and reports the errors of all but the last attempt, and lets the last one propagate, which is allowed in a `rethrows` function because that error came from the closure. Passing the named function `fetchGreeting` works because its type, `(Int) throws -> String`, matches the parameter. The call with a non-throwing closure, `{ attempt in attempt * 2 }`, compiles without `try`. The same mechanism explains why `map` with a closure that can throw needs `try` in front, and an ordinary `map` does not. (A retry helper in real code would also wait between attempts, using the `async` sleep you will meet in the next lesson.)
+
+</Section>
+
+<Section id="traps" kind="human" title="Errors or traps?">
+
+Swift draws a clear line between two kinds of failure, and experienced developers keep it in mind for every function they write:
+
+- **Recoverable errors** are things that can go wrong even in a correct program: a file is missing, the network is down, the user typed letters into an age field. The caller can reasonably do something about them. Use `throws` (or an optional, if there is only one way to fail).
+- **Programmer errors** are violations of assumptions that a correct program would never break: an index out of range, a negative count passed to a function documented to need a positive one, an impossible enum state. No caller can sensibly "handle" these; the right response is to stop before doing damage, and fix the code. Use a **trap**.
+
+The standard library gives you three traps. `precondition(condition, "message")` checks an assumption and stops the program with your message if it is false. `assert(condition, "message")` does the same, but only in debug builds; it is compiled out of optimized builds, so use it for expensive checks during development. `fatalError("message")` stops unconditionally, for code paths that must never be reached. The standard library's own array subscript, integer overflow and force unwrap are traps of exactly this kind.
+
+Why not throw for programmer errors too? Because every caller would then need a `try` and a `catch` that cannot do anything useful, and the noise would bury the real errors that can be handled. Java's checked exceptions are often cited as the cautionary example.
+
+</Section>
+
+<Section id="testing" kind="computation" title="Testing with Swift Testing">
+
+Swift Testing ships with the toolchain since Swift 6 and is the recommended way to write new tests; the older XCTest framework still works and you will see it in existing projects, often side by side. Tests live in a package's `Tests/` folder, in a test target that depends on the code under test. Here is a small package: the library target contains `AgeError` and `parseAge` from above, marked `public` (plus `Equatable` on the error, so tests can compare errors), and the test target contains:
+
+```swift
+import Testing
+@testable import Ages
+
+@Test func parsesAPlainNumber() throws {
+    #expect(try parseAge("42") == 42)
+}
+
+@Test("Rejects text that is not a number")
+func rejectsText() {
+    #expect(throws: AgeError.notANumber("forty")) {
+        try parseAge("forty")
+    }
+}
+
+@Test(arguments: ["-1", "151", "999"])
+func rejectsOutOfRange(input: String) {
+    #expect(throws: AgeError.self) {
+        try parseAge(input)
+    }
+}
+
+@Test func boundaryValues() throws {
+    let youngest = try #require(try? parseAge("0"))
+    #expect(youngest == 0)
+    #expect(try parseAge("150") == 150)
+}
+```
+
+The pieces:
+
+- **`@Test`** marks a function as a test. It may be `throws` (an unexpected error fails the test) and `async`. An optional string gives it a readable name.
+- **`#expect(condition)`** checks a Boolean expression. On failure it records an issue that shows the expression and the values involved, and the test carries on, so one run reports every failing expectation. It is a *macro* (the `#` gives it away), which is how it can see the source of the expression.
+- **`#expect(throws:)`** checks that code throws a particular error value, or any error of a type.
+- **`#require`** is the stricter cousin: if it fails, the test stops there. Use it for preconditions of the rest of the test, such as unwrapping an optional: `try #require(optionalValue)` returns the unwrapped value or ends the test.
+- **`@Test(arguments:)`** makes a **parameterized test**: one function, run once per argument, each reported separately. This replaces copy-pasted near-identical tests.
+- `@testable import` gives the tests access to `internal` declarations as well as `public` ones.
+
+Run them with `swift test` in the package folder. With Swift 6.4 on Linux, the end of the output read:
+
+```text
+✔ Test boundaryValues() passed after 0.001 seconds.
+✔ Test parsesAPlainNumber() passed after 0.001 seconds.
+✔ Test "Rejects text that is not a number" passed after 0.001 seconds.
+✔ Test rejectsOutOfRange(input:) with 3 test cases passed after 0.001 seconds.
+✔ Test run with 4 tests in 0 suites passed after 0.001 seconds.
+```
+
+Tests run in parallel by default, which is why the order is not the order in the file; a good test never depends on another one having run first. To see a failure, change the last expectation to `#expect(try parseAge("15") == 150)`:
+
+```text
+✘ Test boundaryValues() recorded an issue at AgesTests.swift:25:5: Expectation failed: try parseAge("15") == 150
+✘ Test boundaryValues() failed after 0.001 seconds with 1 issue.
+✘ Test run with 4 tests in 0 suites failed after 0.001 seconds with 1 issue.
+```
+
+Tests can also be grouped into **suites** (a struct containing `@Test` methods, which gets a fresh instance for each test), tagged, and enabled or disabled by conditions. Xcode shows each test with a diamond in the margin that you can click to run it.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Swift errors are exceptions, so throwing is slow."** Swift does not unwind the stack with tables the way C++ exceptions do. A throwing function returns its error through a dedicated register, and the caller checks it, at a cost similar to returning an optional. Use errors freely for expected failures.
+
+</Misconception>
+
+<Misconception>
+
+**"`try?` is a safe way to silence errors."** It is safe from crashes, but it throws the information away. A program that uses `try?` everywhere fails silently, which is often worse than failing loudly. Log or handle the error unless you really have nothing to do with it.
+
+</Misconception>
+
+<Misconception>
+
+**"Tests are for after the code works."** In practice, writing a test as soon as you understand what a function should do (often before writing the function) is how professionals avoid spending hours in the debugger. A parameterized test listing edge cases, like ages 0, 150, 151 and −1, is a specification you can run.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,469 @@
+---
+title: Exceptions and context managers
+subtitle: Raising, catching and designing exceptions, handling several failures at once with exception groups, and guaranteeing cleanup with the with statement.
+minutes: 55
+objectives:
+  - Trace exactly which clauses of try, except, else and finally run, and in what order
+  - Design an exception hierarchy for a module, translate low-level errors with raise ... from, and add notes
+  - Decide what to catch and where, following EAFP and the rule of never swallowing errors silently
+  - Raise and handle several errors at once with ExceptionGroup and except*
+  - Write context managers as classes and with contextlib, and use ExitStack and the standard library's managers
+prerequisites: [classes]
+references:
+  - title: "The Python Tutorial: Errors and Exceptions"
+    url: https://docs.python.org/3/tutorial/errors.html
+  - title: "The Python Standard Library: Built-in exceptions (with the class hierarchy)"
+    url: https://docs.python.org/3/library/exceptions.html
+  - title: "The Python Standard Library: contextlib"
+    url: https://docs.python.org/3/library/contextlib.html
+  - title: "PEP 343: The with Statement"
+    url: https://peps.python.org/pep-0343/
+  - title: "PEP 654: Exception Groups and except*"
+    url: https://peps.python.org/pep-0654/
+  - title: "PEP 678: Enriching Exceptions with Notes"
+    url: https://peps.python.org/pep-0678/
+---
+
+<Section id="motivation" kind="motivation" title="When things go wrong, on purpose">
+
+Programs fail. Files are missing, networks drop, users type "twelve" where a number belongs, disks fill up. What separates robust software from fragile software is not that it avoids failure but that it fails *well*: it reports the right problem at the right place, it cleans up whatever it was holding (files, locks, database transactions), and it never pretends an error did not happen.
+
+Python's main tools for this are **exceptions**, which carry an error from the place it is detected to the place that knows what to do about it, and **context managers**, the `with` statement, which guarantee that cleanup happens however a block is left. Since Python 3.11 there is a third: **exception groups**, for the cases where several things fail at once, which happens naturally in concurrent code.
+
+You have used all three already. This lesson is about using them like a professional: designing your own exceptions, catching precisely, preserving the evidence, and writing your own context managers.
+
+</Section>
+
+<Section id="machinery" kind="definitions" title="The machinery">
+
+`raise` creates (or re-raises) an exception and starts **unwinding**: Python abandons the current function, then its caller, and so on up the call stack, until it finds a `try` statement with a matching `except` clause. If none matches, the program stops and prints a traceback.
+
+A `try` statement has up to four kinds of clause:
+
+- `try:` the code that might fail;
+- `except SomeError as err:` runs if that kind of error was raised in the `try` block (the first matching clause wins);
+- `else:` runs only if the `try` block finished *without* an exception;
+- `finally:` runs no matter what: after success, after a handled error, after an unhandled one, and even when the block exits through `return` or `break`.
+
+The order surprises people the first time, so run it:
+
+```python run
+def attempt(n):
+    try:
+        print("  try")
+        result = 10 / n
+    except ZeroDivisionError:
+        print("  except")
+        return "failed"
+    else:
+        print("  else")
+        return result
+    finally:
+        print("  finally")        # runs before either return completes
+
+
+print(attempt(2))
+print(attempt(0))
+```
+
+```text
+  try
+  else
+  finally
+5.0
+  try
+  except
+  finally
+failed
+```
+
+Why have `else` at all? To keep the `try` block as small as possible. Code in `else` is not protected, so an unexpected `ZeroDivisionError` raised there would not be mistaken for the one you meant to catch.
+
+Exceptions are classes arranged in a hierarchy, and `except X` catches `X` *and all its subclasses*. At the top is `BaseException`. Directly under it are a few exceptions you should almost never catch, such as `KeyboardInterrupt` (Ctrl-C) and `SystemExit` (raised by `sys.exit`), and `Exception`, the base of every ordinary error. That split is why `except Exception:` is the widest catch you should normally write: it leaves Ctrl-C working.
+
+</Section>
+
+<Section id="designing" kind="examples" title="Designing your own exceptions">
+
+A library or module of any size should define its own exceptions, usually as a small hierarchy under one base class. Callers can then catch everything from your module with one `except`, or one specific failure precisely, and they get attributes with the details instead of having to parse a message.
+
+```python check
+import traceback
+
+
+class InventoryError(Exception):
+    """Base class for this module's errors: callers can catch them all at once."""
+
+
+class OutOfStock(InventoryError):
+    def __init__(self, item, wanted, available):
+        super().__init__(f"{item}: wanted {wanted}, only {available} left")
+        self.item, self.wanted, self.available = item, wanted, available
+
+
+class UnknownItem(InventoryError, LookupError):
+    """Also a LookupError, so code expecting a failed lookup still works."""
+
+
+STOCK = {"tea": 5, "rice": 0}
+
+
+def take(item, qty):
+    try:
+        available = STOCK[item]
+    except KeyError as err:
+        raise UnknownItem(item) from err          # translate the error, keep the cause
+    if qty > available:
+        raise OutOfStock(item, qty, available)
+    STOCK[item] = available - qty
+    return STOCK[item]
+
+
+for item, qty in [("tea", 2), ("rice", 1), ("salt", 1)]:
+    try:
+        left = take(item, qty)
+    except OutOfStock as err:
+        print("out of stock:", err, "| short by", err.wanted - err.available)
+    except InventoryError as err:
+        print(f"{type(err).__name__}: {err}, caused by {err.__cause__!r}")
+    else:
+        print(f"took {qty} {item}, {left} left")
+
+try:
+    int("12a")
+except ValueError as err:
+    err.add_note("while reading line 7 of prices.csv")   # Python 3.11+
+    print(traceback.format_exception_only(err))
+```
+
+```text
+took 2 tea, 3 left
+out of stock: rice: wanted 1, only 0 left | short by 1
+UnknownItem: salt, caused by KeyError('salt')
+["ValueError: invalid literal for int() with base 10: '12a'\n", 'while reading line 7 of prices.csv\n']
+```
+
+Three techniques are on show.
+
+**A base class per module.** `except InventoryError` caught `UnknownItem`, a subclass. Making `UnknownItem` also inherit from the built-in `LookupError` (the parent of `KeyError` and `IndexError`) means older code that catches `LookupError` keeps working: exceptions can use multiple inheritance like any class.
+
+**`raise ... from ...` (exception chaining).** `take` translates a low-level `KeyError`, an implementation detail of how stock is stored, into the module's own error, and `from err` records the original in `__cause__`. In a traceback, Python prints both, separated by "The above exception was the direct cause of the following exception". Even without `from`, an exception raised inside an `except` block remembers the one being handled in `__context__` ("During handling of the above exception, another exception occurred"); `from None` suppresses that when the original really is irrelevant.
+
+**Notes** (PEP 678, Python 3.11). `add_note` attaches extra context to an exception as it passes through, without changing its type or message. Tracebacks print the notes after the message. Use them where the low-level code knows *what* failed and a higher level knows *where* (which file, which record, which request).
+
+</Section>
+
+<Section id="practice" kind="human" title="What to catch, and where">
+
+Python style favours **EAFP**, "easier to ask forgiveness than permission": try the operation and handle the failure, rather than checking every precondition first (**LBYL**, "look before you leap"). Compare:
+
+```python
+# LBYL: two lookups, and a race if another thread or process changes things in between
+if os.path.exists(path):
+    with open(path) as f:
+        ...
+
+# EAFP: one attempt, and the failure is handled where it happens
+try:
+    with open(path) as f:
+        ...
+except FileNotFoundError:
+    ...
+```
+
+EAFP is more than a style. Between the `exists` check and the `open`, another process can delete the file, so the LBYL version has a bug the EAFP version does not. And since Python 3.11, a `try` block costs essentially nothing when no exception is raised.
+
+The rules experienced developers apply:
+
+- **Catch the narrowest exception that you can actually handle.** `except FileNotFoundError` is a decision; `except Exception` is usually an admission that you do not know what can go wrong.
+- **Never swallow an error silently.** `except Exception: pass` turns a loud, easily located bug into silent corruption. If you really must continue, at least log it, with `logger.exception("...")`, which records the full traceback.
+- **Catch broadly only at the top**: in `main`, in a web framework's request handler, in a worker loop, where the right response to *any* unexpected error is to log it, report it and carry on with the next request.
+- **Re-raise with a bare `raise`** inside an `except` block to send the same exception onwards with its original traceback, for example after logging or cleaning up.
+- **Use `assert` only for internal sanity checks**, never to validate input: assertions are removed when Python runs with `-O`.
+- **Prefer exceptions to error codes and `None` returns** for failures the caller cannot ignore. Return `None` only when "not found" is a normal, expected answer, and say so in the type hint.
+
+</Section>
+
+<Section id="tracebacks" kind="human" title="Reading a traceback">
+
+When an exception escapes, Python prints a **traceback**: the chain of calls that were active when it was raised. Learning to read one quickly is one of the most valuable debugging skills there is. This program provokes a chained error and prints the traceback itself, with the `traceback` module, the same way a logging framework or an error reporter would; it only shortens the temporary directory's path so the output is reproducible:
+
+```python check
+import os
+import traceback
+
+
+def parse_price(text):
+    return int(text.replace(",", ""))
+
+
+def load(lines):
+    prices = {}
+    for number, line in enumerate(lines, start=1):
+        item, _, price = line.partition("=")
+        try:
+            prices[item] = parse_price(price)
+        except ValueError as err:
+            raise RuntimeError(f"bad price on line {number}") from err
+    return prices
+
+
+try:
+    load(["tea=1,200", "rice=12a"])
+except RuntimeError as err:
+    text = "".join(traceback.format_exception(err))
+    print(text.replace(os.path.dirname(__file__) + os.sep, ""))
+```
+
+```text
+Traceback (most recent call last):
+  File "main.py", line 14, in load
+    prices[item] = parse_price(price)
+                   ~~~~~~~~~~~^^^^^^^
+  File "main.py", line 6, in parse_price
+    return int(text.replace(",", ""))
+ValueError: invalid literal for int() with base 10: '12a'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "main.py", line 21, in <module>
+    load(["tea=1,200", "rice=12a"])
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "main.py", line 16, in load
+    raise RuntimeError(f"bad price on line {number}") from err
+RuntimeError: bad price on line 2
+
+```
+
+Read it **from the bottom up**. The last line names the exception and its message: that is *what* went wrong. The frames above it are *where*, innermost last, each with a file, a line number, a function name and the source line. Here there are two tracebacks because of `raise ... from`: the original `ValueError` first, then the `RuntimeError` that `load` raised in response. The lowest frame in *your own* code is usually the place to start looking, and the `~~~^^^` markers (Python 3.11, PEP 657) point at the exact sub-expression that failed, which matters on a line with several calls.
+
+In production you rarely see tracebacks on a console. A web service logs them with `logger.exception(...)` inside the `except` block, or sends them to an error tracker such as Sentry, so that the full chain, including notes and causes, is kept with each failure.
+
+</Section>
+
+<Section id="groups" kind="computation" title="Exception groups">
+
+Sometimes there is more than one error to report. A form validator finds three bad fields; ten concurrent downloads fail in two different ways. Raising only the first error hides the rest. Python 3.11 added `ExceptionGroup` (PEP 654), an exception that carries a list of exceptions, and `except*`, which handles a group by *type*, each clause taking the matching part of the group:
+
+```python check
+def validate(row):
+    problems = []
+    if not row.get("name"):
+        problems.append(ValueError("name is empty"))
+    age = row.get("age")
+    if not isinstance(age, int):
+        problems.append(TypeError(f"age must be an int, got {age!r}"))
+    elif age < 0:
+        problems.append(ValueError("age is negative"))
+    if not str(row.get("email", "")).count("@") == 1:
+        problems.append(ValueError("email needs exactly one @"))
+    if problems:
+        raise ExceptionGroup(f"row {row.get('id')} is invalid", problems)
+
+
+rows = [
+    {"id": 1, "name": "Nadia", "age": 34, "email": "nadia@example.org"},
+    {"id": 2, "name": "", "age": "forty", "email": "kofi.example.org"},
+]
+for row in rows:
+    try:
+        validate(row)
+        print(f"row {row['id']} is fine")
+    except* TypeError as group:
+        for err in group.exceptions:
+            print("  type problem:", err)
+    except* ValueError as group:
+        print(f"  {len(group.exceptions)} value problems in {group.message!r}")
+        for err in group.exceptions:
+            print("  value problem:", err)
+
+group = ExceptionGroup("batch", [ValueError("a"), KeyError("b"), ValueError("c")])
+values, rest = group.split(ValueError)
+print(values.exceptions, rest.exceptions)
+```
+
+```text
+row 1 is fine
+  type problem: age must be an int, got 'forty'
+  2 value problems in 'row 2 is invalid'
+  value problem: name is empty
+  value problem: email needs exactly one @
+(ValueError('a'), ValueError('c')) (KeyError('b'),)
+```
+
+Unlike ordinary `except` clauses, *several* `except*` clauses can run for one group, each receiving a smaller group containing just its matching exceptions. Anything no clause matches is re-raised automatically as a group, so nothing is lost. You can also take groups apart by hand with `split` and `subgroup`.
+
+You will mostly meet exception groups in concurrent code: `asyncio.TaskGroup` (lesson 9) raises one when several tasks fail. In ordinary sequential code, a plain exception is still the right tool. (Two small additions arrived in 3.14: you may write `except TimeoutError, ConnectionError:` without parentheses when there is no `as` clause (PEP 758), and a `return`, `break` or `continue` that would leave a `finally` block now triggers a warning (PEP 765), because it silently discards any exception in flight.)
+
+</Section>
+
+<Section id="context-managers" kind="examples" title="Context managers">
+
+<Definition term="Context manager">
+
+An object with `__enter__` and `__exit__` methods. `with cm as x:` calls `cm.__enter__()` and binds its result to `x`, runs the block, and then calls `cm.__exit__(exc_type, exc, traceback)` however the block ends: normally, by `return` or `break`, or with an exception (in which case the three arguments describe it; otherwise they are `None`). If `__exit__` returns a true value, the exception is suppressed.
+
+</Definition>
+
+The `with` statement (PEP 343, Python 2.5) is a `try`/`finally` you cannot forget to write. Files close, locks release, transactions commit or roll back, temporary directories disappear. You can write a context manager as a class, or, more often, as a generator decorated with `contextlib.contextmanager`, where everything before `yield` is the "enter" part and everything after is the "exit" part:
+
+```python check
+import contextlib
+import time
+
+
+class Timer:
+    """A class-based context manager that measures the block."""
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self                       # bound to the name after "as"
+
+    def __exit__(self, exc_type, exc, tb):
+        self.elapsed = time.perf_counter() - self.start
+        return False                      # never suppress exceptions
+
+
+@contextlib.contextmanager
+def transaction(ledger):
+    """Apply changes to a dict all together, or not at all."""
+    snapshot = dict(ledger)
+    try:
+        yield ledger
+    except Exception:
+        ledger.clear()
+        ledger.update(snapshot)
+        print("  rolled back")
+        raise                             # let the caller see the error
+    else:
+        print("  committed")
+
+
+accounts = {"amina": 100, "joao": 50}
+
+with Timer() as t:
+    with transaction(accounts) as ledger:
+        ledger["amina"] -= 30
+        ledger["joao"] += 30
+print(accounts, t.elapsed < 1.0)
+
+try:
+    with transaction(accounts) as ledger:
+        ledger["amina"] -= 500
+        if ledger["amina"] < 0:
+            raise ValueError("insufficient funds")
+        ledger["joao"] += 500
+except ValueError as err:
+    print("refused:", err)
+print(accounts)
+
+with contextlib.suppress(KeyError):       # the named errors are ignored, on purpose
+    del accounts["nobody"]
+print("still running")
+```
+
+```text
+  committed
+{'amina': 70, 'joao': 80} True
+  rolled back
+refused: insufficient funds
+{'amina': 70, 'joao': 80}
+still running
+```
+
+The generator version is usually shorter, but notice the `try`/`except`/`else` around `yield`: an exception in the `with` block is re-raised *at the `yield`*, so a generator-based manager that needs cleanup on failure must catch it there (or use `finally`). Forgetting this is the most common bug in hand-written context managers.
+
+</Section>
+
+<Section id="stdlib" kind="computation" title="Context managers in the standard library">
+
+Many standard-library objects are context managers, and a few deserve a closer look because they behave in ways people do not expect. `contextlib.ExitStack` handles a *variable* number of resources, unwinding them in reverse order:
+
+```python check
+import sqlite3
+import tempfile
+from contextlib import ExitStack, closing
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as tmp:             # deleted, with its contents, on exit
+    names = ["north.txt", "south.txt", "east.txt"]
+    with ExitStack() as stack:
+        files = [stack.enter_context(open(Path(tmp, n), "w", encoding="utf-8")) for n in names]
+        for f, n in zip(files, names):
+            f.write(f"report for {n.removesuffix('.txt')}\n")
+    print(all(f.closed for f in files))                 # all closed when the stack unwound
+    print(sorted(p.name for p in Path(tmp).iterdir()))
+print(Path(tmp).exists())
+
+# A sqlite3 connection used in a with block manages a *transaction*; it does not close.
+with closing(sqlite3.connect(":memory:")) as db:       # closing() is what closes it
+    with db:
+        db.execute("CREATE TABLE payments (amount INTEGER)")
+        db.execute("INSERT INTO payments VALUES (100)")
+    try:
+        with db:                                       # commit on success, roll back on error
+            db.execute("INSERT INTO payments VALUES (999)")
+            raise ValueError("card declined")
+    except ValueError:
+        pass
+    print(db.execute("SELECT amount FROM payments").fetchall())
+```
+
+```text
+True
+['east.txt', 'north.txt', 'south.txt']
+False
+[(100,)]
+```
+
+The `sqlite3` behaviour is a classic surprise: `with connection:` commits or rolls back, but leaves the connection open, which is why the example wraps it in `contextlib.closing`. When you use a library's context manager, read what its `__exit__` actually does. Other context managers worth knowing: `open` (closes the file), `threading.Lock` (releases it), `decimal.localcontext` (restores precision), `unittest.mock.patch` (undoes the patch), `os.scandir` (releases the directory handle), and `contextlib.chdir` (3.11, restores the working directory).
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A bare `except:` is just a shorter `except Exception:`."** It catches `BaseException`, including `KeyboardInterrupt` and `SystemExit`, so Ctrl-C and `sys.exit()` stop working inside it. Linters flag it, and you should never need it.
+
+</Misconception>
+
+<Misconception>
+
+**"`finally` is for handling errors."** It is for cleanup that must happen whether or not there was an error. It does not stop the exception; after `finally` runs, the exception keeps propagating. Returning from `finally` *does* stop it, which is exactly why 3.14 warns about it.
+
+</Misconception>
+
+<Misconception>
+
+**"Exceptions are slow, so avoid them for control flow."** Since 3.11 entering a `try` block is essentially free; raising and catching costs some microseconds, comparable to a few function calls. Python itself uses exceptions for control flow (`StopIteration` ends every `for` loop). Use them where they make code clearer, and measure before optimising them away.
+
+</Misconception>
+
+<Misconception>
+
+**"`except ValueError or TypeError:` catches both."** The expression `ValueError or TypeError` is evaluated first, and since a class is truthy it is just `ValueError`; type errors sail straight through. Catch several types with a tuple, `except (ValueError, TypeError):`, or, from 3.14, without the parentheses when there is no `as`.
+
+</Misconception>
+
+<Misconception>
+
+**"Whatever `__exit__` returns does not matter."** A true return value *suppresses* the exception. A context manager that ends with `return self`, or returns a non-empty value by accident, silently swallows every error raised in its block. Return `False` or `None` unless suppression is the point, as it is for `contextlib.suppress`.
+
+</Misconception>
+
+<Misconception>
+
+**"`with` closes the file, so the object is gone afterwards."** The name is still bound after the block; only its *state* has changed (the file is closed, the lock is released). That is why the `ExitStack` example could check `f.closed` after the block.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Predict the flow first, then run the code to check. The last exercise asks you to write a context manager.
+
+<Exercises/>
+
+</Section>

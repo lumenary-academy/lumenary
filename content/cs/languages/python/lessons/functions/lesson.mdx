@@ -1,0 +1,429 @@
+---
+title: Functions, closures and decorators
+subtitle: Every kind of parameter, functions as values, how closures capture variables, and the decorators you meet in every framework.
+minutes: 60
+objectives:
+  - Use positional-only, keyword-only, variadic and default parameters, and avoid the mutable-default trap
+  - Pass, return and store functions, and write key functions with lambda and the operator module
+  - Explain Python's scope rules (LEGB), closures, nonlocal, and late binding
+  - Write decorators, with and without arguments, that preserve the wrapped function's metadata
+  - Use functools for caching, partial application and single dispatch
+prerequisites: [iteration]
+related: [math.comp.lambda-calculus]
+references:
+  - title: "The Python Tutorial: More on defining functions"
+    url: https://docs.python.org/3/tutorial/controlflow.html#more-on-defining-functions
+  - title: "The Python Standard Library: functools"
+    url: https://docs.python.org/3/library/functools.html
+  - title: "PEP 318: Decorators for Functions and Methods"
+    url: https://peps.python.org/pep-0318/
+  - title: "PEP 3104: Access to Names in Outer Scopes"
+    url: https://peps.python.org/pep-3104/
+    note: The proposal that added nonlocal.
+  - title: "PEP 570: Python Positional-Only Parameters"
+    url: https://peps.python.org/pep-0570/
+  - title: "The Python Language Reference: Naming and binding"
+    url: https://docs.python.org/3/reference/executionmodel.html#naming-and-binding
+---
+
+<Section id="motivation" kind="motivation" title="Functions are values">
+
+Open the source of almost any Python web application and you will see lines like `@app.get("/users")`, `@pytest.fixture`, `@login_required` or `@functools.cache` sitting on top of function definitions. Look at data code and you will see `sorted(rows, key=...)`, `df.apply(func)` and callbacks passed around freely. All of this rests on one fact you met in lesson 1: **a function is an object**, like a list or a string. You can bind it to another name, put it in a dictionary, pass it as an argument, return it from another function, and attach attributes to it.
+
+This lesson builds from that fact to the tools experienced Python programmers use every day. First, the full parameter syntax, which lets you design function signatures that are hard to call wrongly. Then functions as values, scope and **closures**, which let a function remember variables from where it was defined. Then **decorators**, which are nothing more than functions that take a function and return a replacement, plus a bit of syntax. Finally `functools`, the standard library's toolbox for working with functions.
+
+</Section>
+
+<Section id="parameters" kind="definitions" title="Parameters, precisely">
+
+A Python signature can say exactly how each argument may be passed. In order, a parameter list can contain:
+
+| Kind | Syntax | Caller may write |
+| --- | --- | --- |
+| positional-only | before a `/` | `f(1)` only |
+| positional-or-keyword | ordinary names | `f(1)` or `f(x=1)` |
+| variadic positional | `*args` | any number of extra positional arguments, collected in a tuple |
+| keyword-only | after `*` or `*args` | `f(x=1)` only |
+| variadic keyword | `**kwargs` | any number of extra keyword arguments, collected in a dict |
+
+Why restrict how callers pass arguments? Keyword-only parameters make calls self-documenting where a bare value would be cryptic: `connect(host, timeout=5, retries=3)` is clearer than `connect(host, 5, 3)`, and nobody can mix up the order. Positional-only parameters (PEP 570, Python 3.8) let a library rename a parameter later without breaking anyone, and are used where a name would add nothing, as in `len(obj)`.
+
+```python check
+def book(room, /, guest, *, nights=1, **extras):
+    """room: positional-only; guest: either way; nights: keyword-only."""
+    notes = ", ".join(f"{key}={value}" for key, value in extras.items())
+    return f"room {room} for {guest}, {nights} night(s)" + (f" [{notes}]" if notes else "")
+
+
+print(book(12, "Ama"))
+print(book(12, guest="Ama", nights=3, breakfast=True))
+options = {"nights": 2, "late_checkout": "yes"}
+print(book(7, "Ravi", **options))       # ** unpacks a dict into keyword arguments
+
+for bad_call in (lambda: book(room=12, guest="Ama"), lambda: book(12, "Ama", 3)):
+    try:
+        bad_call()
+    except TypeError as err:
+        print("TypeError:", err)
+
+
+def total(*amounts, start=0):
+    return start + sum(amounts)
+
+
+prices = [3, 4, 5]
+print(total(*prices), total(*prices, start=10))   # * unpacks a sequence into positional arguments
+```
+
+```text
+room 12 for Ama, 1 night(s)
+room 12 for Ama, 3 night(s) [breakfast=True]
+room 7 for Ravi, 2 night(s) [late_checkout=yes]
+TypeError: book() missing 1 required positional argument: 'room'
+TypeError: book() takes 2 positional arguments but 3 were given
+12 22
+```
+
+Look closely at the first error. You might expect a complaint that `room` is positional-only, and without `**extras` that is what you would get ("got some positional-only arguments passed as keyword arguments"). Here, though, `room=12` was a perfectly legal *extra* keyword argument, so it was collected into `extras`, and the error is that the positional `room` is missing. That is a deliberate feature of positional-only parameters: their names stay free for callers to use as keys in `**kwargs`.
+
+### The mutable default trap
+
+Default values are evaluated **once**, when the `def` statement runs, and stored on the function object. If the default is mutable, every call that relies on it shares the same object:
+
+```python run
+def add_item(item, basket=[]):          # one list, created when def ran
+    basket.append(item)
+    return basket
+
+
+print(add_item("rice"), add_item("beans"))
+print(add_item.__defaults__)            # the shared list lives on the function
+
+
+def add_item_fixed(item, basket=None):  # the idiomatic fix
+    if basket is None:
+        basket = []                     # a fresh list on every call
+    basket.append(item)
+    return basket
+
+
+print(add_item_fixed("rice"), add_item_fixed("beans"))
+```
+
+```text
+['rice', 'beans'] ['rice', 'beans']
+(['rice', 'beans'],)
+['rice'] ['beans']
+```
+
+The first line printed the same list twice because both calls returned the same object, which by the time `print` ran held both items. Use `None` (or a private sentinel object, if `None` is a meaningful argument) as the default and create the mutable object inside the function. Linters such as Ruff flag mutable defaults for you.
+
+</Section>
+
+<Section id="first-class" kind="intuition" title="Functions as values">
+
+Since functions are objects, a function can be an argument. The most common case is a **key function**, a one-argument function that tells `sorted`, `min`, `max` or `itertools.groupby` what to compare:
+
+```python run
+from operator import itemgetter
+
+runners = [("Achieng", "40-49", 52.3), ("Tomás", "30-39", 48.9), ("Mei", "40-49", 47.5)]
+
+print(sorted(runners, key=itemgetter(2)))              # by time
+print(sorted(runners, key=lambda r: (r[1], r[2])))     # by age group, then time
+print(min(runners, key=itemgetter(2))[0])              # the fastest
+
+handlers = {"upper": str.upper, "title": str.title, "reverse": lambda s: s[::-1]}
+for name, func in handlers.items():
+    print(f"{name:>7}: {func('river of stars')}")
+```
+
+```text
+[('Mei', '40-49', 47.5), ('Tomás', '30-39', 48.9), ('Achieng', '40-49', 52.3)]
+[('Tomás', '30-39', 48.9), ('Mei', '40-49', 47.5), ('Achieng', '40-49', 52.3)]
+Mei
+  upper: RIVER OF STARS
+  title: River Of Stars
+reverse: srats fo revir
+```
+
+`lambda params: expression` creates a small anonymous function. It can hold one expression only, which is a feature: anything that needs statements deserves a name and a `def`. The `operator` module provides ready-made functions for operators and lookups, such as `itemgetter(2)` (which means `lambda r: r[2]`), `attrgetter("name")` and `operator.mul`, which are slightly faster than lambdas and often clearer.
+
+Notice `str.upper` in the dictionary: a method looked up on the class is a plain function that takes the instance as its first argument. A dictionary from names to functions is a common, readable replacement for a long `if`/`elif` chain.
+
+</Section>
+
+<Section id="closures" kind="computation" title="Scope and closures">
+
+When Python meets a name, it looks it up in four scopes, in order: **L**ocal (the current function), **E**nclosing (any functions the current one is defined inside), **G**lobal (the module) and **B**uilt-in. This is often called the LEGB rule.
+
+The compiler decides, for each function, which names are local: any name that is **assigned** anywhere in the function body is local to it, unless declared otherwise. That decision is made for the whole body before it runs, which explains a famous error:
+
+```python
+count = 0
+
+def bump():
+    count += 1      # assignment, so count is local here; reading it first fails
+```
+
+Calling `bump()` raises `UnboundLocalError`, because `count += 1` must read the *local* `count`, which has no value yet. `global count` would make the function rebind the module's variable (rarely a good idea), and `nonlocal count` rebinds a variable of an enclosing function.
+
+A **closure** is a function that remembers variables from the enclosing scope in which it was *defined*, even after that scope has finished running:
+
+```python check
+def make_counter():
+    count = 0
+
+    def increment():
+        nonlocal count          # rebind the enclosing function's variable
+        count += 1
+        return count
+
+    return increment
+
+
+tick, tock = make_counter(), make_counter()
+print(tick(), tick(), tick(), tock())       # each closure has its own count
+print(tick.__closure__[0].cell_contents)    # where the captured variable lives
+
+
+def make_scaler(factor):
+    return lambda x: x * factor             # captures factor
+
+
+to_cm = make_scaler(2.54)
+print(f"{to_cm(12):.2f}")
+
+# Closures capture variables, not values: all three lambdas see the final i
+late = [lambda x: x * i for i in range(3)]
+print([f(10) for f in late])
+# Freeze the current value with a default argument (evaluated at definition time)
+early = [lambda x, i=i: x * i for i in range(3)]
+print([f(10) for f in early])
+```
+
+```text
+1 2 3 1
+3
+30.48
+[20, 20, 20]
+[0, 10, 20]
+```
+
+Each call to `make_counter` creates a new `count` variable, stored in a *cell* object that the inner function keeps a reference to. That is how `tick` and `tock` count independently.
+
+The last two lines show **late binding**. A closure captures the *variable* `i`, not the value `i` had when the lambda was created; by the time the lambdas run, the loop has finished and `i` is 2. The default-argument trick works because defaults are evaluated at definition time, the very property that caused the mutable-default trap. In real code, `functools.partial` (below) is often clearer.
+
+Closures and classes are two ways to bundle behaviour with state. A closure is lighter for one behaviour and a little state; once you need several methods or want to inspect the state, write a class.
+
+</Section>
+
+<Section id="decorators" kind="examples" title="Decorators">
+
+<Definition term="Decorator">
+
+A callable that takes a function and returns a replacement for it. Writing `@deco` on the line above `def f` is shorthand for `f = deco(f)` immediately after the definition (PEP 318, Python 2.4).
+
+</Definition>
+
+The replacement is usually a closure, a *wrapper* that does something before or after calling the original. Here are the three shapes you will write: a plain decorator, a decorator that takes arguments (a function that *returns* a decorator), and stacked decorators.
+
+```python check
+import functools
+
+
+def counted(func):
+    """Count how often func is called."""
+    @functools.wraps(func)                 # copy __name__, __doc__ and more onto the wrapper
+    def wrapper(*args, **kwargs):          # accept any arguments, pass them all on
+        wrapper.calls += 1
+        return func(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
+
+
+@counted
+def greet(name):
+    """Return a greeting."""
+    return f"Hello, {name}"
+
+
+greet("Zanele")
+greet("Mateo")
+print(greet.calls, greet.__name__, greet.__doc__)
+
+
+def retry(times, exceptions=(Exception,)):
+    """A decorator factory: retry(3) returns the actual decorator."""
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as err:
+                    print(f"  attempt {attempt} failed: {err}")
+            raise RuntimeError(f"{func.__name__} failed {times} times")
+        return wrapper
+    return decorate
+
+
+responses = iter([ConnectionError("timed out"), ConnectionError("reset"), "200 OK"])
+
+
+@retry(times=3, exceptions=(ConnectionError,))
+def fetch():
+    result = next(responses)               # a stand-in for a flaky network call
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+print(fetch())
+
+
+def tag(name):
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return f"<{name}>{func(*args, **kwargs)}</{name}>"
+        return wrapper
+    return decorate
+
+
+@tag("b")          # applied second: wraps the result of tag("i")
+@tag("i")          # applied first: closest to the function
+def word():
+    return "hi"
+
+
+print(word())
+```
+
+```text
+2 greet Return a greeting.
+  attempt 1 failed: timed out
+  attempt 2 failed: reset
+200 OK
+<b><i>hi</i></b>
+```
+
+Three habits separate solid decorators from fragile ones:
+
+- **Always use `functools.wraps`.** Without it, every decorated function is called `wrapper` and loses its docstring, which ruins tracebacks, documentation tools and frameworks that look functions up by name. `wraps` also sets `__wrapped__`, so tools can reach the original.
+- **Accept `*args, **kwargs` and return the result.** A wrapper that forgets `return` silently turns every result into `None`.
+- **Remember when code runs.** The decorator body runs once, at definition time (often at import time); the wrapper body runs on every call. Registration decorators, like a web framework's `@app.get(...)`, do their work at definition time and return the function unchanged.
+
+Decorators work on classes too: `@dataclass` (lesson 5) takes a class and returns it with generated methods.
+
+</Section>
+
+<Section id="functools" kind="computation" title="The functools toolbox">
+
+`functools` collects higher-order tools. Four are worth knowing well:
+
+```python check
+import operator
+from functools import cache, partial, reduce, singledispatch
+
+
+@cache                       # remember every result (lru_cache(maxsize=None))
+def ways(n):
+    """Ways to climb n stairs taking 1 or 2 steps at a time."""
+    return 1 if n <= 1 else ways(n - 1) + ways(n - 2)
+
+
+print(ways(80))
+print(ways.cache_info())
+
+from_binary = partial(int, base=2)     # a new callable with some arguments fixed
+print(from_binary("101101"), from_binary("11111111"))
+
+print(reduce(operator.mul, range(1, 11)))   # ((1*2)*3)*...*10
+
+
+@singledispatch                        # choose an implementation by the first argument's type
+def describe(x):
+    return f"something else: {x!r}"
+
+
+@describe.register
+def _(x: int):
+    return f"an int with {x.bit_length()} bits"
+
+
+@describe.register
+def _(x: list):
+    return f"a list of {len(x)} items"
+
+
+print(describe(255), describe([1, 2]), describe(2.5), sep=" | ")
+```
+
+```text
+37889062373143906
+CacheInfo(hits=78, misses=81, maxsize=None, currsize=81)
+45 255
+3628800
+an int with 8 bits | a list of 2 items | something else: 2.5
+```
+
+Without `@cache`, `ways(80)` would make an astronomical number of calls, because each call makes two more; with it, each value from 0 to 80 is computed once, and every repeat is a cache hit. `cache` keeps results forever, which is right for a pure function with a small domain; `lru_cache(maxsize=1024)` bounds the memory. Both require hashable arguments, and caching a function with side effects, or one whose result depends on the time or a database, is a bug waiting to happen.
+
+`partial` fixes some arguments of a callable; it is often clearer than a lambda and, unlike a closure over a loop variable, it binds values immediately. `reduce` folds a sequence with a two-argument function; for sums, products, joins and maxima, prefer `sum`, `math.prod`, `"".join` and `max`, which say what they mean. `singledispatch` gives you a function that picks an implementation by type, which is handy for "convert anything to JSON"-style code; `singledispatchmethod` does the same for methods.
+
+</Section>
+
+<Section id="design" kind="human" title="Designing functions the way reviewers like">
+
+Knowing the syntax is half the job; the other half is designing functions that are pleasant to call and easy to change. These are habits you will see enforced in code review at most companies that take Python seriously.
+
+**Keep signatures small, and make flags keyword-only.** A call like `export(data, True, False)` is unreadable: what are `True` and `False`? Put a `*` before boolean and optional parameters so the call reads `export(data, compress=True, overwrite=False)`. If a function needs more than four or five parameters, it often wants a small configuration object (a dataclass, lesson 5) or to be split in two.
+
+**Either return a value or change something, not both.** A function that mutates its argument *and* returns it invites callers to assume a copy was made. Python's own library follows this rule: `list.sort()` sorts in place and returns `None`; `sorted()` returns a new list and changes nothing.
+
+**Prefer pure functions where you can.** A function whose result depends only on its arguments, and which changes nothing outside itself, can be tested with one line, cached with `@cache`, and run in parallel safely. Push input, output and other side effects to the edges of a program, and keep the core pure.
+
+**Write a docstring for anything public.** The first line says what the function does, in the imperative ("Return the median of values."); later lines describe arguments, return value and exceptions. Teams usually pick one layout (the Google and NumPy styles are the most common) and tools such as Sphinx and IDEs render it. Type hints (lesson 6) then carry the types, so the docstring does not have to.
+
+**Be wary of `**kwargs` pass-through.** A function that accepts `**kwargs` only to forward them somewhere else hides its real interface from readers, IDEs and type checkers. It is sometimes the right choice for thin wrappers (and decorators must do it), but spell parameters out when you can.
+
+A little history explains the limits of `lambda`. The name comes from Alonzo Church's lambda calculus by way of Lisp, but Python's lambda was kept deliberately small: one expression, no statements. Proposals for multi-line anonymous functions have been made many times and always rejected, on the grounds that a function big enough to need statements deserves a name. Decorators, by contrast, were added after long debate over their syntax, recorded in PEP 318, and `nonlocal` arrived only in Python 3.0 (PEP 3104); before that, closures could read enclosing variables but not rebind them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Default arguments are evaluated on each call."** They are evaluated once, when `def` runs. That is why `def f(xs=[])` shares one list, and why `def log(msg, when=datetime.now())` records the time the module was imported, not the time of the call.
+
+</Misconception>
+
+<Misconception>
+
+**"A closure copies the values it uses."** It keeps a reference to the variables themselves. If the enclosing variable changes later (as a loop variable does), the closure sees the new value.
+
+</Misconception>
+
+<Misconception>
+
+**"Decorators are an advanced, magical feature."** `@deco` above `def f` means exactly `f = deco(f)`. If you can write a function that takes a function and returns one, you can write a decorator. The only subtlety is remembering which code runs at definition time and which at call time.
+
+</Misconception>
+
+<Misconception>
+
+**"Lambdas are more Pythonic than named functions."** A lambda assigned to a name, `square = lambda x: x * x`, is strictly worse than `def square(x): return x * x`: the `def` has a real name in tracebacks and can have a docstring. Use lambdas inline, for short key functions and callbacks.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The last exercise asks you to write a decorator factory; the lesson's `retry` is a good model.
+
+<Exercises/>
+
+</Section>

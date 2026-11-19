@@ -1,0 +1,443 @@
+---
+title: Modules, packages, environments and tests
+subtitle: How import really works, how professionals lay out, isolate and describe a project with pyproject.toml and uv, and how they test it with pytest.
+minutes: 60
+objectives:
+  - Explain what import does step by step, including sys.path, sys.modules and __name__
+  - Organise code into packages, use relative imports, and run a package with python -m
+  - Create isolated environments with venv or uv, and describe a project and its dependencies in pyproject.toml
+  - Write tests with pytest (plain asserts, fixtures, parametrize, raises), and know unittest and doctest
+  - Set up the usual professional toolchain of formatter, linter, type checker and CI
+prerequisites: [errors-and-context-managers]
+references:
+  - title: "The Python Tutorial: Modules"
+    url: https://docs.python.org/3/tutorial/modules.html
+  - title: "The Python Language Reference: The import system"
+    url: https://docs.python.org/3/reference/import.html
+  - title: Python Packaging User Guide
+    url: https://packaging.python.org/
+    note: The official guide to packaging, from writing pyproject.toml to publishing on PyPI.
+  - title: "Writing your pyproject.toml"
+    url: https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
+  - title: uv documentation
+    url: https://docs.astral.sh/uv/
+  - title: pytest documentation
+    url: https://docs.pytest.org/
+  - title: Ruff
+    url: https://docs.astral.sh/ruff/
+    note: A fast linter and formatter, configured in pyproject.toml.
+  - title: Hypothesis
+    url: https://hypothesis.readthedocs.io/
+    note: Property-based testing for Python.
+  - title: "PEP 810: Explicit lazy imports"
+    url: https://peps.python.org/pep-0810/
+---
+
+<Section id="motivation" kind="motivation" title="From a script to a project">
+
+A single `.py` file goes a long way. But sooner or later a program grows past one file, depends on code that someone else wrote, needs to run on a colleague's laptop and on a server, and needs tests so that next month's change does not break last month's feature. At that point you are managing a **project**, and the questions change: how do my files find each other, where do third-party packages get installed, how do I make sure everyone uses the same versions, and how do I know it still works?
+
+Python's answers have changed a lot over the years, and old tutorials are full of advice that is now out of date (`setup.py` with no `pyproject.toml`, `sudo pip install`, a hand-written `requirements.txt` treated as a lock file). This lesson gives you the current, standard picture as of 2026: the import system, which has been stable for a long time; virtual environments; `pyproject.toml` as the single description of a project; **uv** as the fast, all-in-one tool that many teams have moved to; and **pytest** for tests.
+
+</Section>
+
+<Section id="imports" kind="definitions" title="What import actually does">
+
+<Definition term="Module">
+
+A Python file, or a module built into the interpreter or written in C. Importing it creates a module object, whose attributes are the names defined at the file's top level.
+
+</Definition>
+
+<Definition term="Package">
+
+A directory of modules, normally containing an `__init__.py` file, which runs when the package is imported. Packages can contain sub-packages.
+
+</Definition>
+
+The statement `import shop.pricing` does four things:
+
+1. **Check the cache.** If `"shop.pricing"` is already a key in `sys.modules`, use that module object. This is why a module's top-level code runs only once per process, however many files import it.
+2. **Find it.** Otherwise search the directories in `sys.path`, in order: the directory of the script being run (or the current directory, with `-m` or the REPL), then the standard library, then the environment's `site-packages`, where installed packages live. The first match wins, which is why a file of yours named `random.py` or `json.py` can shadow the standard library.
+3. **Load it.** Create a module object, put it in `sys.modules`, and execute the file's code in the module's namespace. For `shop.pricing`, the package `shop` (its `__init__.py`) is imported first.
+4. **Bind a name.** `import shop.pricing` binds `shop` in the importing module; `from shop.pricing import apply_discount` binds `apply_discount`; `import numpy as np` binds `np`.
+
+Every module has a `__name__`: its dotted import name, or `"__main__"` for the module Python was asked to run. That is what the idiom `if __name__ == "__main__":` tests. Here is all of it in action, with a tiny package created in a temporary directory:
+
+```python check
+"""Build a tiny package on disk, import it, then run it with python -m."""
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+FILES = {
+    "shop/__init__.py": (
+        "from .pricing import apply_discount   # re-export for callers\n"
+        "print(f'  running shop/__init__.py as {__name__!r}')\n"
+    ),
+    "shop/pricing.py": (
+        "print(f'  running shop/pricing.py as {__name__!r}')\n"
+        "def apply_discount(cents, percent):\n"
+        "    return cents * (100 - percent) // 100\n"
+    ),
+    "shop/__main__.py": (
+        "from .pricing import apply_discount\n"
+        "print(f'  running shop/__main__.py as {__name__!r}:', apply_discount(2000, 25))\n"
+    ),
+}
+
+with tempfile.TemporaryDirectory() as tmp:
+    for name, text in FILES.items():
+        path = Path(tmp, name)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    sys.path.insert(0, tmp)                  # let import find the package
+    print("first import:")
+    import shop                              # runs __init__.py, which imports pricing
+    print("second import:")
+    import shop.pricing                      # already in sys.modules: nothing runs
+    print(shop.apply_discount(1000, 10), shop.pricing is sys.modules["shop.pricing"])
+    sys.path.remove(tmp)
+
+    print("python -m shop:")
+    run = subprocess.run([sys.executable, "-m", "shop"], cwd=tmp, capture_output=True, text=True)
+    print(run.stdout, end="")
+```
+
+```text
+first import:
+  running shop/pricing.py as 'shop.pricing'
+  running shop/__init__.py as 'shop'
+second import:
+900 True
+python -m shop:
+  running shop/pricing.py as 'shop.pricing'
+  running shop/__init__.py as 'shop'
+  running shop/__main__.py as '__main__': 1500
+```
+
+(The `pricing` line comes first because `__init__.py` imports `pricing` on its first line, before reaching its own `print`.) Notice that the second import printed nothing, and that `python -m shop` ran the package's `__main__.py` with `__name__` set to `"__main__"`, after importing the package itself. Inside a package, **relative imports** such as `from .pricing import apply_discount` (one dot: this package; two dots: the parent) refer to siblings without hard-coding the package name.
+
+A few practical rules follow from the mechanism:
+
+- **Run code inside a package with `-m`.** `python -m shop.report` sets up `sys.path` and the package correctly, so relative imports work; `python shop/report.py` treats the file as a loose script, and its relative imports fail.
+- **Avoid import-time side effects.** Since importing executes the file, a module that opens network connections or parses large files at the top level slows down, or breaks, everything that imports it.
+- **Circular imports** (module A imports B, which imports A) fail when one module uses a name from the other before that module has finished running. The fix is usually to move the shared piece into a third module.
+- **Do not use `from module import *`** outside the REPL: it hides where names come from and can silently overwrite your own. A module can declare its public names in `__all__`.
+
+Python 3.15 added **explicit lazy imports** (PEP 810). Writing `lazy import json` or `lazy from pathlib import Path` at the top of a file defers the real import until the name is first used, which can cut the start-up time of large command-line tools without scattering imports inside functions:
+
+```python
+lazy import json                 # Python 3.15+: nothing is loaded yet
+
+def save(data, path):
+    path.write_text(json.dumps(data))   # json is imported here, on first use
+```
+
+</Section>
+
+<Section id="environments" kind="computation" title="Environments, dependencies and pyproject.toml">
+
+Installing packages into the Python that came with your operating system is a bad idea: different projects need different versions of the same package, and the OS's own tools depend on its Python. Many Linux distributions now refuse with an "externally-managed-environment" error (PEP 668), and that refusal is doing you a favour.
+
+The solution is a **virtual environment**: a directory containing its own `site-packages` and a link to a Python interpreter. Each project gets one, usually named `.venv`. The standard-library way is:
+
+```text
+python3 -m venv .venv              # create it
+source .venv/bin/activate          # use it (on Windows: .venv\Scripts\activate)
+python -m pip install httpx        # install into it, never into the system Python
+```
+
+**uv**, from the company Astral, released in 2024, does all of this (and installs Python versions too) in one fast tool written in Rust, and it has become the default for many teams as of 2026. A typical session:
+
+```text
+uv init market-tools               # create a project with pyproject.toml
+cd market-tools
+uv add httpx                       # add a dependency: updates pyproject.toml and uv.lock
+uv add --dev pytest ruff mypy      # development-only tools
+uv run pytest                      # run a command inside the project's environment
+uv sync                            # make .venv match the lock file exactly
+uvx ruff check .                   # run a tool without adding it to the project
+```
+
+Whatever tool you use, the project is described by **`pyproject.toml`** (PEPs 518 and 621), a TOML file at the root of the repository. It names the project, its version and supported Python, its dependencies, the commands it installs, how to build it, and the configuration of most tools. Python 3.11 added `tomllib` to read TOML, so you can inspect one with the standard library alone:
+
+```python check
+import tomllib
+
+PYPROJECT = """
+[project]
+name = "market-tools"
+version = "0.3.0"
+description = "Small utilities for a weekly market"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "rich>=13,<15",
+]
+
+[project.scripts]
+market = "market_tools.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "mypy", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"""
+
+config = tomllib.loads(PYPROJECT)
+project = config["project"]
+print(project["name"], project["version"], "needs Python", project["requires-python"])
+for requirement in project["dependencies"]:
+    print("  depends on", requirement)
+print("development tools:", ", ".join(config["dependency-groups"]["dev"]))
+print("installs the command:", *project["scripts"])
+print("tool settings for:", sorted(config["tool"]))
+```
+
+```text
+market-tools 0.3.0 needs Python >=3.12
+  depends on httpx>=0.27
+  depends on rich>=13,<15
+development tools: pytest>=8, mypy, ruff
+installs the command: market
+tool settings for: ['pytest', 'ruff']
+```
+
+What each part is for:
+
+- **`[project]`** is the standard metadata. `dependencies` lists what the code needs to *run*, with version ranges (`>=13,<15` means "13 or 14"). Keep ranges loose enough that your package can live alongside others.
+- **`[project.scripts]`** turns a function into a command: after installation, typing `market` runs `market_tools.cli:main`.
+- **`[dependency-groups]`** (PEP 735) holds development-only dependencies such as test and lint tools, which users of your package never need.
+- **`[build-system]`** names the *build backend* that turns your source into a distributable **wheel** (hatchling here; setuptools, flit, PDM's backend and uv's own are common alternatives).
+- **`[tool.*]`** tables configure tools, so one file replaces a drawer full of `setup.cfg`, `pytest.ini` and `.flake8`.
+
+The ranges in `pyproject.toml` say what is *acceptable*; a **lock file** records the exact versions, with hashes, that were actually tested, so every machine installs the same thing. uv writes `uv.lock`; in 2025 PEP 751 standardised a tool-independent format, `pylock.toml`. Commit the lock file for applications; libraries are tested against ranges.
+
+Professional projects usually use the **src layout**: the importable package lives in `src/market_tools/`, tests in `tests/`, and `pyproject.toml` at the root. Because `src/` is not on `sys.path` by default, the tests run against the *installed* package, which catches packaging mistakes that would otherwise only appear on your users' machines.
+
+</Section>
+
+<Section id="pytest" kind="examples" title="Testing with pytest">
+
+**pytest** is the de facto standard test runner for Python. It is a third-party package (`uv add --dev pytest`), and its appeal is that tests are just functions containing plain `assert` statements. Given a module `pricing.py`:
+
+```python
+def apply_discount(cents: int, percent: int) -> int:
+    """Return the price after a percentage discount, rounded down to whole cents."""
+    if not 0 <= percent <= 100:
+        raise ValueError(f"percent must be 0-100, got {percent}")
+    return cents * (100 - percent) // 100
+
+
+def split_bill(cents: int, people: int) -> list[int]:
+    """Split a bill into shares that differ by at most one cent and add up exactly."""
+    share, extra = divmod(cents, people)
+    return [share + 1] * extra + [share] * (people - extra)
+```
+
+a test file `test_pricing.py` might read:
+
+```python
+import pytest
+
+from pricing import apply_discount, split_bill
+
+
+def test_no_discount_keeps_price():
+    assert apply_discount(1999, 0) == 1999
+
+
+@pytest.mark.parametrize(
+    ("cents", "percent", "expected"),
+    [(1000, 10, 900), (999, 50, 499), (1, 100, 0)],
+)
+def test_discounts(cents, percent, expected):
+    assert apply_discount(cents, percent) == expected
+
+
+def test_rejects_bad_percent():
+    with pytest.raises(ValueError, match="0-100"):
+        apply_discount(1000, 120)
+
+
+@pytest.fixture
+def receipt(tmp_path):
+    path = tmp_path / "receipt.txt"
+    path.write_text("total=1000\n", encoding="utf-8")
+    return path
+
+
+def test_split_from_file(receipt):
+    total = int(receipt.read_text(encoding="utf-8").split("=")[1])
+    shares = split_bill(total, 3)
+    assert sum(shares) == total
+    assert shares == [334, 333, 333]
+```
+
+The ideas to know:
+
+- **Discovery.** `pytest` finds files named `test_*.py` and runs every function named `test_*` in them. No classes or registration needed.
+- **Plain `assert`.** pytest rewrites assert statements so that a failure shows the values involved, as you will see below.
+- **`parametrize`** runs one test function with several sets of arguments; each case is reported separately.
+- **`pytest.raises`** asserts that a block raises a given exception (here, with a message matching a regular expression).
+- **Fixtures** provide what tests need. A test asks for one by naming it as a parameter: `receipt` is a fixture we wrote, which itself uses pytest's built-in `tmp_path` fixture, a fresh temporary directory for each test. Fixtures can also clean up after themselves (with `yield`) and be shared across files in a `conftest.py`.
+
+Running `pytest -q` in that directory (pytest 8.4) prints:
+
+```text
+......                                                                   [100%]
+6 passed in 0.01s
+```
+
+Six tests: the parametrised function counted three times. Now suppose someone "fixes" the middle case to expect `500`, forgetting that the function rounds down. The run reports:
+
+```text
+..F...                                                                   [100%]
+=================================== FAILURES ===================================
+__________________________ test_discounts[999-50-500] __________________________
+
+cents = 999, percent = 50, expected = 500
+
+    @pytest.mark.parametrize(
+        ("cents", "percent", "expected"),
+        [(1000, 10, 900), (999, 50, 500), (1, 100, 0)],
+    )
+    def test_discounts(cents, percent, expected):
+>       assert apply_discount(cents, percent) == expected
+E       assert 499 == 500
+E        +  where 499 = apply_discount(999, 50)
+
+test_pricing.py:15: AssertionError
+=========================== short test summary info ============================
+FAILED test_pricing.py::test_discounts[999-50-500] - assert 499 == 500
+1 failed, 5 passed in 0.03s
+```
+
+That report is why people love pytest: the failing case, its parameters, the actual and expected values, and the call that produced the wrong one, without writing a single custom message.
+
+### The standard library's own tools
+
+Python also ships **unittest**, a class-based framework in the style of Java's JUnit, and **doctest**, which runs the examples written in docstrings. pytest runs unittest-style tests too, so older projects can switch gradually. Both are worth recognising:
+
+```python check
+import doctest
+import io
+import unittest
+
+
+def slugify(title: str) -> str:
+    """Turn a title into a URL slug.
+
+    >>> slugify("Hello, World!")
+    'hello-world'
+    >>> slugify("  Café   au lait ")
+    'café-au-lait'
+    """
+    words = "".join(c if c.isalnum() else " " for c in title.lower()).split()
+    return "-".join(words)
+
+
+class SlugifyTests(unittest.TestCase):
+    def test_spaces_collapse(self):
+        self.assertEqual(slugify("a   b"), "a-b")
+
+    def test_only_punctuation(self):
+        self.assertEqual(slugify("!!!"), "")
+
+    def test_digits_kept(self):
+        self.assertEqual(slugify("Top 10 Tips"), "top-10-tips")
+
+
+print(doctest.testmod())                     # checks the >>> examples above
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(SlugifyTests)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(f"unittest: ran {result.testsRun}, failures {len(result.failures)}, errors {len(result.errors)}")
+```
+
+```text
+TestResults(failed=0, attempted=2)
+unittest: ran 3, failures 0, errors 0
+```
+
+Doctests keep documentation honest, since an example that stops working fails the test run. They are a poor fit for anything with complicated setup, which is where pytest takes over.
+
+</Section>
+
+<Section id="toolchain" kind="human" title="The everyday toolchain">
+
+On a well-run Python team in 2026, a pull request typically passes through the same handful of tools, all configured in `pyproject.toml` and run both locally and in continuous integration (CI):
+
+| Job | Common tools |
+| --- | --- |
+| Environment and dependencies | uv; or pip with venv; Poetry and PDM are also used |
+| Formatting | Ruff's formatter (`ruff format`) or Black: no style debates in review |
+| Linting | Ruff (`ruff check`): unused imports, mutable defaults, bare `except`, and hundreds more rules |
+| Type checking | mypy or Pyright (lesson 6) |
+| Tests and coverage | pytest with coverage.py (`pytest --cov` via the pytest-cov plugin) |
+| Property-based tests | Hypothesis, which generates inputs and shrinks failures to a minimal example |
+| Running checks before each commit | pre-commit |
+
+What makes a test suite valuable is less the tool than the habits:
+
+- **Test behaviour, not implementation.** Assert on what a function returns or does, not on which private helpers it calls, so you can refactor freely.
+- **Keep unit tests fast** (milliseconds each) so people run them constantly; mark the slow integration tests and run those in CI.
+- **One reason to fail per test**, with a name that says what broke: `test_split_bill_adds_up_exactly` beats `test_split_3`.
+- **Write the failing test first when fixing a bug.** It proves the bug exists and that your fix removes it, and it stops the bug from returning.
+- **Do not chase 100% coverage.** Coverage shows what was *executed*, not what was *checked*. Use it to find untested areas, not as a score.
+
+</Section>
+
+<Section id="history" kind="history" title="Why packaging advice keeps changing">
+
+If packaging tutorials seem to contradict each other, it is because they were written at different points in a long history. `distutils` arrived in the standard library around 2000; **setuptools** (2004) extended it with dependencies and "eggs"; **virtualenv** (2007) and **pip** (2008) gave us isolated environments and a real installer. **Wheels** (PEP 427, 2012) replaced running arbitrary build code at install time with ready-built archives, and `venv` joined the standard library in Python 3.3. Then the community moved from code to declarations: PEP 518 (2016) introduced `pyproject.toml`, PEP 517 let any tool act as a build backend, PEP 621 (2020) standardised the `[project]` table, and `distutils` was finally removed in Python 3.12. Since 2024, uv has folded the installer, the environment manager, the Python installer and the lock file into one tool, and PEP 751 (2025) standardised lock files.
+
+The durable lesson: prefer what the [Python Packaging User Guide](https://packaging.python.org/) currently recommends over whatever a years-old answer on a forum says.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`sudo pip install` fixes permission errors."** It installs packages into the operating system's Python, where they can break system tools and conflict with each other. Use a virtual environment per project, or `uv tool install` / `pipx` for command-line tools you want everywhere.
+
+</Misconception>
+
+<Misconception>
+
+**"`requirements.txt` with `>=` versions is a lock file."** Ranges say what is allowed; a lock file pins what was tested, including indirect dependencies. Without a lock, two installs a week apart can differ and break in ways nobody can reproduce.
+
+</Misconception>
+
+<Misconception>
+
+**"Re-importing a module reloads it."** A second `import` returns the cached module from `sys.modules` and runs nothing. `importlib.reload` exists, but it is a REPL convenience with many caveats, not a tool for production code.
+
+</Misconception>
+
+<Misconception>
+
+**"Naming my file `random.py` is harmless."** The script's own directory comes first on `sys.path`, so `import random` anywhere in your program, including inside the standard library, now finds your file. Python 3.13 added a hint to the resulting error message, but the fix is to rename the file.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The last exercise asks you to write tests in the pytest style, using plain functions and `assert`.
+
+<Exercises/>
+
+</Section>

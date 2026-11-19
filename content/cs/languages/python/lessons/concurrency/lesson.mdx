@@ -1,0 +1,397 @@
+---
+title: "Concurrency: threads, processes and asyncio"
+subtitle: Waiting versus working, what the global interpreter lock does, and how to choose between threads, processes, asyncio and the new free-threaded Python.
+minutes: 65
+objectives:
+  - Distinguish concurrency from parallelism, and I/O-bound from CPU-bound work
+  - Explain the global interpreter lock, its consequences, and what free-threaded builds change
+  - Use thread pools for waiting, locks and queues for shared state, and process pools for computation
+  - Write asyncio code with tasks, TaskGroup, timeouts and semaphores, without blocking the event loop
+  - Choose a concurrency model for a given problem and justify the choice
+prerequisites: [errors-and-context-managers]
+references:
+  - title: "The Python Standard Library: concurrent.futures"
+    url: https://docs.python.org/3/library/concurrent.futures.html
+  - title: "The Python Standard Library: asyncio"
+    url: https://docs.python.org/3/library/asyncio.html
+  - title: "The Python Standard Library: threading"
+    url: https://docs.python.org/3/library/threading.html
+  - title: "Python support for free threading (HOWTO)"
+    url: https://docs.python.org/3/howto/free-threading-python.html
+  - title: "PEP 703: Making the Global Interpreter Lock Optional in CPython"
+    url: https://peps.python.org/pep-0703/
+  - title: "PEP 779: Criteria for supported status for free-threaded Python"
+    url: https://peps.python.org/pep-0779/
+  - title: "PEP 734: Multiple Interpreters in the Stdlib"
+    url: https://peps.python.org/pep-0734/
+  - title: Python free-threading guide
+    url: https://py-free-threading.github.io/
+    note: A community guide to installing, testing and porting packages for free-threaded Python.
+---
+
+<Section id="motivation" kind="motivation" title="Waiting versus working">
+
+A program that downloads 200 web pages one after another spends almost all of its time *waiting*: for DNS, for the connection, for the server to answer. A program that resizes 200 photos spends almost all of its time *working*: the CPU is busy every microsecond. Both are slow when done one at a time, but for opposite reasons, and they need opposite cures.
+
+Python offers several tools for doing more than one thing at a time: **threads**, **processes**, **asyncio**, and since 3.13 an optional **free-threaded** build of CPython. Choosing between them is one of the most consequential design decisions in a Python service, and it depends almost entirely on whether your program is mostly waiting or mostly working. By the end of this lesson you will be able to make that choice and defend it.
+
+If you want the operating-system background (what threads and processes are, how scheduling works), the [Lumenary CS lesson on concurrency](/en/cs/concurrency/) covers it; here we focus on how Python frames it.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Vocabulary, and the lock in the middle">
+
+<Definition term="Concurrency and parallelism">
+
+**Concurrency** is structuring a program so that several tasks are in progress at once, taking turns. **Parallelism** is several tasks literally executing at the same instant, on different CPU cores. Concurrency is about dealing with many things; parallelism is about doing many things.
+
+</Definition>
+
+<Definition term="I/O-bound and CPU-bound">
+
+A task is **I/O-bound** if its speed is limited by waiting for input and output (network, disk, a database, a user); it is **CPU-bound** if it is limited by computation.
+
+</Definition>
+
+<Definition term="Global interpreter lock (GIL)">
+
+A lock inside the standard CPython interpreter that allows only one thread at a time to execute Python bytecode. Threads still run concurrently, but on a GIL build, pure-Python code in several threads does not run in parallel.
+
+</Definition>
+
+Why does the GIL exist? CPython manages memory by **reference counting**: every object counts how many references point at it and is freed when the count reaches zero. Updating those counts from many threads at once would need a lock on every object, or atomic operations everywhere, which would slow down single-threaded code. One big lock was the simple, fast solution in the 1990s, and it also made writing C extensions much easier.
+
+The GIL matters less than its reputation suggests, for two reasons. First, a thread **releases the GIL while it waits** for I/O (and in `time.sleep`), so threads work very well for I/O-bound programs. Second, well-written C extensions release it during long computations: NumPy, many image and compression libraries, and database drivers run in parallel threads perfectly well. The GIL bites in one specific case: **CPU-bound work written in pure Python**.
+
+</Section>
+
+<Section id="threads" kind="examples" title="Threads for waiting">
+
+The standard library's `concurrent.futures` module gives threads and processes the same simple interface: an **executor** that runs function calls for you and returns **futures**, placeholders for results that will arrive later. `pool.map` returns results in input order; `as_completed` yields futures as they finish.
+
+```python check
+"""I/O-bound work: threads overlap the waiting."""
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def fetch(page):
+    time.sleep(0.25)                  # stands in for a network request: mostly waiting
+    return f"page {page}"
+
+
+pages = range(1, 9)
+
+start = time.perf_counter()
+one_by_one = [fetch(p) for p in pages]
+print(f"one at a time: {time.perf_counter() - start:.1f}s")
+
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=8) as pool:
+    together = list(pool.map(fetch, pages))       # results come back in input order
+print(f"8 threads:     {time.perf_counter() - start:.1f}s")
+print(together == one_by_one, together[:3])
+
+with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = {pool.submit(fetch, p): p for p in [3, 1, 2]}
+    for future in as_completed(futures):          # in completion order instead
+        assert future.result() == f"page {futures[future]}"
+    print(sorted(f.result() for f in futures))
+```
+
+```text
+one at a time: 2.0s
+8 threads:     0.3s
+True ['page 1', 'page 2', 'page 3']
+['page 1', 'page 2', 'page 3']
+```
+
+Eight waits of a quarter of a second took two seconds in sequence and about a quarter of a second with eight threads, because while one thread sleeps (or waits on a socket), it releases the GIL and the others proceed. Using the executor as a context manager waits for all work to finish and shuts the threads down. If a call raised an exception, `future.result()` (or iterating over `pool.map`) re-raises it in your thread, so errors are not lost.
+
+</Section>
+
+<Section id="shared-state" kind="computation" title="Shared state: races, locks and queues">
+
+Threads share memory, which is both their convenience and their danger. When two threads read, modify and write the same variable, one can overwrite the other's update: a **race condition**. The GIL does *not* prevent this. It makes individual bytecode instructions atomic, but `balance = balance + amount` is several instructions, and a thread can be switched out between them. The program below widens that gap with a short sleep so the race happens every time:
+
+```python check
+"""A race condition, the lock that fixes it, and a queue that avoids sharing."""
+import queue
+import threading
+import time
+
+balance = 0
+
+
+def deposit_unsafe(amount):
+    global balance
+    current = balance            # read...
+    time.sleep(0.001)            # (another thread runs here)
+    balance = current + amount   # ...write: may overwrite someone else's deposit
+
+
+lock = threading.Lock()
+
+
+def deposit_safe(amount):
+    global balance
+    with lock:                   # only one thread at a time in this block
+        current = balance
+        time.sleep(0.001)
+        balance = current + amount
+
+
+for deposit in (deposit_unsafe, deposit_safe):
+    balance = 0
+    threads = [threading.Thread(target=deposit, args=(10,)) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()                 # wait for every thread to finish
+    print(f"{deposit.__name__}: expected 200, got {balance}" if balance != 200
+          else f"{deposit.__name__}: 200, as expected")
+
+# Producer and consumer: the queue does the locking for you.
+orders: queue.Queue[str | None] = queue.Queue()
+packed = []
+
+
+def packer():
+    while (item := orders.get()) is not None:   # None is the "no more work" signal
+        packed.append(item.upper())
+
+
+worker = threading.Thread(target=packer)
+worker.start()
+for item in ["rice", "lentils", "mangoes"]:
+    orders.put(item)
+orders.put(None)
+worker.join()
+print(packed)
+```
+
+```text
+deposit_unsafe: expected 200, got 10
+deposit_safe: 200, as expected
+['RICE', 'LENTILS', 'MANGOES']
+```
+
+(The unsafe total varies from run to run, which is exactly what makes races so hard to debug: the bug may hide for weeks and appear only under load.) Two rules keep threaded code sane:
+
+- **Protect every read-modify-write of shared data with a lock**, held for as short a time as possible, and always through `with lock:` so it is released even if an exception occurs.
+- **Better still, do not share.** Give each thread its own data and communicate through a `queue.Queue`, which is thread-safe, as the packer does. Passing messages instead of sharing variables removes whole classes of bugs.
+
+</Section>
+
+<Section id="processes" kind="computation" title="Processes for computing">
+
+For CPU-bound pure-Python code on a standard build, the way to use several cores is **several processes**: each has its own interpreter, its own memory and its own GIL. `ProcessPoolExecutor` has the same interface as the thread pool. The program first reports what kind of build it is running on:
+
+```python check
+"""CPU-bound work: threads versus processes on a standard (GIL) build."""
+import sys
+import sysconfig
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+
+def count_primes(limit):
+    """Deliberately plain Python: pure computation, no waiting."""
+    count = 0
+    for n in range(2, limit):
+        if all(n % d for d in range(2, int(n ** 0.5) + 1)):
+            count += 1
+    return count
+
+
+def timed(label, run):
+    start = time.perf_counter()
+    result = run()
+    print(f"{label:<12}{time.perf_counter() - start:5.2f}s  {result}")
+
+
+if __name__ == "__main__":                       # required: worker processes import this file
+    print("free-threaded build:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
+    print("GIL enabled:", sys._is_gil_enabled())  # Python 3.13+
+    jobs = [150_000] * 4
+    timed("sequential", lambda: [count_primes(n) for n in jobs])
+    with ThreadPoolExecutor(4) as pool:
+        timed("4 threads", lambda: list(pool.map(count_primes, jobs)))
+    with ProcessPoolExecutor(4) as pool:
+        timed("4 processes", lambda: list(pool.map(count_primes, jobs)))
+```
+
+One run with CPython 3.13 on a multi-core machine printed the following; your timings will differ, but the pattern will not:
+
+```text
+free-threaded build: False
+GIL enabled: True
+sequential   0.60s  [13848, 13848, 13848, 13848]
+4 threads    0.55s  [13848, 13848, 13848, 13848]
+4 processes  0.18s  [13848, 13848, 13848, 13848]
+```
+
+Four threads took as long as doing the work in sequence, because only one of them could execute Python at a time. Four processes ran on four cores. Processes have costs, though:
+
+- **Start-up and transfer.** Arguments and results are **pickled** (serialised) and sent between processes, so they must be picklable, and sending large data can cost more than it saves. Give each process a big chunk of work, not millions of tiny calls.
+- **The `__main__` guard is mandatory.** Depending on the platform's *start method*, worker processes re-import your main module (`spawn` on Windows and macOS; `forkserver` became the default on Linux in 3.14, replacing `fork`). Without the guard, each worker would try to start its own pool.
+- **No shared variables.** Each process has its own copy of every global. Share results by returning them, or use `multiprocessing`'s queues and shared-memory tools.
+
+</Section>
+
+<Section id="asyncio" kind="examples" title="asyncio: one thread, many waits">
+
+Threads are managed by the operating system, which can switch between them at any instruction. **asyncio** takes a different approach: **cooperative** multitasking in a single thread. A coroutine, defined with `async def`, runs until it reaches an `await` on something that is not ready (a network response, a timer), and *there* it gives control back to the **event loop**, which runs another coroutine that is ready. Because switches happen only at `await`, code between two `await`s never has to worry about another task changing things halfway through.
+
+This runs in your browser; watch the order of the lines:
+
+```python run
+import asyncio
+
+
+async def brew(drink, minutes):
+    print(f"start {drink}")
+    await asyncio.sleep(minutes / 10)      # waiting: other coroutines run meanwhile
+    print(f"done {drink}")
+    return drink
+
+
+results = await asyncio.gather(brew("chai", 3), brew("coffee", 1), brew("mate", 2))
+print(results)
+```
+
+```text
+start chai
+start coffee
+start mate
+done coffee
+done mate
+done chai
+['chai', 'coffee', 'mate']
+```
+
+(In a script you would put this inside `async def main()` and call `asyncio.run(main())`; the browser already runs an event loop, so this page allows `await` at the top level.) All three started at once and finished in order of their waits; `gather` returned the results in the order the coroutines were *given*.
+
+Modern asyncio code (Python 3.11 and later) uses **`TaskGroup`** for structured concurrency: tasks started in the group are awaited when the `async with` block ends, and if any task fails, the others are cancelled and the failures arrive together as an exception group (lesson 7). Timeouts and limits are context managers and objects too:
+
+```python check
+import asyncio
+import time
+
+
+async def fetch(name, delay):
+    await asyncio.sleep(delay)              # waiting: the event loop runs other tasks
+    return f"{name} after {delay}s"
+
+
+async def flaky(n):
+    if n % 2:
+        raise ValueError(f"task {n} failed")
+    await asyncio.sleep(0.05)
+    return n
+
+
+async def limited(sem, n, log):
+    async with sem:                         # at most two tasks inside at once
+        log.append(f"+{n}")
+        await asyncio.sleep(0.05)
+        log.append(f"-{n}")
+
+
+async def main():
+    start = time.perf_counter()
+    async with asyncio.TaskGroup() as tg:   # Python 3.11+: structured concurrency
+        tasks = [tg.create_task(fetch(name, d)) for name, d in [("weather", 0.3), ("news", 0.2), ("rates", 0.1)]]
+    print([t.result() for t in tasks])
+    print(f"three waits of 0.3s, 0.2s and 0.1s took about {time.perf_counter() - start:.1f}s")
+
+    try:
+        async with asyncio.timeout(0.15):   # Python 3.11+
+            await fetch("slow report", 1.0)
+    except TimeoutError:
+        print("gave up on the slow report after 0.15s")
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for n in range(4):
+                tg.create_task(flaky(n))
+    except* ValueError as group:
+        print("failures:", sorted(str(e) for e in group.exceptions))
+
+    sem, log = asyncio.Semaphore(2), []
+    await asyncio.gather(*(limited(sem, n, log) for n in range(4)))
+    print(" ".join(log))
+
+
+asyncio.run(main())
+```
+
+```text
+['weather after 0.3s', 'news after 0.2s', 'rates after 0.1s']
+three waits of 0.3s, 0.2s and 0.1s took about 0.3s
+gave up on the slow report after 0.15s
+failures: ['task 1 failed', 'task 3 failed']
++0 +1 -0 -1 +2 +3 -2 -3
+```
+
+The last line shows the semaphore at work: tasks 0 and 1 entered (`+0 +1`), and 2 and 3 entered only after those had left. In real code the same pattern limits how many requests you send to one server at a time.
+
+asyncio's great strength is scale: a single thread can hold tens of thousands of open network connections, each costing a small object instead of an operating-system thread. Its great weakness is that **anything that blocks the thread blocks every task**. Calling `time.sleep`, `requests.get` or a slow CPU-bound function inside a coroutine freezes the whole program. Use async libraries (such as httpx or aiohttp for HTTP, asyncpg for PostgreSQL), and push unavoidable blocking calls to a thread with `await asyncio.to_thread(func, ...)`. And because `async` spreads (only a coroutine can `await`), adopting asyncio is a decision for a whole program or service, not for one function.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Choosing a model, and the free-threaded future">
+
+A summary that experienced Python engineers would broadly agree with:
+
+| Situation | Usual choice | Why |
+| --- | --- | --- |
+| A script that makes a few dozen network or disk calls | `ThreadPoolExecutor` | Simplest; works with ordinary blocking libraries |
+| A server or crawler with thousands of concurrent connections | asyncio | One thread scales to many waits; structured cancellation and timeouts |
+| CPU-bound pure Python on a standard build | `ProcessPoolExecutor` | One GIL per process, so real parallelism |
+| Numerical work on arrays | NumPy and friends, possibly with threads | The heavy loops run in C, often releasing the GIL |
+| CPU-bound Python on a free-threaded build | Threads | Parallel threads without processes' copying costs |
+
+**Free-threaded Python.** PEP 703, accepted in 2023, made the GIL optional. Python 3.13 shipped an experimental free-threaded build (often installed as `python3.13t`); 3.14 declared it officially supported (PEP 779), with a single-threaded slowdown of roughly 5 to 10 percent according to its release notes; and 3.15 gave extensions a stable ABI for it (PEP 803), which makes it much easier for package authors to ship compatible wheels. The standard build still has the GIL, and is still the default on most platforms. On a free-threaded build, the CPU-bound program above would speed up with threads too, but your code must then be genuinely thread-safe: the race in the deposit example is a bug with or without a GIL, and more such bugs become visible once threads truly run in parallel. As of late 2026, the ecosystem is in transition: many popular packages support free threading, and some C extensions still re-enable the GIL when imported. Check with `sys._is_gil_enabled()`, and see the community's [free-threading guide](https://py-free-threading.github.io/) for the state of particular packages.
+
+**Subinterpreters** are a third path. Python 3.14 added `concurrent.interpreters` (PEP 734) and `InterpreterPoolExecutor`: several isolated interpreters in one process, each with its own GIL, communicating through queues. They start faster and share a process, but have the same "no shared objects" discipline as processes.
+
+Whatever the model, the professional habits are the same. Measure before choosing (lesson 10 shows how): many programs that feel slow are waiting on one slow query, not short of cores. Prefer high-level tools (`concurrent.futures`, `TaskGroup`) over raw threads and processes. Share as little as possible, and pass messages through queues. And always give long-running concurrent work a way to time out and be cancelled.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Because of the GIL, threads are useless in Python."** They are excellent for I/O-bound work, which is most of what services and scripts do, and for calling C libraries that release the GIL. They do not speed up pure-Python computation on a standard build.
+
+</Misconception>
+
+<Misconception>
+
+**"The GIL makes my code thread-safe."** It protects the interpreter's internals, not your logic. Any read-modify-write sequence on shared data, such as `count += 1` or check-then-act on a dict, can be interleaved by another thread. Use locks or queues.
+
+</Misconception>
+
+<Misconception>
+
+**"`async` makes code faster."** It lets one thread overlap many *waits*. It does nothing for computation, and a coroutine that never awaits anything slow simply runs sequentially with extra overhead.
+
+</Misconception>
+
+<Misconception>
+
+**"More workers is always better."** Each thread costs memory, each process costs start-up and copying, and a remote server may throttle or block a client that opens hundreds of connections. Pick a pool size by measuring, and cap concurrency against external services with a semaphore.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Several exercises ask you to classify workloads; the last asks you to write a small asyncio program.
+
+<Exercises/>
+
+</Section>

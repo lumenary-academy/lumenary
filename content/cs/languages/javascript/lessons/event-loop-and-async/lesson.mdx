@@ -1,0 +1,430 @@
+---
+title: The event loop, promises and async/await
+subtitle: How one thread handles thousands of waiting tasks, and how to write asynchronous code that reads like ordinary code.
+minutes: 65
+objectives:
+  - Explain run-to-completion, tasks and microtasks, and predict the order of asynchronous output
+  - Create, chain and recover from promises, and wrap a callback API in a promise
+  - Write async functions with await, and run independent operations concurrently instead of one by one
+  - Choose between Promise.all, allSettled, any and race, and add timeouts and cancellation with AbortController
+  - Consume asynchronous sequences with for await...of, and avoid blocking the event loop
+prerequisites: [errors-and-testing]
+references:
+  - title: "MDN: JavaScript execution model"
+    author: Mozilla and contributors
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model
+    note: Agents, the job queue and run-to-completion, precisely.
+  - title: "MDN: Using promises"
+    author: Mozilla and contributors
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises
+  - title: "Node.js: The event loop, timers and process.nextTick()"
+    author: OpenJS Foundation
+    url: https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick
+    note: The phases of Node's event loop, in detail.
+  - title: "HTML Standard: Event loops"
+    author: WHATWG
+    url: https://html.spec.whatwg.org/multipage/webappapis.html#event-loops
+    note: The browser's event loop as specified, including rendering.
+  - title: "MDN: AbortController"
+    author: Mozilla and contributors
+    url: https://developer.mozilla.org/en-US/docs/Web/API/AbortController
+---
+
+<Section id="motivation" kind="motivation" title="Waiting without stopping">
+
+A web server spends most of its life waiting: for a database to answer, a file to be read, another service to reply. A web page waits for the user to click, for images to arrive, for a timer to fire. If a program stopped completely every time it waited, a server could serve one person at a time and a page would freeze on every request.
+
+Many languages solve this with threads: run many sequences of instructions at once, each allowed to block. JavaScript took a different path. Your code runs on a **single thread**, and instead of blocking, every slow operation is started and then *handed off*; when it finishes, a callback is queued, and the **event loop** runs it once the thread is free. One thread, never blocked by waiting, can juggle tens of thousands of open connections. This design is why Node.js became popular for network servers in 2009, and it is why the browser stays responsive.
+
+The price is that asynchronous code has to be written differently. The language's answer evolved in three stages: **callbacks**, then **promises** (ES2015), then **async/await** (ES2017). This lesson explains the event loop first, because everything else follows from it.
+
+</Section>
+
+<Section id="event-loop" kind="intuition" title="The event loop">
+
+<Definition term="run-to-completion, task and microtask">
+
+JavaScript code runs to completion: once a function starts, nothing else in the same thread can interrupt it. Work waiting to run sits in queues. A **task** (also called a macrotask) is a unit of work such as running a script, a timer callback, or handling a click or a network response. A **microtask** is a smaller unit, used for promise reactions, `await` continuations and `queueMicrotask`. After each task finishes, the engine runs **every** queued microtask, including any queued by those microtasks, before it starts the next task (and, in a browser, before it repaints the screen).
+
+</Definition>
+
+That rule predicts the order of everything:
+
+```javascript check
+// The order of events: synchronous code, then microtasks, then the next task.
+console.log("1. script starts");
+
+setTimeout(() => console.log("7. timeout callback (a task)"), 0);
+
+Promise.resolve().then(() => console.log("4. promise reaction (a microtask)"));
+
+queueMicrotask(() => {
+  console.log("5. queued microtask");
+});
+
+(async () => {
+  console.log("2. async function runs synchronously until its first await");
+  await null;
+  console.log("6. ...and resumes later, as a microtask");
+})();
+
+console.log("3. script ends");
+```
+
+```text
+1. script starts
+2. async function runs synchronously until its first await
+3. script ends
+4. promise reaction (a microtask)
+5. queued microtask
+6. ...and resumes later, as a microtask
+7. timeout callback (a task)
+```
+
+Walk through it. Running the script is one task, so lines 1, 2 and 3 print first: nothing can interrupt it, and calling an async function runs its body synchronously up to the first `await`. Along the way, three microtasks were queued (the `then` callback, the `queueMicrotask` callback and the rest of the async function, in that order) and one task (the timer). When the script ends, the microtask queue is drained: 4, 5, 6. Only then does the event loop take the next task, the timer: 7. A delay of 0 means "as soon as possible, *as a new task*", never "immediately".
+
+<Figure caption="One thread, two queues. After each task, the engine empties the microtask queue completely before taking the next task.">
+
+<svg viewBox="0 0 560 210" role="img" aria-label="A diagram of the event loop: the call stack runs one task to completion; after it finishes, every queued microtask runs; then the next task is taken from the task queue.">
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="20" width="150" height="170" rx="8"/>
+    <rect x="230" y="20" width="310" height="60" rx="8"/>
+    <rect x="230" y="130" width="310" height="60" rx="8"/>
+    <path d="M230 50 C 200 50 200 90 172 100"/>
+    <path d="M230 160 C 200 160 200 120 172 110"/>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="13">
+    <text x="95" y="45" textAnchor="middle">call stack</text>
+    <text x="95" y="100" textAnchor="middle">runs one task</text>
+    <text x="95" y="118" textAnchor="middle">to completion</text>
+    <text x="245" y="45">microtask queue: promise reactions,</text>
+    <text x="245" y="65">await continuations. All of them run.</text>
+    <text x="245" y="155">task queue: timers, events, I/O.</text>
+    <text x="245" y="175">One is taken per turn of the loop.</text>
+    <text x="178" y="38">first</text>
+    <text x="178" y="190">then</text>
+  </g>
+</svg>
+
+</Figure>
+
+Two consequences matter in practice. First, a long synchronous computation blocks everything: no timers fire, no clicks are handled, and in a browser the page cannot even repaint until it finishes. Second, nothing in your own synchronous code can be interrupted halfway, so JavaScript has no data races of the kind threads have, a real simplification. Logical races are still possible, though: between two `await`s, other code may run and change shared state, so re-check anything you read before an `await` if it may have changed. (Node adds one more queue of its own, `process.nextTick`, which runs before promise microtasks; Node's documentation recommends the standard `queueMicrotask` for most new code.)
+
+</Section>
+
+<Section id="promises" kind="definitions" title="Promises">
+
+Before promises, asynchronous functions took a callback: `readFile(path, (err, data) => { ... })`. That works for one step, but a sequence of steps nests deeper and deeper, error handling must be repeated at every level, and it is easy to call a callback twice or never. Old Node code looked like this, a shape nicknamed the "pyramid of doom":
+
+```javascript
+readConfig((err, config) => {
+  if (err) return done(err);
+  connect(config.db, (err, db) => {
+    if (err) return done(err);
+    db.query("SELECT ...", (err, rows) => {
+      if (err) return done(err);
+      done(null, rows.length);
+    });
+  });
+});
+```
+
+Every level repeats the same error check, and nothing stops a careless edit from forgetting one. Promises, and then `await`, turned this into flat code with a single place to handle errors: with promise-returning versions of the same functions, the body becomes three `await` lines inside one `try`.
+
+<Definition term="promise">
+
+A **promise** is an object representing the eventual result of an asynchronous operation. It is **pending** at first, and later **settles** exactly once: either **fulfilled** with a value or **rejected** with a reason (normally an `Error`). `promise.then(onFulfilled)` registers a function to run with the value, `catch(onRejected)` one to run with the reason, and `finally(fn)` one to run either way. Each of them returns a *new* promise, which is what makes chaining possible.
+
+</Definition>
+
+```javascript check
+// Promises: a value that will be available later, or an error.
+const delay = (ms, value) => new Promise((resolve) => setTimeout(() => resolve(value), ms));
+
+function fetchUser(id) {
+  // A stand-in for a network request: succeeds for known ids, fails otherwise.
+  const users = { 1: { id: 1, name: "Aiko" }, 2: { id: 2, name: "Babajide" } };
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (users[id]) resolve(users[id]);
+      else reject(new Error(`no user with id ${id}`));
+    }, 20);
+  });
+}
+
+const p = fetchUser(1);
+console.log("right after the call:", p);
+
+p.then((user) => user.name)                       // then returns a new promise
+  .then((name) => name.toUpperCase())
+  .then((shout) => console.log("chained result:", shout))
+  .catch((err) => console.log("never reached:", err.message))
+  .finally(() => console.log("first chain settled"));
+
+fetchUser(99)
+  .then((user) => console.log("never reached:", user))
+  .catch((err) => {
+    console.log("caught:", err.message);
+    return { id: 0, name: "guest" };                // recover with a fallback value
+  })
+  .then((user) => console.log("continuing as", user.name));
+
+await delay(50);
+console.log("after a 50 ms pause:", p);
+```
+
+```text
+right after the call: Promise { <pending> }
+chained result: AIKO
+first chain settled
+caught: no user with id 99
+continuing as guest
+after a 50 ms pause: Promise { { id: 1, name: 'Aiko' } }
+```
+
+- **Creating one.** `new Promise((resolve, reject) => { ... })` runs the function immediately and gives it two functions to settle the promise. You rarely need it except to wrap an old callback-based API, as `delay` wraps `setTimeout` and `fetchUser` simulates a request. Most promises you meet are returned by APIs such as `fetch`, or by async functions.
+- **Chaining.** Whatever a `then` callback returns becomes the value of the next promise in the chain; if it returns a promise, the chain waits for it. So each step can be asynchronous, and the code stays flat.
+- **Errors flow down the chain** to the nearest `catch`, skipping the `then` steps in between, much like an exception skipping lines to the nearest `catch` block. A `catch` that returns a value *recovers*, and the chain continues.
+- **Unhandled rejections.** A rejected promise that nobody handles is a bug. Browsers log it; since Node 15, an unhandled rejection crashes the process by default. Every chain needs a `catch` at the end, or must be returned or awaited by something that has one.
+
+The `await delay(50)` at the end uses **top-level await**, allowed in ES modules: the module itself pauses there.
+
+</Section>
+
+<Section id="async-await" kind="computation" title="async and await">
+
+An `async` function always returns a promise. Inside it, `await promise` pauses the function until the promise settles, then either gives back the fulfilled value or *throws* the rejection reason. The function's caller is not blocked: while it waits, the event loop runs other work. The result is asynchronous code that reads top to bottom, with ordinary `try`/`catch`, loops and `if`s.
+
+```javascript check
+// async/await: write asynchronous code that reads top to bottom.
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const log = [];
+
+async function download(name, ms) {
+  log.push(`start ${name}`);
+  await delay(ms);
+  log.push(`end ${name}`);
+  return `${name} (${ms} ms)`;
+}
+
+// Sequential: each await waits for the previous download to finish.
+async function oneByOne() {
+  const a = await download("A", 30);
+  const b = await download("B", 10);
+  const c = await download("C", 20);
+  return [a, b, c];
+}
+
+// Concurrent: start all three, then wait for all of them.
+async function allTogether() {
+  return Promise.all([download("A", 30), download("B", 10), download("C", 20)]);
+}
+
+console.log(await oneByOne());
+console.log(log.join(", "));
+log.length = 0;
+
+console.log(await allTogether());
+console.log(log.join(", "));
+
+// Errors: a rejected promise makes await throw, so try/catch works again.
+async function failing() {
+  await delay(5);
+  throw new Error("server said 503");
+}
+try {
+  await failing();
+} catch (err) {
+  console.log("caught:", err.message);
+}
+
+// An async function always returns a promise.
+console.log(download("D", 0) instanceof Promise);
+```
+
+```text
+[ 'A (30 ms)', 'B (10 ms)', 'C (20 ms)' ]
+start A, end A, start B, end B, start C, end C
+[ 'A (30 ms)', 'B (10 ms)', 'C (20 ms)' ]
+start A, start B, start C, end B, end C, end A
+caught: server said 503
+true
+```
+
+Both versions return the same results, but the logs show the difference. `oneByOne` waits for each download before *starting* the next, so it takes about 30 + 10 + 20 = 60 ms. `allTogether` starts all three at once and waits for the slowest, about 30 ms; the downloads finish in order of speed, but `Promise.all` still returns results in the order you asked for them. With real network requests the difference is often seconds. The rule: **`await` in sequence only when a step needs the previous result.** When requests are independent, start them together.
+
+The most common async bug is a forgotten `await`. Without it, you get a pending promise instead of a value (`if (await isAllowed(user))` versus `if (isAllowed(user))`, which is always truthy because a promise is an object), and any error it throws becomes an unhandled rejection. Linters such as typescript-eslint's `no-floating-promises` rule catch it.
+
+</Section>
+
+<Section id="combinators" kind="examples" title="Many promises at once, timeouts and cancellation">
+
+Four static methods combine promises, and each answers a different question:
+
+```javascript check
+// Combining promises: all, allSettled, any, race.
+const succeedAfter = (ms, value) =>
+  new Promise((resolve) => setTimeout(() => resolve(value), ms));
+const failAfter = (ms, message) =>
+  new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
+
+// all: every result, in input order; rejects as soon as any one rejects.
+console.log(await Promise.all([succeedAfter(20, "prices"), succeedAfter(10, "stock")]));
+try {
+  await Promise.all([succeedAfter(20, "prices"), failAfter(10, "stock service down")]);
+} catch (err) {
+  console.log("all rejected:", err.message);
+}
+
+// allSettled: wait for everything, and report each outcome.
+const outcomes = await Promise.allSettled([
+  succeedAfter(10, "Nairobi weather"),
+  failAfter(5, "Quito weather timed out"),
+]);
+for (const o of outcomes) {
+  console.log(o.status, o.status === "fulfilled" ? o.value : o.reason.message);
+}
+
+// any: the first success wins; rejects only if every one fails.
+const mirror = await Promise.any([
+  failAfter(5, "mirror 1 unreachable"),
+  succeedAfter(15, "mirror 2"),
+  succeedAfter(25, "mirror 3"),
+]);
+console.log("downloaded from", mirror);
+
+// race: the first to settle wins, success or failure. Useful for timeouts.
+function withTimeout(promise, ms) {
+  return Promise.race([promise, failAfter(ms, `timed out after ${ms} ms`)]);
+}
+console.log(await withTimeout(succeedAfter(10, "fast answer"), 50));
+try {
+  await withTimeout(succeedAfter(100, "slow answer"), 20);
+} catch (err) {
+  console.log(err.message);
+}
+```
+
+```text
+[ 'prices', 'stock' ]
+all rejected: stock service down
+fulfilled Nairobi weather
+rejected Quito weather timed out
+downloaded from mirror 2
+fast answer
+timed out after 20 ms
+```
+
+| Method | Fulfils with | Rejects | Typical use |
+| --- | --- | --- | --- |
+| `Promise.all` | an array of all values, in order | as soon as any input rejects | a page that needs every piece of data |
+| `Promise.allSettled` | an array of `{ status, value }` or `{ status, reason }` | never | a dashboard that shows whatever succeeded |
+| `Promise.any` | the first value to arrive | only if all reject, with an `AggregateError` | trying several mirrors or replicas |
+| `Promise.race` | the first to settle, value or error | if the first to settle rejects | a timeout around a slow operation |
+
+A promise cannot be cancelled by itself: `race` stops *waiting* for the slow operation, but the operation carries on. Real cancellation uses an **`AbortController`**, the standard mechanism in browsers and Node: you pass its `signal` to an API (`fetch(url, { signal })`, many Node APIs, your own functions), and calling `controller.abort()` makes that API stop and reject.
+
+```javascript check
+// Cancelling with AbortController, and consuming a stream with for await...of.
+const delay = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    const id = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(id);
+      reject(signal.reason);
+    }, { once: true });
+  });
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(new Error("user pressed cancel")), 20);
+try {
+  await delay(1000, controller.signal);
+  console.log("finished");
+} catch (err) {
+  console.log("stopped early:", err.message);
+}
+
+// AbortSignal.timeout makes a signal that aborts by itself.
+try {
+  await delay(1000, AbortSignal.timeout(15));
+} catch (err) {
+  console.log(err.name);
+}
+
+// An async generator produces values over time; for await...of consumes them.
+async function* pages(total) {
+  for (let page = 1; page <= total; page++) {
+    await delay(5);                         // pretend each page is a request
+    yield { page, items: [`item ${2 * page - 1}`, `item ${2 * page}`] };
+  }
+}
+
+const collected = [];
+for await (const { page, items } of pages(3)) {
+  console.log(`page ${page}:`, items.join(", "));
+  collected.push(...items);
+}
+console.log(collected.length, "items in total");
+```
+
+```text
+stopped early: user pressed cancel
+TimeoutError
+page 1: item 1, item 2
+page 2: item 3, item 4
+page 3: item 5, item 6
+6 items in total
+```
+
+Our `delay` honours a signal the way built-in APIs do: it listens for `abort`, clears its timer so no work is wasted, and rejects with the signal's `reason`. `AbortSignal.timeout(ms)` gives a signal that aborts on its own with a `TimeoutError`, which is the tidy way to put a deadline on a `fetch`: `fetch(url, { signal: AbortSignal.timeout(5000) })`. (The `withTimeout` helper above leaves its timer running after the race is decided, harmless in a small script but wasteful in a server; signals avoid that.)
+
+The second half shows **async iteration**. An `async function*` is an async generator: it can both `await` and `yield`. `for await...of` pulls one value at a time, waiting for each. It is the natural shape for paginated APIs, lines of a large file, or messages arriving on a connection, and Node's streams and the browser's `ReadableStream` support it directly.
+
+</Section>
+
+<Section id="practice" kind="human" title="What experienced developers watch for">
+
+- **Never block the loop.** Parsing a 200 MB file synchronously, or a heavy calculation in a click handler, freezes everything that shares the thread. Split the work into chunks, move it to a **worker** (`Worker` in browsers, `worker_threads` in Node, both real threads with their own event loops that communicate by messages), or do it on a server.
+- **Prefer the promise-based APIs.** Node's `node:fs/promises`, `node:timers/promises` (`await setTimeout(100)`) and the web's `fetch` all return promises. Wrap a callback API yourself only when no promise version exists (Node's `util.promisify` does it for standard error-first callbacks).
+- **Limit concurrency.** `Promise.all` over ten thousand URLs fires ten thousand requests at once. Process them in batches, or use a small pool of workers that each take the next item. The project in lesson ten builds one.
+- **`async` callbacks don't make their caller wait.** `items.forEach(async (item) => { await save(item); })` starts every save and returns immediately; `forEach` ignores the promises. Use `for...of` with `await` for one-at-a-time, or `await Promise.all(items.map(save))` for all-at-once.
+- **Know `Promise.withResolvers()`.** Occasionally the code that settles a promise is far from the code that creates it: a queue that resolves a waiting caller when a slot frees up, for example. ES2024's `const { promise, resolve, reject } = Promise.withResolvers()` hands you all three at once, replacing the old trick of copying `resolve` out of the executor function into an outer variable.
+- **Handle every rejection.** At the top of a Node program, an `await` in a `try` (or a `.catch` on the outermost promise) is your last line of defence, so the process reports the error clearly before exiting.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`setTimeout(fn, 0)` runs `fn` immediately."** It queues `fn` as a new task, which runs only after the current code and every pending microtask have finished. Browsers also clamp nested timers to a minimum of about 4 ms.
+
+</Misconception>
+
+<Misconception>
+
+**"`async`/`await` makes code run in parallel," or "makes it run on another thread."** Your JavaScript still runs on one thread. `await` lets *other* code run while an operation (a network request, a timer, a file read handled by the operating system) is in progress. CPU-heavy JavaScript in an async function blocks just as much as anywhere else.
+
+</Misconception>
+
+<Misconception>
+
+**"`await` blocks the program."** It suspends only the async function it is in. The event loop keeps running everything else: other requests, other timers, user input.
+
+</Misconception>
+
+<Misconception>
+
+**"`Promise.race` cancels the losers."** It ignores them; they keep running. To actually stop work, pass an `AbortSignal` to it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+For each program, list the tasks and microtasks it queues, then predict the output.
+
+<Exercises/>
+
+</Section>
