@@ -8,6 +8,7 @@ objectives:
   - Explain load balancers, caches, CDNs and queues, and when each helps
   - Implement a token-bucket rate limiter and compare it with a fixed window
   - Design a URL shortener and a news feed end to end, and defend the trade-offs
+narrators: [chloe, margaret, gideon]
 prerequisites: [storage-at-scale, data-processing, replication-and-consensus]
 related: [math.applied.modelling-with-functions, math.prob.probability-rules]
 references:
@@ -130,6 +131,12 @@ A cache keeps copies of hot data in fast storage (memory, usually Redis or Memca
 3. On a write, update the database, then **delete** the cache entry (rather than updating it, which races with concurrent reads that can put an old value back).
 
 The expected latency with hit ratio $h$ is roughly $h \cdot t_{\text{cache}} + (1 - h)(t_{\text{cache}} + t_{\text{db}})$, so going from 90% to 99% hits can cut database load tenfold. The hard part is **invalidation**: stale reads between a write and the delete, values cached from a lagging replica, and the **thundering herd** when a hot key expires and thousands of requests miss at once and all hit the database. Remedies include request coalescing (one request fetches, the others wait for it), leases (Facebook's memcache paper), and jittered TTLs so hot keys do not all expire together. Read-through, write-through and write-behind variants move these duties into the cache layer, with their own trade-offs.
+
+<Narrator who="gideon">
+
+Delete-on-write narrows the race but does not close it. A reader misses, reads the *old* value from the database and is delayed; meanwhile a writer updates the database and deletes the key; then the reader puts the old value into the cache, where it stays until its TTL expires. That is the "stale set" Facebook's leases were designed to reject, and it is why every cache-aside entry needs a TTL: the TTL is the bound on how long such a bug can last.
+
+</Narrator>
 
 A **content delivery network** (CDN) is a cache run at hundreds of locations near users. It serves static assets — images, video segments, scripts — and increasingly whole cacheable pages, from a server a few milliseconds away. You control it with cache keys, TTLs and purges, and you design URLs with versions (`app.3f9a1c.js`) so content can be cached forever and changed by changing its name.
 
@@ -288,9 +295,21 @@ for n in (10**6, 10**8, 10**10):
           f" P(the next new code collides) = {n / space:.1e}")
 ```
 
+<Narrator who="chloe">
+
+Why is $i \mapsto iK \bmod 62^7$ a bijection? Because $\gcd(K, 62^7) = 1$, Bézout's identity gives an inverse $K^{-1}$ modulo $62^7$, and multiplying by it undoes the scrambling. The same algebra shows why it is not secret: the codes of consecutive ids differ by exactly $K$, so decoding `03qBNLf` and `06RdBwu` and subtracting reveals 3,141,592,653, and with it every other id.
+
+</Narrator>
+
 **Data model and storage.** One table, `links(code PRIMARY KEY, long_url, owner_id, created_at, expires_at)`, read by key only. That access pattern suits a key–value store partitioned by hash of `code`, or a relational database — at these numbers, a primary with read replicas is enough for years, and partitioning by code is easy to add later because every query is by code. Custom aliases need a uniqueness check, which a conditional insert on the primary key provides.
 
 **High-level design.** Clients hit a global load balancer, then stateless API servers. Redirects check a cache (cache-aside, keyed by code, with a TTL) before the database; the cache absorbs almost all reads because link popularity is extremely skewed. Every redirect also emits a click event to a log such as Kafka; a stream job aggregates clicks per code per day into the statistics table. Analytics never sit on the redirect's critical path.
+
+<Narrator who="margaret">
+
+How much does the cache buy? At the estimated peak of 6,944 reads per second, a 90% hit ratio still sends about 690 queries a second to the database, a 99% ratio about 70 — the difference between needing read replicas and not. With 0.5 ms cache and 5 ms database lookups, the average lookup only falls from 1.0 ms to 0.55 ms: the hit ratio matters far more for the database's load than for the user's wait.
+
+</Narrator>
 
 **Deep dives.** *A link goes viral*: one hot key; the cache holds it, and the API servers can keep a small in-process cache for the very hottest codes. *Abuse*: shorteners are used to disguise phishing and malware; check new URLs against a safe-browsing list, rate-limit creation per user and per IP, and be able to disable a code. *Expiry*: check `expires_at` at read time, and clean up in a background batch job. *Availability*: the redirect path depends only on the cache and a replicated read store, so it can survive the write path being down.
 
