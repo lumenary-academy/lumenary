@@ -1,0 +1,438 @@
+---
+title: Errors, undefined behaviour and sanitizers
+subtitle: Exceptions and std::expected for the failures you plan for, and undefined behaviour, hardened libraries and sanitizers for the bugs you do not.
+minutes: 70
+objectives:
+  - Distinguish recoverable errors, programming bugs and undefined behaviour, and choose a mechanism for each
+  - Throw and catch exceptions, explain stack unwinding, and state the basic, strong and nothrow exception-safety guarantees
+  - Return failures as values with std::expected and chain steps with and_then and transform
+  - Explain what undefined behaviour is, why compilers exploit it, and why "it worked when I tried it" proves nothing
+  - Find memory and arithmetic bugs with AddressSanitizer, UndefinedBehaviorSanitizer and a hardened standard library
+prerequisites: [stl-and-ranges]
+references:
+  - title: Exceptions
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/language/exceptions
+    note: Including the exception-safety guarantees.
+  - title: "std::expected"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/utility/expected
+  - title: Undefined behavior
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/language/ub
+  - title: AddressSanitizer
+    author: LLVM project
+    url: https://clang.llvm.org/docs/AddressSanitizer.html
+  - title: UndefinedBehaviorSanitizer
+    author: LLVM project
+    url: https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+  - title: Google C++ Style Guide
+    url: https://google.github.io/styleguide/cppguide.html
+    note: A large codebase's reasoned choice not to use exceptions, worth reading alongside the Core Guidelines' case for them.
+---
+
+<Section id="motivation" kind="motivation" title="Three kinds of going wrong">
+
+Things go wrong in programs in three quite different ways, and C++ treats them differently.
+
+**Expected failures** are part of normal life: a file is missing, a user types `80x` where a port number belongs, the network times out. The program should notice, report and carry on. C++ offers two mechanisms: **exceptions** and, since C++23, **`std::expected`**.
+
+**Programming bugs** are mistakes in the program itself: calling `mean` on an empty list when its contract says not to, indexing past the end of an array. No amount of careful handling at run time fixes them; the code must be changed. The tools are assertions, contracts, tests, and checking tools.
+
+**Undefined behaviour** is what certain bugs become in C++. The standard lists operations, such as reading outside an array, overflowing a signed integer or using a destroyed object, for which it places *no requirements at all* on what happens. The program may crash, print a plausible wrong answer, or work perfectly until the day it is compiled with a different flag. Undefined behaviour is the source of many security vulnerabilities in C and C++ software, and understanding it is what separates people who write C++ from people who write C++ safely.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="exception">
+
+An object thrown with `throw` to signal a failure the current function cannot handle. Control leaves the function immediately and travels up the call stack to the nearest `try` block with a matching `catch` clause. Standard exceptions derive from `std::exception`, whose `what()` returns a message.
+
+</Definition>
+
+<Definition term="stack unwinding">
+
+While an exception travels up the stack, every local object in every function it leaves is destroyed, in reverse order, with its destructor run. That is why RAII and exceptions fit together: files are closed and locks released on the error path without any extra code.
+
+</Definition>
+
+<Definition term="exception-safety guarantees">
+
+What a function promises if an exception escapes it. **Basic**: no resources leak and every object is still valid, though perhaps changed. **Strong**: the operation either succeeds completely or has no effect, like a transaction. **Nothrow**: it never throws, which you state with `noexcept`. Destructors, moves and swaps should be `noexcept`.
+
+</Definition>
+
+<Definition term="std::expected (C++23)">
+
+A type that holds either a value or an error. `std::expected<int, ParseError>` is an `int` on success and a `ParseError` on failure; `std::unexpected(e)` creates the failure case. Failures are ordinary return values that the caller must look at.
+
+</Definition>
+
+<Definition term="undefined behaviour">
+
+Behaviour of an erroneous operation for which the standard imposes no requirements. Common examples: out-of-bounds access, dereferencing a null or dangling pointer, signed integer overflow, reading an uninitialised variable (until C++26), a data race between threads, and violating a library function's precondition, such as `std::sort` with a comparison that is not an ordering.
+
+</Definition>
+
+</Section>
+
+<Section id="exceptions" kind="computation" title="Exceptions">
+
+This program parses port numbers and shows a custom exception type, the order of `catch` clauses, and stack unwinding.
+
+```cpp check
+#include <print>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+// A custom exception type that carries extra information.
+class ConfigError : public std::runtime_error {
+public:
+    ConfigError(const std::string& key, const std::string& why)
+        : std::runtime_error("config key '" + key + "': " + why), key_{key} {}
+    const std::string& key() const { return key_; }
+private:
+    std::string key_;
+};
+
+struct Guard {   // shows that destructors run while an exception propagates
+    std::string name;
+    ~Guard() { std::println("  cleanup: {}", name); }
+};
+
+int parse_port(const std::string& text) {
+    Guard g{"parse_port"};
+    std::size_t used = 0;
+    int port = std::stoi(text, &used);   // throws std::invalid_argument or std::out_of_range
+    if (used != text.size()) throw ConfigError("port", "trailing characters in '" + text + "'");
+    if (port < 1 || port > 65535) throw ConfigError("port", std::to_string(port) + " is out of range");
+    return port;
+}
+
+int main() {
+    std::vector<std::string> inputs{"8080", "80x", "70000", "http", "99999999999"};
+    for (const auto& in : inputs) {
+        try {
+            int port = parse_port(in);
+            std::println("ok: {}", port);
+        } catch (const ConfigError& e) {          // most specific first
+            std::println("config error ({}): {}", e.key(), e.what());
+        } catch (const std::invalid_argument&) {
+            std::println("not a number: {}", in);
+        } catch (const std::exception& e) {       // any other standard exception
+            std::println("other error: {}", e.what());
+        }
+    }
+}
+```
+
+```text
+  cleanup: parse_port
+ok: 8080
+  cleanup: parse_port
+config error (port): config key 'port': trailing characters in '80x'
+  cleanup: parse_port
+config error (port): config key 'port': 70000 is out of range
+  cleanup: parse_port
+not a number: http
+  cleanup: parse_port
+other error: stoi
+```
+
+`Guard`'s destructor ran on every path, success or failure: that is stack unwinding at work. Catch clauses are tried in order, so the most specific type goes first; catching by `const&` avoids copying and preserves the real type of a derived exception. `std::stoi` threw `std::invalid_argument` for `http` and `std::out_of_range` for a number too big for an `int`; the latter fell through to the generic `std::exception` handler, whose message from GCC's library is just the function name. Library messages are often terse, which is one reason to wrap them in your own exception types near the boundary where you know the context.
+
+Exceptions have a clear cost model in the major implementations. The path where nothing is thrown costs almost nothing, because the information needed to unwind lives in side tables rather than in the code. Throwing is expensive, typically microseconds, because it must search those tables. So exceptions suit failures that are genuinely exceptional, not ordinary control flow. Some fields (parts of game development, embedded systems, some large companies) compile with exceptions disabled for reasons of code size, predictable timing or history; the Google C++ Style Guide explains one such decision.
+
+
+<Example title="Giving an operation the strong guarantee">
+
+A class keeps a list of bookings and an index from guest name to booking. Adding a booking must update both, and either update could throw (for instance, if memory runs out). Written naively, a throw between the two updates leaves the list and the index disagreeing, which breaks the class's invariant:
+
+```cpp
+void Hotel::add(Booking b) {
+    bookings_.push_back(b);                      // succeeds...
+    by_guest_[b.guest] = bookings_.size() - 1;   // ...and this throws: the two now disagree
+}
+```
+
+The standard remedy is to do all the work that can throw on the side, then commit with operations that cannot throw:
+
+```cpp
+void Hotel::add(Booking b) {
+    auto bookings = bookings_;                   // copies: may throw, but nothing has changed yet
+    auto index = by_guest_;
+    bookings.push_back(b);
+    index[b.guest] = bookings.size() - 1;
+    bookings_.swap(bookings);                    // swaps never throw: commit
+    by_guest_.swap(index);
+}
+```
+
+This gives the strong guarantee at the cost of two copies, which may or may not be acceptable; a cheaper version would undo the first change in a `catch` block and rethrow. Deciding which guarantee each operation offers, and documenting it, is part of designing a class. If an exception ever escapes a function marked `noexcept`, the program calls `std::terminate` and stops, so `noexcept` is a promise to keep, not a hint.
+
+</Example>
+
+</Section>
+
+<Section id="expected" kind="examples" title="Errors as values: std::expected">
+
+When failure is a normal outcome that the immediate caller should handle, such as parsing input, returning it as a value is often clearer than throwing.
+
+```cpp check
+#include <charconv>
+#include <expected>
+#include <print>
+#include <string>
+#include <string_view>
+
+enum class ParseError { empty, not_a_number, too_large, negative };
+
+std::string_view describe(ParseError e) {
+    switch (e) {
+        case ParseError::empty: return "empty input";
+        case ParseError::not_a_number: return "not a number";
+        case ParseError::too_large: return "too large";
+        case ParseError::negative: return "negative";
+    }
+    return "unknown";
+}
+
+// Either an int or the reason there is none. No exceptions involved.
+std::expected<int, ParseError> parse_int(std::string_view s) {
+    if (s.empty()) return std::unexpected(ParseError::empty);
+    int value = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (ec == std::errc::result_out_of_range) return std::unexpected(ParseError::too_large);
+    if (ec != std::errc{} || ptr != s.data() + s.size()) return std::unexpected(ParseError::not_a_number);
+    return value;
+}
+
+std::expected<int, ParseError> non_negative(int x) {
+    if (x < 0) return std::unexpected(ParseError::negative);
+    return x;
+}
+
+int main() {
+    for (std::string_view in : {"42", "", "4x2", "-7", "123456789012"}) {
+        // Chain steps: and_then runs the next step only on success,
+        // transform changes a successful value.
+        auto result = parse_int(in).and_then(non_negative).transform([](int x) { return x * 2; });
+        if (result) {
+            std::println("'{}' -> {}", in, *result);
+        } else {
+            std::println("'{}' -> error: {}", in, describe(result.error()));
+        }
+    }
+    std::println("value_or: {}", parse_int("oops").value_or(-1));
+}
+```
+
+```text
+'42' -> 84
+'' -> error: empty input
+'4x2' -> error: not a number
+'-7' -> error: negative
+'123456789012' -> error: too large
+value_or: -1
+```
+
+`std::from_chars` (C++17) is the fast, non-throwing, locale-independent way to parse numbers; it reports problems through an error code, which `parse_int` turns into a meaningful `ParseError`. The C++23 member functions make pipelines of fallible steps readable: `and_then` calls the next step only if the previous one succeeded, `transform` changes a successful value, and `or_else` and `transform_error` do the same for errors. `value_or` supplies a fallback.
+
+### Which to use?
+
+| Situation | Prefer |
+| --- | --- |
+| The immediate caller will usually handle the failure (parsing, validation, lookups) | `std::expected`, or `std::optional` when no reason is needed |
+| Failure must cross many layers to a place that can handle it (a request handler, a main loop) | exceptions |
+| A constructor cannot establish its invariant | exceptions (constructors have no return value) |
+| Code compiled without exceptions, or hot paths where failure is common | `std::expected` |
+| The caller violated a precondition (a bug) | neither: an assertion or contract, then fix the bug |
+
+Many codebases use both: `std::expected` in parsing and I/O layers, exceptions for rare failures that unwind far. Older code you will maintain has two more conventions: C-style integer return codes (often with the real error in `errno`), and `std::error_code`, the standard library's portable way to carry an operating-system error, which `std::filesystem` functions accept as an optional out-parameter instead of throwing. An error enum inside `std::expected` is the modern successor to both.
+
+</Section>
+
+<Section id="ub" kind="examples" title="Undefined behaviour, and the tools that catch it">
+
+Why would a language leave behaviour undefined? Because checking costs time on every operation, and because assuming that bugs do not happen lets the optimiser generate faster code. If signed overflow cannot happen, then `i + 1 > i` is always true and a loop counter can live in a wider register. The price is that when the assumption is false, the optimiser's reasoning produces nonsense. This function is compiled twice from the same source:
+
+```cpp
+[[gnu::noinline]] bool next_is_bigger(int x) {
+    int next = x + 1;   // undefined behaviour when x == INT_MAX
+    return next > x;
+}
+// main: std::println("{}", next_is_bigger(INT_MAX));
+```
+
+```text
+-O0: false
+-O1: true
+-O2: true
+```
+
+Without optimisation the addition wrapped around and the comparison was false. With optimisation GCC 14 reasoned that overflow cannot happen, so `x + 1 > x` must be true, and never did the arithmetic. Neither answer is wrong by the rules, because the program has no meaning. Bugs like this appear and disappear with compiler versions and flags. Worse, undefined behaviour is not confined to the line where it happens. The standard says that a program which executes an undefined operation has no meaning *as a whole*, so an optimiser may use "this pointer is dereferenced later, therefore it is not null" to delete a null check that comes *earlier*. Compiler writers did not invent this to be cruel; it falls out of many small, individually reasonable optimisations, combined.
+
+### AddressSanitizer
+
+The next program has a classic off-by-one error: `i <= scores.size()` reads one element past the end.
+
+```cpp
+std::vector<int> scores{90, 85, 77};
+int total = 0;
+for (std::size_t i = 0; i <= scores.size(); ++i) {   // bug: <= reads one past the end
+    total += scores[i];
+}
+std::println("total {}", total);
+```
+
+Compiled normally, it printed `total 252` and exited successfully. The out-of-bounds read happened to find a zero, so the bug was invisible. Compiled with `g++ -std=c++23 -g -O1 -fsanitize=address,undefined`, it stopped at the first bad read (abridged):
+
+```text
+==12==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x50200000001c at pc 0x000000403c95 bp 0x7ffccd107e30 sp 0x7ffccd107e28
+READ of size 4 at 0x50200000001c thread T0
+    #0 0x403c94 in main /w/main.cpp:8
+...
+0x50200000001c is located 0 bytes after 12-byte region [0x502000000010,0x50200000001c)
+allocated by thread T0 here:
+...
+    #7 0x40398b in main /w/main.cpp:5
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /w/main.cpp:8 in main
+```
+
+It names the kind of bug, the line that did it (8), how far outside the allocation it read, and where the memory was allocated (line 5). **AddressSanitizer** (ASan) finds out-of-bounds accesses, use-after-free, double frees and leaks by surrounding allocations with poisoned memory and checking every access, at a cost of roughly twice the run time and memory. An older alternative, Valgrind's Memcheck, needs no recompilation but runs programs many times slower, so most teams now prefer the sanitizers and keep Valgrind for binaries they cannot rebuild.
+
+### UndefinedBehaviorSanitizer and a hardened library
+
+Signed overflow is not a memory error, so ASan ignores it, but **UndefinedBehaviorSanitizer** (UBSan, the `undefined` in the flag) checks it. A loop that adds deposits to a balance near the maximum `int` reported:
+
+```text
+main.cpp:7:17: runtime error: signed integer overflow: 4 + 2147483644 cannot be represented in type 'int'
+```
+
+There is also a cheaper, always-useful option: a **hardened standard library**. Compiling the off-by-one program with `-D_GLIBCXX_ASSERTIONS` makes libstdc++ check every `operator[]` on its containers, and the program stopped with (abridged):
+
+```text
+/usr/local/include/c++/14.4.0/bits/stl_vector.h:1143: ... Assertion '__n < this->size()' failed.
+Aborted (core dumped)
+```
+
+Clang's libc++ has hardening modes too, and C++26 standardises the idea. Some large companies have reported enabling library hardening in production software at a small measured cost. The third sanitizer, **ThreadSanitizer**, finds data races and appears in the next lesson.
+
+Sanitizers only find bugs on paths your tests actually run. That is why professionals run their whole test suite under ASan and UBSan in continuous integration, and why fuzzers (tools that generate millions of inputs) are usually paired with sanitizers.
+
+</Section>
+
+<Section id="checked" kind="computation" title="Checked alternatives">
+
+Most undefined behaviour has a checked alternative that costs a little and says what you mean:
+
+```cpp check
+#include <cassert>
+#include <climits>
+#include <print>
+#include <stdexcept>
+#include <vector>
+
+// Checked alternatives to operations whose misuse is undefined behaviour.
+
+bool add_checked(int a, int b, int& out) {
+    return !__builtin_add_overflow(a, b, &out);   // GCC and Clang built-in; C23 spells it ckd_add
+}
+
+double mean(const std::vector<double>& v) {
+    assert(!v.empty() && "mean of an empty vector");   // checked in debug builds (unless NDEBUG)
+    double sum = 0;
+    for (double x : v) sum += x;
+    return sum / static_cast<double>(v.size());
+}
+
+int main() {
+    std::vector<int> v{10, 20, 30};
+    try {
+        std::println("{}", v.at(3));      // at() checks the index and throws
+    } catch (const std::out_of_range&) {
+        std::println("caught out_of_range");
+    }
+
+    int sum = 0;
+    if (add_checked(INT_MAX, 1, sum)) std::println("sum {}", sum);
+    else std::println("overflow detected");
+    if (add_checked(40, 2, sum)) std::println("sum {}", sum);
+
+    std::println("mean {:.2f}", mean({1.0, 2.0, 4.0}));
+}
+```
+
+```text
+caught out_of_range
+overflow detected
+sum 42
+mean 2.33
+```
+
+`v.at(i)` checks the index and throws `std::out_of_range`. `__builtin_add_overflow` is a GCC and Clang built-in that reports overflow instead of causing it (C23 standardised it as `ckd_add`). `assert`, from `<cassert>`, checks a condition in debug builds and is compiled away when `NDEBUG` is defined, so it documents and tests a precondition at no cost in release builds. C++26 adds **contracts** (`pre`, `post` and `contract_assert`), which put preconditions in function declarations where tools and callers can see them; compilers are implementing them during 2026.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Undefined behaviour means the program will crash."** Often it does not, which is the problem: the off-by-one program above printed a plausible total. Undefined behaviour can also make the compiler delete checks you wrote, as `next_is_bigger` showed. Never reason "it ran fine, so it's fine".
+
+</Misconception>
+
+<Misconception>
+
+**"Catching `...` everywhere makes a program robust."** A `catch (...)` that swallows every exception hides bugs and leaves the program running in an unknown state. Catch what you can handle, where you can handle it, and let the rest reach a top-level handler that logs and exits or restarts cleanly.
+
+</Misconception>
+
+<Misconception>
+
+**"`assert` is how you validate input."** Assertions are compiled away when `NDEBUG` is defined, which release builds usually do, so an assertion that checks user input or file contents simply disappears in production. Use assertions for conditions that can only be false if *the program* is wrong; check input with ordinary code that reports an error.
+
+</Misconception>
+
+<Misconception>
+
+**"Exceptions make C++ slow."** In mainstream implementations the non-throwing path costs essentially nothing at run time; the costs are binary size and slow throws. Code that throws thousands of times per second for ordinary outcomes is misusing them; code that throws for rare failures pays almost nothing.
+
+</Misconception>
+
+<Misconception>
+
+**"Unsigned integers are safer because they cannot overflow."** Unsigned arithmetic wraps instead of being undefined, but a wrapped value is still usually a bug: `size - 1` when `size` is 0 is four billion, not minus one. UBSan can check unsigned wrap-around too, with `-fsanitize=unsigned-integer-overflow` in Clang, because it is so often unintended.
+
+</Misconception>
+
+</Section>
+
+<Section id="human" kind="human" title="What professionals do">
+
+Teams that ship reliable C++ tend to share a short list of habits. They **compile with many warnings** (`-Wall -Wextra -Wpedantic`, often `-Wconversion` and `-Wshadow`) and treat new warnings as errors in continuous integration. They **write tests**, usually with a framework such as GoogleTest or Catch2, including tests of the error paths. They **run the tests under sanitizers** (ASan with UBSan in one build, ThreadSanitizer in another) and often under a fuzzer. They **enable a hardened library** at least in testing, and increasingly in production. And they **use static analysis**, such as clang-tidy and the compilers' own analysers, to find bugs no test exercises.
+
+A unit test in GoogleTest, for instance, is a few lines that exercise one behaviour, including a failure:
+
+```cpp
+TEST(ParseInt, RejectsTrailingCharacters) {
+    auto r = parse_int("4x2");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ParseError::not_a_number);
+}
+```
+
+The test framework, the build system (next-but-one lesson) and the sanitizer flags combine into a single command that every change must pass before it is merged.
+
+None of this makes C++ memory-safe. It makes bugs rarer and finds most of them before users do, which, together with modern idioms (RAII, containers instead of raw arrays, views with clear lifetimes), is how large C++ codebases stay trustworthy.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

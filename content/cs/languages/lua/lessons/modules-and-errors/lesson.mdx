@@ -1,0 +1,409 @@
+---
+title: Modules and error handling
+subtitle: Organising code with require and module tables, and raising, catching and cleaning up after errors with error, pcall, xpcall and to-be-closed variables.
+minutes: 60
+objectives:
+  - Write a module as a file that returns a table, and load it with require, package.path and package.preload
+  - Explain how require caches modules in package.loaded and why modules should not create globals
+  - Raise errors with error at the right level, with strings or tables, and catch them with pcall
+  - Choose between raising an error and returning nil plus a message, and use assert to convert between them
+  - Get a stack traceback with xpcall, and release resources reliably with to-be-closed variables
+prerequisites: [metatables-and-objects]
+references:
+  - title: "Reference Manual: Modules"
+    url: https://www.lua.org/manual/5.5/manual.html#6.3
+    note: require, package.path, package.cpath, package.loaded, package.preload and the searchers.
+  - title: "Reference Manual: Error Handling"
+    url: https://www.lua.org/manual/5.5/manual.html#2.3
+    note: How errors are raised and caught, message handlers and error objects.
+  - title: "Reference Manual: To-be-closed Variables"
+    url: https://www.lua.org/manual/5.5/manual.html#3.3.8
+    note: The exact rules for when __close runs and with which arguments.
+  - title: LuaRocks
+    url: https://luarocks.org/
+    note: The repository and installer for Lua modules, covered in lesson 8.
+---
+
+<Section id="motivation" kind="motivation" title="Code that others can use, and that fails well">
+
+Two things separate a script from a program that a team can maintain: it is divided into **modules** with clear interfaces, and it **fails well**, reporting what went wrong and where, cleaning up after itself, and letting callers decide what to do.
+
+Lua's module system, true to form, is not a special language feature. A module is just a file that returns a value, almost always a table of functions, and `require` is an ordinary function that finds, runs and caches such files. Error handling is equally plain: `error` raises any value, and `pcall` calls a function in **protected mode**, returning instead of crashing when something goes wrong. Lua 5.4 added the one piece that was missing, **to-be-closed variables**, which release resources at a precise moment however a block is left.
+
+</Section>
+
+<Section id="modules" kind="examples" title="Modules and require">
+
+<Definition term="Module">
+
+A Lua file (or a C library) that, when run, returns a value representing its public interface, usually a table of functions. `require("name")` finds the file by trying each template in `package.path`, with `?` replaced by the name (and dots in the name turned into directory separators), runs it once, stores its result in `package.loaded[name]`, and returns it. Later calls return the stored value without running the file again.
+
+</Definition>
+
+The program below writes a small module to a temporary file, exactly as it would sit in a project, adds the temporary location to `package.path`, and requires it:
+
+```lua check
+-- A module is a file that returns a value, usually a table of functions.
+-- Write one to a temporary file, as it would sit in your project.
+local base = os.tmpname()                       -- a fresh temporary file name
+local path = base .. "_units.lua"
+local f = assert(io.open(path, "w"))
+f:write([[
+local M = {}                                    -- the module's public table
+
+local KM_PER_MILE <const> = 1.609344            -- private: a local, not exported
+
+function M.miles_to_km(miles) return miles * KM_PER_MILE end
+function M.km_to_miles(km) return km / KM_PER_MILE end
+
+print("units.lua is being loaded")              -- runs only the first time
+return M
+]])
+f:close()
+
+-- require searches package.path, replacing '?' with the module name.
+package.path = base .. "_?.lua;" .. package.path
+local units = require("units")
+local again = require("units")                 -- cached: the file is not run again
+print(units.miles_to_km(26.2), units == again, package.loaded.units == units)
+print(string.format("%.1f miles", units.km_to_miles(42.195)))
+
+-- package.preload registers a loader function directly: handy for tests
+-- and for programs that bundle all their modules into one file.
+package.preload["greeting"] = function(name)
+  return { hello = function(who) return "Kia ora, " .. who end, name = name }
+end
+local greeting = require("greeting")
+print(greeting.hello("Mere"), greeting.name)
+
+print(pcall(require, "no_such_module") and "found" or "missing module raises an error")
+os.remove(path)
+os.remove(base)
+```
+
+It printed:
+
+```text
+units.lua is being loaded
+42.1648128	true	true
+26.2 miles
+Kia ora, Mere	greeting
+missing module raises an error
+```
+
+### The module pattern
+
+The module's source follows the conventions almost every Lua module uses:
+
+```lua
+local M = {}                       -- 1. a local table for the public interface
+
+local function helper(x)           -- 2. private things are locals
+  return x * 2
+end
+
+function M.double_all(list)        -- 3. public things are fields of M
+  local out = {}
+  for i, v in ipairs(list) do out[i] = helper(v) end
+  return out
+end
+
+return M                           -- 4. the file returns the table
+```
+
+and the user writes `local units = require("units")`, choosing a local name for the module. Nothing is added to the global environment: the module's functions are reachable only through the table the user chose to keep. Old Lua 5.1 code sometimes used a `module()` function that created globals; it was deprecated in 5.2 and later removed, and modules should never create globals.
+
+Other points from the program:
+
+- **Caching.** The message "units.lua is being loaded" appeared once, though `require` was called twice, and both calls returned the same table. Modules are effectively singletons: state stored in a module table is shared by everyone who requires it.
+- **`package.path`** is a string of templates separated by semicolons, such as `/usr/local/share/lua/5.5/?.lua;...;./?.lua;./?/init.lua`. It is initialised from the environment variable `LUA_PATH_5_5` or `LUA_PATH` if set. `require("app.util")` looks for `app/util.lua`, which is how larger projects arrange modules in directories. C modules are searched for in `package.cpath`.
+- **`package.preload`** maps module names to loader functions, which `require` tries before searching the file system. Programs that bundle all their code into one file, and tests that substitute a fake module, use it.
+- **A missing module is an error**, and its message lists every path that was tried, which is the first thing to read when a `require` fails.
+
+<Misconception>
+
+"`require` takes a file path, so `require("myapp/parser.lua")` is right." It takes a **module name**. Lua replaces each dot with a directory separator and adds the extension itself from the templates, so the correct call is `require("myapp.parser")`. With `"units.lua"`, Lua 5.5 dutifully turns the dot into a separator and searches for files such as `units/lua.lua`, and the error message, which lists every path it tried, shows exactly that. Using one consistent dotted name everywhere also matters for caching: `package.loaded` is keyed by the name you pass, so two spellings of the same module would load it twice.
+
+</Misconception>
+
+Do not let two modules `require` each other at load time: each `require` starts loading the other again, and with Lua 5.5 the cycle ends in a "C stack overflow" error. Restructure so that dependencies form a tree, or move the `require` inside the function that needs it.
+
+</Section>
+
+<Section id="errors" kind="examples" title="Raising and catching errors">
+
+<Definition term="error and pcall">
+
+`error(value, level)` raises an error with any value as the **error object**. If the value is a string, Lua prefixes it with the position where the error happened: `level` 1 (the default) means the function that called `error`, 2 means the function that called *that* one, and 0 means no position. `pcall(f, ...)` calls `f` with the given arguments in protected mode: if no error occurs it returns `true` followed by `f`'s results; if an error occurs it returns `false` and the error object.
+
+</Definition>
+
+```lua check
+-- error raises; pcall catches and returns false plus the error value.
+local function parse_age(text)
+  local n = tonumber(text)
+  if not n then error("not a number: " .. tostring(text)) end
+  if n < 0 or n > 150 or n % 1 ~= 0 then error("out of range: " .. n, 2) end
+  return n
+end
+
+for _, input in ipairs({ "42", "forty", "200" }) do
+  local ok, result = pcall(function()
+    local age = parse_age(input)           -- line 11: level 2 points here
+    return age
+  end)
+  print(input, ok, result)
+end
+
+-- Level 0 adds no position; any value, such as a table, can be raised.
+local ok, err = pcall(error, { code = 404, message = "no such page" })
+print(ok, type(err), err.code, err.message)
+print(pcall(error, "plain message", 0))
+
+-- The other convention: return nil plus a message, and let the caller decide.
+local function read_config(path)
+  local file, msg = io.open(path, "r")
+  if not file then return nil, "cannot read config: " .. msg end
+  local text = file:read("a")
+  file:close()
+  return text
+end
+local text, why = read_config("/no/such/dir/app.conf")
+print(text, why)
+
+-- assert turns a nil-plus-message result into an error.
+print(pcall(function() return assert(read_config("/no/such/dir/app.conf")) end))
+print(select("#", assert(1, 2, 3)), "values pass through a successful assert")
+```
+
+It printed:
+
+```text
+42	true	42
+forty	false	main.lua:4: not a number: forty
+200	false	main.lua:11: out of range: 200
+false	table	404	no such page
+false	plain message
+nil	cannot read config: /no/such/dir/app.conf: No such file or directory
+false	main.lua:34: cannot read config: /no/such/dir/app.conf: No such file or directory
+3	values pass through a successful assert
+```
+
+What to take from it:
+
+- **Levels.** "not a number" was raised at level 1, so its position is line 4, inside `parse_age`. "out of range" was raised at level 2, so its position is line 11, in the *caller*. Use level 2 when the mistake is the caller's, such as a bad argument; the person reading the message then looks at the right line. (A call in tail position, `return parse_age(input)`, would have removed the caller's frame, and with it the position, which is why the program stores the result in a local first.)
+- **Error objects can be tables.** A table with fields like `code` and `message` lets the catcher decide what to do without parsing strings. Positions are added only to strings.
+- **Two conventions for failure.** Functions in the standard library that fail for *expected* reasons, such as `io.open` on a missing file or `tonumber` on bad input, **return `nil` and a message** rather than raising. Programming mistakes, such as indexing `nil` or calling a non-function, **raise errors**. Follow the same split in your own code: expected failures are values the caller checks; bugs and broken invariants are errors.
+- **`assert(v, message)`** returns all its arguments if `v` is true, and raises `message` otherwise. `local f = assert(io.open(path))` is the idiom for "this must work, and if it does not, stop with the reason": the `nil, message` pair from `io.open` becomes the assertion's arguments.
+
+<Misconception>
+
+"Wrapping everything in `pcall` makes a program robust." A `pcall` that ignores its error turns a crash with a clear message into wrong behaviour with none. Catch errors at **boundaries** where you can do something sensible: in a game's main loop, so one broken script does not stop the game; in a server, so one bad request gets an error response; in a plugin host, so a faulty plugin is disabled and reported. Inside ordinary code, let errors propagate.
+
+</Misconception>
+
+</Section>
+
+<Section id="tracebacks" kind="examples" title="Tracebacks with xpcall">
+
+By the time `pcall` returns, the stack has unwound and the information about *where* the error came from is gone, apart from the position in the message. `xpcall(f, handler, ...)` calls a **message handler** at the moment of the error, while the stack is intact, and returns whatever the handler returns. Passing `debug.traceback` as the handler, or a function that calls it, captures the full call stack.
+
+```lua check
+-- xpcall runs a message handler at the point of the error, before the
+-- stack unwinds, so the handler can record where it happened.
+local function inner(x) return x.field end      -- fails when x is nil
+local function middle(x)
+  local value = inner(x)
+  return value
+end
+
+local function handler(err)
+  local trace = debug.traceback(err, 2)
+  local lines = {}
+  for line in trace:gmatch("[^\n]+") do lines[#lines + 1] = line end
+  return table.concat(lines, "\n", 1, 5)          -- the message and the first frames
+end
+
+local ok, report = xpcall(middle, handler, nil)
+print(ok)
+print(report)
+
+-- pcall and xpcall pass arguments through and return every result.
+print(xpcall(function(a, b) return a + b, a * b end, handler, 6, 7))
+
+-- Lua 5.5: raising nil is replaced by a message, so it can't vanish silently.
+print(pcall(error, nil))
+```
+
+It printed:
+
+```text
+false
+main.lua:3: attempt to index a nil value (local 'x')
+stack traceback:
+	main.lua:3: in upvalue 'inner'
+	main.lua:5: in function <main.lua:4>
+	[C]: in global 'xpcall'
+true	13	42
+false	<no error object>
+```
+
+The traceback shows the error in `inner` at line 3, called from line 5 in `middle`, called from `xpcall`. This is what you log in a server or show in a developer console. The last line shows a small Lua 5.5 change: raising `nil` as an error object now produces a message (`<no error object>`) instead of a `nil` that the catcher might mistake for success.
+
+Lua also has a separate, lightweight **warning** channel: `warn("message")` writes to standard error as `Lua warning: message`, but only after warnings have been switched on with `warn("@on")` or by running `lua -W`. Use it for things a developer should notice but that should not stop the program.
+
+</Section>
+
+<Section id="close" kind="examples" title="Cleaning up with to-be-closed variables">
+
+Files, sockets, locks and database transactions must be released even when an error interrupts the code that uses them. Before Lua 5.4 that took careful `pcall` wrappers. Now a local variable marked **`<close>`** does it: when the variable goes out of scope, for any reason, Lua calls the value's `__close` metamethod.
+
+```lua check
+-- To-be-closed variables (Lua 5.4): when the variable goes out of scope,
+-- by normal exit, break, return or error, its __close metamethod runs.
+local function resource(name)
+  print("open " .. name)
+  return setmetatable({ name = name }, {
+    __close = function(r, err)
+      print("close " .. r.name .. (err and (" after error: " .. err) or ""))
+    end,
+  })
+end
+
+do
+  local a <close> = resource("A")
+  local b <close> = resource("B")
+  print("working with " .. a.name .. " and " .. b.name)
+end                                              -- closed in reverse order: B, then A
+
+local ok, err = pcall(function()
+  local conn <close> = resource("connection")
+  error("network dropped", 0)
+end)
+print("pcall:", ok, err)
+
+-- Files have a __close metamethod, so this file is closed however we leave.
+local path = os.tmpname()
+do
+  local out <close> = assert(io.open(path, "w"))
+  out:write("line one\nline two\n")
+end
+local count = 0
+for _ in io.lines(path) do count = count + 1 end
+print("lines written and read back:", count)
+os.remove(path)
+```
+
+It printed:
+
+```text
+open A
+open B
+working with A and B
+close B
+close A
+open connection
+close connection after error: network dropped
+pcall:	false	network dropped
+lines written and read back:	2
+```
+
+- Variables are closed in **reverse order** of declaration, B before A, just as resources acquired in order should be released in reverse.
+- When the scope is left by an **error**, `__close` receives the error object as its second argument, and the error then continues to propagate to `pcall`.
+- Files returned by `io.open` already have a `__close` metamethod, so `local f <close> = assert(io.open(path, "w"))` guarantees the file is closed and flushed at the end of the block. `io.lines(path)` opens, iterates and closes by itself.
+- A `<close>` variable is also constant: it cannot be reassigned. Its value must have a `__close` metamethod, or be `nil` or `false`, which are ignored.
+
+<Note>
+
+Coroutines that are abandoned mid-way never leave their scopes, so their to-be-closed variables would never be closed. `coroutine.close(co)` closes them explicitly; the next lesson covers coroutines.
+
+</Note>
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing with nothing but pcall">
+
+Lesson 8 introduces busted, the usual test framework. But `error` and `pcall` are all a test runner fundamentally needs: a test is a function that raises an error when something is wrong, and the runner calls each one in protected mode and counts the failures. Seeing this in a dozen lines demystifies every test framework you will use.
+
+```lua check
+-- A test runner in a dozen lines: each test is a function; pcall catches failures.
+local function check_equal(got, want)
+  if got ~= want then
+    error(string.format("expected %s, got %s", tostring(want), tostring(got)), 2)
+  end
+end
+
+local function run_tests(tests)
+  local names, failed = {}, 0
+  for name in pairs(tests) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local ok, err = pcall(tests[name])
+    print((ok and "ok    " or "FAIL  ") .. name .. (ok and "" or ("\n      " .. err)))
+    if not ok then failed = failed + 1 end
+  end
+  print(string.format("%d tests, %d failed", #names, failed))
+  return failed == 0
+end
+
+-- The code under test.
+local function slugify(title)
+  return (title:lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", ""))
+end
+
+local all_passed = run_tests({
+  simple      = function() check_equal(slugify("Hello World"), "hello-world") end,
+  punctuation = function() check_equal(slugify("Lua: 5.5!"), "lua-5-5") end,
+  edges       = function() check_equal(slugify("  spaced out  "), "spaced-out") end,
+  accents     = function() check_equal(slugify("São Paulo"), "sao-paulo") end,
+})
+print(all_passed and "all passed" or "some failed")
+```
+
+It printed:
+
+```text
+FAIL  accents
+      main.lua:30: expected sao-paulo, got s-o-paulo
+ok    edges
+ok    punctuation
+ok    simple
+4 tests, 1 failed
+some failed
+```
+
+The failing test is deliberate, and instructive. `check_equal` raises its error at **level 2**, so the reported position, line 30, is the test that made the bad comparison, not the helper. And the failure itself documents a real limitation: Lua's patterns work on **bytes**, so `[^%w]+` treats the two bytes of `ã` as non-letters and turns them into a hyphen. The fix might be to transliterate accented letters first, or to decide that `s-o-paulo` is acceptable and change the test; either way, the test has made the behaviour visible. A real runner would end with `os.exit(all_passed and 0 or 1)` so that a failing suite stops a build; this one only prints, so that the page's program finishes normally.
+
+`slugify` also shows a small idiom: `gsub` returns two values, and the parentheses around the whole chain keep only the string, so the function never leaks the replacement count to its callers.
+
+</Section>
+
+<Section id="practice" kind="human" title="Organising a Lua project">
+
+A small Lua application or library is usually laid out like this:
+
+```text
+myapp/
+  main.lua              entry point: parses arguments, calls the modules
+  myapp/init.lua        require("myapp") finds this through the ./?/init.lua template
+  myapp/parser.lua      require("myapp.parser")
+  spec/parser_spec.lua  tests (busted, lesson 8)
+  myapp-1.0-1.rockspec  package description for LuaRocks (lesson 8)
+```
+
+Habits that keep such projects healthy:
+
+- **One module, one table, no globals.** Run luacheck to make sure.
+- **Require at the top of the file** into locals (`local parser = require("myapp.parser")`), so dependencies are visible at a glance and lookups are fast.
+- **Validate arguments at module boundaries** with `error(..., 2)` so that messages point at the caller's mistake.
+- **Return `nil, message` for expected failures**, document which functions do so, and use `assert` at call sites that cannot continue.
+- **Catch errors only at boundaries**, with `xpcall` and a traceback when you log them.
+- **Release resources with `<close>`** on Lua 5.4 and newer; on Lua 5.1 and LuaJIT, use `pcall` and explicit cleanup.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

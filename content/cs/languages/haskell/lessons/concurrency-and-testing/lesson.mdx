@@ -1,0 +1,396 @@
+---
+title: Concurrency, exceptions and testing
+subtitle: Lightweight threads, MVars and software transactional memory; exceptions in IO; and testing with properties instead of examples.
+minutes: 65
+objectives:
+  - Start lightweight threads with forkIO and coordinate them with MVars and channels
+  - Use software transactional memory (TVar, atomically, retry) to update shared state without locks or races
+  - Throw, catch and clean up after exceptions in IO with throwIO, try, bracket and finally
+  - Explain property-based testing and how QuickCheck generates and shrinks counterexamples
+  - Name the libraries professionals use for concurrency and testing, such as async, hspec, tasty and QuickCheck
+prerequisites: [laziness-and-performance]
+references:
+  - title: Parallel and Concurrent Programming in Haskell
+    author: Simon Marlow
+    year: 2013
+    note: The standard book on the subject, by one of the authors of GHC's runtime system (O'Reilly).
+  - title: The stm package
+    url: https://hackage.haskell.org/package/stm
+    note: TVar, TMVar, TChan, TQueue and the rest of software transactional memory.
+  - title: The async package
+    url: https://hackage.haskell.org/package/async
+    note: Higher-level concurrency (concurrently, race, mapConcurrently) that handles exceptions correctly.
+  - title: The QuickCheck package
+    url: https://hackage.haskell.org/package/QuickCheck
+    note: The original property-based testing library.
+  - title: "Composable Memory Transactions"
+    author: Tim Harris, Simon Marlow, Simon Peyton Jones and Maurice Herlihy
+    year: 2005
+    note: The paper that introduced STM as it exists in GHC, presented at PPoPP.
+  - title: "QuickCheck: a lightweight tool for random testing of Haskell programs"
+    author: Koen Claessen and John Hughes
+    year: 2000
+    note: The ICFP paper that started property-based testing, now available for dozens of languages.
+---
+
+<Section id="motivation" kind="motivation" title="Why Haskell is good at doing several things at once">
+
+Concurrency is hard in most languages for one reason: **shared mutable state**. Two threads read a balance, both add to it, both write it back, and one deposit vanishes. Locks prevent that, but locks bring deadlocks, forgotten unlocks, and code that cannot be combined safely.
+
+Haskell starts with an advantage: almost nothing is mutable. Pure values can be shared between any number of threads with no locking at all, because nobody can change them. The little mutable state a program needs lives in a few explicit kinds of variables, whose types say how they may be used. And GHC's runtime makes threads so cheap (about a kilobyte each; servers routinely run tens of thousands) that "one thread per connection" is a perfectly good design.
+
+This lesson covers the three building blocks (threads, MVars, and software transactional memory), then exceptions, which in IO code behave much as in other languages, and finally testing, where Haskell gave the world one of its most widely copied ideas: **property-based testing**.
+
+</Section>
+
+<Section id="history" kind="history" title="A research lab for concurrency">
+
+Several ideas in this lesson were first worked out in Haskell, then spread elsewhere.
+
+**Concurrent Haskell**, described by Simon Peyton Jones, Andrew Gordon and Sigbjorn Finne in 1996, introduced `forkIO` and the `MVar`. It showed that a pure language could add concurrency as a small set of IO actions without compromising the purity of the rest of the program. GHC's runtime then grew lightweight threads scheduled onto operating-system threads, and later (from the mid-2000s) a parallel runtime and garbage collector that run those threads on many cores.
+
+**Software transactional memory** had been studied for databases and hardware, but the 2005 paper "Composable Memory Transactions" by Tim Harris, Simon Marlow, Simon Peyton Jones and Maurice Herlihy made it practical as a programming abstraction, with `retry` and `orElse`. Haskell's type system was essential: because `STM` actions cannot perform IO, transactions can be safely re-run, a guarantee that other languages' STM implementations found hard to provide. Clojure later made STM central to its design.
+
+**QuickCheck**, by Koen Claessen and John Hughes in 2000, began as a small Haskell library and became a whole testing discipline. There are now property-based testing libraries for nearly every language (Hypothesis for Python, proptest for Rust, jqwik for Java, fast-check for JavaScript), and John Hughes went on to apply the approach commercially, testing telecom and automotive software.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The building blocks">
+
+<Definition term="Thread and forkIO">
+
+`forkIO :: IO () -> IO ThreadId` starts an action in a new **lightweight thread** and returns at once. GHC's runtime schedules many such threads onto a few operating-system threads. Compile with `-threaded` and run with `+RTS -N` to let them run on all the machine's cores.
+
+</Definition>
+
+<Definition term="MVar">
+
+An **MVar** is a box that is either empty or full. `takeMVar` empties it, waiting while it is empty; `putMVar` fills it, waiting while it is full. One primitive serves as a result slot, a lock, or a one-place channel.
+
+</Definition>
+
+<Definition term="Software transactional memory (STM)">
+
+A **TVar** is a mutable variable that can only be read and written inside an `STM` transaction. `atomically :: STM a -> IO a` runs a transaction as if no other thread existed: either all of its writes happen or none do. `retry` abandons the transaction and blocks the thread until one of the TVars it read changes, then tries again.
+
+</Definition>
+
+<Definition term="Exception">
+
+In IO code, an **exception** interrupts the normal flow until it is caught. `throwIO` raises one, `try` turns it into an `Either`, `catch` and `handle` run a handler, and `bracket` and `finally` make sure clean-up code runs whatever happens.
+
+</Definition>
+
+<Definition term="Property-based test">
+
+A **property** is a statement that should hold for *all* inputs, such as "reversing a list twice gives the original list". A property-based testing tool checks it on many generated inputs and, when it finds a failing one, **shrinks** it to a minimal counterexample.
+
+</Definition>
+
+</Section>
+
+<Section id="examples" kind="examples" title="Threads, transactions, exceptions, properties">
+
+### Threads and MVars
+
+```haskell check
+import Control.Concurrent
+import Control.Monad (forM, forM_, replicateM_)
+
+-- Sum one range of numbers in its own thread and put the answer in a box.
+worker :: MVar Int -> Int -> Int -> IO ()
+worker box lo hi = putMVar box $! sum [lo .. hi] -- ($!): do the work here, not later
+
+main :: IO ()
+main = do
+  -- 1. MVars as result slots: one per worker.
+  boxes <- forM [0 .. 3] $ \i -> do
+    box <- newEmptyMVar
+    _ <- forkIO (worker box (i * 250000 + 1) ((i + 1) * 250000))
+    pure box
+  partials <- mapM takeMVar boxes -- wait for each worker in turn
+  print partials
+  print (sum partials)
+
+  -- 2. An MVar as a lock around shared state.
+  counter <- newMVar (0 :: Int)
+  finished <- newEmptyMVar
+  forM_ [1 .. 10 :: Int] $ \_ -> forkIO $ do
+    replicateM_ 1000 (modifyMVar_ counter (pure . (+ 1)))
+    putMVar finished ()
+  replicateM_ 10 (takeMVar finished)
+  readMVar counter >>= print
+
+  -- 3. A channel as a queue between a producer and a consumer.
+  queue <- newChan
+  _ <- forkIO $ forM_ ["order 17", "order 18", "order 19", "stop"] (writeChan queue)
+  let consume handled = do
+        msg <- readChan queue
+        if msg == "stop" then pure (reverse handled) else consume (msg : handled)
+  consume [] >>= print
+```
+
+```text
+[31250125000,93750125000,156250125000,218750125000]
+500000500000
+10000
+["order 17","order 18","order 19"]
+```
+
+Three patterns, all common in real code.
+
+1. **Result slots.** Each worker gets an empty MVar and fills it when done; `mapM takeMVar` waits for them in order. Notice the `$!` in `worker`. Without it, the worker would put an *unevaluated thunk* for `sum [lo .. hi]` into the box in a microsecond, and the actual summing would happen later, in the main thread, when `print` demanded it. Laziness and threads interact this way often: make sure the work is forced in the thread meant to do it.
+2. **A lock.** `modifyMVar_` takes the value out (so other threads wait), applies the function and puts the result back, and restores the old value if an exception occurs in between. Ten threads each add 1,000, and no increment is lost.
+3. **A queue.** A `Chan` is an unbounded FIFO channel. The producer writes four messages; the consumer reads until the agreed `"stop"`.
+
+The order in which threads *run* is up to the scheduler, but the program's *output* does not depend on it, because only the main thread prints and it collects results in a fixed order. Designing concurrent programs so that their results are deterministic, even if their schedule is not, is a large part of doing concurrency well.
+
+### Software transactional memory
+
+```haskell check
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM
+import Control.Monad (forM_, replicateM_, when)
+
+-- Move money between accounts. The whole block happens atomically:
+-- no other thread ever sees the money in neither account or in both.
+transfer :: TVar Int -> TVar Int -> Int -> STM ()
+transfer from to amount = do
+  balance <- readTVar from
+  when (balance < amount) retry -- block until a change makes this possible
+  modifyTVar' from (subtract amount)
+  modifyTVar' to (+ amount)
+
+main :: IO ()
+main = do
+  accounts@[amara, bilal, chen] <- mapM newTVarIO [500, 300, 200]
+  done <- newEmptyMVar
+
+  -- Three threads shuffle money around concurrently, 100 times each.
+  forM_ [(amara, bilal, 7), (bilal, chen, 5), (chen, amara, 3)] $ \(from, to, amt) ->
+    forkIO $ do
+      replicateM_ 100 (atomically (transfer from to amt))
+      putMVar done ()
+  replicateM_ 3 (takeMVar done)
+  balances <- mapM readTVarIO accounts
+  print (balances, sum balances)
+
+  -- A transfer that cannot happen yet waits, without polling, until it can.
+  _ <- forkIO $ do
+    atomically (transfer chen amara 1000)
+    putMVar done ()
+  atomically (modifyTVar' chen (+ 800)) -- a deposit arrives; the waiting thread wakes up
+  takeMVar done
+  mapM readTVarIO accounts >>= print
+```
+
+```text
+([100,500,400],1000)
+[1100,500,200]
+```
+
+`transfer` reads one balance and writes two, and it contains no lock. Inside `atomically`, the runtime logs every read and write; at the end it checks that no other transaction changed what this one read, and if so commits all the writes at once, otherwise it throws the log away and runs the transaction again. The total is 1000 after three hundred concurrent transfers, and each balance is exactly what the arithmetic predicts, however the threads were interleaved.
+
+`retry` is the remarkable part. Chen cannot pay 1000 while holding 400, so the transaction calls `retry`, and the thread sleeps until some TVar it read changes. When the main thread deposits 800, the sleeper wakes, re-runs the transaction, finds 1200, and completes. There is no condition variable to signal and no polling loop.
+
+The great advantage of STM over locks is that **transactions compose**. Two correct `transfer`s glued together with `do` inside one `atomically` are one larger correct transaction: you cannot get that by combining two lock-protected methods. And the type system keeps you honest: an `STM` action cannot perform IO (a transaction may run several times, so printing or launching rockets inside one would be a bug), and that rule is checked at compile time. `orElse` combines alternatives: try one transaction, and if it retries, try another.
+
+### Exceptions
+
+```haskell check
+import Control.Exception
+
+-- Our own exception type: any type with Show can become one.
+data BankError = InsufficientFunds Int | UnknownAccount String
+  deriving (Show)
+
+instance Exception BankError
+
+withdraw :: Int -> Int -> IO Int
+withdraw balance amount
+  | amount > balance = throwIO (InsufficientFunds (amount - balance))
+  | otherwise = pure (balance - amount)
+
+main :: IO ()
+main = do
+  r1 <- try (withdraw 100 30) :: IO (Either BankError Int)
+  print r1
+  r2 <- try (withdraw 100 130) :: IO (Either BankError Int)
+  print r2
+  r3 <- try (evaluate (10 `div` (0 :: Int))) :: IO (Either ArithException Int)
+  print r3
+
+  -- bracket: acquire, use, and always release, even if the use throws.
+  r4 <- try $
+    bracket
+      (putStrLn "open connection" >> pure "conn-1")
+      (\c -> putStrLn ("close " ++ c))
+      (\c -> do
+         putStrLn ("using " ++ c)
+         _ <- throwIO (UnknownAccount "X-99")
+         putStrLn "never printed")
+  print (r4 :: Either BankError ())
+
+  handle (\e -> putStrLn ("handled: " ++ show (e :: BankError))) $ do
+    left <- withdraw 5 10
+    print left
+  (putStrLn "working" >> pure ()) `finally` putStrLn "cleaning up"
+```
+
+```text
+Right 70
+Left (InsufficientFunds 30)
+Left divide by zero
+open connection
+using conn-1
+close conn-1
+Left (UnknownAccount "X-99")
+handled: InsufficientFunds 5
+working
+cleaning up
+```
+
+Any type with a `Show` instance becomes an exception type with an empty `instance Exception`. `try` needs to know *which* exceptions to catch, given by the type annotation on its result; others pass through. Division by zero in pure code raises an `ArithException`, but only when the division is *evaluated*, which is why `evaluate` is there: exceptions from pure code appear wherever laziness happens to force the value, a good reason to keep failures in pure code as `Maybe` and `Either` values instead.
+
+`bracket acquire release use` is the Haskell equivalent of `try`-with-resources or `using`: the release action runs even though the use threw, as the output shows. Every file, socket and database connection in professional Haskell code is managed this way (often via `withFile`, `withConnection` and similar functions built on `bracket`).
+
+### Testing with properties
+
+QuickCheck is a library on Hackage, so the next program builds a miniature version of it with only the standard library, to show how property testing works inside: generate many inputs, check the property on each, and shrink the first failure.
+
+```haskell check
+import Data.List (sort)
+
+-- A tiny property tester in the spirit of QuickCheck, using only base.
+-- A fixed-seed pseudo-random generator makes every run identical.
+nextSeed :: Int -> Int
+nextSeed s = (s * 1103515245 + 12345) `mod` 2147483648
+
+-- An endless supply of test lists: lengths 0..9, elements -20..20.
+samples :: [[Int]]
+samples = go 2026
+  where
+    go s =
+      let len = s `mod` 10
+          seeds = take (len + 1) (iterate nextSeed (nextSeed s))
+          xs = [x `mod` 41 - 20 | x <- drop 1 seeds]
+       in xs : go (nextSeed (last seeds))
+
+-- Smaller variants of a list: drop one element, or move one number towards 0.
+shrinks :: [Int] -> [[Int]]
+shrinks xs =
+  [take i xs ++ drop (i + 1) xs | i <- [0 .. length xs - 1]]
+    ++ [take i xs ++ [y `quot` 2] ++ drop (i + 1) xs | (i, y) <- zip [0 ..] xs, y /= 0]
+
+-- Keep shrinking while some smaller list still fails.
+shrinkFailure :: ([Int] -> Bool) -> [Int] -> [Int]
+shrinkFailure p xs = case filter (not . p) (shrinks xs) of
+  [] -> xs
+  (smaller : _) -> shrinkFailure p smaller
+
+property :: String -> ([Int] -> Bool) -> IO ()
+property name p = case filter (not . p) (take 300 samples) of
+  [] -> putStrLn ("ok   " ++ name ++ " (300 cases)")
+  (bad : _) -> putStrLn ("FAIL " ++ name ++ ": " ++ show bad ++ ", shrunk to " ++ show (shrinkFailure p bad))
+
+main :: IO ()
+main = do
+  property "reversing twice changes nothing" (\xs -> reverse (reverse xs) == xs)
+  property "sorting is idempotent" (\xs -> sort (sort xs) == sort xs)
+  property "sorting keeps the length" (\xs -> length (sort xs) == length xs)
+  property "sorted output is in order" (\xs -> and (zipWith (<=) (sort xs) (drop 1 (sort xs))))
+  property "reverse is the identity (false!)" (\xs -> reverse xs == xs)
+  property "sum of list is below 50 (false!)" (\xs -> sum xs < 50)
+```
+
+```text
+ok   reversing twice changes nothing (300 cases)
+ok   sorting is idempotent (300 cases)
+ok   sorting keeps the length (300 cases)
+ok   sorted output is in order (300 cases)
+FAIL reverse is the identity (false!): [16,13,19,6,15,-16], shrunk to [0,-1]
+FAIL sum of list is below 50 (false!): [16,13,19,6,15,-16], shrunk to [13,19,3,15]
+```
+
+The properties describe what `sort` and `reverse` *must* do, not particular examples, and 300 generated lists check them. The two false properties fail, and shrinking turns the first failing input into something you can reason about at a glance: a two-element list is the smallest that `reverse` changes, and a list summing to exactly 50 sits right on the boundary of the false claim. That is the experience of using QuickCheck, which does all of this with a much richer generator and shrinker for every common type.
+
+</Section>
+
+<Section id="human" kind="human" title="What professionals use">
+
+### Concurrency in practice
+
+Raw `forkIO` is the foundation, but production code mostly uses the **async** library, because it gets the hard part, exceptions, right: if one of several concurrent tasks fails, the others are cancelled and the exception reaches the caller.
+
+```haskell
+import Control.Concurrent.Async (concurrently, mapConcurrently, race)
+
+main :: IO ()
+main = do
+  (profile, rates) <- concurrently loadProfile loadRates   -- both at once, wait for both
+  pages <- mapConcurrently fetchPage urls                    -- one thread per URL
+  winner <- race slowServer timeoutAfterFiveSeconds         -- first to finish wins
+  ...
+```
+
+For shared state, the usual advice is: an `IORef` with `atomicModifyIORef'` for a single counter or cache, STM (with `TVar`, `TQueue` and `TMVar`) for anything involving more than one variable, and `MVar` where you want its blocking behaviour. For **parallelism** (using several cores to compute a pure result faster, rather than doing several things at once), the `parallel` package's strategies and the `Par` monad let you parallelise pure code deterministically; Simon Marlow's book covers both.
+
+### Testing in practice
+
+A Haskell project's tests usually live in a `test/` directory, declared as a `test-suite` in the `.cabal` file and run with `cabal test`. The common libraries:
+
+- **hspec** and **tasty**: test frameworks that organise and run tests and report results.
+- **QuickCheck** and **hedgehog**: property-based testing; hedgehog generates and shrinks with one combined description.
+- **doctest**: runs the examples written in documentation comments, so the docs cannot go stale.
+
+A QuickCheck property is just a function returning `Bool`; the library derives generators from the argument types:
+
+```haskell
+import Data.List (sort)
+import Test.QuickCheck
+
+prop_sortKeepsLength :: [Int] -> Bool
+prop_sortKeepsLength xs = length (sort xs) == length xs
+
+main :: IO ()
+main = quickCheck prop_sortKeepsLength
+```
+
+By default it tries 100 random inputs and reports either success or a shrunk counterexample. Good properties to look for are **round trips** (`decode (encode x) == x`), **invariants** (a balanced tree stays balanced after every insertion), **comparison with a simple model** (a fast data structure agrees with a slow list-based one), and **laws** (the `Functor` and `Monoid` laws of lesson 6). Strong types reduce the number of tests you need; they do not remove the need for tests of behaviour.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`forkIO` creates an operating-system thread."** It creates a lightweight thread managed by GHC's runtime, costing about a kilobyte of memory. You can start a hundred thousand of them. (`forkOS` exists for the rare cases, such as some C libraries, that need a dedicated OS thread.)
+
+</Misconception>
+
+<Misconception>
+
+**"The worker thread did the work, because it put the result in the MVar."** Not if it put a thunk there. Use `putMVar box $! result`, or `evaluate (force result)` for structures, so the computation happens in the thread you intended.
+
+</Misconception>
+
+<Misconception>
+
+**"I can catch errors from pure code with `try` around the call."** An `error` or division by zero inside a pure value is raised only when the value is evaluated, which may be after your `try` has returned. Use `evaluate` inside `try`, or better, return `Maybe` or `Either` from pure code.
+
+</Misconception>
+
+<Misconception>
+
+**"With types this strong, Haskell code does not need tests."** Types rule out whole classes of mistakes, but a well-typed `sort` can still sort in the wrong order. Haskell programmers test, and the community invented property-based testing precisely because they wanted stronger tests, not fewer.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

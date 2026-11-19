@@ -1,0 +1,388 @@
+---
+title: Coroutines
+subtitle: Functions that pause and resume, and what they make easy, from generators and pipelines to schedulers for game scripts and asynchronous code.
+minutes: 60
+objectives:
+  - Create, resume and yield coroutines, pass values in both directions, and read their status
+  - Explain how errors in coroutines are reported by resume and by wrap
+  - Write generators and producer-filter-consumer pipelines with coroutine.wrap
+  - Build a small cooperative scheduler, and explain how hosts use coroutines to hide callbacks
+  - Explain what stackful means, compare coroutines with threads, and close suspended coroutines
+prerequisites: [modules-and-errors]
+references:
+  - title: "Reference Manual: Coroutines"
+    url: https://www.lua.org/manual/5.5/manual.html#2.6
+    note: The semantics of coroutines in Lua, with a worked example.
+  - title: "Reference Manual: Coroutine Manipulation"
+    url: https://www.lua.org/manual/5.5/manual.html#6.2
+    note: create, resume, yield, status, wrap, isyieldable, running and close.
+  - title: Revisiting Coroutines
+    author: Ana Lúcia de Moura and Roberto Ierusalimschy
+    year: 2009
+    note: "A paper in ACM Transactions on Programming Languages and Systems arguing that full, asymmetric coroutines, the kind Lua has, are as expressive as one-shot continuations."
+  - title: Neovim
+    url: https://neovim.io/
+    note: An editor whose Lua API is a common place to meet coroutines wrapping asynchronous callbacks.
+---
+
+<Section id="motivation" kind="motivation" title="Pausing in the middle of a function">
+
+An ordinary function runs from start to finish, then returns. Many problems are more naturally written as functions that **pause**: produce a value and wait until someone wants the next one; walk to a door, wait two seconds, open it; send a request, wait for the reply, carry on. Without a way to pause, you end up turning such code inside out, keeping state in variables and splitting the logic into callbacks.
+
+Lua's answer, since version 5.0, is the **coroutine**: a function with its own stack that can **yield** (pause, handing a value out) and later be **resumed** exactly where it stopped, with all its local variables intact. Coroutines are behind generators and iterators, behind the scripting of characters and cutscenes in games, and behind libraries that let Neovim plugins and OpenResty web handlers write asynchronous code as if it were sequential.
+
+Coroutines are not threads. Only one runs at a time, and it runs until it chooses to yield. That makes them simple and safe: no locks, no data races, no surprises in the middle of an operation.
+
+</Section>
+
+<Section id="basics" kind="examples" title="Create, resume, yield">
+
+<Definition term="Coroutine">
+
+A value of type `thread` created by `coroutine.create(f)`. It starts **suspended**. `coroutine.resume(co, ...)` runs it; the first resume passes its arguments to `f`. Inside, `coroutine.yield(...)` suspends it again, and its arguments become the extra results of the `resume` that started this stretch. The next `resume(co, ...)` continues after the `yield`, and its arguments become `yield`'s results. When `f` returns, the coroutine is **dead** and `resume` returns `true` followed by `f`'s results.
+
+</Definition>
+
+```lua check
+-- A coroutine is a function that can pause (yield) and later continue (resume).
+local co = coroutine.create(function(a, b)
+  print("started with", a, b)
+  local c = coroutine.yield(a + b)          -- pause, handing a + b to resume
+  print("resumed with", c)
+  local d, e = coroutine.yield(c * 2)
+  print("resumed with", d, e)
+  return "finished", d + e
+end)
+
+print(coroutine.status(co))
+print(coroutine.resume(co, 1, 2))           -- runs until the first yield
+print(coroutine.status(co))
+print(coroutine.resume(co, 10))             -- 10 becomes the result of yield
+print(coroutine.resume(co, 3, 4))           -- runs to the end; return values come out
+print(coroutine.status(co))
+print(coroutine.resume(co))                 -- a dead coroutine cannot be resumed
+
+-- Errors inside a coroutine are caught by resume, like pcall.
+local faulty = coroutine.create(function()
+  coroutine.yield("ok so far")
+  error("something broke", 0)
+end)
+print(coroutine.resume(faulty))
+print(coroutine.resume(faulty))
+print(coroutine.status(faulty))
+
+-- wrap gives a function that resumes for you and raises errors directly.
+local next_id = coroutine.wrap(function()
+  local id = 0
+  while true do
+    id = id + 1
+    coroutine.yield(string.format("ID-%04d", id))
+  end
+end)
+print(next_id(), next_id(), next_id())
+```
+
+It printed:
+
+```text
+suspended
+started with	1	2
+true	3
+suspended
+resumed with	10
+true	20
+resumed with	3	4
+true	finished	7
+dead
+false	cannot resume dead coroutine
+true	ok so far
+false	something broke
+dead
+ID-0001	ID-0002	ID-0003
+```
+
+Trace the values: the first resume passed 1 and 2 as `a` and `b`, and got back `true, 3` from `yield(a + b)`. The second resume passed 10, which came out of that `yield` as `c`, and got back `true, 20`. The third passed 3 and 4 into the second `yield`, the function ran to its end, and `resume` returned its results. Data flows **both ways** through `resume` and `yield`, which is what makes coroutines more than generators.
+
+The status is one of `"suspended"` (created or yielded), `"running"` (it is the one executing), `"normal"` (it resumed another coroutine and is waiting for it) or `"dead"` (finished or failed).
+
+- **Errors** inside a coroutine do not propagate to the resumer: `resume` returns `false` and the error, like `pcall`, and the coroutine is dead.
+- **`coroutine.wrap(f)`** returns a function instead of a coroutine object. Each call resumes it and returns just the yielded values, without the leading `true`; an error inside is raised in the caller. Use `wrap` for generators, where you want a plain function, and `create`/`resume` when you need the status or want to handle errors yourself.
+
+</Section>
+
+<Section id="generators" kind="examples" title="Generators and pipelines">
+
+A coroutine wrapped with `coroutine.wrap` is a ready-made iterator for the generic `for`: each call produces the next value, and when the coroutine finishes it returns nothing, which ends the loop.
+
+```lua check
+-- Generators: a coroutine yields values one at a time to a for loop.
+local function permutations(list)
+  local function permute(n)
+    if n <= 1 then
+      coroutine.yield(table.concat(list))
+    else
+      for i = 1, n do
+        list[n], list[i] = list[i], list[n]
+        permute(n - 1)                          -- yield works from nested calls
+        list[n], list[i] = list[i], list[n]
+      end
+    end
+  end
+  return coroutine.wrap(function() permute(#list) end)
+end
+local all = {}
+for p in permutations({ "a", "b", "c" }) do all[#all + 1] = p end
+print(#all .. " permutations: " .. table.concat(all, " "))
+
+-- A pipeline: producer -> filter -> consumer, each a coroutine.
+local function producer(lines)
+  return coroutine.wrap(function()
+    for _, line in ipairs(lines) do coroutine.yield(line) end
+  end)
+end
+local function only_errors(source)
+  return coroutine.wrap(function()
+    for line in source do
+      if line:find("ERROR", 1, true) then coroutine.yield(line) end
+    end
+  end)
+end
+local function numbered(source)
+  return coroutine.wrap(function()
+    local n = 0
+    for line in source do n = n + 1; coroutine.yield(n .. ": " .. line) end
+  end)
+end
+
+local log = { "INFO start", "ERROR disk full", "INFO retry", "ERROR timeout", "INFO done" }
+for line in numbered(only_errors(producer(log))) do print(line) end
+```
+
+It printed:
+
+```text
+6 permutations: bca cba cab acb bac abc
+1: ERROR disk full
+2: ERROR timeout
+```
+
+The permutation generator is the classic example of why this matters. Generating permutations is naturally **recursive**; writing it as a closure-based iterator would mean managing an explicit stack by hand. With a coroutine, the recursive function simply yields each complete permutation from deep inside its recursion, and the `for` loop receives them one at a time.
+
+The **pipeline** connects three coroutines: a producer of lines, a filter that passes only errors, and a stage that numbers them. Each stage pulls values from the one before by calling it, and pushes results on with `yield`. Nothing is buffered: each line flows through the whole pipeline before the next is read, so the same code would handle a log of any size in constant memory. Unix pipes work the same way, and this design is the subject of a well-known section of *Programming in Lua*.
+
+</Section>
+
+<Section id="scheduler" kind="examples" title="A cooperative scheduler">
+
+Game engines use coroutines to let designers write a character's behaviour as a straight script: patrol, wait two seconds, patrol again. Behind the scenes, a **scheduler** keeps a list of coroutines, resumes each one when its wait is over, and moves on when it yields.
+
+```lua check
+-- A tiny cooperative scheduler, the way game engines run many scripts "at once".
+local tasks = {}
+local now = 0
+
+local function spawn(name, fn)
+  tasks[#tasks + 1] = { name = name, co = coroutine.create(fn), wake = 0 }
+end
+
+local function wait(ticks)                   -- called from inside a task
+  coroutine.yield(ticks)
+end
+
+local function run()
+  while #tasks > 0 do
+    now = now + 1
+    for i = #tasks, 1, -1 do                 -- backwards, so removal is safe
+      local t = tasks[i]
+      if t.wake <= now then
+        local ok, ticks = coroutine.resume(t.co)
+        if not ok then
+          print(string.format("[%d] %s crashed: %s", now, t.name, ticks))
+          table.remove(tasks, i)
+        elseif coroutine.status(t.co) == "dead" then
+          table.remove(tasks, i)
+        else
+          t.wake = now + ticks
+        end
+      end
+    end
+  end
+end
+
+spawn("guard", function()
+  for _ = 1, 3 do
+    print(string.format("[%d] guard patrols", now))
+    wait(2)
+  end
+end)
+spawn("baker", function()
+  print(string.format("[%d] baker puts bread in the oven", now))
+  wait(5)
+  print(string.format("[%d] baker takes the bread out", now))
+end)
+spawn("bell", function()
+  wait(3)
+  error("rope snapped", 0)
+end)
+run()
+print("all tasks finished at tick " .. now)
+```
+
+It printed:
+
+```text
+[1] baker puts bread in the oven
+[1] guard patrols
+[3] guard patrols
+[4] bell crashed: rope snapped
+[5] guard patrols
+[6] baker takes the bread out
+all tasks finished at tick 7
+```
+
+Read the guard's script: a loop that patrols and waits. It looks like it blocks for two ticks, but `wait` just yields the number of ticks to the scheduler, which records when to wake the guard and resumes the others meanwhile. The baker and the guard interleave, and the bell's error is caught by `resume` and reported without disturbing the other tasks. A real engine would use frame times instead of ticks and events as well as timers, but the shape is the same.
+
+<Analogy>
+
+A cooperative scheduler is like a chess player giving a simultaneous exhibition. She walks along a row of boards, makes one move at each, and moves on. Each game is a coroutine: it waits, suspended, with its whole position intact, until she returns. Nothing happens at a board while she is elsewhere, and she never interrupts herself in the middle of a move.
+
+</Analogy>
+
+### Hiding callbacks
+
+The same trick turns callback-based I/O into sequential code. A host whose API is "start reading, call me back when done" can be wrapped like this (a sketch; `host.read_async` stands for whatever the host provides):
+
+```lua
+local function read(path)
+  local co = coroutine.running()
+  host.read_async(path, function(data) coroutine.resume(co, data) end)
+  return coroutine.yield()            -- pause until the callback resumes us
+end
+
+-- Inside a coroutine, asynchronous code now reads top to bottom:
+local config = read("settings.json")
+local theme = read(config.theme_file)
+```
+
+OpenResty uses this idea to let each web request run as a coroutine inside nginx, and several Neovim plugin libraries use it to tame Neovim's asynchronous APIs.
+
+</Section>
+
+<Section id="stackful" kind="examples" title="Stackful coroutines, and closing them">
+
+<Definition term="Stackful coroutine">
+
+A coroutine with its own complete call stack, so that `yield` may be called from any function it calls, however deeply nested, and suspends the whole chain of calls at once. Lua's coroutines are stackful. Generators in Python and JavaScript are **stackless**: only the generator function itself can yield, and nested functions need `yield from` or `yield*` to pass values up.
+
+</Definition>
+
+```lua check
+-- Coroutines are "stackful": yield works from any depth of nested calls.
+-- An in-order walk of a binary tree, written recursively, becomes an iterator.
+local function node(value, left, right) return { value = value, left = left, right = right } end
+local tree = node(50,
+  node(30, node(20), node(40)),
+  node(70, node(60), node(80)))
+
+local function walk(t)
+  if t then
+    walk(t.left)
+    coroutine.yield(t.value)
+    walk(t.right)
+  end
+end
+local function in_order(t)
+  return coroutine.wrap(function() walk(t) end)
+end
+
+local out = {}
+for v in in_order(tree) do out[#out + 1] = v end
+print(table.concat(out, " "))
+
+-- Comparing two trees lazily: stop at the first difference.
+local other = node(50, node(30, node(20), node(45)), node(70))
+local a, b = in_order(tree), in_order(other)
+repeat
+  local x, y = a(), b()
+  if x ~= y then print("first difference:", x, y) break end
+until x == nil
+
+-- coroutine.close ends a suspended coroutine and runs its pending __close handlers.
+local co = coroutine.create(function()
+  local guard <close> = setmetatable({}, { __close = function() print("cleanup ran") end })
+  coroutine.yield("working")
+  print("never reached")
+end)
+print(coroutine.resume(co))
+print(coroutine.close(co), coroutine.status(co))
+print(coroutine.isyieldable(), select(2, coroutine.running()))   -- in the main program
+```
+
+It printed:
+
+```text
+20 30 40 50 60 70 80
+first difference:	40	45
+true	working
+cleanup ran
+true	dead
+false	true
+```
+
+The recursive `walk` yields from inside its own recursion, and the coroutine suspends all those nested calls at once. The comparison loop then pulls values from two trees **in step** and stops at the first difference without walking the rest of either tree: a problem that is awkward without coroutines.
+
+**Closing.** A coroutine that is suspended and never resumed still holds its stack and any resources in it. `coroutine.close(co)` (Lua 5.4) puts it in the dead state and runs the `__close` handlers of its pending to-be-closed variables, as the "cleanup ran" line shows. Close coroutines you abandon, especially in long-running programs.
+
+Finally, `coroutine.running()` returns the running coroutine and a boolean that is `true` in the main program, and `coroutine.isyieldable()` says whether the current code may yield; in the main program it may not.
+
+<Misconception>
+
+"Coroutines run in parallel and make my program faster on several cores." They do not. Only one coroutine runs at a time, on one operating-system thread, and switching between them happens only at `yield` and `resume`. Their value is in **structure**: writing interleaved activities as straight-line code. For parallelism, Lua programs use several Lua states in separate threads (each with its own data), or let the host do parallel work in C. A coroutine that loops without yielding also blocks every other coroutine: cooperative means every task must cooperate.
+
+</Misconception>
+
+One technical limit is worth knowing: a coroutine cannot yield across certain **C function calls**, such as a callback invoked by a C library that was not written to allow it; Lua reports "attempt to yield across a C-call boundary". The standard library's `pcall`, `xpcall` and iterator functions are written to allow yields since Lua 5.2, so ordinary Lua code rarely hits the limit.
+
+</Section>
+
+<Section id="compare" kind="intuition" title="Coroutines, threads and async/await">
+
+Many languages now offer some way to write code that waits without blocking everything else. It helps to place Lua's coroutines among them.
+
+| | Lua coroutines | Operating-system threads | async/await (JavaScript, Python, C#, Rust) |
+| --- | --- | --- | --- |
+| Who decides when to switch | the code, at `yield` | the operating system, at any instruction | the code, at `await` |
+| Runs in parallel on several cores | no | yes | usually no (depends on the runtime) |
+| Needs locks for shared data | no | yes | rarely |
+| Can pause inside nested ordinary calls | yes (stackful) | yes | no: every function on the path must be `async` |
+| Cost of one | about a kilobyte to start (measured on Lua 5.5), growing as needed | typically a large reserved stack and a kernel object | a small heap object per call |
+
+The last two rows are where Lua's design shines. Because coroutines are **stackful**, a library can add pausing to ordinary-looking functions (like `read` in the sketch above) without every caller changing its signature, the problem other languages call "function colouring". And because they are cheap, a game can run thousands of them.
+
+Lua's coroutines are also **asymmetric**: `yield` always returns control to whoever called `resume`, rather than transferring it to an arbitrary other coroutine. Ana Lúcia de Moura and Roberto Ierusalimschy showed in their paper *Revisiting Coroutines* that this form is as expressive as the symmetric kind and as one-shot continuations, while being much easier to understand, because control flow still looks like ordinary calls and returns.
+
+<Misconception>
+
+"Any function can call `coroutine.yield` to pause." Only code running *inside* a coroutine can. Called from the main program, `yield` fails with "attempt to yield from outside a coroutine". Libraries that yield on your behalf, such as a `wait` or `sleep` helper, therefore document that they must be called from a task, and schedulers usually start every script inside a coroutine for exactly this reason. `coroutine.isyieldable()` lets a helper check before trying.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="human" title="Coroutines in practice">
+
+- **Prefer `coroutine.wrap` for iterators**, and `create`/`resume` for schedulers, where you need status and error results.
+- **Always check `resume`'s first result.** An error in a coroutine is otherwise silently swallowed: the scheduler above prints it.
+- **Keep the scheduler small and in one place.** Game and server code usually has one loop that owns all resumes; scripts only yield (through helpers like `wait`).
+- **Remember shared state.** Coroutines need no locks for *individual operations*, but state can still change between your `yield` and your next line, because other coroutines ran in between. Re-check conditions after waking.
+- **Debug with the coroutine's own stack.** `debug.traceback(co)` returns the stack of a suspended coroutine, showing exactly which nested call it is paused in, which is the first thing to print when a task seems stuck.
+- **Close what you abandon** with `coroutine.close`, and do not hold large data in locals across long waits without reason.
+- **Know your host.** LuaJIT and Lua 5.1 have coroutines but not `coroutine.close` or to-be-closed variables; Roblox's Luau has coroutines plus its own task scheduler library.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

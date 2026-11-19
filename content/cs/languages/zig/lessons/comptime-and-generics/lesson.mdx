@@ -1,0 +1,408 @@
+---
+title: Comptime and generics
+subtitle: Running ordinary Zig code during compilation, treating types as values, and building generic data structures and functions without a separate template language.
+minutes: 65
+objectives:
+  - Explain what comptime means and run functions, blocks and loops at compile time
+  - Build lookup tables and other constants during compilation, and raise the evaluation limit when needed
+  - Write generic types as functions that return types, and generic functions with comptime type parameters and anytype
+  - Inspect types with @typeInfo, @hasDecl, @field and inline for, and report misuse with @compileError
+  - Compare comptime with C macros and C++ templates, and know its limits
+prerequisites: [allocators]
+references:
+  - title: "Zig language reference: comptime"
+    url: https://ziglang.org/documentation/0.17.0/
+    note: Compile-time parameters, variables and expressions, generic data structures, and a case study of how print is implemented.
+  - title: "Zig language reference: @typeInfo, @Int, @Struct and related builtins"
+    url: https://ziglang.org/documentation/0.17.0/
+  - title: "std.meta (standard library documentation)"
+    url: https://ziglang.org/documentation/master/std/
+---
+
+<Section id="motivation" kind="motivation" title="One language, two times">
+
+Most systems languages grew a second language for doing things at compile time. C has the preprocessor, a text-substitution system that knows nothing about types. C++ has templates and `constexpr`, which together are powerful but have their own rules, their own error messages and a reputation for being hard to read. Rust has generics with trait bounds plus two kinds of macros.
+
+Zig has one idea instead: **comptime**. Any ordinary Zig expression can be evaluated by the compiler, as long as everything it needs is known at compile time. Types are values that comptime code can pass around, compare and compute. A generic data structure is simply a function that takes a type and returns a new type. A lookup table is a loop that runs inside the compiler. There is no new syntax to learn for "the generic version", which is why Zig code that uses generics reads much like Zig code that does not.
+
+This lesson is where Zig stops looking like a cleaned-up C and shows its own character. You have already been using comptime: `std.debug.print` checks its format string against its arguments during compilation, and `std.ArrayList(u32)` is a function call that returns a type.
+
+
+<Analogy>
+
+Think of a restaurant kitchen. Some work can be done before service starts: stocks simmered, sauces made, vegetables cut. Other work must wait until an order arrives. A good kitchen does as much as possible in advance, so that service is fast. Comptime is the preparation shift of your program: whatever can be worked out before any input arrives is done by the compiler, and only the rest is left for run time. The cook and the recipes are the same in both shifts.
+
+</Analogy>
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="comptime">
+
+A keyword that forces an expression, block or parameter to be evaluated at compile time. `comptime fibonacci(90)` runs the function in the compiler and puts the result into the program as a constant. Code at the top level of a file (global `const` initialisers) is always evaluated at compile time.
+
+</Definition>
+
+<Definition term="comptime parameter">
+
+A function parameter marked `comptime` must be known when the call is compiled. The compiler creates a separate version of the function for each distinct comptime argument. A parameter of type `type` (`comptime T: type`) makes a function generic.
+
+</Definition>
+
+<Definition term="anytype">
+
+A parameter declared `x: anytype` accepts any type; the function is instantiated for each type it is called with, and `@TypeOf(x)` names it. Whatever the body does with `x` must make sense for that type, or compilation fails.
+
+</Definition>
+
+<Definition term="reflection builtins">
+
+`@TypeOf(x)` gives the type of an expression; `@typeInfo(T)` describes a type (its kind, and for a struct its field names and field types); `@hasDecl(T, "name")` and `@hasField` test for members; `@field(x, "name")` accesses a field by a comptime-known name; `@typeName(T)` gives a printable name; `@compileError("message")` stops compilation with your own message. Builtins such as `@Int`, `@Struct` and `@Enum` create new types.
+
+</Definition>
+
+<Definition term="comptime variable">
+
+`comptime var count = 0;` declares a variable that exists only during compilation. It can be changed by comptime code, such as an `inline for` counting fields, but never by run-time code, and its final value is baked into the program.
+
+</Definition>
+
+<Definition term="inline for">
+
+A loop the compiler unrolls, so that each iteration can work with a different comptime value, such as a different field name or a different element type in a tuple.
+
+</Definition>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Computing at compile time">
+
+```zig check
+const std = @import("std");
+
+fn fibonacci(n: u32) u64 {
+    var a: u64 = 0;
+    var b: u64 = 1;
+    for (0..n) |_| {
+        const next = a + b;
+        a = b;
+        b = next;
+    }
+    return a;
+}
+
+// A lookup table built by the compiler: the CRC-8 remainders of every byte value.
+const crc8_table: [256]u8 = blk: {
+    @setEvalBranchQuota(5000); // 256 x 8 loop iterations: more than the default limit of 1000
+    var table: [256]u8 = undefined;
+    for (&table, 0..) |*entry, i| {
+        var crc: u8 = @intCast(i);
+        for (0..8) |_| {
+            crc = if (crc & 0x80 != 0) (crc << 1) ^ 0x07 else crc << 1;
+        }
+        entry.* = crc;
+    }
+    break :blk table;
+};
+
+fn crc8(data: []const u8) u8 {
+    var crc: u8 = 0;
+    for (data) |byte| crc = crc8_table[crc ^ byte];
+    return crc;
+}
+
+// A comptime parameter: the array length must be known when compiling.
+fn zeros(comptime n: usize) [n]f32 {
+    return @splat(0);
+}
+
+pub fn main() void {
+    const at_compile_time = comptime fibonacci(90); // computed by the compiler
+    var n: u32 = 90;
+    _ = &n;
+    const at_run_time = fibonacci(n); // same function, run normally
+    std.debug.print("fib(90) = {d} (equal: {})\n", .{ at_compile_time, at_compile_time == at_run_time });
+
+    std.debug.print("crc8 table starts {any}\n", .{crc8_table[0..6]});
+    std.debug.print("crc8(\"123456789\") = 0x{x:0>2}\n", .{crc8("123456789")});
+
+    const buf = zeros(4);
+    std.debug.print("{s} with {d} elements\n", .{ @typeName(@TypeOf(buf)), buf.len });
+}
+```
+
+```text
+fib(90) = 2880067194370816120 (equal: true)
+crc8 table starts { 0, 7, 14, 9, 28, 27 }
+crc8("123456789") = 0xf4
+[4]f32 with 4 elements
+```
+
+`fibonacci` is an ordinary function. Called with `comptime`, the compiler runs it and embeds 2880067194370816120 in the executable; called with a run-time value, it runs normally. Nothing about the function itself had to change.
+
+`crc8_table` is a global constant whose initialiser is a labeled block containing two loops, so the compiler computes all 256 entries of the table while building the program. CRC-8 is a simple checksum used in sensors and communication buses, and the table lets `crc8` process a byte with one lookup instead of eight bit operations. Its result for the string `123456789`, 0xf4, is the published check value for this variant of CRC-8, a quick way to confirm the table is right.
+
+The first version of this program did not compile:
+
+```text
+main.zig:19:9: error: evaluation exceeded 1000 backwards branches
+        for (0..8) |_| {
+        ^~~
+main.zig:19:9: note: use @setEvalBranchQuota() to raise the branch limit from 1000
+```
+
+The compiler limits how long comptime code may loop, so that a mistake cannot make compilation hang. `@setEvalBranchQuota(5000)` raises the limit for that block. Finally, `zeros(4)` shows a comptime parameter used as an array length: the return type `[n]f32` depends on the argument, which is only possible because `n` is known at compile time.
+
+</Section>
+
+<Section id="generic-types" kind="examples" title="Generic types are functions">
+
+```zig check
+const std = @import("std");
+
+// A generic type is a function that takes types (and other comptime values) and returns a type.
+fn RingBuffer(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        items: [capacity]T = undefined,
+        start: usize = 0,
+        len: usize = 0,
+
+        const Self = @This();
+
+        // Adds an item, overwriting the oldest one when full.
+        pub fn push(self: *Self, item: T) void {
+            const end = (self.start + self.len) % capacity;
+            self.items[end] = item;
+            if (self.len < capacity) {
+                self.len += 1;
+            } else {
+                self.start = (self.start + 1) % capacity;
+            }
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.len == 0) return null;
+            const item = self.items[self.start];
+            self.start = (self.start + 1) % capacity;
+            self.len -= 1;
+            return item;
+        }
+    };
+}
+
+const Reading = struct { station: []const u8, celsius: f32 };
+
+pub fn main() void {
+    var recent: RingBuffer(u32, 3) = .{};
+    for (1..6) |i| recent.push(@intCast(i * 10)); // 10..50; only the last three survive
+    while (recent.pop()) |x| std.debug.print("{d} ", .{x});
+    std.debug.print("\n", .{});
+
+    var log: RingBuffer(Reading, 2) = .{};
+    log.push(.{ .station = "Nuuk", .celsius = -12.5 });
+    log.push(.{ .station = "Perth", .celsius = 31.0 });
+    log.push(.{ .station = "Cusco", .celsius = 9.5 });
+    while (log.pop()) |r| std.debug.print("{s}: {d}\n", .{ r.station, r.celsius });
+
+    std.debug.print("{s}\n", .{@typeName(RingBuffer(u8, 16))});
+    std.debug.print("same type: {}\n", .{RingBuffer(u8, 16) == RingBuffer(u8, 16)});
+}
+```
+
+```text
+30 40 50 
+Perth: 31
+Cusco: 9.5
+main.RingBuffer(u8,16)
+same type: true
+```
+
+`RingBuffer` is not a special kind of declaration. It is a function, run at compile time, that takes a type and a number and returns an anonymous `struct` type built from them; `@This()` inside lets the struct refer to itself. `RingBuffer(u32, 3)` and `RingBuffer(Reading, 2)` are two different types, each with an array of the right element type and size laid out inline, with no heap allocation and no indirection. Calling the function twice with the same arguments returns the *same* type, which the last line confirms, so `RingBuffer(u8, 16)` written in two files means one type.
+
+This is exactly how the standard library defines `std.ArrayList(T)`, `std.AutoHashMap(K, V)` and every other container. A generic type can also take values other than types, as `capacity` shows, and can contain comptime logic of its own: a `RingBuffer` could check `if (capacity == 0) @compileError("capacity must be positive");` at the top of the function, so that a mistaken instantiation fails with a clear message instead of a division by zero at run time. When you read their source, which Zig programmers do routinely, you will find nothing more exotic than this.
+
+</Section>
+
+<Section id="reflection" kind="examples" title="Generic functions and reflection">
+
+```zig check
+const std = @import("std");
+
+// Works for any struct: walks its fields at compile time.
+fn describe(value: anytype) void {
+    const T = @TypeOf(value);
+    const info = @typeInfo(T).@"struct";
+    std.debug.print("{s} {{", .{@typeName(T)});
+    inline for (info.field_names, info.field_types) |name, FieldType| {
+        // Chosen at compile time, separately for each field.
+        const spec = if (FieldType == []const u8) " {s}=\"{s}\"" else " {s}={any}";
+        std.debug.print(spec, .{ name, @field(value, name) });
+    }
+    std.debug.print(" }}\n", .{});
+}
+
+// A generic function with its own compile-time check on the type.
+fn largest(comptime T: type, items: []const T) T {
+    switch (@typeInfo(T)) {
+        .int, .float => {},
+        else => @compileError("largest() needs numbers, not " ++ @typeName(T)),
+    }
+    var best = items[0];
+    for (items[1..]) |x| best = @max(best, x);
+    return best;
+}
+
+// Duck typing: anything with an area() method is accepted.
+fn totalArea(shapes: anytype) f64 {
+    var sum: f64 = 0;
+    inline for (shapes) |s| {
+        if (!@hasDecl(@TypeOf(s), "area")) @compileError(@typeName(@TypeOf(s)) ++ " has no area()");
+        sum += s.area();
+    }
+    return sum;
+}
+
+const Square = struct {
+    side: f64,
+    pub fn area(s: Square) f64 {
+        return s.side * s.side;
+    }
+};
+const Circle = struct {
+    r: f64,
+    pub fn area(c: Circle) f64 {
+        return std.math.pi * c.r * c.r;
+    }
+};
+const Book = struct { title: []const u8, author: []const u8, year: i16 };
+
+pub fn main() void {
+    describe(Book{ .title = "Things Fall Apart", .author = "Chinua Achebe", .year = 1958 });
+    describe(Square{ .side = 2 });
+
+    std.debug.print("{d} {d}\n", .{ largest(i32, &.{ 4, -2, 17, 9 }), largest(f64, &.{ 0.5, 2.25 }) });
+    // largest(bool, &.{ true, false });   // compile error: largest() needs numbers, not bool
+
+    // A tuple of different types: inline for unrolls the loop for each one.
+    std.debug.print("{d:.3}\n", .{totalArea(.{ Square{ .side = 2 }, Circle{ .r = 1 }, Square{ .side = 1 } })});
+
+    // Types can be computed: an unsigned integer exactly wide enough for 1000 values.
+    const Index = @Int(.unsigned, std.math.log2_int_ceil(u32, 1000));
+    std.debug.print("{s} holds up to {d}\n", .{ @typeName(Index), std.math.maxInt(Index) });
+}
+```
+
+```text
+main.Book { title="Things Fall Apart" author="Chinua Achebe" year=1958 }
+main.Square { side=2 }
+17 2.25
+8.142
+u10 holds up to 1023
+```
+
+`describe` takes `anytype` and asks `@typeInfo` for the struct's field names and field types. (In Zig 0.17 these are two parallel arrays, `field_names` and `field_types`; older versions had a single `fields` array, so reflection code from older tutorials needs adjusting.) `inline for` unrolls the loop so that each iteration knows its field's name and type at compile time, which lets `@field(value, name)` access the field and lets the format string be chosen per field: text gets `{s}` in quotes, everything else `{any}`. The `{{` and `}}` print literal braces.
+
+`largest` takes the type explicitly and checks it with a `switch` on `@typeInfo(T)`. For a type that is not a number, compilation stops with the function author's own message:
+
+```text
+main.zig:20:17: error: largest() needs numbers, not bool
+        else => @compileError("largest() needs numbers, not " ++ @typeName(T)),
+                ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+`totalArea` is **duck typing** checked at compile time: it accepts a tuple of values of different types, and each must have an `area` method. `Square` and `Circle` share no interface declaration; they just both have the method. The explicit `@hasDecl` check turns "no field or member function named area" deep inside the loop into a clear message.
+
+The last two lines compute a type: `@Int(.unsigned, 10)` is `u10`, the smallest unsigned integer that can index 1000 items. (`@Int` and its siblings `@Struct`, `@Enum` and `@Union` replaced the older single `@Type` builtin.)
+
+</Section>
+
+<Section id="build-facts" kind="examples" title="Compiling for this build: conditional code without a preprocessor">
+
+C programs use `#ifdef` to include code only for some platforms or build types. Zig uses comptime instead: facts about the current build are constants in the `builtin` module, and an `if` or `switch` on a comptime-known value is resolved during compilation.
+
+```zig check
+const std = @import("std");
+const builtin = @import("builtin");
+
+// Facts about the build are comptime constants, so branches on them are
+// resolved during compilation and the untaken branch is not compiled at all.
+const verbose = builtin.mode == .debug;
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    if (verbose) std.debug.print("[debug] " ++ fmt ++ "\n", args);
+}
+
+pub fn main() void {
+    log("starting on {t}/{t}", .{ builtin.os.tag, builtin.cpu.arch });
+    const line_ending = switch (builtin.os.tag) {
+        .windows => "\\r\\n",
+        else => "\\n",
+    };
+    std.debug.print("mode {t}, {d}-bit pointers, line ending {s}\n", .{ builtin.mode, @bitSizeOf(usize), line_ending });
+    log("done", .{});
+}
+```
+
+```text
+[debug] starting on linux/x86_64
+mode debug, 64-bit pointers, line ending \n
+[debug] done
+```
+
+`verbose` is true only in debug builds. In a `-O fast` build the `if (verbose)` inside `log` is known to be false at compile time, so the call disappears entirely, along with its format string. The `switch` on `builtin.os.tag` picks a line ending; the branch for Windows is never even analysed when compiling for Linux, so it may refer to Windows-only declarations without breaking the Linux build. Notice also `"[debug] " ++ fmt`: because `fmt` is a comptime parameter, the two strings are joined by the compiler.
+
+### How `print` checks its format string
+
+`std.debug.print`'s format argument is a `comptime fmt: []const u8`. Inside, the standard library walks the string *at compile time* with an `inline` loop, finds each `{...}` placeholder, and for each one emits a call that formats the corresponding element of the argument tuple according to its specifier and type. If there are more placeholders than arguments, or fewer, or a specifier that makes no sense for a type (`{d}` for a string), it calls `@compileError`, which is the error you saw in the first lesson. At run time, all that remains is a straight sequence of "write this text, format this number" calls, with no parsing of the format string at all. The language reference walks through a simplified version of this implementation, and it is worth reading once you are comfortable with this lesson: it is comptime's best advertisement.
+
+</Section>
+
+<Section id="comparison" kind="human" title="Comptime compared with macros and templates">
+
+| | C preprocessor | C++ templates | Zig comptime |
+| --- | --- | --- | --- |
+| Language | a separate text language | a separate sub-language | ordinary Zig |
+| Knows about types | no | yes | yes; types are values |
+| Constraints on generic parameters | none | concepts (C++20) | any comptime check, `@compileError` |
+| Can run arbitrary computation | barely | yes (`constexpr`, with limits) | yes, with a branch quota |
+| Can generate new types | only by pasting text | yes | yes, with `@Struct`, `@Int` and others |
+
+Comptime is not unlimited. Comptime code cannot do I/O (no reading files during compilation, apart from `@embedFile`, which includes a file's bytes as a constant), cannot allocate from a run-time allocator, and runs much more slowly than compiled code, so heavy computation belongs at run time or in a build step. Generic functions using `anytype` can also be harder to document, because the signature does not say what the type must support; good Zig code states the requirement in a doc comment and, as `largest` and `totalArea` do, checks it early with a readable `@compileError`.
+
+Finally, comptime generics are instantiated per type, like C++ templates: `RingBuffer(u8, 16)` and `RingBuffer(u16, 16)` are separate code. That is what makes them fast, and it is also how a program's size can grow if a generic function is used with many types. When that matters, the run-time interface pattern from the structs lesson (a pointer plus a table of functions) is the alternative.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Comptime is a macro system."** Macros transform source text or syntax trees. Comptime evaluates typed Zig expressions with the same semantics they have at run time, including overflow checks. A comptime integer overflow is a compile error, not a silent wrap.
+
+</Misconception>
+
+<Misconception>
+
+**"`anytype` makes Zig dynamically typed."** Each call with a new type compiles a new, fully typed version of the function. Nothing is decided at run time, and a type that lacks something the body needs is a compile error.
+
+</Misconception>
+
+<Misconception>
+
+**"Everything marked `const` is computed at compile time."** A local `const x = f(y);` with a run-time `y` is computed at run time; `const` only means it cannot change. Top-level declarations, `comptime` expressions and comptime parameters are evaluated during compilation.
+
+</Misconception>
+
+<Misconception>
+
+**"`inline for` is an optimisation, like loop unrolling in C."** It changes what the loop *can* do: each iteration may use a different type or a different comptime value, which a normal loop cannot. Use it for iterating over fields, tuples and types, not to make an ordinary loop faster; the optimiser already unrolls where it pays.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,535 @@
+---
+title: Classes, interfaces and traits
+subtitle: Objects with typed properties and promoted constructors, contracts with interfaces, shared code with abstract classes and traits, and PHP 8.4's property hooks.
+minutes: 60
+objectives:
+  - Define classes with typed properties, constructor promotion, visibility and static members
+  - Explain that variables hold object handles, and when to use clone
+  - Design with interfaces and abstract classes, and say when inheritance is the wrong tool
+  - Reuse code across unrelated classes with traits, and know their limits
+  - Use property hooks and asymmetric visibility (PHP 8.4) to protect an object's state
+prerequisites: [arrays-and-strings]
+references:
+  - title: "PHP Manual: Classes and Objects"
+    url: https://www.php.net/manual/en/language.oop5.php
+    note: The whole object model, chapter by chapter.
+  - title: "PHP Manual: Object Interfaces"
+    url: https://www.php.net/manual/en/language.oop5.interfaces.php
+  - title: "PHP Manual: Traits"
+    url: https://www.php.net/manual/en/language.oop5.traits.php
+    note: Including conflict resolution with insteadof and as.
+  - title: "PHP Manual: Predefined Interfaces and Classes"
+    url: https://www.php.net/manual/en/reserved.interfaces.php
+    note: Countable, IteratorAggregate, Stringable, JsonSerializable and others your classes can implement.
+  - title: "PHP RFC: Property hooks"
+    url: https://wiki.php.net/rfc/property-hooks
+    note: The design and reasoning behind PHP 8.4's get and set hooks.
+---
+
+<Section id="motivation" kind="motivation" title="From arrays of data to objects with rules">
+
+In the last lesson a sale was an array: `["seller" => "Ngozi", "kg" => 12, …]`. That is quick to write, and it has no rules. Nothing stops a typo like `"kgs"`, a negative weight, or a missing key that turns into `null` three functions later. As a program grows, the bugs that come from loosely shaped data grow with it.
+
+A **class** fixes that by putting data and its rules in one place. A `Sale` class can declare exactly which properties exist and their types, refuse to be created with a negative weight, and offer methods that compute things from its data. Code that receives a `Sale` knows what it has.
+
+PHP's modern object model arrived in PHP 5 (2004) and has grown steadily since: typed properties (7.4), constructor promotion (8.0), readonly properties (8.1), and in PHP 8.4 property hooks and asymmetric visibility. Modern PHP frameworks are built almost entirely from small classes, and most of the PHP you read at work will be methods on objects. This lesson covers classes, interfaces and traits; the next one covers enums, readonly data and the rest of the type system.
+
+</Section>
+
+<Section id="classes" kind="examples" title="Classes, constructors and object handles">
+
+Here is a small model of a music playlist. Read it once for shape, then read the notes below it.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+final class Track
+{
+    private static int $created = 0;
+
+    public function __construct(
+        public readonly string $title,
+        public readonly string $artist,
+        private int $seconds,
+    ) {
+        if ($seconds <= 0) {
+            throw new InvalidArgumentException("A track must have a positive length");
+        }
+        self::$created++;
+    }
+
+    /** Parses "Artist - Title (m:ss)". */
+    public static function fromString(string $line): self
+    {
+        if (!preg_match('/^(.+) - (.+) \((\d+):(\d{2})\)$/', $line, $m)) {
+            throw new InvalidArgumentException("Cannot parse: $line");
+        }
+        return new self(title: $m[2], artist: $m[1], seconds: (int) $m[3] * 60 + (int) $m[4]);
+    }
+
+    public function seconds(): int
+    {
+        return $this->seconds;
+    }
+
+    public function length(): string
+    {
+        return sprintf("%d:%02d", intdiv($this->seconds, 60), $this->seconds % 60);
+    }
+
+    public static function createdSoFar(): int
+    {
+        return self::$created;
+    }
+}
+
+final class Playlist implements Countable, IteratorAggregate
+{
+    /** @var list<Track> */
+    private array $tracks = [];
+
+    public function __construct(public string $name)
+    {
+    }
+
+    public function add(Track ...$tracks): static
+    {
+        foreach ($tracks as $track) {
+            $this->tracks[] = $track;
+        }
+        return $this;
+    }
+
+    public function count(): int
+    {
+        return count($this->tracks);
+    }
+
+    public function getIterator(): Iterator
+    {
+        return new ArrayIterator($this->tracks);
+    }
+
+    public function totalSeconds(): int
+    {
+        return array_sum(array_map(fn(Track $t): int => $t->seconds(), $this->tracks));
+    }
+}
+
+$list = new Playlist("Evening");
+$list->add(
+    Track::fromString("Amadou Diallo - Morning in Bamako (4:05)"),
+    Track::fromString("Lucía Ferrer - Rain on the Plaza (3:41)"),
+    new Track("Night Ferry", "Hoang Minh", 312),
+);
+
+foreach ($list as $i => $track) {
+    printf("%d. %-18s %-14s %s\n", $i + 1, $track->title, $track->artist, $track->length());
+}
+printf("%s: %d tracks, %d seconds\n", $list->name, count($list), $list->totalSeconds());
+
+// Objects are handled by reference-like handles: both variables point to one object.
+$alias = $list;
+$alias->name = "Road trip";
+echo "list is now called: ", $list->name, "\n";
+
+// clone makes a second object (a shallow copy).
+$copy = clone $list;
+$copy->name = "Copy";
+echo $list->name, " / ", $copy->name, " / same tracks: ", count($copy), "\n";
+
+try {
+    Track::fromString("no length here");
+} catch (InvalidArgumentException $e) {
+    echo "Rejected: ", $e->getMessage(), "\n";
+}
+echo "Tracks created: ", Track::createdSoFar(), "\n";
+```
+
+```text
+1. Morning in Bamako  Amadou Diallo  4:05
+2. Rain on the Plaza  Lucía Ferrer  3:41
+3. Night Ferry        Hoang Minh     5:12
+Evening: 3 tracks, 778 seconds
+list is now called: Road trip
+Road trip / Copy / same tracks: 3
+Rejected: Cannot parse: no length here
+Tracks created: 3
+```
+
+(The second row is one space short because `printf` pads by bytes, and `í` in Lucía is two bytes: the lesson on strings in action.)
+
+**Constructor property promotion** (PHP 8.0). In `Track`, the constructor parameters marked `public readonly` and `private` *are* the property declarations: PHP creates the properties and assigns the arguments to them. Before 8.0 you wrote each property three times (declaration, parameter, assignment). The constructor body can still check the arguments, as `Track` does for the length.
+
+**Visibility.** `public` members can be used from anywhere, `protected` ones from the class and its subclasses, `private` ones only from the class itself. The convention in modern PHP is to keep properties private (or public but readonly) and expose behaviour through methods, so the class can guarantee its own rules. `readonly` (PHP 8.1) means a property can be set once, from inside the class, and never changed; the next lesson looks at it closely.
+
+**Static members** belong to the class, not to any object: `self::$created` counts every `Track` ever constructed. `Track::fromString()` is a **named constructor**, a static method that builds an object from another representation. It is a common pattern, because a class can have only one `__construct`, and names like `fromString`, `fromArray` or `fromDatabaseRow` say how the object is being made. Inside a class, `self` means "this class" and `static` means "the class this was actually called on", which differs when a subclass inherits the method.
+
+**Implementing built-in interfaces** made `Playlist` work with the language: `Countable` lets you call `count($list)`, and `IteratorAggregate` lets you `foreach` over it. `add` returns `static` (the object itself), so calls can be chained.
+
+**Variables hold handles, not objects.** `$alias = $list` does not copy the playlist. Both variables now hold a handle to the *same* object, so renaming through `$alias` renames `$list`. This is the opposite of arrays, which copy on assignment, and it is the same for objects passed to functions: a function that receives an object can change it. To get a second object, use `clone`, which copies the properties. The copy is **shallow**: `$copy` has its own `name` but shares the same `Track` objects (here harmless, because tracks are readonly). If a class holds mutable objects that must not be shared, it can define `__clone()` to clone them too.
+
+</Section>
+
+<Section id="interfaces" kind="human" title="Interfaces, abstract classes and inheritance">
+
+An **interface** is a contract: a list of public methods, with their types, that a class promises to provide. Code that depends on the interface works with any class that implements it, including ones written years later. That is the backbone of how PHP frameworks let you swap a mailer, a cache or a logger without changing the code that uses it.
+
+An **abstract class** is a partly finished class: it can contain real methods and properties, and some `abstract` methods that subclasses must fill in. It cannot be instantiated itself. A class `extends` exactly one parent class but may `implement` any number of interfaces.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+interface Exporter
+{
+    public function contentType(): string;
+
+    /** @param list<array<string, string|int|float>> $rows */
+    public function export(array $rows): string;
+}
+
+/** Shared skeleton for line-based formats; subclasses fill in the details. */
+abstract class LineExporter implements Exporter
+{
+    public function contentType(): string
+    {
+        return "text/plain";
+    }
+
+    public function export(array $rows): string
+    {
+        if ($rows === []) {
+            return "";
+        }
+        $lines = [$this->header(array_keys($rows[0])), ...array_map($this->row(...), $rows)];
+        return implode("\n", $lines);
+    }
+
+    /** @param list<string> $columns */
+    abstract protected function header(array $columns): string;
+
+    /** @param array<string, string|int|float> $row */
+    abstract protected function row(array $row): string;
+}
+
+final class CsvExporter extends LineExporter
+{
+    #[\Override]
+    public function contentType(): string
+    {
+        return "text/csv";
+    }
+
+    protected function header(array $columns): string
+    {
+        return implode(",", $columns);
+    }
+
+    protected function row(array $row): string
+    {
+        return implode(",", $row);
+    }
+}
+
+final class MarkdownExporter extends LineExporter
+{
+    protected function header(array $columns): string
+    {
+        return "| " . implode(" | ", $columns) . " |\n|" . str_repeat(" --- |", count($columns));
+    }
+
+    protected function row(array $row): string
+    {
+        return "| " . implode(" | ", $row) . " |";
+    }
+}
+
+final class JsonExporter implements Exporter
+{
+    public function contentType(): string
+    {
+        return "application/json";
+    }
+
+    public function export(array $rows): string
+    {
+        return json_encode($rows, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
+    }
+}
+
+/** This function knows only the interface, never the concrete classes. */
+function send(Exporter $exporter, array $rows): void
+{
+    echo "Content-Type: ", $exporter->contentType(), "\n", $exporter->export($rows), "\n\n";
+}
+
+$rows = [
+    ["product" => "Teff flour", "stock" => 40],
+    ["product" => "Masa harina", "stock" => 12],
+];
+
+foreach ([new CsvExporter(), new MarkdownExporter(), new JsonExporter()] as $exporter) {
+    send($exporter, $rows);
+}
+
+var_dump(new MarkdownExporter() instanceof Exporter, new JsonExporter() instanceof LineExporter);
+```
+
+```text
+Content-Type: text/csv
+product,stock
+Teff flour,40
+Masa harina,12
+
+Content-Type: text/plain
+| product | stock |
+| --- | --- |
+| Teff flour | 40 |
+| Masa harina | 12 |
+
+Content-Type: application/json
+[{"product":"Teff flour","stock":40},{"product":"Masa harina","stock":12}]
+
+bool(true)
+bool(false)
+```
+
+What to notice:
+
+- `send()` is typed against the **interface** `Exporter`. It neither knows nor cares which class it gets. Adding an XML exporter later means writing one new class; `send()` does not change. This is what people mean by "program to an interface".
+- `LineExporter` holds the shared algorithm (header line, then one line per row) and leaves the two format-specific steps abstract. This is the *template method* pattern, and it is the main legitimate use of an abstract class.
+- `#[\Override]` (PHP 8.3) is an **attribute** saying "this method overrides one from a parent or interface". If the parent's method is later renamed or removed, PHP raises an error instead of silently leaving you with a method nobody calls.
+- `final` on a class forbids subclasses. Many teams make every class `final` unless it was designed to be extended, because a subclass depends on the internals of its parent and makes the parent hard to change. You can always remove `final` later; adding it back would break someone's subclass.
+- `instanceof` checks whether an object is an instance of a class or implements an interface. `JsonExporter` implements `Exporter` directly, so it is not a `LineExporter`.
+
+**Composition over inheritance.** Inheritance is the tightest coupling there is: a subclass inherits everything, including its parent's bugs and future changes. When you want to reuse behaviour, first try giving one object another as a property (a `ReportService` that *has* an `Exporter`) and calling its methods. Reserve inheritance for genuine "is a kind of" relationships with a small, stable parent.
+
+</Section>
+
+<Section id="traits" kind="examples" title="Traits, property hooks and asymmetric visibility">
+
+A **trait** is a bundle of methods and properties that PHP copies into any class that writes `use TraitName;`. It is PHP's answer to "these unrelated classes need the same small piece of behaviour" without forcing them into one inheritance tree. The program below uses a trait for timestamps, together with two PHP 8.4 features that let a class control how its properties are read and written.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+trait HasTimestamps
+{
+    public private(set) ?string $createdAt = null;
+    public private(set) ?string $updatedAt = null;
+
+    public function touch(string $now): void
+    {
+        $this->createdAt ??= $now;
+        $this->updatedAt = $now;
+    }
+}
+
+final class Article implements Stringable
+{
+    use HasTimestamps;
+
+    // A property hook (PHP 8.4): every assignment goes through set.
+    public string $title {
+        set(string $value) {
+            $value = trim($value);
+            if ($value === "") {
+                throw new InvalidArgumentException("A title cannot be empty");
+            }
+            $this->title = $value;
+        }
+    }
+
+    // A virtual property: computed on every read, never stored.
+    public string $slug {
+        get => trim(strtolower(preg_replace('/[^A-Za-z0-9]+/', "-", $this->title)), "-");
+    }
+
+    public function __construct(string $title)
+    {
+        $this->title = $title;
+    }
+
+    public function __toString(): string
+    {
+        return "{$this->title} [{$this->slug}]";
+    }
+}
+
+$post = new Article("  Street Food in Penang!  ");
+$post->touch("2026-11-01");
+$post->title = "Street Food in Penang and Ipoh";
+$post->touch("2026-11-19");
+
+echo $post, "\n";
+echo "created ", $post->createdAt, ", updated ", $post->updatedAt, "\n";
+echo new Article("Hello, World")->slug, "\n";    // no extra parentheses needed since 8.4
+
+try {
+    $post->createdAt = "yesterday";
+} catch (Error $e) {
+    echo get_class($e), ": ", $e->getMessage(), "\n";
+}
+try {
+    $post->title = "   ";
+} catch (InvalidArgumentException $e) {
+    echo "Rejected: ", $e->getMessage(), "\n";
+}
+echo "class uses: ", implode(", ", class_uses($post)), "\n";
+```
+
+```text
+Street Food in Penang and Ipoh [street-food-in-penang-and-ipoh]
+created 2026-11-01, updated 2026-11-19
+hello-world
+Error: Cannot modify private(set) property Article::$createdAt from global scope
+Rejected: A title cannot be empty
+class uses: HasTimestamps
+```
+
+**The trait.** `HasTimestamps` gives any class `createdAt`, `updatedAt` and `touch()`. `class_uses` lists the traits a class uses. Traits can declare abstract methods that the using class must provide, and when two traits define the same method you choose with `insteadof`. They have real limits: a trait is not a type (you cannot write `function f(HasTimestamps $x)`), and its code runs as if pasted into the class, with access to private members, so a trait used in many places becomes hard to change. Use them for small, self-contained helpers; for anything bigger, prefer composition.
+
+**Asymmetric visibility** (PHP 8.4). `public private(set) ?string $createdAt` means: anyone may *read* it, only this class may *write* it. Before 8.4 you needed a private property plus a getter method for that. The attempt to assign it from outside throws an `Error`, as the output shows.
+
+**Property hooks** (PHP 8.4). A property can declare a `set` hook that runs on every assignment, and a `get` hook that runs on every read:
+
+- The `set` hook on `title` trims the value and rejects an empty title. Because it runs on *every* assignment, including the one in the constructor, an `Article` can never hold an invalid title. Inside the hook, `$this->title = …` writes the underlying value.
+- `slug` has only a `get` hook and never refers to its own stored value, so it is a **virtual property**: computed from `title` each time it is read, never stored. From outside, it looks like an ordinary property.
+
+Hooks let you start with a plain public property and add validation or computation later without changing every caller from `$a->title` to `$a->getTitle()`. In code that must run on PHP 8.3 or earlier, you will see the older style: private properties with `getTitle()` and `setTitle()` methods.
+
+Two smaller things in the program: `__toString()` is a **magic method** that PHP calls when an object is used as a string (and implementing it makes the class `Stringable`). And `new Article("Hello, World")->slug` works without wrapping the `new` expression in parentheses, which PHP 8.4 allowed.
+
+</Section>
+
+<Section id="dependency-injection" kind="human" title="How objects get their collaborators">
+
+Interfaces pay off most when a class receives the objects it works with instead of creating them. This is called **dependency injection**, and despite the grand name it is just "pass things in through the constructor". It is how nearly every modern PHP application is wired together.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+interface Clock
+{
+    public function now(): DateTimeImmutable;
+}
+
+interface Mailer
+{
+    public function send(string $to, string $subject): void;
+}
+
+final class ReminderService
+{
+    public function __construct(
+        private readonly Clock $clock,
+        private readonly Mailer $mailer,
+    ) {
+    }
+
+    /** @param array<string, string> $dueDates email address => due date (Y-m-d) */
+    public function sendDueToday(array $dueDates): int
+    {
+        $today = $this->clock->now()->format("Y-m-d");
+        $sent = 0;
+        foreach ($dueDates as $email => $date) {
+            if ($date === $today) {
+                $this->mailer->send($email, "Your library book is due today");
+                $sent++;
+            }
+        }
+        return $sent;
+    }
+}
+
+// In production you would pass a clock that reads the system time and a mailer
+// that talks to an SMTP server. Here we pass simple stand-ins.
+final class FixedClock implements Clock
+{
+    public function __construct(private readonly DateTimeImmutable $at)
+    {
+    }
+
+    public function now(): DateTimeImmutable
+    {
+        return $this->at;
+    }
+}
+
+final class MemoryMailer implements Mailer
+{
+    /** @var list<string> */
+    public private(set) array $outbox = [];
+
+    public function send(string $to, string $subject): void
+    {
+        $this->outbox[] = "$to: $subject";
+    }
+}
+
+$mailer = new MemoryMailer();
+$service = new ReminderService(new FixedClock(new DateTimeImmutable("2026-11-19")), $mailer);
+
+$count = $service->sendDueToday([
+    "aiyana@example.org" => "2026-11-19",
+    "tariq@example.org" => "2026-11-20",
+    "mei@example.org" => "2026-11-19",
+]);
+
+echo "$count reminders sent\n";
+echo implode("\n", $mailer->outbox), "\n";
+```
+
+```text
+2 reminders sent
+aiyana@example.org: Your library book is due today
+mei@example.org: Your library book is due today
+```
+
+`ReminderService` needs to know today's date and to send email. If it called `new DateTimeImmutable()` and an SMTP library directly, it would be impossible to check its logic without waiting for a real due date and sending real email. Instead it asks for a `Clock` and a `Mailer` in its constructor, typed as interfaces. The program passes a clock frozen at 19 November 2026 and a mailer that only records messages, and we can see exactly what the service did. In production the same class receives a system clock and a real mailer. Nothing in `ReminderService` changes.
+
+Notice how little ceremony this needs: constructor promotion declares the two collaborators in two lines, `readonly` guarantees they are never swapped afterwards, and `public private(set)` lets anyone read the outbox but only the mailer write to it. Frameworks such as Symfony and Laravel add a **service container** that reads constructor types and builds these object graphs automatically ("autowiring"), but the idea underneath is exactly this one. You will put it to work in the testing part of the last lesson.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"Objects are passed by reference."** Not quite. A variable holds a *handle* to an object, and assigning or passing it copies the handle. Both copies reach the same object, so changes through one are visible through the other. But reassigning the parameter inside a function (`$list = new Playlist("x")`) only changes the function's copy of the handle; the caller still has the original object. True references (`&`) are something else and rarely needed for objects.
+
+</Misconception>
+
+<Misconception>
+
+**"`readonly` makes an object immutable."** It makes that *property* impossible to reassign after it is set. If a readonly property holds an array, the array cannot be changed either (arrays are values); but if it holds an object, that object's own properties can still change. Deep immutability needs every object along the way to be immutable too.
+
+</Misconception>
+
+<Misconception>
+
+**"Traits are PHP's version of multiple inheritance, so use them to share code everywhere."** Traits are compile-time copy and paste with conflict rules. They do not create a type, and they couple every class that uses them to the trait's internals. A class that `use`s five traits is usually a class that should have been split into collaborating objects.
+
+</Misconception>
+
+<Misconception>
+
+**"Getters and setters for every property are good practice."** A setter for every property means any code can change any field, which is the problem classes were supposed to solve. Expose the operations that make sense for the object (`touch()`, `add()`), keep the rest private or readonly, and reach for property hooks only where a property genuinely needs a rule.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

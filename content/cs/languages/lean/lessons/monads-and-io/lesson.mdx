@@ -1,0 +1,324 @@
+---
+title: Monads, do-notation and IO
+subtitle: How a pure language handles failure, state and the outside world. Option and Except, the Monad class behind do-notation, mutable-looking loops that are pure underneath, and real input and output.
+minutes: 60
+objectives:
+  - Chain computations that may fail with Option and Except, first by hand and then with do-notation
+  - Explain what a monad is in terms of pure and bind, and how do-notation is translated into them
+  - Write loops with let mut, for, while, break, continue and early return, in pure code with Id.run and in IO
+  - Thread state through a computation with StateM, and use IO.Ref, try, catch and throw in IO
+  - Structure a program as a pure core with a thin layer of effects
+prerequisites: [type-classes-and-dependent-types]
+related: [math.cat.monads]
+references:
+  - title: "Functional Programming in Lean: Monads and do-notation"
+    author: David Thrane Christiansen
+    url: https://lean-lang.org/functional_programming_in_lean/
+    note: The official book builds monads up from scratch and then covers monad transformers.
+  - title: "The Lean Language Reference: do-notation and IO"
+    url: https://lean-lang.org/doc/reference/latest/
+    note: Every form allowed in a do block, how each is translated, and the IO library.
+  - title: Notions of computation and monads
+    author: Eugenio Moggi
+    year: 1991
+    note: The paper that brought monads from category theory into the study of programming languages.
+  - title: "'do' Unchained: Embracing Local Imperativity in a Purely Functional Language"
+    author: Sebastian Ullrich and Leonardo de Moura
+    year: 2022
+    note: How Lean 4's do-notation supports mutable variables, loops and early return, and how it translates them into pure code (ICFP 2022).
+---
+
+<Section id="motivation" kind="motivation" title="A chain of things that can go wrong">
+
+A timetable lists departures and arrivals as text, `"22:10"` and `"06:35"`. To compute how long the journey takes, we must parse both times, either of which may be malformed, and only then subtract. With `Option`, the honest way to write a function that may fail, a first attempt looks like this:
+
+```lean
+def durationNested (departs arrives : String) : Option Nat :=
+  match parseTime departs with
+  | none => none
+  | some d =>
+    match parseTime arrives with
+    | none => none
+    | some a => some ((a + 24 * 60 - d) % (24 * 60))
+```
+
+It is correct, but the actual computation, one line of arithmetic, is buried under bookkeeping, and every additional step that can fail adds another level of nesting. The bookkeeping is always the same: "if this produced nothing, the whole thing produces nothing; otherwise, carry on with the value". When a pattern repeats like that, functional programmers give it a name and a function. The function is called **bind**, the pattern is called a **monad**, and Lean's **do-notation** lets you write the chain as if it were a sequence of statements. The same idea then handles errors with messages, state, and input and output, which is how a language without mutation or side effects ends up writing perfectly ordinary-looking imperative code.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Monads, pure and bind">
+
+<Definition term="Monad">
+
+A **monad** is a type constructor `m` (such as `Option`, `Except String` or `IO`), where `m α` describes a computation that produces an `α`, possibly with some extra behaviour (failing, logging, keeping state, doing input and output), together with two operations:
+
+- `pure : α → m α` makes a computation that just produces a value, with no extra behaviour;
+- `bind : m α → (α → m β) → m β`, written `x >>= f`, runs `x` and, if it produces a value `a`, continues with `f a`.
+
+What "runs" and "continues" mean is up to each monad. For `Option`, `none >>= f` is `none`, and `some a >>= f` is `f a`.
+
+</Definition>
+
+With bind, the timetable function becomes a straight line:
+
+```lean
+def durationBind (departs arrives : String) : Option Nat :=
+  parseTime departs >>= fun d =>
+  parseTime arrives >>= fun a =>
+  pure ((a + 24 * 60 - d) % (24 * 60))
+```
+
+and **do-notation** is shorthand for exactly this. Inside `do`, the line `let d ← parseTime departs` means "bind the result of `parseTime departs` to `d`, and the rest of the block is the function that receives it". (Type `←` as `\l` or `<-`.) Here is the whole thing, written the way Lean programmers actually write it:
+
+```lean check
+/-- "07:45" becomes 465 minutes after midnight; anything malformed becomes `none`. -/
+def parseTime (s : String) : Option Nat := do
+  let [h, m] := s.splitOn ":" | none
+  let hours ← h.toNat?
+  let mins ← m.toNat?
+  if hours < 24 && mins < 60 then pure (hours * 60 + mins) else none
+
+/-- Minutes from departure to arrival, allowing for an overnight journey. -/
+def duration (departs arrives : String) : Option Nat := do
+  let d ← parseTime departs
+  let a ← parseTime arrives
+  return (a + 24 * 60 - d) % (24 * 60)
+
+#eval parseTime "07:45"
+#eval parseTime "7:5"
+#eval parseTime "25:00"
+#eval parseTime "noon"
+#eval duration "22:10" "06:35"
+#eval duration "08:00" "8h30"
+#eval (duration "09:15" "11:00").map (fun m => s!"{m / 60} h {m % 60} min")
+```
+
+```text
+some 465
+some 425
+none
+none
+some 505
+none
+some "1 h 45 min"
+```
+
+Three forms of `let` appear in that program, and the difference matters:
+
+- `let hours ← h.toNat?` runs a computation in the monad and names its result; if `h.toNat?` is `none`, the whole block is `none` at once.
+- `let [h, m] := s.splitOn ":" | none` matches a pattern, and if the match fails, uses the alternative after `|`. Here a string without exactly one colon gives `none`.
+- A plain `let x := e`, without an arrow, just names a pure value, as everywhere else in Lean.
+
+`return e` is `pure e` (with one extra power inside loops, which we will see shortly). Note that `"7:5"` is accepted as 7:05: the parser checks ranges but not the number of digits, the kind of leniency a real program should decide about deliberately.
+
+The functions `pure` and `bind` belong to the type classes `Pure` and `Bind`, which `Monad` combines, so every function written for "any monad `m`" works with `Option`, `Except`, `IO` and your own. The same family includes `Functor`, whose `map`, written `f <$> x`, applies a function inside the computation: `(· * 2) <$> some 21` is `some 42`. In mathematics, monads come from category theory; Lumenary Math's lesson on <TopicLink id="math.cat.monads">monads</TopicLink> tells that side of the story, but you need none of it to program with them.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Errors with messages, and loops that look mutable">
+
+`Option` says *that* something failed, not *why*. **`Except ε α`** is either `.ok a` with a result or `.error e` with an error value of type `ε`, usually a `String` or an inductive type of error cases. Its monad stops at the first error, and `throw e` raises one. Here is a calculator for **reverse Polish notation**, where operators follow their operands (`3 4 +` means 3 + 4), so no parentheses are needed:
+
+```lean check
+/-- Evaluate an expression in reverse Polish notation, such as "3 4 + 2 *". -/
+def evalRPN (input : String) : Except String Int := do
+  let mut stack : List Int := []
+  for token in input.splitOn " " do
+    if token.isEmpty then continue
+    match token.toInt? with
+    | some n => stack := n :: stack
+    | none =>
+      let b :: a :: rest := stack
+        | throw s!"not enough operands for '{token}'"
+      let result ← match token with
+        | "+" => pure (a + b)
+        | "-" => pure (a - b)
+        | "*" => pure (a * b)
+        | "/" => if b == 0 then throw "division by zero" else pure (a / b)
+        | _ => throw s!"unknown token '{token}'"
+      stack := result :: rest
+  match stack with
+  | [r] => return r
+  | [] => throw "empty expression"
+  | _ => throw s!"{stack.length} values left over"
+
+def report (input : String) : String :=
+  match evalRPN input with
+  | .ok v => s!"{input}  =>  {v}"
+  | .error e => s!"{input}  =>  error: {e}"
+
+def main : IO Unit := do
+  for e in ["3 4 + 2 *", "10 2 8 * + 3 -", "1 0 /", "2 +", "4 5 6 +", "2 3 ^"] do
+    IO.println (report e)
+```
+
+```text
+3 4 + 2 *  =>  14
+10 2 8 * + 3 -  =>  23
+1 0 /  =>  error: division by zero
+2 +  =>  error: not enough operands for '+'
+4 5 6 +  =>  error: 2 values left over
+2 3 ^  =>  error: unknown token '^'
+```
+
+This looks like Python. There is a mutable variable, `let mut stack`, a `for` loop, a `continue`, and assignments `stack := …`. Yet `evalRPN` is a pure function: given the same string it always returns the same result, and it changes nothing outside itself. How?
+
+**`let mut` and `:=` are translated away.** Inside a `do` block, Lean turns each reassignment into a new binding of the same name, and turns the loop into a call to a higher-order function (`forIn`) that passes the current values of all mutable variables from one iteration to the next. `continue`, `break` and an early `return` become ways of choosing what to pass on. You get to write the algorithm in the order you think of it, and the result is still an ordinary function you can test, reuse and, in lesson 9, prove things about. Two restrictions remind you of what is really happening: a `let mut` variable can only be reassigned inside the `do` block that declared it, and a closure (a `fun` inside the loop) cannot assign to it.
+
+To use the same style in code that has no monad of its own, run the block in the **identity monad** with `Id.run do`. And for a computation that threads a value through many steps, such as a counter or a random-number seed, the **state monad** `StateM σ` makes the state implicit, with `get` and `set` to read and replace it:
+
+```lean check
+/-- The largest sum of a run of consecutive elements (Kadane's algorithm). -/
+def maxRunSum (xs : List Int) : Int := Id.run do
+  let mut best := 0
+  let mut current := 0
+  for x in xs do
+    current := max 0 (current + x)
+    best := max best current
+  return best
+
+/-- The position of the first element above `limit`, if there is one. -/
+def firstAbove (xs : Array Float) (limit : Float) : Option Nat := Id.run do
+  for i in [0:xs.size] do
+    if xs[i]! > limit then
+      return some i
+  return none
+
+/-- A fresh name each time: the state is the next number to use. -/
+def fresh (pfx : String) : StateM Nat String := do
+  let n ← get
+  set (n + 1)
+  return s!"{pfx}{n}"
+
+def threeNames : StateM Nat (List String) := do
+  let a ← fresh "x"
+  let b ← fresh "y"
+  let c ← fresh "x"
+  return [a, b, c]
+
+#eval maxRunSum [2, -5, 3, 4, -1, 2, -8, 1]
+#eval firstAbove #[18.5, 21.0, 31.5, 29.0] 30
+#eval firstAbove #[18.5, 21.0] 30
+#eval threeNames.run 0
+#eval threeNames.run' 10
+```
+
+```text
+8
+some 2
+none
+(["x0", "y1", "x2"], 3)
+["x10", "y11", "x12"]
+```
+
+`maxRunSum` finds the best run, `3, 4, -1, 2`, with sum 8, in one pass. In `firstAbove`, `return some i` inside the loop leaves the *whole function* at once, which is the extra power of `return` mentioned above; `[0:xs.size]` is the range of indices from 0 up to, but not including, `xs.size`. `threeNames` never mentions the counter, yet each `fresh` sees the value left by the one before. `run 0` starts the state at 0 and returns the result with the final state; `run'` returns only the result.
+
+</Section>
+
+<Section id="computation" kind="computation" title="IO: talking to the world">
+
+`IO α` is the type of actions that may interact with the world (print, read files, read the clock, start processes) and then produce an `α`. `main` is an `IO` action, and the Lean runtime performs it. `IO` is also a monad, so everything above applies: `do`, `←`, `let mut`, loops. It adds exceptions (`throw`, `try … catch`) and mutable references, `IO.Ref`, for state shared across functions:
+
+```lean check
+/-- Withdraw from an account, failing if the balance is too low. -/
+def withdraw (account : IO.Ref Int) (amount : Int) : IO Unit := do
+  let balance ← account.get
+  if amount > balance then
+    throw (IO.userError s!"cannot withdraw {amount}: the balance is only {balance}")
+  account.set (balance - amount)
+
+def main : IO Unit := do
+  let account ← IO.mkRef (100 : Int)
+  let mut refused := 0
+  for amount in [30, 50, 40, 10] do
+    try
+      withdraw account amount
+      IO.println s!"withdrew {amount}, balance now {← account.get}"
+    catch e =>
+      IO.println s!"refused: {e}"
+      refused := refused + 1
+  IO.println s!"{refused} withdrawal(s) refused, final balance {← account.get}"
+```
+
+```text
+withdrew 30, balance now 70
+withdrew 50, balance now 20
+refused: cannot withdraw 40: the balance is only 20
+withdrew 10, balance now 10
+1 withdrawal(s) refused, final balance 10
+```
+
+`IO.mkRef` creates a reference cell, `get` reads it and `set` replaces its contents; unlike `let mut`, a reference can be passed to other functions, which can change it. `{← account.get}` is a **nested action**: Lean lifts it out, runs it just before the line, and splices in the result, which saves a separate `let`. `throw (IO.userError msg)` raises an exception; `try … catch e => …` handles it. An exception that nobody catches ends the program: when we ran a `main` that printed `before` and then threw `something went wrong`, it printed `before` and then `uncaught exception: something went wrong`, and exited with status 1.
+
+The rest of the `IO` library is what you would expect from any language, with the types telling you what may fail. A few signposts:
+
+```lean
+def main (args : List String) : IO UInt32 := do   -- command-line arguments, exit code
+  let stdin ← IO.getStdin
+  let line ← stdin.getLine                          -- one line of input, with its newline
+  let text ← IO.FS.readFile "notes.txt"             -- a whole file as a String
+  IO.FS.writeFile "copy.txt" text
+  IO.eprintln s!"read {text.length} characters"     -- to standard error
+  return 0
+```
+
+`main` may take the command-line arguments and may return a `UInt32` exit code. Files, directories, processes, time and environment variables live under `IO.FS`, `IO.Process` and `IO` itself; the API reference lists them all.
+
+</Section>
+
+<Section id="history" kind="history" title="From category theory to for loops">
+
+Monads entered programming through the study of programming languages. Around 1989, Eugenio Moggi showed that many different "notions of computation" (partiality, exceptions, state, input and output, nondeterminism) could be described uniformly as monads, a structure from category theory. In the early 1990s Philip Wadler and others turned the idea into a programming technique, and in 1996 Haskell 1.3 adopted monads as its way of doing input and output in a pure language, along with an early form of do-notation. For years afterwards, "monad" had a reputation as the hardest word in functional programming, mostly because it was explained abstractly rather than shown at work.
+
+Lean 4 went further than Haskell in one direction: making monadic code look like the imperative code programmers already know. Its `do`-notation supports `let mut`, `for`, `while`, `break`, `continue`, early `return`, nested actions and pattern-matching `let`s with fallbacks, all translated into pure functions. Sebastian Ullrich and Leonardo de Moura described the design, and the translation, in the 2022 paper *'do' Unchained: Embracing Local Imperativity in a Purely Functional Language*. The paper's point is the one this lesson has made: local mutation that nothing outside a function can observe is harmless, so a pure language can offer it without giving anything up.
+
+</Section>
+
+<Section id="human" kind="human" title="A pure core and a thin shell">
+
+The shape of a well-written Lean program follows from all this. Put the logic in **pure functions**: `parseTime`, `evalRPN`, `maxRunSum`. They are easy to test with `#eval` and `#guard` (lesson 9), easy to reuse, and they are the only code you can prove things about. Keep `IO` to a **thin shell** around them: read the input, call the pure core, print the result. `evalRPN` returns an `Except` rather than throwing an `IO` exception for exactly this reason: the decision about *what to do* with an error belongs to the caller.
+
+Some guidance from practice:
+
+- **Prefer `Except` with an inductive error type** over strings once errors need to be handled differently, so that the compiler checks you have handled each kind.
+- **Use `let mut` freely** in `do` blocks. It is idiomatic Lean, not a concession; the code it produces is pure and usually as fast as a hand-written fold.
+- **Reach for `StateM`, `ReaderM` and the monad transformers** (`StateT`, `ExceptT`, `ReaderT`, which add state, errors or a read-only environment on top of another monad, often `IO`) when a computation needs several effects at once. Lean's own compiler is built from such stacks. The official book's chapter on transformers is the place to learn them.
+- **Do not reach for `IO.Ref` by reflex.** A reference is right for state genuinely shared between parts of an `IO` program; a local counter belongs in `let mut`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`let mut` means Lean has mutable variables after all."** It has mutable *notation*. Each assignment creates a new binding, and loops pass the current values along, so nothing outside the `do` block can observe a change. That is why `maxRunSum` is still a pure function.
+
+</Misconception>
+
+<Misconception>
+
+**"A monad is a container."** Some monads look like containers (`Option`, `List`), but `IO Nat` does not contain a number: it is a description of an action that will produce one when performed. Think of `m α` as "a computation that produces an `α`, in the style of `m`".
+
+</Misconception>
+
+<Misconception>
+
+**"`return` ends the function, as in C."** Usually it does. Inside a `do` block it returns from the whole block, including from inside loops, and the value is wrapped with `pure`. But a `return` inside a nested `fun` returns only from that inner function, and `return` is not needed at the end of a block whose last line already has the right type.
+
+</Misconception>
+
+<Misconception>
+
+**"`← e` can be used anywhere."** Only inside a `do` block, and only for a computation in that block's monad. You cannot use `←` to get the value out of an `IO` action inside a pure function; that would make the function impure, and the type system forbids it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Use the definitions from the lesson, and check your answers with `#eval`.
+
+<Exercises/>
+
+</Section>

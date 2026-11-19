@@ -1,0 +1,353 @@
+---
+title: "Concurrency: threads, mutexes and atomics"
+subtitle: Running work on several cores at once without data races, using jthread, locks, condition variables, atomics and futures.
+minutes: 70
+objectives:
+  - Start and join threads with std::thread and std::jthread, and stop a jthread cooperatively with a stop_token
+  - Define a data race, explain why it is undefined behaviour, and find one with ThreadSanitizer
+  - Protect shared data with std::mutex and std::scoped_lock, and avoid deadlock
+  - Use std::atomic for counters and flags, and know what the default memory order guarantees
+  - Coordinate threads with a condition variable, and run tasks with std::async and futures
+prerequisites: [errors-and-undefined-behaviour]
+references:
+  - title: Concurrency support library
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/thread
+  - title: "std::jthread"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/thread/jthread
+  - title: "std::atomic"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/atomic/atomic
+  - title: ThreadSanitizer
+    author: LLVM project
+    url: https://clang.llvm.org/docs/ThreadSanitizer.html
+  - title: "C++ Core Guidelines: CP (concurrency and parallelism)"
+    url: https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines
+---
+
+<Section id="motivation" kind="motivation" title="Many cores, one memory">
+
+A laptop in 2026 has somewhere between eight and twenty-odd cores, and a server may have hundreds. A program that runs on one thread uses one of them. Games split each frame between physics, audio and rendering threads; databases serve thousands of queries at once; compilers build many files in parallel; trading systems answer the market within microseconds while logging on another core. C++ is used in all of these, and since C++11 the language itself has known about threads, with a precisely specified **memory model** saying what one thread can see of another's writes. Before that, threads came from platform libraries (POSIX threads, Windows threads) and the language standard did not mention them at all, which meant compilers could legally make optimisations that broke threaded code. Hans Boehm's 2005 paper *Threads Cannot Be Implemented as a Library* made the case that the language itself had to define what concurrent programs mean, and C++11's memory model, which Boehm helped design, was the result.
+
+Threads in C++ share memory. That is what makes them fast (no copying between them) and what makes them dangerous: two threads that touch the same variable at the same time, with at least one writing, without coordination, have a **data race**, and a data race is undefined behaviour. This lesson teaches the tools for sharing safely, from the simplest (do not share) to the subtlest (atomics), and the sanitizer that finds the races you miss.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="thread">
+
+An independent sequence of execution within a program, with its own stack, sharing the program's memory with the other threads. `std::thread t{f};` starts running `f` on a new thread. Before a `std::thread` object is destroyed you must call `join()` (wait for it to finish) or `detach()` (let it run on unsupervised), or the program is terminated.
+
+</Definition>
+
+<Definition term="std::jthread (C++20)">
+
+A thread that joins automatically in its destructor, which is the RAII behaviour you want almost always. It also carries a **stop source**: if its function takes a `std::stop_token`, another thread can call `request_stop()` and the function can check `st.stop_requested()` and finish cleanly. The destructor requests a stop and then joins.
+
+</Definition>
+
+<Definition term="data race">
+
+Two accesses to the same memory location from different threads, at least one of them a write, not ordered by synchronisation (a mutex, an atomic operation, a thread start or join). A program with a data race has undefined behaviour.
+
+</Definition>
+
+<Definition term="mutex and lock">
+
+A **mutex** (mutual exclusion) can be held by one thread at a time; others that try to lock it wait. A **lock** is the RAII object that holds it: `std::scoped_lock lock{m};` locks `m` and unlocks it at the end of the scope, even if an exception is thrown.
+
+</Definition>
+
+<Definition term="atomic">
+
+A `std::atomic<int>` (or of another small type) is a variable whose individual operations — load, store, `fetch_add`, compare-and-exchange — are indivisible and never race. By default they are also **sequentially consistent**: all threads observe all atomic operations in one single order.
+
+</Definition>
+
+<Definition term="condition variable">
+
+A way for a thread to sleep until another thread tells it that something it is waiting for may have happened, such as "the queue is no longer empty". It is always used together with a mutex and a condition to re-check.
+
+</Definition>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Three ways to share safely">
+
+The program below sums a million numbers on four threads, then counts with an atomic and records with a mutex.
+
+```cpp check
+#include <atomic>
+#include <mutex>
+#include <numeric>
+#include <print>
+#include <thread>
+#include <vector>
+
+int main() {
+    // 1. Split work so that each thread writes only its own slot: no sharing, no locks.
+    std::vector<long long> data(1'000'000);
+    std::iota(data.begin(), data.end(), 1);          // 1, 2, ..., 1000000
+    constexpr int n_threads = 4;
+    std::vector<long long> partial(n_threads, 0);
+    {
+        std::vector<std::jthread> workers;
+        const std::size_t chunk = data.size() / n_threads;
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&, t] {
+                auto first = data.begin() + t * chunk;
+                auto last = (t == n_threads - 1) ? data.end() : first + chunk;
+                partial[t] = std::accumulate(first, last, 0LL);
+            });
+        }
+    }   // each jthread joins in its destructor here
+    std::println("sum = {}", std::accumulate(partial.begin(), partial.end(), 0LL));
+
+    // 2. A shared counter: an atomic makes each increment indivisible.
+    std::atomic<long> hits{0};
+    // 3. A shared structure: a mutex makes a whole block of code exclusive.
+    std::mutex m;
+    std::vector<int> finished_order;
+    {
+        std::vector<std::jthread> workers;
+        for (int t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&, t] {
+                for (int i = 0; i < 100'000; ++i) hits.fetch_add(1, std::memory_order_relaxed);
+                std::scoped_lock lock{m};          // released at the end of the scope
+                finished_order.push_back(t);
+            });
+        }
+    }
+    std::println("hits = {}, threads finished = {}", hits.load(), finished_order.size());
+}
+```
+
+```text
+sum = 500000500000
+hits = 400000, threads finished = 4
+```
+
+**Don't share.** The first part gives each thread its own slot in `partial`. Different elements of a vector are different memory locations, so four threads writing four different elements do not race. The `jthread`s join at the closing brace, and a join synchronises: everything a thread wrote is visible to the thread that joined it. Only then does `main` read `partial`. Partitioning the data so that threads never touch the same memory is the fastest and simplest form of concurrency, and you should look for it first.
+
+**Atomics for single variables.** `hits.fetch_add(1)` is an indivisible read-modify-write, so 400,000 increments give exactly 400,000. The `std::memory_order_relaxed` argument says that this counter does not need to order any *other* memory operations, only itself, which lets the hardware do less work; for a plain statistic that is enough. When in doubt, leave the argument out and get the sequentially consistent default.
+
+**Mutexes for everything else.** A `std::vector`'s `push_back` touches the size, the capacity and maybe a new buffer: several memory locations that must change together. An atomic cannot protect that, but a mutex can make the whole call exclusive. Hold a lock for as short a time as possible, and never call unknown code (callbacks, virtual functions supplied by others) while holding one.
+
+<Example title="Publishing data with release and acquire">
+
+Atomics can do more than count: an atomic flag can *publish* ordinary data from one thread to another.
+
+```cpp
+std::string report;               // ordinary, non-atomic data
+std::atomic<bool> ready{false};
+
+// producer thread
+report = build_report();
+ready.store(true, std::memory_order_release);    // everything written before this...
+
+// consumer thread
+while (!ready.load(std::memory_order_acquire)) { /* wait */ }
+use(report);                                      // ...is visible after this
+```
+
+A **release** store and an **acquire** load that reads its value create a *happens-before* relationship: every write the producer made before the release is visible to the consumer after the acquire. That is why the consumer may read `report`, which is not atomic, without a race. With `memory_order_relaxed` on both sides there would be no such guarantee, and the consumer could see the flag set but the report half-written. The default, sequentially consistent ordering also gives the guarantee, at a small extra cost on some processors. (A real consumer would not spin in a loop like this; C++20's `ready.wait(false)` sleeps until the value changes.)
+
+</Example>
+
+### What a data race looks like
+
+Replace the atomic with a plain `long` and the increments race. Run three times, the racy version printed:
+
+```text
+hits = 265308 (expected 400000)
+hits = 166807 (expected 400000)
+hits = 209441 (expected 400000)
+```
+
+`++hits` is a load, an add and a store; two threads interleave them and lose updates. Built with `-fsanitize=thread` (ThreadSanitizer), the program reported (abridged):
+
+```text
+WARNING: ThreadSanitizer: data race (pid=12)
+  Read of size 8 at 0x7fffffffe9e8 by thread T2:
+    #0 operator() /w/main.cpp:11 (t+0x4025f8)
+...
+  Previous write of size 8 at 0x7fffffffe9e8 by thread T1:
+    #0 operator() /w/main.cpp:11 (t+0x402607)
+...
+SUMMARY: ThreadSanitizer: data race /w/main.cpp:11 in operator()
+```
+
+ThreadSanitizer records which thread touched which memory and which synchronisation happened in between, and reports any two conflicting accesses that were not ordered, even if they did not collide on this particular run. (On recent Linux kernels with high address-space randomisation, older sanitizer runtimes stop with "unexpected memory mapping"; running the program under `setarch -R`, which disables randomisation for it, is the usual workaround, and was used here.)
+
+</Section>
+
+<Section id="coordination" kind="examples" title="Waiting for work: condition variables and stop tokens">
+
+Threads often need to *wait* for each other: a worker waits for jobs, a writer waits for space in a buffer. Busy-waiting in a loop wastes a core. A condition variable lets the waiting thread sleep.
+
+```cpp check
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <print>
+#include <queue>
+#include <stop_token>
+#include <string>
+#include <thread>
+#include <utility>
+
+// A small thread-safe queue: one mutex guards the data, a condition variable
+// lets consumers sleep until there is something to take.
+template <typename T>
+class WorkQueue {
+public:
+    void push(T item) {
+        {
+            std::scoped_lock lock{m_};
+            items_.push(std::move(item));
+        }
+        ready_.notify_one();
+    }
+
+    // Waits for an item. Returns nothing once the queue is empty and a stop has been requested.
+    std::optional<T> pop(std::stop_token st) {
+        std::unique_lock lock{m_};
+        if (!ready_.wait(lock, st, [this] { return !items_.empty(); })) return std::nullopt;
+        T item = std::move(items_.front());
+        items_.pop();
+        return item;
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable_any ready_;
+    std::queue<T> items_;
+};
+
+int main() {
+    WorkQueue<std::string> queue;
+    int processed = 0;   // written only by the worker, read by main after the join
+    {
+        std::jthread worker([&](std::stop_token st) {
+            while (auto job = queue.pop(st)) {
+                std::println("worker: resizing {}", *job);
+                ++processed;
+            }
+            std::println("worker: queue empty and stop requested, exiting");
+        });
+
+        for (const char* photo : {"lagos.jpg", "kyoto.jpg", "cusco.jpg"}) queue.push(photo);
+    }   // ~jthread: request_stop(), then join()
+    std::println("main: {} jobs done", processed);
+}
+```
+
+```text
+worker: resizing lagos.jpg
+worker: resizing kyoto.jpg
+worker: resizing cusco.jpg
+worker: queue empty and stop requested, exiting
+main: 3 jobs done
+```
+
+`pop` locks the mutex and calls `wait` with a condition. `wait` atomically releases the mutex and sleeps; when notified, it re-locks and re-checks the condition, because wake-ups can be spurious and another consumer may have taken the item first. Always wait with a condition, never bare. The C++20 overload used here also takes the `std::stop_token`: it keeps waiting while no stop has been requested, and once one has, it returns the condition's current value. So the worker drains the queue and then exits, which is exactly the shutdown behaviour you want. `push` releases the lock before notifying, so the woken thread does not immediately block on the mutex the notifier still holds.
+
+The end of `main`'s inner block shows `std::jthread` at its best: its destructor requests a stop and joins, so no thread outlives the objects it uses. With a plain `std::thread`, forgetting to join would terminate the program, and detaching would let the thread run on after `queue` was destroyed.
+
+</Section>
+
+<Section id="tasks" kind="examples" title="Tasks and futures">
+
+Often you do not want to manage threads at all, only to run several independent computations and collect their results.
+
+```cpp check
+#include <future>
+#include <print>
+#include <vector>
+
+bool is_prime(int n) {
+    if (n < 2) return false;
+    for (int d = 2; d * d <= n; ++d)
+        if (n % d == 0) return false;
+    return true;
+}
+
+int count_primes(int lo, int hi) {
+    int count = 0;
+    for (int n = lo; n < hi; ++n) count += is_prime(n);
+    return count;
+}
+
+int main() {
+    // std::async runs a function (here, on a new thread) and gives back a future for its result.
+    std::vector<std::future<int>> parts;
+    for (int lo = 0; lo < 400'000; lo += 100'000) {
+        parts.push_back(std::async(std::launch::async, count_primes, lo, lo + 100'000));
+    }
+    int total = 0;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        int c = parts[i].get();          // waits for that part; rethrows if it threw
+        std::println("block {}: {} primes", i, c);
+        total += c;
+    }
+    std::println("primes below 400000: {}", total);
+}
+```
+
+```text
+block 0: 9592 primes
+block 1: 8392 primes
+block 2: 8013 primes
+block 3: 7863 primes
+primes below 400000: 33860
+```
+
+`std::async` with `std::launch::async` runs the function on a new thread and returns a `std::future`, a handle to a result that will exist later. `get()` waits for it, and if the function threw, rethrows the exception in the caller. Results are collected in a fixed order, so the output is deterministic even though the blocks finish in an unpredictable order. C++20 also added small coordination tools worth knowing: `std::latch` (wait until a count reaches zero, once), `std::barrier` (make a group of threads wait for each other, phase after phase) and `std::counting_semaphore` (limit how many threads use a resource at once). Futures are convenient for a handful of coarse tasks; for many small tasks, creating a thread per task is too expensive, and real systems use a **thread pool**.
+
+The standard library is filling in that gap. The C++17 **parallel algorithms** accept an execution policy, as in `std::sort(std::execution::par, v.begin(), v.end())`, and let the library spread the work over cores (GCC's library implements them on top of Intel's oneTBB, which must be installed and linked). C++26 adds `std::execution`, a framework of "senders and receivers" for composing asynchronous work on schedulers such as thread pools. Until it is widely available, production code uses libraries like oneTBB, Folly or Asio, or a company's own executor.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`volatile` makes a variable safe to share between threads."** In C++, `volatile` is for memory-mapped hardware registers. It provides no atomicity and no ordering between threads; a `volatile int` counter still races. Use `std::atomic`.
+
+</Misconception>
+
+<Misconception>
+
+**"A race on a simple `bool` flag is harmless."** It is still undefined behaviour, and in practice the optimiser may hoist the load out of a loop (`while (!done) {}` becomes an infinite loop) or reorder the writes that the flag was supposed to publish. Make it a `std::atomic<bool>`, or use a `std::stop_token`.
+
+</Misconception>
+
+<Misconception>
+
+**"Adding threads always makes a program faster."** Threads cost time to create and to synchronise, and threads that write to nearby memory fight over cache lines ("false sharing"), sometimes making a parallel version slower than the serial one. Measure, and partition the work so each thread mostly touches its own data.
+
+</Misconception>
+
+<Misconception>
+
+**"Locking two mutexes one after the other is fine."** If one thread locks A then B while another locks B then A, each can end up holding one and waiting for the other for ever: a **deadlock**. Lock several mutexes at once with `std::scoped_lock lock{a, b};`, which uses a deadlock-avoidance algorithm, or always lock in one agreed global order.
+
+</Misconception>
+
+</Section>
+
+<Section id="human" kind="human" title="How professionals approach concurrency">
+
+The engineers who write the most reliable concurrent C++ share a preference for **boring designs**. They keep most data owned by a single thread and pass messages (through queues like the one above) rather than sharing structures. When they must share, they use a mutex and keep the critical sections tiny. They reach for atomics with relaxed or acquire/release ordering only for specific, measured hot spots, and they treat lock-free data structures as specialist work, usually taken from a well-tested library rather than written in-house.
+
+They also test differently. Concurrency bugs depend on timing, so a test that passes a thousand times proves little. Running the test suite under ThreadSanitizer in continuous integration catches races that have not yet caused a visible failure, and stress tests with many threads, randomised delays and sanitizers find the rest. Herb Sutter's and Anthony Williams's writings on C++ concurrency, and the Core Guidelines' CP section, are good next steps.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

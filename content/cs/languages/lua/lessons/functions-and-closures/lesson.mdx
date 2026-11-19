@@ -1,0 +1,393 @@
+---
+title: Functions, closures and iterators
+subtitle: First-class functions, multiple results, varargs and Lua 5.5's named vararg tables, closures and upvalues, iterators, and proper tail calls.
+minutes: 60
+objectives:
+  - Define and pass functions as values, and use local functions for recursion
+  - Predict how arguments and multiple results are adjusted in calls, returns, assignments and constructors
+  - Write variadic functions with ..., select and table.pack, and with Lua 5.5's named vararg tables
+  - Explain closures and upvalues, and use them for counters, shared state, memoisation and higher-order helpers
+  - Write closure-based and stateless iterators for the generic for, and use proper tail calls
+prerequisites: [tables]
+references:
+  - title: "Reference Manual: Function Definitions"
+    url: https://www.lua.org/manual/5.5/manual.html#3.4.11
+    note: Function syntax, parameters, variadic functions and named vararg tables.
+  - title: "Reference Manual: Lists of Expressions, Multiple Results, and Adjustment"
+    url: https://www.lua.org/manual/5.5/manual.html#3.4.12
+    note: The precise rules for when a call gives all its results and when only one.
+  - title: "Reference Manual: For Statement"
+    url: https://www.lua.org/manual/5.5/manual.html#3.3.5
+    note: The protocol the generic for uses to call iterators.
+  - title: "Reference Manual: Visibility Rules"
+    url: https://www.lua.org/manual/5.5/manual.html#2.2
+    note: Lexical scoping and upvalues, with the example of closures created in a loop.
+---
+
+<Section id="motivation" kind="motivation" title="Functions are the other half of Lua">
+
+If tables are Lua's one data structure, functions are its one abstraction. Lua has no classes, no special syntax for modules, no generators, no decorators. Instead it has functions that are ordinary values, that can capture the variables around them, that can take and return any number of values, and that can call each other in tail position without growing the stack. With those properties, and tables, you can build objects, modules, iterators, callbacks, event handlers and state machines, and the following lessons do exactly that.
+
+Lua's functions came from the functional programming tradition, particularly Scheme: full lexical closures, first-class functions and proper tail calls are all Scheme ideas, packaged in a syntax that engineers find friendly.
+
+</Section>
+
+<Section id="basics" kind="examples" title="Functions as values, and multiple results">
+
+<Definition term="Function value">
+
+`function (params) body end` is an **expression** that creates a function. `function name(params) ... end` is shorthand for assigning such an expression to the variable `name`, and `local function name(params) ... end` declares a local variable first, so the body can call itself recursively. A function returns values with `return`, and may return several.
+
+</Definition>
+
+```lua check
+-- Functions are values: stored in variables and tables, passed and returned.
+local function square(x) return x * x end
+local twice = function(f, x) return f(f(x)) end
+local ops = { square = square, negate = function(x) return -x end }
+print(twice(square, 3), ops.negate(5), type(square))
+
+-- Arguments are adjusted to the parameters: missing ones are nil, extras are dropped.
+local function greet(name, greeting)
+  greeting = greeting or "Hello"            -- a default value
+  return greeting .. ", " .. (name or "stranger")
+end
+print(greet("Amina"), "|", greet("Tomás", "Hola", "extra ignored"), "|", greet())
+
+-- Several results.
+local function min_max(list)
+  local lo, hi = list[1], list[1]
+  for _, v in ipairs(list) do
+    if v < lo then lo = v end
+    if v > hi then hi = v end
+  end
+  return lo, hi
+end
+local lo, hi = min_max({ 7, 2, 9, 4 })
+print(lo, hi)
+
+-- A call expands to all its results only at the END of a list of expressions.
+print(min_max({ 5, 1 }))                   -- both results
+print(min_max({ 5, 1 }), "end")            -- not last: only the first result
+print((min_max({ 5, 1 })))                 -- parentheses: exactly one result
+local t = { min_max({ 5, 1 }), min_max({ 8, 3 }) }
+print(#t, t[1], t[2], t[3])
+
+-- Calls with one table or one string argument may drop the parentheses.
+local function describe(opts) return opts.city .. " (" .. opts.country .. ")" end
+print(describe{ city = "Kyoto", country = "Japan" }, type"word")
+```
+
+It printed:
+
+```text
+81	-5	function
+Hello, Amina	|	Hola, Tomás	|	Hello, stranger
+2	9
+1	5
+1	end
+1
+3	1	3	8
+Kyoto (Japan)	string
+```
+
+### Adjustment: the rule behind calls and results
+
+Lua never complains about the number of arguments. When a function is called, the arguments are **adjusted** to the parameters: missing ones become `nil`, extra ones are thrown away. That is why `greet()` worked and why `greeting = greeting or "Hello"` is the usual way to give a parameter a default. (The default idiom has the same limit as in lesson 2: it replaces `false` as well as `nil`.)
+
+Results are adjusted too, and the rule is worth memorising:
+
+<Definition term="Multiple results">
+
+A function call that returns several values contributes **all** of them only when it is the **last** (or only) expression in a list: the arguments of a call, a `return` list, a table constructor, or the right-hand side of an assignment. Anywhere else, it contributes exactly **one** value, its first result (or `nil` if it returned nothing). Wrapping a call in parentheses also cuts it to one value.
+
+</Definition>
+
+Look at the output again with that rule: `print(min_max(...))` printed both values, but with `"end"` after it only the first; `(min_max(...))` gave one; and in the constructor `{ min_max(a), min_max(b) }`, the first call gave one value and the last gave two, so the table has three elements. The same rule explains lesson 3's `city:find(...)` and `gsub` results.
+
+Two shortcuts in the last line: a call whose only argument is a table constructor or a string literal can drop the parentheses, `describe{ ... }` and `type"word"`. The table form is the idiom for **named arguments**: Lua has no keyword arguments, so functions with many options take one table.
+
+</Section>
+
+<Section id="varargs" kind="examples" title="Variadic functions">
+
+A function whose parameter list ends with `...` accepts any number of extra arguments. Inside it, the expression `...` stands for all of them, as a list of values that follows the adjustment rule above.
+
+```lua check
+-- '...' collects any number of extra arguments.
+local function sum(...)
+  local total = 0
+  for _, v in ipairs({ ... }) do total = total + v end
+  return total
+end
+print(sum(), sum(1, 2, 3), sum(10, 20))
+
+-- select('#', ...) counts arguments, including nils; select(n, ...) skips n - 1.
+local function info(...)
+  return select("#", ...), (select(2, ...))
+end
+print(info("a", "b", "c"))
+print(info(nil, nil))
+
+-- Forwarding arguments to another function.
+local function logged(f)
+  return function(...)
+    print("calling with " .. select("#", ...) .. " arguments")
+    return f(...)
+  end
+end
+local logged_max = logged(math.max)
+print(logged_max(3, 9, 4))
+
+-- Lua 5.5: give the vararg table a name. It is a table with the extra
+-- arguments and a field n with their count, even when some are nil.
+local function report(label, ...args)
+  local parts = {}
+  for i = 1, args.n do parts[i] = tostring(args[i]) end
+  return label .. ": " .. args.n .. " values [" .. table.concat(parts, ", ") .. "]"
+end
+print(report("readings", 3, nil, 7.5))
+print(report("empty"))
+```
+
+It printed:
+
+```text
+0	6	30
+3	b
+2	nil
+calling with 3 arguments
+9
+readings: 3 values [3, nil, 7.5]
+empty: 0 values []
+```
+
+- **`{ ... }`** collects the extra arguments into a table, which is fine unless they may contain `nil`: then the table has holes, and `#` and `ipairs` become unreliable (lesson 3).
+- **`select("#", ...)`** counts the arguments, nils included. **`select(n, ...)`** returns the arguments from the n-th onwards; wrap it in parentheses to get just one.
+- **`table.pack(...)`** makes a table with the arguments and a field `n` holding their count, nils included.
+- **Forwarding** with `f(...)` passes every argument on unchanged, nils and all. The `logged` wrapper works for any function: a small example of a higher-order function that returns a new function.
+
+### Named vararg tables in Lua 5.5
+
+Lua 5.5 lets you **name** the varargs: `function report(label, ...args)` makes `args` a read-only local holding a table of the extra arguments, with their count in `args.n`. It combines the convenience of a table with the correctness of `select("#", ...)`, and when the function uses `args` only for indexing, as here, Lua does not even need to build a real table. In Lua 5.4 and earlier, write `local args = table.pack(...)` instead. The plain `...` still works in 5.5, so older code runs unchanged.
+
+</Section>
+
+<Section id="closures" kind="intuition" title="Closures and upvalues">
+
+<Definition term="Closure and upvalue">
+
+When a function refers to a local variable of an enclosing function, that variable is an **upvalue** of the inner function. Each time the inner function expression is evaluated, Lua creates a **closure**: a function value together with references to its upvalues. The upvalues stay alive as long as the closure does, even after the enclosing function has returned.
+
+</Definition>
+
+```lua check
+-- A closure keeps the local variables it was created with (its upvalues).
+local function make_counter(step)
+  local count = 0
+  return function()
+    count = count + step
+    return count
+  end
+end
+local by_one, by_five = make_counter(1), make_counter(5)
+by_one(); by_one()
+print(by_one(), by_five(), by_five())
+
+-- Each loop iteration has its own fresh variable, so each closure sees its own.
+local shouts = {}
+for _, name in ipairs({ "Ife", "Lars", "Mei" }) do
+  shouts[#shouts + 1] = function() return name:upper() .. "!" end
+end
+print(shouts[1](), shouts[3]())
+
+-- Two closures sharing one upvalue.
+local function make_account(balance)
+  local function deposit(n) balance = balance + n end
+  local function get() return balance end
+  return deposit, get
+end
+local deposit, get = make_account(100)
+deposit(25)
+print("balance:", get())
+
+-- Higher-order helpers, written once and reused.
+local function map(list, f)
+  local out = {}
+  for i, v in ipairs(list) do out[i] = f(v) end
+  return out
+end
+local function filter(list, keep)
+  local out = {}
+  for _, v in ipairs(list) do if keep(v) then out[#out + 1] = v end end
+  return out
+end
+local function reduce(list, f, acc)
+  for _, v in ipairs(list) do acc = f(acc, v) end
+  return acc
+end
+local nums = { 3, 8, 12, 5, 6 }
+local evens = filter(nums, function(n) return n % 2 == 0 end)
+print(table.concat(map(evens, function(n) return n * n end), " "),
+      reduce(nums, function(a, b) return a + b end, 0))
+
+-- Memoisation: a closure over a cache table.
+local function memoize(f)
+  local cache = {}
+  return function(n)
+    local v = cache[n]
+    if v == nil then v = f(n); cache[n] = v end
+    return v
+  end
+end
+local calls = 0
+local fib
+fib = memoize(function(n)
+  calls = calls + 1
+  if n < 2 then return n end
+  return fib(n - 1) + fib(n - 2)
+end)
+print("fib(80) =", fib(80), "computed with", calls, "calls")
+```
+
+It printed:
+
+```text
+3	5	10
+IFE!	MEI!
+balance:	125
+64 144 36	34
+fib(80) =	23416728348467685	computed with	81	calls
+```
+
+Four things happened:
+
+- **Private state.** Each call to `make_counter` created a new `count`, and the closure it returned is the only code in the world that can reach it. `by_one` and `by_five` do not interfere. This is how Lua code hides state without classes.
+- **Fresh variables per iteration.** In a `for` loop, each pass has its own loop variable, so each closure in `shouts` captured a different `name`. (In some languages, closures created in a loop all share one variable and see its last value; in Lua they do not.)
+- **Shared upvalues.** `deposit` and `get` were created in the same call and share one `balance`: a tiny object with two methods and a truly private field.
+- **Higher-order helpers and memoisation.** `map`, `filter` and `reduce` take functions as arguments. `memoize` wraps a function in a closure over a cache table, so `fib(80)`, which naively takes about $7.6 \times 10^{16}$ calls, needed 81. Note the two-step `local fib` then `fib = memoize(...)`: the inner function must refer to the memoised `fib`, so the variable has to exist before the function expression is evaluated.
+
+<Analogy>
+
+A closure is like a letter written in a particular room, sealed in an envelope with the room's key. Wherever the envelope travels, whoever opens it can walk back into that room and find the furniture exactly as it is now, including any changes made since by others holding a key to the same room.
+
+</Analogy>
+
+</Section>
+
+<Section id="iterators" kind="examples" title="Iterators and tail calls">
+
+The generic `for` works with any function, not only `pairs` and `ipairs`. `for v1, v2 in explist do ... end` evaluates `explist` to an **iterator function**, an optional **state** and an initial **control value**; then on each pass it calls `iterator(state, control)`, assigns the results to the loop variables, and stops when the first result is `nil`. (Since Lua 5.4 the list may also give a fourth, *closing* value; lesson 6 explains to-be-closed variables.)
+
+```lua check
+-- An iterator is a function the generic for calls until it returns nil.
+-- A closure-based iterator keeps its state in upvalues.
+local function range(from, to, step)
+  step = step or 1
+  local i = from - step
+  return function()
+    i = i + step
+    if (step > 0 and i <= to) or (step < 0 and i >= to) then return i end
+  end
+end
+for n in range(1, 10, 3) do io.write(n, " ") end
+print()
+
+-- A stateless iterator: the for passes the state and the control value back in.
+local function evens_step(list, i)
+  repeat i = i + 1 until list[i] == nil or list[i] % 2 == 0
+  if list[i] ~= nil then return i, list[i] end
+end
+local function evens(list) return evens_step, list, 0 end
+for i, v in evens({ 5, 4, 7, 10, 3, 8 }) do io.write(i, ":", v, " ") end
+print()
+
+-- Iterating over pieces of a string with a closure around string.find.
+local function fields(s, sep)
+  local pos = 1
+  return function()
+    if pos > #s + 1 then return nil end
+    local stop = s:find(sep, pos, true) or #s + 1
+    local field = s:sub(pos, stop - 1)
+    pos = stop + 1
+    return field
+  end
+end
+for f in fields("Accra;;Dakar;Lomé", ";") do io.write("[", f, "]") end
+print()
+
+-- Proper tail calls: 'return f(x)' reuses the stack frame, so this
+-- recursion a million levels deep needs no extra memory.
+local function count_down(n)
+  if n == 0 then return "done" end
+  return count_down(n - 1)
+end
+print(count_down(1000000))
+```
+
+It printed:
+
+```text
+1 4 7 10 
+2:4 4:10 6:8 
+[Accra][][Dakar][Lomé]
+done
+```
+
+- **Closure-based iterators**, like `range` and `fields`, keep their position in upvalues. They are the easiest to write; each loop creates one small closure.
+- **Stateless iterators**, like `evens`, return a function plus the state and starting value, and the `for` passes them back in on each call. `ipairs` works this way. They avoid creating a closure, which matters only in very hot loops.
+- `fields` uses `string.find` with a fourth argument `true`, which turns off pattern matching so the separator is matched literally. It reports empty fields between two separators, which a pattern like `[^;]+` would silently skip.
+
+<Definition term="Proper tail call">
+
+A call of the form `return f(args)` is a **tail call**: nothing remains to be done in the caller after `f` returns. Lua implements tail calls properly: the caller's stack frame is reused, so a chain of tail calls of any length runs in constant stack space. `count_down(1000000)` recursed a million times without running out of stack.
+
+</Definition>
+
+Only the exact form `return f(args)` counts. `return f(args) + 1`, `return (f(args))` and a bare `f(args)` followed by `return` all leave work in the caller, so they are not tail calls. Tail calls make it practical to write state machines as functions that call each other: each state is a function, and moving to the next state is `return next_state(...)`.
+
+</Section>
+
+<Section id="pitfalls" kind="misconceptions" title="Four function pitfalls">
+
+<Misconception>
+
+"`local f = function(n) ... f(n - 1) ... end` is the same as `local function f(n)`." Not for recursion. In the first form, the `f` inside the body is compiled before the `local f` declaration takes effect, so it refers to a *global* `f`, usually `nil`, and the first recursive call fails with "attempt to call a nil value (global 'f')". `local function f` declares the local first, which is why the manual describes it as `local f; f = function ... end`.
+
+</Misconception>
+
+<Misconception>
+
+"`...` can be used anywhere inside a variadic function." Only in the function's own body. An inner function that writes `...` is compiled as using *its own* varargs, and if it is not variadic, Lua refuses with "cannot use '...' outside a vararg function". To use the outer arguments in a closure, copy them first: `local args = table.pack(...)`, or name them in Lua 5.5 with `...args`.
+
+</Misconception>
+
+<Misconception>
+
+"A closure captures the *value* a variable had when the closure was made." It captures the *variable*. If the variable changes later, the closure sees the change, and two closures over the same variable see each other's updates, as `deposit` and `get` did. The loop example works because each iteration has a new variable, not because values are copied.
+
+</Misconception>
+
+<Misconception>
+
+"Every function call needs parentheses." `f"text"` and `f{ ... }` are calls too, which surprises people reading DSL-style Lua such as build files or configuration (`package "mylib" { version = "1.0" }` is two chained calls). It also means a line beginning with `(` may be read as a call on the previous line's last expression; Lua parses such code as a call, so start the line with `;` or restructure it if that is not what you meant.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="human" title="Functions in everyday Lua">
+
+- **Prefer `local function`.** It is faster to call, invisible to other files, and allows recursion. Group a module's functions as locals and export only the public ones (lesson 6).
+- **Use a table for more than three or four parameters**, especially optional ones: `open_window{ title = "Map", width = 800 }` documents itself.
+- **Return `nil, message` for expected failures.** Many standard functions, such as `io.open` and `tonumber`, return `nil` (plus an error message, where one makes sense) instead of raising an error, and callers write `local f, err = io.open(path)`. Lesson 6 compares this with `error` and `pcall`.
+- **Mind the adjustment rule** when a function returns a variable number of results. `t[#t + 1] = f()` stores one; `t = { f() }` stores all.
+- **Do not overuse closures in hot loops.** Creating a closure allocates memory. Creating one per call of a function called a million times a second, as callbacks in game loops sometimes do, puts pressure on the garbage collector; hoist it out of the loop where you can.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

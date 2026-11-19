@@ -1,0 +1,425 @@
+---
+title: Java interoperability, Gradle and testing
+subtitle: Calling Java from Kotlin and Kotlin from Java, building with Gradle's Kotlin DSL, and testing with kotlin.test, JUnit and their relatives.
+minutes: 60
+objectives:
+  - Call Java APIs from Kotlin, including getters as properties, static methods, SAM conversion and checked exceptions
+  - Handle platform types safely and explain where nullability information comes from
+  - Shape a Kotlin API for Java callers with @JvmStatic, @JvmOverloads, @JvmField, @JvmName and @Throws
+  - Read and write a Gradle build script for a Kotlin/JVM project, and know the main compiler plugins
+  - Write unit tests with kotlin.test and JUnit, and know Kotest, MockK and the coroutine test tools
+  - Describe how teams format, lint and gradually migrate code to Kotlin
+prerequisites: [coroutines]
+references:
+  - title: "Calling Java from Kotlin (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/java-interop.html
+    note: Properties, platform types, nullability annotations, SAM conversions and more.
+  - title: "Calling Kotlin from Java (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/java-to-kotlin-interop.html
+    note: What the compiler generates, and the @Jvm annotations that shape it.
+  - title: "Gradle (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/gradle.html
+    note: Configuring Kotlin projects with Gradle, including toolchains and compiler options.
+  - title: "Test code using JUnit in JVM (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/jvm-test-using-junit.html
+    note: A tutorial on kotlin.test with JUnit 5.
+  - title: "Kotlin coding conventions"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/coding-conventions.html
+    note: The official style guide that formatters and linters enforce.
+---
+
+<Section id="motivation" kind="motivation" title="Living in a Java world">
+
+Almost every Kotlin/JVM project depends on Java. The web framework may be Spring, written in Java. The database driver, the JSON library, the logging library and the HTTP client are often Java. Many companies have millions of lines of Java and add Kotlin file by file. Kotlin's success rests on making this mixture painless: Kotlin calls Java directly, Java calls Kotlin directly, and both compile to the same bytecode in the same build.
+
+Painless is not the same as invisible. Java has no null safety, so values that come from Java need care. Java has checked exceptions and static methods, which Kotlin does not. Kotlin has default arguments, properties, top-level functions and companion objects, which Java does not. Knowing how each side appears to the other is what separates a team that mixes the two languages smoothly from one that fights mysterious `NullPointerException`s and awkward APIs.
+
+The second half of the lesson covers the tools that every professional Kotlin project uses: Gradle with its Kotlin DSL, the test libraries, and the formatters and linters that keep a codebase consistent.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="Platform type">
+
+The type Kotlin gives a value from Java whose nullability is unknown, written `String!` in compiler messages (you cannot write it yourself). You may treat it as `String` or `String?`. If you treat it as non-null and it is null, an exception is thrown at that point. Java code annotated with nullability annotations (JSpecify, JetBrains, Android and others) gets real Kotlin types instead.
+
+</Definition>
+
+<Definition term="SAM conversion">
+
+A Kotlin lambda can be passed where Java expects an interface with a **single abstract method** (`Runnable`, `Callable`, `Comparator`, listeners). Kotlin interfaces get the same treatment when declared as `fun interface`.
+
+</Definition>
+
+<Definition term="JVM annotations">
+
+`@JvmStatic` makes a companion or object member a real static method; `@JvmOverloads` generates Java overloads for default arguments; `@JvmField` exposes a property as a public field; `@JvmName` renames the generated method or file class; `@Throws` declares checked exceptions for Java callers.
+
+</Definition>
+
+<Definition term="Gradle Kotlin DSL">
+
+Gradle build scripts written in Kotlin (`build.gradle.kts`), with code completion and type checking in the IDE. They are the default for new Kotlin and Android projects.
+
+</Definition>
+
+</Section>
+
+<Section id="calling-java" kind="examples" title="Calling Java from Kotlin">
+
+```kotlin check
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+
+fun main() {
+    // Java getters and setters appear as properties; boolean "is" getters keep their name
+    val builder = StringBuilder("kotlin")
+    builder.setLength(3)                         // a Java method call...
+    println("${builder.length} ${builder.isEmpty()}")   // ...and Java getters read as properties
+    val list = java.util.ArrayList(listOf(3, 1, 2))
+    println("${list.size} ${list.isEmpty()}")
+
+    // Static Java methods are called on the class
+    println(Math.floorMod(-7, 3) + Integer.parseInt("40"))
+
+    // Platform types: Java says nothing about null, so you decide; choose String? when in doubt
+    val missing: String? = System.getProperty("no.such.property")
+    println(missing?.length ?: "property not set")
+
+    // SAM conversion: a Kotlin lambda can implement a Java single-method interface
+    val pool = Executors.newFixedThreadPool(2)
+    val future = pool.submit(Callable { (1..10).sum() })
+    println("sum from another thread: ${future.get()}")
+    pool.shutdown()
+    list.sortWith { a, b -> b - a }              // java.util.Comparator, implemented by a lambda
+    println(list)
+
+    // Checked exceptions are not enforced: catch what you want to handle
+    try {
+        Files.readString(Path.of("/definitely/not/here.txt"))
+    } catch (e: NoSuchFileException) {
+        println("no such file: ${e.file}")
+    }
+}
+```
+
+```text
+3 false
+3 false
+42
+property not set
+sum from another thread: 55
+[3, 2, 1]
+no such file: /definitely/not/here.txt
+```
+
+Most of the time, Java code simply works from Kotlin, with a few translations:
+
+- **Getters and setters become properties**: `getLength()` is read as `length`, `getFile()` as `file`, and `setX(...)` methods can be assigned with `x = ...`. Methods that are not getters stay methods.
+- **Static members** are called on the class, as in Java: `Math.floorMod`, `Integer.parseInt`.
+- **Platform types.** `System.getProperty` is a Java method that returns null for an unknown key, but its Java signature does not say so. Kotlin lets you choose, and the safe choice is to declare the variable as `String?` and handle null. Choosing `String` compiles too, and when the property is missing it fails at once, at the assignment, with a `NullPointerException` whose message is `getProperty(...) must not be null`. At the boundary with unannotated Java code, assume null is possible unless the documentation guarantees otherwise.
+- **SAM conversion.** `Callable { (1..10).sum() }` and the comparator lambda in `sortWith` implement Java's single-method interfaces directly. You will use this constantly with Java libraries: listeners, callbacks, executors, comparators.
+- **Checked exceptions** are just exceptions in Kotlin. `Files.readString` declares `IOException`, but Kotlin does not force you to catch or declare it. That removes boilerplate, and puts the responsibility on you to know what a Java method can throw.
+
+Kotlin's collections are Java's collections at run time. A <code>List&lt;String&gt;</code> passed to Java arrives as a `java.util.List`, and a Java `List` arrives in Kotlin as a platform type that you can treat as `List` or `MutableList`.
+
+</Section>
+
+<Section id="calling-kotlin" kind="examples" title="What Java sees of your Kotlin">
+
+The compiler turns Kotlin constructs into Java-compatible bytecode, and a few annotations let you shape the result for Java callers. This program uses reflection to list exactly what a Java caller would see:
+
+```kotlin check
+import java.lang.reflect.Modifier
+
+class Account(val owner: String, var balance: Long) {
+    val isOverdrawn: Boolean get() = balance < 0
+    @JvmField val currency: String = "KES"
+
+    @JvmOverloads
+    fun deposit(amount: Long, note: String = "", notify: Boolean = true) {
+        balance += amount
+    }
+
+    companion object {
+        @JvmStatic fun open(owner: String) = Account(owner, 0)
+        fun withBonus(owner: String) = Account(owner, 100)
+        const val MIN_BALANCE = -500L
+    }
+}
+
+fun formatCents(cents: Long): String = "%d.%02d".format(cents / 100, cents % 100)
+
+/** Lists what Java code sees: public methods and fields, with static ones marked. */
+fun javaView(className: String) {
+    val type = Class.forName(className)
+    val members = type.declaredMethods.filter { Modifier.isPublic(it.modifiers) && !it.isSynthetic }.map { m ->
+        val static = if (Modifier.isStatic(m.modifiers)) "static " else ""
+        "${static}${m.returnType.simpleName} ${m.name}(${m.parameterTypes.joinToString { it.simpleName }})"
+    } + type.declaredFields.filter { Modifier.isPublic(it.modifiers) }.map { f ->
+        val static = if (Modifier.isStatic(f.modifiers)) "static " else ""
+        "${static}field ${f.type.simpleName} ${f.name}"
+    }
+    println("$className:")
+    members.sorted().forEach { println("  $it") }
+}
+
+fun main() {
+    javaView("Account")
+    javaView("Account\$Companion")
+    javaView("MainKt")
+}
+```
+
+```text
+Account:
+  String getOwner()
+  boolean isOverdrawn()
+  field String currency
+  long getBalance()
+  static Account open(String)
+  static field Companion Companion
+  static field long MIN_BALANCE
+  void deposit(long)
+  void deposit(long, String)
+  void deposit(long, String, boolean)
+  void setBalance(long)
+Account$Companion:
+  Account open(String)
+  Account withBonus(String)
+MainKt:
+  static String formatCents(long)
+  static void javaView(String)
+  static void main()
+```
+
+Reading the output:
+
+- **Properties become getters and setters**: `owner` (a `val`) has only `getOwner()`; `balance` (a `var`) has `getBalance()` and `setBalance(long)`; a property whose name starts with `is` keeps it, `isOverdrawn()`. `@JvmField` turns `currency` into a plain public field instead.
+- **`@JvmOverloads`** generated three `deposit` methods, one for each way of leaving trailing defaults out. Without it, Java would see only the full three-parameter version.
+- **Companion members** live on a nested class, `Account$Companion`, reached from Java through the static field `Companion`: Java would write `Account.Companion.withBonus("Bao")`. `@JvmStatic` adds a real static method too, so Java can write `Account.open("Amara")`. `const val` becomes a static constant.
+- **Top-level functions** become static methods of a class named after the file, `MainKt` for `main.kt`. The annotation `@file:JvmName("Money")` at the top of a file would rename that class.
+- `Long` became the primitive `long`, because these values cannot be null; a `Long?` would have become the boxed `java.lang.Long`.
+
+Two more annotations matter at this boundary. Because Kotlin does not declare checked exceptions, a Java caller cannot `catch (IOException e)` around a Kotlin function unless that function is annotated `@Throws(IOException::class)`. And Kotlin's own nullability shows up in Java as annotations (`@NotNull`, `@Nullable`) on the generated methods, so Java IDEs warn about misuse.
+
+</Section>
+
+<Section id="details" kind="human" title="Smaller interop details worth knowing">
+
+- **Kotlin keywords as Java names.** Java methods may be called `is`, `in`, `object` or `when`, which are keywords in Kotlin. Call them by putting the name in backticks. Mockito's `when` is the famous case, one reason the Kotlin-first mocking library MockK exists.
+- **Arrays.** Kotlin's `IntArray`, `LongArray` and friends are Java's `int[]`, `long[]`; a Kotlin array of strings is Java's `String[]`. A Java varargs method takes them with the spread operator, `String.format(pattern, *args)`.
+- **`Unit` and `Nothing`.** A Kotlin function returning `Unit` looks to Java like a `void` method. One returning `Nothing` looks like it returns `Void`, and Java has no way to know it never returns.
+- **`internal` is visible to Java, with a mangled name.** Java has no module-level visibility, so `internal` members compile to public methods whose names carry a suffix, discouraging accidental use.
+- **Signature clashes.** Because of erasure, two functions named `total` taking a list of `Int` and a list of `Long` would compile to the same JVM signature. Kotlin reports the clash; give one of them a different JVM name with `@JvmName("totalLongs")`.
+- **Java records, sealed classes and streams** all work from Kotlin: record components are read like properties, sealed Java hierarchies are exhaustive in `when`, and the `kotlin.streams` package converts between Java streams and Kotlin sequences and lists.
+
+</Section>
+
+<Section id="gradle" kind="human" title="Building with Gradle">
+
+A minimal `build.gradle.kts` for a Kotlin/JVM application. The Kotlin Gradle plugin's version is the Kotlin version, here the one used throughout this course:
+
+```text
+// build.gradle.kts
+plugins {
+    kotlin("jvm") version "2.4.21"
+    application
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:VERSION")   // current version from its GitHub page
+    testImplementation(kotlin("test"))
+}
+
+kotlin {
+    jvmToolchain(21)        // compile and run with JDK 21, downloaded by Gradle if necessary
+}
+
+application {
+    mainClass = "org.example.MainKt"
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
+```
+
+The standard layout is the same as for Java (`src/main/kotlin`, `src/test/kotlin`; Java files can sit alongside in `src/main/java`), and the commands are the Gradle ones: `./gradlew build` compiles and runs the tests, `./gradlew run` runs the application, `./gradlew test` runs the tests. Commit the Gradle wrapper so that everyone builds with the same Gradle version. Maven works too, through the `kotlin-maven-plugin`, and some Java shops prefer it.
+
+**Compiler plugins** extend what the Kotlin compiler generates, and you will meet them in real projects:
+
+- **all-open** and **no-arg** (configured for you by `kotlin("plugin.spring")` and `kotlin("plugin.jpa")`) make classes open and give them no-argument constructors where frameworks such as Spring and JPA expect Java-style classes;
+- **kotlinx.serialization** generates JSON (and other format) serializers for classes marked `@Serializable`;
+- the **Compose compiler** turns `@Composable` functions into user-interface code for Jetpack Compose and Compose Multiplatform.
+
+Annotation processing that generates code from annotations uses **KSP** (Kotlin Symbol Processing), which has largely replaced Java's older `kapt` route in Kotlin projects.
+
+</Section>
+
+<Section id="testing" kind="computation" title="Testing">
+
+With the `kotlin("test")` dependency, tests are ordinary classes with annotated functions, run by JUnit 5:
+
+```kotlin
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+
+class SlugifyTest {
+    @Test
+    fun `lowercases and joins words with hyphens`() {
+        assertEquals("hello-kotlin", slugify("Hello Kotlin"))
+    }
+
+    @Test
+    fun `rejects a blank title`() {
+        assertFailsWith<IllegalArgumentException> { slugify("   ") }
+    }
+}
+```
+
+Kotlin allows function names in backticks with spaces, which makes test reports read like specifications; this is common in tests and avoided elsewhere. `assertFailsWith` is a reified inline function, as in <LessonLink slug="generics-and-variance">Generics and variance</LessonLink>, and returns the exception so you can check its message.
+
+Test frameworks are themselves just Kotlin code. To show how little magic there is, here is a miniature framework built from the features of earlier lessons (a lambda with a receiver for the DSL, `runCatching` to record failures, and a reified `assertFailsWith`), testing the same function:
+
+```kotlin check
+// The code under test
+fun slugify(title: String): String {
+    require(title.isNotBlank()) { "title must not be blank" }
+    return title.lowercase()
+        .replace(Regex("[^a-z0-9]+"), "-")
+        .trim('-')
+}
+
+// A tiny test framework: a DSL built from lambdas with receivers, like Kotest's or kotlin.test's helpers
+class TestSuite(private val name: String) {
+    private val results = mutableListOf<Pair<String, Throwable?>>()
+
+    fun test(description: String, body: () -> Unit) {
+        results += description to runCatching(body).exceptionOrNull()
+    }
+
+    fun report(): Boolean {
+        println(name)
+        for ((description, error) in results) {
+            println(if (error == null) "  ok   $description" else "  FAIL $description: ${error.message}")
+        }
+        val failed = results.count { it.second != null }
+        println("  ${results.size - failed} passed, $failed failed")
+        return failed == 0
+    }
+}
+
+fun suite(name: String, block: TestSuite.() -> Unit): Boolean = TestSuite(name).apply(block).report()
+
+fun <T> assertEquals(expected: T, actual: T) {
+    if (expected != actual) throw AssertionError("expected <$expected> but was <$actual>")
+}
+
+inline fun <reified E : Throwable> assertFailsWith(block: () -> Unit): E {
+    try {
+        block()
+    } catch (e: Throwable) {
+        if (e is E) return e
+        throw AssertionError("expected ${E::class.simpleName} but got ${e::class.simpleName}")
+    }
+    throw AssertionError("expected ${E::class.simpleName} but nothing was thrown")
+}
+
+fun main() {
+    val allPassed = suite("slugify") {
+        test("lowercases and joins words with hyphens") {
+            assertEquals("hello-kotlin", slugify("Hello Kotlin"))
+        }
+        test("collapses punctuation and spaces") {
+            assertEquals("ready-set-go", slugify("Ready, set... GO!"))
+        }
+        test("keeps digits") {
+            assertEquals("top-10-tips", slugify("Top 10 tips"))
+        }
+        test("rejects a blank title") {
+            val e = assertFailsWith<IllegalArgumentException> { slugify("   ") }
+            assertEquals("title must not be blank", e.message)
+        }
+        test("drops accents (not implemented yet)") {
+            assertEquals("cafe-creme", slugify("Café crème"))
+        }
+    }
+    println(if (allPassed) "all green" else "some tests failed")
+}
+```
+
+```text
+slugify
+  ok   lowercases and joins words with hyphens
+  ok   collapses punctuation and spaces
+  ok   keeps digits
+  ok   rejects a blank title
+  FAIL drops accents (not implemented yet): expected <cafe-creme> but was <caf-cr-me>
+  4 passed, 1 failed
+some tests failed
+```
+
+The key is the type `TestSuite.() -> Unit`, a **function type with a receiver**: inside the block passed to `suite`, `this` is a `TestSuite`, so `test(...)` calls its method without a prefix. That is how Gradle scripts, Ktor routing, HTML builders and Kotest specs all achieve their "built-in syntax" look. The failing test is honest: the simple regular expression treats accented letters as separators, and a real implementation would first normalise them (for example with `java.text.Normalizer`).
+
+The wider toolbox: **Kotest** offers several DSL styles for specifications plus property-based testing; **MockK** is a mocking library designed for Kotlin (final classes, coroutines, extension functions); **kotlinx-coroutines-test** provides `runTest` with virtual time for suspend functions; **Turbine** is popular for testing flows. For Android there are the AndroidX test libraries and Compose testing APIs.
+
+</Section>
+
+<Section id="practice" kind="human" title="How teams work">
+
+- **Format and lint automatically.** The official [coding conventions](https://kotlinlang.org/docs/coding-conventions.html) are enforced by IntelliJ IDEA's formatter, by **ktlint** (formatting and style) and by **detekt** (static analysis for code smells and complexity), usually run in CI on every pull request.
+- **Migrate gradually.** In a Java codebase, teams typically start by writing new tests in Kotlin, then new classes, then convert existing files one at a time (IntelliJ IDEA has a Java-to-Kotlin converter; review its output, which is correct but not always idiomatic). Annotating Java code for nullability first makes the converted Kotlin much better.
+- **Design APIs for both languages when needed.** A library used from Java should use `@JvmStatic`, `@JvmOverloads` and `@Throws` where they help, avoid Kotlin-only features (such as suspend functions or inline classes) in its Java-facing API, or offer Java-friendly wrappers.
+- **Keep Kotlin and dependencies current.** Kotlin ships a language release about twice a year with migration guides; staying current is easier in small steps. Libraries compiled with newer Kotlin versions may need a newer compiler to consume them.
+- **Document with KDoc.** Kotlin's documentation comments use Markdown, and the **Dokka** tool turns them into HTML, mixing Kotlin and Java sources.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Values from Java are non-null in Kotlin unless the type has a question mark."** Unannotated Java values have platform types; the compiler does not know. If you treat one as non-null and it is null, you get an exception at run time.
+
+</Misconception>
+
+<Misconception>
+
+**"Java can call Kotlin functions with default arguments as Kotlin does."** Java sees one method with all parameters unless you add `@JvmOverloads`.
+
+</Misconception>
+
+<Misconception>
+
+**"Companion object functions are static methods."** They are methods of the companion instance. Java calls them through `ClassName.Companion` unless they carry `@JvmStatic`.
+
+</Misconception>
+
+<Misconception>
+
+**"Kotlin ignores exceptions."** Kotlin has exceptions; it only drops the *checked* rule. Exceptions still propagate and still need handling where it makes sense.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

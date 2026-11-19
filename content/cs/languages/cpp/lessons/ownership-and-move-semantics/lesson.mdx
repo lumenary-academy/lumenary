@@ -1,0 +1,370 @@
+---
+title: Ownership, move semantics and smart pointers
+subtitle: Who owns each object, how ownership is handed over without copying, and the rule of five for the rare class that manages memory itself.
+minutes: 65
+objectives:
+  - Explain the difference between copying and moving, and what std::move really does
+  - Write a class that follows the rule of five, and explain why noexcept on its move operations matters
+  - State what a moved-from object may and may not be used for
+  - Choose among std::unique_ptr, std::shared_ptr, std::weak_ptr and plain pointers or references for a given ownership relationship
+  - Use virtual functions through owning smart pointers, and recognise a shared_ptr reference cycle
+prerequisites: [classes-and-raii]
+references:
+  - title: Move constructors
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/language/move_constructor
+  - title: "std::move"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/utility/move
+  - title: "std::unique_ptr"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/memory/unique_ptr
+  - title: "std::shared_ptr"
+    author: cppreference.com
+    url: https://en.cppreference.com/w/cpp/memory/shared_ptr
+  - title: "C++ Core Guidelines: R (resource management), including the smart pointer rules"
+    url: https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines
+---
+
+<Section id="motivation" kind="motivation" title="Copies you did not ask for">
+
+Value semantics make C++ programs easy to reason about, but taken literally they would be slow. Imagine a function that builds a vector of a million readings and returns it. If returning meant copying a million numbers into the caller's variable and then throwing the original away, nobody would write functions that return containers. Before 2011, C++ programmers often contorted their code to avoid exactly that.
+
+Notice that in this case the copy is pointless: the original is about to be destroyed. It would be enough to hand over the pointer to the readings, a few bytes, and leave the dying original empty. That is a **move**. C++11 added moves to the language, and they changed how C++ is written: containers can be returned by value, objects that must not be copied (files, threads, unique ownership of memory) can still be passed around, and the standard library got cheaper everywhere without anybody changing their code.
+
+Moves are also the key to **ownership**, the question every C++ programmer asks about every pointer: who is responsible for destroying this object? This lesson answers both.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="lvalue and rvalue (simplified)">
+
+An **lvalue** is an expression that names an object with an identity you could refer to again, such as a variable `name`. An **rvalue** is a temporary that is about to disappear, such as the result of `make_squares(1000)` or the string literal converted to a `std::string` in `push_back("Thandiwe")`. Moving from an rvalue is always safe, because nobody can look at it afterwards.
+
+</Definition>
+
+<Definition term="rvalue reference">
+
+A reference declared with `&&`, as in `Buffer(Buffer&& other)`. It binds only to rvalues, so an overload taking `T&&` is chosen exactly when the argument is a temporary (or has been cast to look like one). That is how a class provides a separate, cheaper "move" version of its constructor and assignment.
+
+</Definition>
+
+<Definition term="std::move">
+
+A cast, nothing more: `std::move(x)` turns the lvalue `x` into an rvalue so that a move overload can be chosen. It moves nothing by itself. Writing it is a promise that you no longer need `x`'s value.
+
+</Definition>
+
+<Definition term="moved-from state">
+
+What an object is left as after being moved from. Standard library types leave it **valid but unspecified**: you may destroy it or assign a new value to it, and call functions with no preconditions (such as `size()` or `clear()`), but you must not assume what value it holds.
+
+</Definition>
+
+<Definition term="the rule of five">
+
+If a class declares any of the destructor, copy constructor, copy assignment, move constructor or move assignment, it should think about all five, because the compiler's defaults for the others are probably wrong for it. The **rule of zero**, from the last lesson, is the preferred alternative: own resources only through members that already handle them.
+
+</Definition>
+
+<Definition term="smart pointer">
+
+A class that owns an object on the free store and destroys it automatically. `std::unique_ptr` is the sole owner and can be moved but not copied. `std::shared_ptr` shares ownership among copies, using a reference count; the object is destroyed when the last owner goes. `std::weak_ptr` observes an object owned by `shared_ptr`s without keeping it alive.
+
+</Definition>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Moving in everyday code">
+
+You rarely write move operations yourself; you use the ones the library provides. This program shows what moves look like from the outside.
+
+```cpp check
+#include <print>
+#include <string>
+#include <utility>
+#include <vector>
+
+int main() {
+    std::string a = "a long string that does not fit in the small-string buffer";
+    std::string b = a;              // copy: b gets its own characters
+    std::string c = std::move(a);   // move: c takes a's characters
+    std::println("a=\"{}\" (size {})", a, a.size());
+    std::println("b == c: {}", b == c);
+
+    a = "reusable";                 // a moved-from string may be assigned again
+    std::println("a=\"{}\"", a);
+
+    std::vector<std::string> names;
+    std::string name = "Oluwaseun";
+    names.push_back(name);              // copies name
+    names.push_back(std::move(name));   // moves name into the vector
+    names.push_back("Thandiwe");        // a temporary: moved automatically
+    std::println("{} names, name is now \"{}\"", names.size(), name);
+}
+```
+
+```text
+a="" (size 0)
+b == c: true
+a="reusable"
+3 names, name is now ""
+```
+
+`c` took `a`'s characters, so no copy was made. With GCC's library, the moved-from `a` happens to be empty, but the standard only promises it is *valid*. Assigning `"reusable"` to it is fine, because assignment has no precondition. In `push_back(std::move(name))` the vector moved the string in; the call `push_back("Thandiwe")` built a temporary string, which is an rvalue, so it was moved without being asked.
+
+### The rule of five, written out once
+
+To see what the library does for you, here is a class that owns a heap array through a raw pointer and implements all five special member functions. Each copy and move prints a line.
+
+```cpp check
+#include <algorithm>
+#include <cstddef>
+#include <print>
+#include <utility>
+#include <vector>
+
+// A hand-written owner of a heap array, to show the rule of five.
+// (In real code, use std::vector<int> and write none of this.)
+class Buffer {
+public:
+    explicit Buffer(std::size_t n) : size_{n}, data_{new int[n]{}} {}
+
+    ~Buffer() { delete[] data_; }                               // 1. destructor
+
+    Buffer(const Buffer& other)                                 // 2. copy constructor
+        : size_{other.size_}, data_{new int[other.size_]} {
+        std::copy(other.data_, other.data_ + size_, data_);
+        std::println("  copy  ({} ints)", size_);
+    }
+
+    Buffer& operator=(const Buffer& other) {                    // 3. copy assignment
+        Buffer temp{other};                                     //    copy, then swap:
+        swap(temp);                                             //    safe even for b = b
+        return *this;
+    }
+
+    Buffer(Buffer&& other) noexcept                             // 4. move constructor
+        : size_{std::exchange(other.size_, 0)},
+          data_{std::exchange(other.data_, nullptr)} {
+        std::println("  move");
+    }
+
+    Buffer& operator=(Buffer&& other) noexcept {                // 5. move assignment
+        Buffer temp{std::move(other)};
+        swap(temp);
+        return *this;
+    }
+
+    void swap(Buffer& other) noexcept {
+        std::swap(size_, other.size_);
+        std::swap(data_, other.data_);
+    }
+
+    std::size_t size() const { return size_; }
+    int& operator[](std::size_t i) { return data_[i]; }
+
+private:
+    std::size_t size_;
+    int* data_;
+};
+
+Buffer make_squares(std::size_t n) {
+    Buffer b{n};
+    for (std::size_t i = 0; i < n; ++i) b[i] = static_cast<int>(i * i);
+    return b;   // no copy: returned directly or, at worst, moved
+}
+
+int main() {
+    std::println("make:");
+    Buffer sq = make_squares(1000);
+    std::println("copy:");
+    Buffer backup = sq;
+    std::println("move:");
+    Buffer stolen = std::move(sq);
+    std::println("sizes {} {} {}", sq.size(), backup.size(), stolen.size());
+
+    std::println("vector growth:");
+    std::vector<Buffer> v;
+    v.reserve(1);
+    v.emplace_back(10);
+    v.emplace_back(20);   // reallocation: the old element is moved, because the move is noexcept
+}
+```
+
+```text
+make:
+copy:
+  copy  (1000 ints)
+move:
+  move
+sizes 0 1000 1000
+vector growth:
+  move
+```
+
+Walk through the output.
+
+- **`make_squares` printed nothing.** The local `b` was built directly in the caller's `sq` (the optimisation called NRVO). If the compiler could not do that, the return would use the move constructor; it would never silently copy.
+- **`Buffer backup = sq;`** copies, because `sq` is an lvalue and you still want it.
+- **`Buffer stolen = std::move(sq);`** moves: the move constructor takes `sq`'s pointer and size with `std::exchange`, which stores a new value and returns the old one, leaving `sq` with size 0 and a null pointer. Its destructor then does `delete[] nullptr`, which is allowed and does nothing.
+- **Copy assignment uses copy-and-swap**: build a full copy first, then swap it with `*this`. If the copy throws (say, memory runs out), `*this` is untouched, and self-assignment `b = b` is automatically correct. The move assignment uses the same trick.
+- **The vector moved, rather than copied, its element when it grew.** When `std::vector` reallocates, it must transfer the old elements to new memory, and it promises that if anything throws, the vector is left as it was. It can keep that promise with a move only if the move cannot throw, so it moves only when the move constructor is `noexcept` and otherwise copies. Mark your move operations `noexcept`; the compiler-generated ones already are, when the members' are.
+
+Now the important part: **do not write classes like this.** `std::vector<int>` already does everything `Buffer` does, correctly, with the rule of zero. Writing the five functions by hand is for the few classes that wrap a resource no library type handles, and even then most of them can hold a `std::unique_ptr` with a custom deleter instead.
+
+</Section>
+
+<Section id="smart-pointers" kind="examples" title="Smart pointers and the shape of ownership">
+
+Before C++11, objects created with `new` had to be destroyed with `delete` by hand, and every early return or exception was a chance to leak or to delete twice. Modern C++ almost never writes `new` or `delete`. When an object must live on the free store — because its type is only known at run time, because it is large, or because its lifetime does not match any scope — a smart pointer owns it.
+
+This program uses `std::unique_ptr` to own objects of different types behind a common base class, and `std::shared_ptr` with `std::weak_ptr` for a relationship with several owners.
+
+```cpp check
+#include <memory>
+#include <numbers>
+#include <print>
+#include <string>
+#include <vector>
+
+class Shape {
+public:
+    virtual ~Shape() = default;                // a base class needs a virtual destructor
+    virtual double area() const = 0;           // pure virtual: every shape must say
+    virtual std::string name() const = 0;
+};
+
+class Circle : public Shape {
+public:
+    explicit Circle(double r) : r_{r} {}
+    double area() const override { return std::numbers::pi * r_ * r_; }
+    std::string name() const override { return "circle"; }
+private:
+    double r_;
+};
+
+class Rect : public Shape {
+public:
+    Rect(double w, double h) : w_{w}, h_{h} {}
+    double area() const override { return w_ * h_; }
+    std::string name() const override { return "rectangle"; }
+private:
+    double w_, h_;
+};
+
+struct Team;
+
+struct Person {
+    std::string name;
+    std::weak_ptr<Team> team;                  // observes the team without owning it
+    ~Person() { std::println("  {} destroyed", name); }
+};
+
+struct Team {
+    std::vector<std::shared_ptr<Person>> members;
+    ~Team() { std::println("  team destroyed"); }
+};
+
+int main() {
+    // unique_ptr: exactly one owner; the vector owns the shapes.
+    std::vector<std::unique_ptr<Shape>> shapes;
+    shapes.push_back(std::make_unique<Circle>(1.0));
+    shapes.push_back(std::make_unique<Rect>(2.0, 3.5));
+    for (const auto& s : shapes) {
+        std::println("{:<9} {:6.3f}", s->name(), s->area());
+    }
+
+    std::unique_ptr<Shape> first = std::move(shapes[0]);   // ownership moves
+    std::println("shapes[0] is empty: {}", shapes[0] == nullptr);
+
+    // shared_ptr: several owners; the object dies with the last one.
+    std::println("shared:");
+    {
+        auto team = std::make_shared<Team>();
+        auto ana = std::make_shared<Person>("Ana", team);
+        team->members.push_back(ana);
+        std::println("  owners of Ana: {}", ana.use_count());
+        if (auto t = ana->team.lock()) {       // weak_ptr: is the team still alive?
+            std::println("  Ana's team has {} member(s)", t->members.size());
+        }
+    }
+    std::println("end of main");
+}
+```
+
+```text
+circle     3.142
+rectangle  7.000
+shapes[0] is empty: true
+shared:
+  owners of Ana: 2
+  Ana's team has 1 member(s)
+  team destroyed
+  Ana destroyed
+end of main
+```
+
+**Virtual functions.** `Shape` declares `area` and `name` as `virtual`, and `= 0` makes them **pure virtual**, so `Shape` is an abstract interface that cannot be created on its own. `Circle` and `Rect` inherit from it publicly and `override` the functions. Calling `s->area()` through a pointer to the base calls the right override at run time, by looking it up in a table that each object carries a pointer to. That is **dynamic polymorphism**, and it needs pointers or references: a `std::vector` of `Shape` values could not hold a `Circle`, because the vector stores objects of one fixed size. A vector of `std::unique_ptr` to `Shape` is the standard way to own a collection of different types behind one interface. The base class's destructor is `virtual` so that destroying a `Circle` through a pointer to `Shape` runs `Circle`'s destructor too; forgetting that is undefined behaviour.
+
+**`unique_ptr` is the default.** It is the same size as a raw pointer and costs nothing extra to use. It cannot be copied (two owners would delete twice), only moved, as `first = std::move(shapes[0])` shows. Create one with `std::make_unique` (C++14), never with a bare `new`.
+
+**`shared_ptr` counts owners.** `ana` was owned by the local variable and by the team's member list, so `use_count()` was 2. At the end of the block the locals are destroyed in reverse order: first `ana` (the count drops to 1), then `team`, whose destructor runs and destroys its vector, releasing the last owner of Ana. That is the order you see. Sharing costs something: the count lives in a separately allocated control block (`std::make_shared` puts object and count in one allocation) and is updated with atomic instructions, so copying a `shared_ptr` is far more expensive than copying a raw pointer.
+
+**`weak_ptr` breaks cycles.** A person refers back to her team. If that back-reference were a `shared_ptr`, team and person would keep each other alive for ever and neither destructor would run: a leak that no garbage collector will rescue. `weak_ptr` does not count as an owner; `lock()` returns a `shared_ptr` if the object still exists and an empty one if it does not.
+
+### Which one to use
+
+| Relationship | Use |
+| --- | --- |
+| This object owns that one, alone | a member or local of that type, if possible; otherwise `std::unique_ptr` |
+| Ownership genuinely shared, lifetime decided by the last user | `std::shared_ptr` |
+| Needs to observe something owned by `shared_ptr`s, possibly after it is gone | `std::weak_ptr` |
+| Uses an object it does not own, which outlives the use | a reference, or a plain pointer if it may be null |
+
+The last row matters as much as the others. A function that only *uses* a shape should take `const Shape&`, not a smart pointer. Passing a `std::unique_ptr` by value means "I am taking ownership"; passing a `shared_ptr` by value means "I am becoming a co-owner". If neither is true, do not say it.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`std::move` moves things."** It is a cast that makes a move *possible*. If the type has no move constructor, or the object is `const`, the copy constructor is chosen instead, silently. `std::move` on a `const std::vector` copies the whole vector.
+
+</Misconception>
+
+<Misconception>
+
+**"`return std::move(result);` makes returning faster."** It usually makes it slower. Returning a local by name already allows the compiler to construct it in place, and falls back to a move automatically. Wrapping it in `std::move` disables the in-place construction. GCC warns about this with `-Wpessimizing-move`.
+
+</Misconception>
+
+<Misconception>
+
+**"A moved-from object is empty."** Many are, in practice (GCC's library empties a moved-from `std::string`, as the first program showed), but the standard only guarantees a valid, unspecified state for most library types, and your own types may leave anything behind. Do not read a moved-from object's value; give it a new one or let it be destroyed.
+
+</Misconception>
+
+<Misconception>
+
+**"Use `shared_ptr` everywhere and you will never have memory bugs."** Shared ownership makes lifetimes hard to reason about, costs atomic operations on every copy, and leaks on cycles. Most objects have one obvious owner. Start with values and `unique_ptr`, and reach for `shared_ptr` when you can name the reason ownership is shared.
+
+</Misconception>
+
+</Section>
+
+<Section id="human" kind="human" title="Thinking in ownership">
+
+Experienced C++ programmers draw an ownership tree in their heads for every design. Each object has exactly one owner — a scope, another object, a container, or (rarely) a group of `shared_ptr`s — and everything else that touches it merely refers to it, for a time shorter than the owner's. When that tree is clear, memory bugs mostly disappear, because destruction follows the tree automatically.
+
+When the tree is not clear, that is a design problem to fix, not a reason to scatter `shared_ptr`. Rust, which you may meet in another course, turned this same discipline into compiler-checked rules; in C++ it is a habit, supported by warnings, static analysers, code review and the sanitizers of the Professional level.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

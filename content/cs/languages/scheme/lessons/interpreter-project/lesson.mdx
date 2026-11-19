@@ -1,0 +1,352 @@
+---
+title: "Project: an interpreter, the implementations, and SICP"
+subtitle: Write an evaluator for a small Scheme in Scheme, survey today's implementations, and see why one textbook shaped a generation of computer scientists.
+minutes: 75
+objectives:
+  - Use the Scheme reader as a free parser that turns program text into lists
+  - Build an interpreter with environments, closures, special forms and primitive procedures
+  - Explain how the interpreter inherits lexical scope and proper tail calls from its design and its host
+  - Package code as an R7RS library with define-library
+  - Compare the major Scheme implementations and describe the place of SICP and its successors in computing education
+prerequisites: [macros-and-continuations]
+related: [math.comp.lambda-calculus, math.comp.computability]
+references:
+  - title: Structure and Interpretation of Computer Programs, second edition
+    author: Harold Abelson and Gerald Jay Sussman with Julie Sussman
+    year: 1996
+    url: https://mitp-content-server.mit.edu/books/content/sectbyfn/books_pres_0/6515/sicp.zip/index.html
+    note: MIT Press's site for the book, with the full text online. Chapter 4 builds interpreters.
+  - title: "MIT OpenCourseWare: 6.001 Structure and Interpretation of Computer Programs"
+    url: https://ocw.mit.edu/courses/6-001-structure-and-interpretation-of-computer-programs-spring-2005/
+    note: Course materials from MIT's SICP-based introductory course.
+  - title: How to Design Programs
+    url: https://htdp.org/
+    note: A systematic introduction to program design, built on Racket's teaching languages; free online.
+  - title: "R7RS-small, section 5.6: Libraries"
+    url: https://standards.scheme.org/corrected-r7rs/r7rs.html
+    note: The define-library form and its declarations.
+  - title: Racket
+    url: https://racket-lang.org/
+    note: Scheme's best-known descendant, with a large ecosystem and the DrRacket environment.
+  - title: Chez Scheme
+    url: https://cisco.github.io/ChezScheme/
+    note: A fast optimising compiler, open source since 2016.
+  - title: GNU Guile
+    url: https://www.gnu.org/software/guile/
+    note: The GNU project's extension language.
+  - title: Scheme implementations
+    url: https://get.scheme.org/
+    note: The community's list of current implementations.
+---
+
+<Section id="motivation" kind="motivation" title="The program that runs programs">
+
+An interpreter is a program that takes another program as data and carries it out. That sounds like an advanced topic, and in most languages it is: before you can interpret anything you must write a lexer, a parser and a syntax tree, often hundreds of lines before the first expression is evaluated. In Scheme, programs already *are* data. The reader turns text into lists, and you have spent this whole course writing procedures that take lists apart. An interpreter for a useful subset of Scheme fits on two screens.
+
+Writing one is the traditional capstone of learning Scheme, and for good reason. It forces you to say precisely what every construct means: what a variable is, what `lambda` creates, what happens when a procedure is called. It turns the environment diagrams of lesson 2 into running code. And it reveals that the languages you use every day, Python, JavaScript or Clojure, are themselves implemented by programs with this same basic structure.
+
+This lesson builds the interpreter, explains each part, and then steps back to look at the Scheme world as it is today: the implementations people use, the textbook that made Scheme famous, and where to go next.
+
+</Section>
+
+<Section id="reader" kind="examples" title="The reader is a free parser">
+
+The `read` procedure from `(scheme read)` reads one datum (a number, a string, a symbol or a whole nested list) from a port, using exactly the syntax you type in programs. A string port lets it read from a string:
+
+```scheme check
+(import (scheme base) (scheme write) (scheme read) (scheme cxr))
+
+(define source
+  "(define (square x) (* x x))
+   (square 12)   ; a comment the reader skips
+   \"a string\" #t 42 'quoted (a . b)")
+
+(define (kind datum)
+  (cond ((pair? datum) 'pair)
+        ((symbol? datum) 'symbol)
+        ((string? datum) 'string)
+        ((number? datum) 'number)
+        ((boolean? datum) 'boolean)
+        (else 'other)))
+
+(define port (open-input-string source))
+
+(let loop ((count 0))
+  (let ((datum (read port)))
+    (if (eof-object? datum)
+        (begin (display "data read: ") (write count) (newline))
+        (begin
+          (write (kind datum)) (display "  ") (write datum) (newline)
+          (loop (+ count 1))))))
+
+(define program (read (open-input-string "(+ 1 (* 2 3))")))
+(write (list (car program) (length program) (caddr program)))
+(newline)
+```
+
+```text
+pair  (define (square x) (* x x))
+pair  (square 12)
+string  "a string"
+boolean  #t
+number  42
+pair  (quote quoted)
+pair  (a . b)
+data read: 7
+(+ 3 (* 2 3))
+```
+
+`read` skipped the comment and the whitespace, turned `'quoted` into `(quote quoted)`, and returned the program `(+ 1 (* 2 3))` as a three-element list whose third element is itself a list. That is the entire front end of our interpreter: no tokenizer, no grammar. The interpreter below starts from such data, quoted directly in the program for simplicity; connecting it to `read` is one line.
+
+</Section>
+
+<Section id="interpreter" kind="examples" title="The interpreter">
+
+The interpreted language has numbers, booleans and strings; variables; `quote`, `if`, `lambda`, `define`, `let` and `begin`; procedure calls; and a handful of primitive procedures borrowed from the host Scheme. Here is all of it, followed by a short session.
+
+```scheme check
+(import (scheme base) (scheme write) (scheme cxr))
+
+;;; Environments: a list of frames; each frame is an alist of (name . value).
+
+(define (extend-env names values env)
+  (cons (map cons names values) env))
+
+(define (lookup name env)
+  (if (null? env)
+      (error "unbound variable" name)
+      (let ((binding (assq name (car env))))
+        (if binding
+            (cdr binding)
+            (lookup name (cdr env))))))
+
+(define (define-variable! name value env)
+  (let ((binding (assq name (car env))))
+    (if binding
+        (set-cdr! binding value)
+        (set-car! env (cons (cons name value) (car env))))))
+
+;;; Procedures made by the interpreted program.
+
+(define-record-type closure
+  (make-closure params body env)
+  closure?
+  (params closure-params)
+  (body closure-body)
+  (env closure-env))
+
+;;; The evaluator.
+
+(define (evaluate expr env)
+  (cond ((or (number? expr) (boolean? expr) (string? expr)) expr)
+        ((symbol? expr) (lookup expr env))
+        ((pair? expr)
+         (case (car expr)
+           ((quote) (cadr expr))
+           ((if) (if (evaluate (cadr expr) env)
+                     (evaluate (caddr expr) env)
+                     (if (null? (cdddr expr)) #f (evaluate (cadddr expr) env))))
+           ((lambda) (make-closure (cadr expr) (cddr expr) env))
+           ((define) (if (pair? (cadr expr))
+                         (define-variable! (caadr expr)
+                                           (make-closure (cdadr expr) (cddr expr) env)
+                                           env)
+                         (define-variable! (cadr expr) (evaluate (caddr expr) env) env))
+                     (if (pair? (cadr expr)) (caadr expr) (cadr expr)))
+           ((let) (evaluate (cons (cons 'lambda (cons (map car (cadr expr)) (cddr expr)))
+                                  (map cadr (cadr expr)))
+                            env))
+           ((begin) (evaluate-body (cdr expr) env))
+           (else (apply-procedure (evaluate (car expr) env)
+                                  (map (lambda (e) (evaluate e env)) (cdr expr))))))
+        (else (error "cannot evaluate" expr))))
+
+(define (evaluate-body exprs env)
+  (if (null? (cdr exprs))
+      (evaluate (car exprs) env)
+      (begin (evaluate (car exprs) env)
+             (evaluate-body (cdr exprs) env))))
+
+(define (apply-procedure proc args)
+  (cond ((procedure? proc) (apply proc args))
+        ((closure? proc)
+         (evaluate-body (closure-body proc)
+                        (extend-env (closure-params proc) args (closure-env proc))))
+        (else (error "not a procedure" proc))))
+
+;;; The global environment: primitives borrowed from the host Scheme.
+
+(define (make-global-env)
+  (extend-env '(+ - * / = < > <= >= cons car cdr null? list not)
+              (list + - * / = < > <= >= cons car cdr null? list not)
+              '()))
+
+;;; A tiny session.
+
+(define session
+  '((+ 1 (* 2 3))
+    (define (square x) (* x x))
+    (square 12)
+    (define (make-adder n) (lambda (x) (+ x n)))
+    ((make-adder 10) 5)
+    (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+    (fact 20)
+    (define (map f lst) (if (null? lst) '() (cons (f (car lst)) (map f (cdr lst)))))
+    (map square '(1 2 3 4))
+    (let ((a 3) (b 4)) (+ (square a) (square b)))
+    (define (count-down n) (if (= n 0) 'done (count-down (- n 1))))
+    (count-down 10000)
+    (undefined-thing 1)
+    (1 2 3)))
+
+(define global (make-global-env))
+
+(for-each
+ (lambda (expr)
+   (display "> ") (write expr) (newline)
+   (guard (e ((error-object? e)
+              (display "error: ")
+              (display (error-object-message e))
+              (for-each (lambda (x) (display " ") (write x)) (error-object-irritants e))
+              (newline)))
+     (write (evaluate expr global))
+     (newline)))
+ session)
+```
+
+```text
+> (+ 1 (* 2 3))
+7
+> (define (square x) (* x x))
+square
+> (square 12)
+144
+> (define (make-adder n) (lambda (x) (+ x n)))
+make-adder
+> ((make-adder 10) 5)
+15
+> (define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+fact
+> (fact 20)
+2432902008176640000
+> (define (map f lst) (if (null? lst) (quote ()) (cons (f (car lst)) (map f (cdr lst)))))
+map
+> (map square (quote (1 2 3 4)))
+(1 4 9 16)
+> (let ((a 3) (b 4)) (+ (square a) (square b)))
+25
+> (define (count-down n) (if (= n 0) (quote done) (count-down (- n 1))))
+count-down
+> (count-down 10000)
+done
+> (undefined-thing 1)
+error: unbound variable undefined-thing
+> (1 2 3)
+error: not a procedure 1
+```
+
+### How it works
+
+**Environments.** An environment is a list of **frames**, innermost first, and a frame is an association list from names to values. `lookup` searches frame by frame, which is exactly the rule of lexical scope from lesson 2: inner bindings shadow outer ones. `extend-env` makes a new frame in front of an existing environment without changing it. `define-variable!` adds to (or updates) the innermost frame, which is why it is the one place that mutates.
+
+**Closures.** Evaluating a `lambda` does not run anything. It creates a `closure` record holding the parameters, the body and, crucially, the environment in which the `lambda` was evaluated. That stored environment is what lets `(make-adder 10)` return a procedure that still knows `n` is 10 after `make-adder` has returned. Here the abstract idea of lesson 5 becomes three fields of a record.
+
+**The evaluator.** `evaluate` is a case analysis on the kind of expression, mirroring the evaluation rules of lesson 1. Self-evaluating data return themselves; symbols are looked up; `quote` returns its argument unevaluated; `if` evaluates the test and then exactly one branch; `lambda` makes a closure; `define` binds a name in the current frame (and the procedure-defining shorthand becomes a closure directly); `let` is rewritten into an immediately applied `lambda`, the same translation the R7RS report uses; `begin` evaluates a sequence. Anything else is a procedure call: evaluate the operator, evaluate every operand, and apply.
+
+**Application.** `apply-procedure` distinguishes two kinds of procedure. A **primitive** is a host procedure such as `+`, applied directly with the host's `apply`. A **closure** is applied by evaluating its body in a new environment: a frame binding the parameters to the arguments, in front of the *closure's* environment, not the caller's. That one choice, the closure's environment rather than the caller's, is what makes the language lexically scoped. Change it to the caller's environment and you have implemented dynamic scope.
+
+**Errors.** Errors in the interpreted program, such as an unbound variable or calling a number, are signalled with the host's `error` and caught by `guard` in the driver loop, so one bad expression does not end the session.
+
+### What it inherits from its host
+
+The interpreted language has proper tail calls, and the interpreter never had to implement them. Look at the path from a call in tail position: `evaluate` hands the closure to `apply-procedure` as its last action, which calls `evaluate-body`, which calls `evaluate` on the last expression as *its* last action, and `if` evaluates the chosen branch as its last action. Every step of an interpreted tail call is a host tail call, so `count-down` loops in constant host stack. An interpreter written in a language without tail calls would need extra machinery (usually a loop called a trampoline) to achieve the same.
+
+Other features are inherited too: numbers, including big integers and exact rationals, come straight from the host, and so does garbage collection. A different choice of representation would make different properties explicit. Representing continuations as procedures in the interpreter, for instance, would make `call/cc` easy to add, and that is how many compilers for Scheme work internally.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions about interpreters">
+
+<Misconception>
+
+**"An interpreter written in Scheme for Scheme explains nothing, because it relies on Scheme."** It relies on the host only for what it chooses to borrow: numbers, pairs, primitive procedures. The things it defines itself (variable lookup, closures, scope, procedure application) are exactly the ones it explains. Swap `closure-env` for the caller's environment and you change the language's scoping rule, which shows the rule is in the interpreter, not inherited.
+
+</Misconception>
+
+<Misconception>
+
+**"Interpreters are toys; real languages are compiled."** Many production languages are implemented by interpreters, often of a compact internal code rather than of the source text: CPython, Ruby and Lua among them, and Chibi-Scheme too. Compilers and interpreters are two ends of a range, and most real systems mix both, for example by interpreting first and compiling the hot spots.
+
+</Misconception>
+
+<Misconception>
+
+**"Special forms are just procedures with unusual names."** `if`, `lambda`, `define` and `quote` each needed their own branch in `evaluate` precisely because they do *not* evaluate all their operands before acting. Treating `if` as a procedure would evaluate both branches, and recursion like `fact` would never stop.
+
+</Misconception>
+
+</Section>
+
+<Section id="library" kind="human" title="Packaging code as a library">
+
+R7RS programs import libraries; R7RS also lets you write your own. The interpreter would be packaged by putting its definitions in a file such as `mini/interpreter.sld`:
+
+```scheme
+(define-library (mini interpreter)
+  (export evaluate make-global-env)
+  (import (scheme base) (scheme cxr))
+  (begin
+    ;; extend-env, lookup, define-variable!, the closure record,
+    ;; evaluate, evaluate-body, apply-procedure and make-global-env
+    ;; exactly as above
+    ))
+```
+
+A program then writes `(import (scheme base) (scheme write) (mini interpreter))` and sees only the two exported names: the environment representation and the closure record stay private, which is the data abstraction of lesson 6 enforced by the language. Each implementation has its own convention for finding library files; with Chibi-Scheme, add the directory that contains `mini/` to the search path, as in `chibi-scheme -I . main.scm`. (This exact library, with the definitions above pasted in, was checked that way.) Package managers such as Snow (for R7RS libraries), CHICKEN's eggs and Racket's `raco pkg` distribute libraries to others.
+
+How professionals would grow this interpreter: add `set!`, `cond` and `and`/`or` (the last two as rewrites, like `let`); add a `read`-based REPL; separate **syntactic analysis** from execution, so each expression is examined once and turned into a procedure that runs quickly many times (a large speedup, and the first step toward a compiler); and add tests that run each feature against the host Scheme's own answers.
+
+</Section>
+
+<Section id="implementations" kind="reading" title="Scheme implementations today">
+
+Scheme's small standard has produced an unusually varied family of implementations. As of 2026, the ones you are most likely to meet are:
+
+| Implementation | Character | Standard |
+| --- | --- | --- |
+| **Racket** | Began as PLT Scheme in the 1990s and was renamed in 2010; now a language of its own and a platform for building languages (`#lang`), with the DrRacket IDE, a large package collection and strong teaching materials. Since version 8.0 (2021) its default runtime is built on Chez Scheme. | its own; R5RS, R6RS and R7RS (via a package) available |
+| **Chez Scheme** | Kent Dybvig's optimising native-code compiler, developed commercially from the mid-1980s and open-sourced by Cisco in 2016. Among the fastest Scheme systems. | R6RS |
+| **GNU Guile** | The GNU project's official extension language, embedded in applications and used to write and configure the GNU Guix system and package manager. | R6RS and much of R7RS |
+| **Chibi-Scheme** | Alex Shinn's small, embeddable interpreter, a close match to R7RS-small, with many optional libraries; the implementation used for this course. | R7RS |
+| **CHICKEN** | Compiles Scheme to C, with a large library collection ("eggs"). | R5RS, R7RS via an egg |
+| **Gauche** | A practical scripting implementation with strong Unicode and library support. | R7RS |
+| **Gambit** | Compiles to C and JavaScript; known for speed and lightweight threads. | R5RS, R7RS |
+| **MIT/GNU Scheme** | The descendant of the system used with SICP at MIT. | R7RS |
+
+Code that sticks to R7RS-small, as this course does, runs on all the R7RS systems. Real projects usually commit to one implementation, because each offers valuable extensions (foreign function interfaces, threads, networking, packaging) beyond the standard. Ongoing work on R7RS-large aims to standardise more of those libraries.
+
+</Section>
+
+<Section id="sicp" kind="history" title="SICP and its place in computer science education">
+
+*Structure and Interpretation of Computer Programs* by Harold Abelson and Gerald Jay Sussman, with Julie Sussman, was published by MIT Press in 1985, with a second edition in 1996. It was the text for MIT's introductory course 6.001 for more than two decades, and was adopted by universities around the world. Its cover shows a wizard, which is why programmers call it "the wizard book". MIT Press hosts the full text of the second edition [online](https://mitp-content-server.mit.edu/books/content/sectbyfn/books_pres_0/6515/sicp.zip/index.html), and lecture materials from the course are on [MIT OpenCourseWare](https://ocw.mit.edu/courses/6-001-structure-and-interpretation-of-computer-programs-spring-2005/).
+
+What made SICP distinctive was its view of programming as the management of complexity through abstraction: procedures as abstractions of processes, data abstraction, modularity through objects with state and through streams, and, in its fourth and fifth chapters, building interpreters and a register machine, so that by the end a student had implemented the language they had been using. Scheme was chosen because it got out of the way: with almost no syntax to learn, the course could spend its time on ideas.
+
+In the late 2000s MIT replaced 6.001 with a new introductory curriculum using Python, and several other universities that had taught from SICP moved to Python too, while often keeping much of its approach. SICP's ideas live on in many forms, including a JavaScript adaptation of the book published by MIT Press in 2022. A different Scheme-based tradition grew from **How to Design Programs** by Matthias Felleisen, Robert Bruce Findler, Matthew Flatt and Shriram Krishnamurthi, which teaches a systematic design recipe with Racket's teaching languages and is free at [htdp.org](https://htdp.org/). And the playful *Little Schemer* books by Daniel Friedman and colleagues teach recursion through dialogue.
+
+Whatever you read next, the ideas in this course (evaluation, environments, closures, recursion, data abstraction, syntax as data, continuations) are the vocabulary those books share. You now have it.
+
+<Reflection title="Simple things, faithfully combined">
+
+Scheme's designers trusted that a few simple ideas, combined carefully, would be enough to build everything else, and they were right. There is something worth noticing in that beyond programming. Much of what lasts is built the same way: not from grand features piled up, but from small, sound pieces, each faithful to its purpose, put together with patience. The interpreter you wrote is a hundred lines of such pieces, and it can run any program you can write in its language.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
