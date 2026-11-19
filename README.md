@@ -2,13 +2,13 @@
 
 **All the sciences. Many languages. Every nation.**
 
-Lumenary Academy is a Christian-inspired education project in three divisions. This repository holds its website, [lumenary.academy](https://lumenary.academy), the first four subjects of Lumenary Scientia — **Lumenary Math**, **Lumenary CS** (with its programming-language courses and electives), **Lumenary EE** and **Lumenary Robotics** — and the first two courses of **Lumenary Lingua**.
+Lumenary Academy is a Christian-inspired education project in three divisions. This repository holds its website, [lumenary.academy](https://lumenary.academy), the first three subjects of Lumenary Scientia — **Lumenary Math**, **Lumenary CS** (with its programming-language courses and electives) and **Lumenary EE** — and the first two courses of **Lumenary Lingua**.
 
 ## The three divisions
 
 | Division | What it is | Status |
 | --- | --- | --- |
-| **Lumenary Scientia** | The sciences, free and open source for ever: no accounts, no advertising, no paid tiers | Available: mathematics (**[Lumenary Math](content/math/README.md)**), computer science (**Lumenary CS**, `content/cs/`, with programming languages from Assembly to Zig in `content/cs/languages/` and electives in `content/cs/electives/`), electrical engineering (**Lumenary EE**, `content/ee/`) and robotics (**Lumenary Robotics**, `content/robotics/`). Physics, chemistry, biology and other sciences pending |
+| **Lumenary Scientia** | The sciences, free and open source for ever: no accounts, no advertising, no paid tiers | Available: mathematics (**[Lumenary Math](content/math/README.md)**), computer science (**Lumenary CS**, `content/cs/`, with programming languages from Assembly to Zig in `content/cs/languages/` and electives in `content/cs/electives/`), and electrical engineering (**Lumenary EE**, `content/ee/`). Robotics, physics, chemistry, biology and other sciences pending |
 | **Lumenary Lingua** | Languages, each taught through a language the learner already knows | Available, A1 to C2: Spanish taught in English (`content/lingua/spanish/`) and English taught in Spanish (`content/lingua/ingles/`). Other pairs pending |
 | **Lumenary Prep** | Exam preparation as a paid service: one price per course, paid once, for lifetime access | At [prep.lumenary.academy](https://prep.lumenary.academy), built in a separate repository |
 
@@ -20,9 +20,9 @@ Mathematics from kindergarten counting to the first year of graduate school, eve
 
 **[Lumenary Math's README](content/math/README.md)** covers what exists today, the honesty notes, the Lean and Python toolchain and the curriculum documentation.
 
-## Lumenary CS, EE, Robotics and Lingua
+## Lumenary CS, EE and Lingua
 
-Computer science, electrical engineering, robotics and the language courses are **courses**: a syllabus (`course.json`) and one directory per lesson (`lesson.mdx`, `exercises.json`), rendered with the same lesson components (and the same cat guides) as Lumenary Math. Lumenary CS runs from a first program to the frontier of AI in 55 lessons across eight levels (online at `/en/cs/`), with a course for each major programming language (`/en/cs/languages/`) and electives (`/en/cs/electives/`, starting with Blockchains & Verifiable Computation). Lumenary EE (`/en/ee/`) runs from a first circuit to chips, power grids and radios, and Lumenary Robotics (`/en/robotics/`) from a first moving robot to robot learning and humanoids. Their runnable Python blocks and Python exercises run in the browser; they, and the programs in other languages (compiled and run with each language's toolchain, Verilog with Icarus Verilog and circuits with ngspice), are executed by `npm run verify:courses`. Each Lingua course has six levels, A1 to C2, of six lessons (`/en/lingua/spanish/`, `/es/lingua/ingles/`). All of it is AI-drafted and awaits human review, as the pages say. [docs/courses.md](docs/courses.md) is the authoring guide.
+Computer science, electrical engineering and the language courses are **courses**: a syllabus (`course.json`) and one directory per lesson (`lesson.mdx`, `exercises.json`), rendered with the same lesson components (and the same cat guides) as Lumenary Math. Lumenary CS runs from a first program to the frontier of AI in 55 lessons across eight levels (online at `/en/cs/`), with a course for each major programming language (`/en/cs/languages/`) and electives (`/en/cs/electives/`, starting with Blockchains & Verifiable Computation). Lumenary EE (`/en/ee/`) runs from a first circuit to chips, power grids and radios. Their runnable Python blocks and Python exercises run in the browser; they, and the programs in other languages (compiled and run with each language's toolchain, Verilog with Icarus Verilog and circuits with ngspice), are executed by `npm run verify:courses`. Each Lingua course has six levels, A1 to C2, of six lessons (`/en/lingua/spanish/`, `/es/lingua/ingles/`). All of it is AI-drafted and awaits human review, as the pages say. [docs/courses.md](docs/courses.md) is the authoring guide.
 
 ## Quick start
 
@@ -48,7 +48,6 @@ content/
   math/              Lumenary Math: knowledge graph, lessons, trails (see its README)
   cs/                Lumenary CS: course.json and lessons/<slug>/, languages/<id>/, electives/<id>/ (see docs/courses.md)
   ee/                Lumenary EE: course.json and lessons/<slug>/
-  robotics/          Lumenary Robotics: course.json and lessons/<slug>/
   lingua/<course>/   Lumenary Lingua courses: spanish/ (taught in English), ingles/ (taught in Spanish)
   pages/             About, Divisions, Contribute, Educators, evaluation package (MDX)
   registry/          languages.json, countries.json, glossaries/
@@ -56,7 +55,7 @@ content/
 formal/              Lean 4 project for Lumenary Math
 compute/             Python experiments for Lumenary Math, tests, verify.py, pinned requirements
 src/
-  app/[locale]/      routes (static export): the front page (the three divisions), math/, cs/, ee/, robotics/, lingua/, and the project pages
+  app/[locale]/      routes (static export): the front page (the three divisions), math/, cs/, ee/, lingua/, and the project pages
   components/        UI, lesson blocks, widgets, graph, exercises
   i18n/              locale config and message catalogues
   lib/               schemas (zod), content loaders, MDX, layout, sandbox
