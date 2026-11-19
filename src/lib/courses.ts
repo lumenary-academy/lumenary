@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import type { Locale } from "@/i18n/config";
-import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, ExercisesFile, type CourseLevel, type Exercise } from "./schema";
+import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, ExercisesFile, GUIDE_SETS, type CourseLevel, type Exercise, type GuideSet } from "./schema";
 import { ROOT } from "./content";
 
 /**
@@ -78,6 +78,18 @@ export function getCourses(): LoadedCourse[] {
       return { course, dir, path: course.division === "lingua" ? `lingua/${course.id}` : dir, collection: collectionOf(dir), slugs: course.levels.flatMap((l) => l.lessons) };
     }),
   );
+}
+
+/**
+ * The cat guides' roles in a course: the course's own `guides`, else the programming-language set for
+ * cs/languages, else its subject's set (cs and its electives, ee, robotics, chemistry…). Undefined for
+ * Lingua, which has no cat guides.
+ */
+export function guideSet(c: LoadedCourse): GuideSet | undefined {
+  if (c.course.guides) return c.course.guides;
+  if (c.collection === "cs/languages") return "programming";
+  const subject = c.dir.split("/")[0]!;
+  return (GUIDE_SETS as readonly string[]).includes(subject) ? (subject as GuideSet) : undefined;
 }
 
 /** A subject (cs, ee, robotics) or a Lingua course, by id; never a course nested in a collection. */

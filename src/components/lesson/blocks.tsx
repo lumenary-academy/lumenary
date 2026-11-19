@@ -7,7 +7,12 @@ import { LENSES, SECTION_KINDS, type Lens, type SectionKind } from "./kinds";
 
 type P = { children?: React.ReactNode };
 
-export function makeBlocks(t: TFunction) {
+/** Where a cat guide's label comes from: Lumenary Math's roles by default, or a subject's set (`narrators.sets.<set>`). */
+export function guideKey(who: NarratorId, field: "Role" | "Q", guides?: string): string {
+  return guides ? `narrators.sets.${guides}.${who}${field}` : `narrators.${who}${field}`;
+}
+
+export function makeBlocks(t: TFunction, guides?: string) {
   function Section({ id, kind, title, children }: P & { id: string; kind: SectionKind; title: string }) {
     const meta = SECTION_KINDS[kind] ?? SECTION_KINDS.human;
     const { Icon } = meta;
@@ -39,7 +44,7 @@ export function makeBlocks(t: TFunction) {
         <div className={`relative min-w-0 flex-1 rounded-2xl rounded-ss-md px-4 py-3 font-sans text-[0.98rem] leading-relaxed text-ink ${NARRATOR_BG[who]}`}>
           <p className={`text-xs font-bold ${NARRATOR_FG[who]}`}>
             <span data-cat>{t(`narrators.${who}`)} · </span>
-            <span>{t(`narrators.${who}Role`)}</span>
+            <span>{t(guideKey(who, "Role", guides))}</span>
           </p>
           <div className="mt-1 [&>p]:m-0 [&>p+p]:mt-2">{children}</div>
         </div>

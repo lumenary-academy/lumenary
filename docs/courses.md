@@ -160,9 +160,20 @@ One course per language under `content/cs/languages/<id>/` (`id` is the director
 
 Lumenary Math's three cat guides appear in every Lumenary Scientia course too — Lumenary CS, its programming languages and electives, Lumenary EE and Lumenary Robotics (not in Lingua). They are shown by default; anyone can hide them with the cat button, and then only the role ("The Formalist") and the text remain, so every aside must read well without the cat. Each `<Narrator who="…">` aside is 1–4 sentences and must add something; put it inside a section, between paragraphs, never inside another component. Every lesson has at least one; from the second level on, two to four, from more than one cat. List every cat who speaks in the frontmatter `narrators`.
 
-- **Chloe** (the Mathematician, "Why is this true?") names the key idea, asks the question that drives an explanation, or connects it to the mathematics underneath.
-- **Margaret** (the Computationalist, "What happens if we calculate it?") proposes, runs or interprets a computation: a program's output, a measurement, a simulation, a back-of-the-envelope estimate with numbers.
-- **Gideon** (the Formalist, "Can we prove this precisely?") points out the hidden assumption, the edge case, the invariant or the precise condition: undefined behaviour, an off-by-one, the limit of a model, the units, the case where a rule of thumb fails, the safety condition.
+Each cat keeps one character everywhere: **Chloe** brings the idea and the "why"; **Margaret** the numbers, measurements, computations and experiments; **Gideon** precision: the hidden assumption, the edge case, the precise condition, the limit of a model, safety. In Lumenary Math they are the Mathematician ("Why is this true?"), the Computationalist ("What happens if we calculate it?") and the Formalist ("Can we prove this precisely?"). Those roles don't fit other subjects, so every subject gives the cats its own roles: the label shown above each aside and on the course page, and the question that guides what the cat says. Write each aside in your subject's role, and don't name the role inside it (the page shows it).
+
+| Subject | Chloe | Margaret | Gideon |
+| --- | --- | --- | --- |
+| Lumenary CS and its electives | The Computer Scientist: "What's the idea that makes it work?" | The Experimenter: "What happens when we run it?" | The Verifier: "Is it correct in every case?" |
+| Programming languages | The Designer: "Why is the language built this way?" | The Profiler: "What does it print, and what does it cost?" | The Language Lawyer: "What exactly does the language guarantee?" |
+| Lumenary EE | The Physicist: "What is really happening in the circuit?" | The Bench Engineer: "What would we measure?" | The Design Reviewer: "Where are the limits, and is it safe?" |
+| Lumenary Robotics | The Builder: "How do we get a robot to do this?" | The Experimenter: "What happens when we simulate it?" | The Safety Engineer: "What could go wrong?" |
+| Lumenary Chemistry | The Chemist: "Why do the atoms behave this way?" | The Analyst: "How much, and how do we know?" | The Sceptic: "Under what conditions is that true?" |
+| Lumenary ME | The Designer: "What is it for, and how does it work?" | The Test Engineer: "What do the numbers say?" | The Checker: "What did we assume, and is there enough margin?" |
+| Lumenary Materials | The Materials Scientist: "What is happening inside, down to the atoms?" | The Tester: "What does the test measure?" | The Failure Analyst: "How could it fail?" |
+| Lumenary Statistics | The Statistician: "What question are we really asking?" | The Simulator: "What happens if we try it ten thousand times?" | The Sceptic: "What does this assume, and could it be chance?" |
+
+The labels live in the messages under `narrators.sets.<set>` (all six locales); `guideSet` in `src/lib/courses.ts` picks a course's set: its `course.json` `guides` if given (a data-science elective may use `"statistics"`), `programming` for `cs/languages/*`, otherwise its subject's. A new subject adds its set to `GUIDE_SETS` in `src/lib/schema.ts` and to the messages.
 
 In Start lessons the cats guide, ask and encourage; from then on they speak as friendly colleagues. Keep them correct and useful (no filler); a light feline touch now and then is welcome.
 

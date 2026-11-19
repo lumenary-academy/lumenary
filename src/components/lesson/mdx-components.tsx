@@ -12,9 +12,9 @@ import { WIDGETS } from "./widget-map";
 
 export { EXPERIMENTS } from "./widget-map";
 
-export function makeMdxComponents({ locale, t, exercises = [] }: { locale: Locale; t: TFunction; exercises?: RenderedExercise[] }): MdxComponents {
+export function makeMdxComponents({ locale, t, exercises = [], guides }: { locale: Locale; t: TFunction; exercises?: RenderedExercise[]; guides?: string }): MdxComponents {
   return {
-    ...makeBlocks(t),
+    ...makeBlocks(t, guides),
     Lean: (p: { decl?: string; region?: string; title?: string }) => <LeanBlock t={t} {...p} />,
     Python: (p: { id: string; title?: string }) => <PythonBlock t={t} {...p} />,
     Trail: (p: { slug: string }) => <TrailCard locale={locale} t={t} slug={p.slug} />,

@@ -194,3 +194,17 @@ it("links into a Scientia subject that is not published yet are plain text until
   const link = '<a href="/en/robotics/">Lumenary Robotics</a>';
   expect(unlinkUnpublished(`See ${link}.`)).toBe(published ? `See ${link}.` : "See Lumenary Robotics.");
 });
+
+it("every subject's cat guides have a role and a question in every set, and courses pick the right set", async () => {
+  const { GUIDE_SETS } = await import("@/lib/schema");
+  const { getCourses, guideSet } = await import("@/lib/courses");
+  const en = json("src/i18n/messages/en.json") as { narrators: { sets: Record<string, Record<string, string>> } };
+  for (const set of GUIDE_SETS)
+    for (const key of ["chloeRole", "chloeQ", "margaretRole", "margaretQ", "gideonRole", "gideonQ"]) expect(en.narrators.sets[set]?.[key], `narrators.sets.${set}.${key}`).toBeTruthy();
+  for (const c of getCourses()) {
+    const set = guideSet(c);
+    if (c.course.division === "lingua") expect(set, c.dir).toBeUndefined();
+    else expect(GUIDE_SETS, c.dir).toContain(set);
+    if (c.collection === "cs/languages" && !c.course.guides) expect(set, c.dir).toBe("programming");
+  }
+});
