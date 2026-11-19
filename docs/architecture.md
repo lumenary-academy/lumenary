@@ -59,7 +59,7 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/en/cs/electives/`, `…/[course]/`, `…/[course]/[slug]/` | Lumenary CS's electives: the index, each elective and its lessons |
 | `/en/ee/`, `/en/ee/[slug]/` | Lumenary EE: the course page and its lessons (English only) |
 | `/en/robotics/`, `/en/robotics/[slug]/` | Lumenary Robotics: the course page and its lessons (English only) |
-| `/en/chemistry/`, `/en/me/`, `/en/materials/` and their `[slug]/` | Lumenary Chemistry, ME and Materials: each course page and its lessons (English only) |
+| `/en/chemistry/`, `/en/chemistry/[slug]/` | Lumenary Chemistry: the course page and its lessons (English only) |
 | `/[locale]/lingua/` | Lumenary Lingua's courses |
 | `/[course locale]/lingua/[course]/`, `…/[slug]/` | A Lingua course and its lessons, generated only in the locale it is taught in |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
