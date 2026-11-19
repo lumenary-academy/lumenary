@@ -40,6 +40,33 @@ function courseLocales() {
   return out;
 }
 
+/** The site's locales, from src/i18n/config.ts. */
+function siteLocales() {
+  const m = fs.readFileSync(path.join(ROOT, "src/i18n/config.ts"), "utf8").match(/export const LOCALES = \[([^\]]*)\]/);
+  return m ? [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]) : ["en"];
+}
+
+/**
+ * Translations of Scientia courses (docs/i18n/every-nation.md): for each course path and locale, whether
+ * the course page is translated (course.<locale>.json) and which lessons are (lessons/<slug>/lesson.<locale>.mdx).
+ */
+function courseTranslations(courses) {
+  const out = {};
+  const locales = siteLocales();
+  for (const [coursePath, taught] of Object.entries(courses)) {
+    const dir = path.join(CONTENT, coursePath);
+    const syllabus = JSON.parse(fs.readFileSync(path.join(dir, "course.json"), "utf8"));
+    const slugs = syllabus.levels.flatMap((l) => l.lessons);
+    for (const l of locales) {
+      if (l === taught) continue;
+      const lessons = slugs.filter((s) => fs.existsSync(path.join(dir, "lessons", s, `lesson.${l}.mdx`)));
+      const course = fs.existsSync(path.join(dir, `course.${l}.json`));
+      if (course || lessons.length) (out[coursePath] ??= {})[l] = { course, lessons };
+    }
+  }
+  return out;
+}
+
 export function contentLocales() {
   const lessons = {};
   for (const slug of fs.readdirSync(LESSONS).sort()) {
@@ -48,7 +75,8 @@ export function contentLocales() {
     const locales = fs.readdirSync(dir).filter((f) => /^[A-Za-z-]+\.mdx$/.test(f) && f !== "en.mdx").map((f) => f.replace(/\.mdx$/, "")).sort();
     if (locales.length) lessons[slug] = locales;
   }
-  return { lessons, courses: courseLocales() };
+  const courses = courseLocales();
+  return { lessons, courses, courseTranslations: courseTranslations(courses) };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

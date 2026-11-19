@@ -201,6 +201,10 @@ They follow the same pattern as Lumenary EE and Robotics: a Start level for abou
 
 tests/safety.test.ts scans these courses too.
 
+## Translations
+
+Every course can be translated: `course.<locale>.json` next to `course.json` translates the course page, and `lesson.<locale>.mdx` with `exercises.<locale>.json` next to a lesson's English files translate the lesson. A translation keeps the English lesson's code, components and exercise data exactly and records its `translation` status and `sourceHash`; the site generates translated pages only where they exist. Volunteers' AI drafts, corrections and expert review are organised by Lumenary Every Nation: see [i18n/every-nation.md](i18n/every-nation.md). Write English lessons with translation in mind: keep code comments few and plain, and keep text out of code where it can live in prose.
+
 ## Checking
 
 ```bash

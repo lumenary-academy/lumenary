@@ -1,14 +1,14 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { resolveLocale } from "@/i18n/server";
-import { getCollection, getCollectionCourse } from "@/lib/courses";
+import { courseLocalesOf, getCollection, getCollectionCourse } from "@/lib/courses";
 import { CourseOverview } from "@/components/course/CoursePages";
 
 export const dynamicParams = false;
 
 /** Lumenary CS electives are taught in English; their pages exist only under /en/. */
 export function generateStaticParams() {
-  return getCollection("cs/electives").map((c) => ({ locale: c.course.locale, course: c.course.id }));
+  return getCollection("cs/electives").flatMap((c) => courseLocalesOf(c).map((locale) => ({ locale, course: c.course.id })));
 }
 
 type Params = { params: Promise<{ locale: string; course: string }> };
@@ -22,6 +22,6 @@ export default async function ElectiveCoursePage({ params }: Params) {
   const { course } = await params;
   const locale = await resolveLocale(params);
   const c = getCollectionCourse("cs/electives", course);
-  if (!c || c.course.locale !== locale) notFound();
+  if (!c || !courseLocalesOf(c).includes(locale)) notFound();
   return <CourseOverview c={c} locale={locale} />;
 }

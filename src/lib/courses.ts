@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import type { Locale } from "@/i18n/config";
-import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, ExercisesFile, GUIDE_SETS, type CourseLevel, type Exercise, type GuideSet } from "./schema";
-import { ROOT } from "./content";
+import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, CourseTranslationFile, ExercisesFile, GUIDE_SETS, type CourseLevel, type Exercise, type GuideSet } from "./schema";
+import { ROOT, shortHash } from "./content";
+import { LOCALES } from "@/i18n/config";
 
 /**
  * Courses outside Lumenary Math: Lumenary Scientia's other subjects (content/cs, content/ee,
@@ -47,6 +48,10 @@ export interface CourseLesson {
   frontmatter: CourseLessonFrontmatter;
   body: string;
   level: CourseLevel;
+  /** The language this text is in: the course's own, or a translation's. */
+  locale: Locale;
+  /** For a translation: true when the original lesson has changed since it was translated. */
+  stale: boolean;
 }
 
 const memo = new Map<string, unknown>();
@@ -115,18 +120,58 @@ export function getLanguageCourse(id: string): LoadedCourse | undefined {
   return getCollectionCourse("cs/languages", id);
 }
 
-export function getCourseLesson(c: LoadedCourse, slug: string): CourseLesson {
-  return cached(`lesson:${c.dir}:${slug}`, () => {
-    const { data, content } = matter(read(path.join(CONTENT, c.dir, "lessons", slug, "lesson.mdx")));
+const lessonFile = (c: LoadedCourse, slug: string, locale: Locale) => path.join(CONTENT, c.dir, "lessons", slug, locale === c.course.locale ? "lesson.mdx" : `lesson.${locale}.mdx`);
+
+/** A lesson in a locale: its translation (lesson.<locale>.mdx) when there is one, otherwise the original. */
+export function getCourseLesson(c: LoadedCourse, slug: string, locale: Locale = c.course.locale): CourseLesson {
+  const use = locale !== c.course.locale && exists(lessonFile(c, slug, locale)) ? locale : c.course.locale;
+  return cached(`lesson:${c.dir}:${slug}:${use}`, () => {
+    const { data, content } = matter(read(lessonFile(c, slug, use)));
     const level = c.course.levels.find((l) => l.lessons.includes(slug));
     if (!level) throw new Error(`${slug} is in no level of ${c.dir}/course.json`);
-    return { slug, frontmatter: CourseLessonFrontmatter.parse(data), body: content, level };
+    const frontmatter = CourseLessonFrontmatter.parse(data);
+    let stale = false;
+    if (use !== c.course.locale) {
+      const recorded = frontmatter.translation?.sourceHash;
+      stale = recorded !== undefined && recorded !== shortHash(matter(read(lessonFile(c, slug, c.course.locale))).content);
+    }
+    return { slug, frontmatter, body: content, level, locale: use, stale };
   });
 }
 
-export function getCourseExercises(c: LoadedCourse, slug: string): Exercise[] {
-  const p = path.join(CONTENT, c.dir, "lessons", slug, "exercises.json");
+export function getCourseExercises(c: LoadedCourse, slug: string, locale: Locale = c.course.locale): Exercise[] {
+  const dir = path.join(CONTENT, c.dir, "lessons", slug);
+  const translated = path.join(dir, `exercises.${locale}.json`);
+  const p = locale !== c.course.locale && exists(translated) && exists(lessonFile(c, slug, locale)) ? translated : path.join(dir, "exercises.json");
   return exists(p) ? ExercisesFile.parse(JSON.parse(read(p))).exercises : [];
+}
+
+/** A course's translated page (course.<locale>.json), if there is one. */
+export function getCourseTranslation(c: LoadedCourse, locale: Locale): CourseTranslationFile | null {
+  if (locale === c.course.locale) return null;
+  const p = path.join(CONTENT, c.dir, `course.${locale}.json`);
+  return exists(p) ? cached(`courseTranslation:${c.dir}:${locale}`, () => CourseTranslationFile.parse(JSON.parse(read(p)))) : null;
+}
+
+/** The course's human-readable fields in a locale (translated where a course.<locale>.json exists); the syllabus is unchanged. */
+export function localizedCourse(c: LoadedCourse, locale: Locale): CourseFile {
+  const t = getCourseTranslation(c, locale);
+  if (!t) return c.course;
+  const levels = c.course.levels.map((l) => {
+    const tl = t.levels.find((x) => x.id === l.id);
+    return tl ? { ...l, title: tl.title, short: tl.short, summary: tl.summary } : l;
+  });
+  return { ...c.course, title: t.title, subtitle: t.subtitle, description: t.description, ui: t.ui, levels, locale };
+}
+
+/** The locales a course's own page exists in: the language it is taught in, and each language with a course.<locale>.json. */
+export function courseLocalesOf(c: LoadedCourse): Locale[] {
+  return [c.course.locale, ...LOCALES.filter((l) => getCourseTranslation(c, l) !== null)];
+}
+
+/** The locales a lesson's page exists in: the course's language, and each language with a lesson.<locale>.mdx. */
+export function lessonLocalesOf(c: LoadedCourse, slug: string): Locale[] {
+  return [c.course.locale, ...LOCALES.filter((l) => l !== c.course.locale && exists(lessonFile(c, slug, l)))];
 }
 
 /** The locale a course's pages are generated in, by course path ("cs", "ee", "cs/languages/rust"). */
