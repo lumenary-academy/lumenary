@@ -1,0 +1,630 @@
+---
+title: Feedback and PID control
+subtitle: Measure, compare, correct, a hundred times a second — the loop that makes a robot joint go where it is told and stay there.
+minutes: 70
+objectives:
+  - Explain the difference between open-loop and closed-loop control, and why feedback copes with loads and modelling errors that a fixed command cannot
+  - Predict what the proportional, integral and derivative terms each do to a robot joint, and simulate P, PI, PD and PID control of a geared DC motor
+  - Tune a PID loop by experiment and by rule (Ziegler–Nichols), and say what each method assumes
+  - Implement PID at a fixed rate with output limits, anti-windup, derivative on measurement and a derivative filter
+  - Describe the cascaded current, velocity and position loops inside a real robot joint and why each inner loop must be faster
+prerequisites: [moving, robot-dynamics]
+related: [math.analysis.ordinary-differential-equations, math.analysis.single-variable-calculus, math.comp.numerical-methods]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Feedback Systems: An Introduction for Scientists and Engineers"
+    author: Karl Johan Åström and Richard M. Murray
+    year: 2021
+    url: https://fbswiki.org/
+    note: A free textbook; its PID chapter covers windup, derivative filtering and tuning rules in more depth than this lesson.
+  - title: "On Governors"
+    author: James Clerk Maxwell
+    year: 1868
+    url: https://doi.org/10.1098/rspl.1867.0055
+    note: The first mathematical analysis of a feedback controller's stability, prompted by steam-engine governors that hunted.
+  - title: "Directional stability of automatically steered bodies"
+    author: Nicolas Minorsky
+    year: 1922
+    note: The ship-steering paper in which the three-term (PID) law was first worked out from watching helmsmen. Journal of the American Society of Naval Engineers.
+  - title: "Optimum settings for automatic controllers"
+    author: John G. Ziegler and Nathaniel B. Nichols
+    year: 1942
+    note: The tuning rules still taught today, from engineers at an instrument company. Transactions of the ASME 64.
+  - title: "Advanced PID Control"
+    author: Karl Johan Åström and Tore Hägglund
+    year: 2006
+    note: The standard professional reference on PID structures, anti-windup and automatic tuning, including the relay method.
+  - title: "ros2_control"
+    url: https://control.ros.org/
+    note: The ROS 2 framework for robot controllers, whose joint-trajectory and PID controllers run loops like the ones in this lesson.
+  - title: "PX4 autopilot documentation"
+    url: https://docs.px4.io/
+    note: An open-source flight stack whose multicopter controller is a cascade of position, velocity, attitude and rate loops.
+  - title: "moteus brushless controller"
+    url: https://github.com/mjbots/moteus
+    note: Open-source firmware and hardware for a robot joint drive, with its current, velocity and position loops in plain C++.
+---
+
+<Section id="motivation" kind="motivation" title="Holding still is harder than it looks">
+
+A small arm in a school in Accra is meant to lift its forearm from hanging slightly down to exactly horizontal, then hold it there while a student places a sensor in its gripper. The forearm is driven by a geared DC motor; the more voltage you apply, the more torque it makes. Surely you can work out the voltage that holds the arm level, apply it, and be done?
+
+Try it and three things go wrong. The arm swings past horizontal on the way up, because it arrives with speed. It then settles a little low, because the torque you calculated was for a forearm whose weight you guessed, and the gripper's cable drags a little more than you thought. And when the student puts the sensor in the gripper, the arm sags further, because nothing in your plan knew the sensor was coming. Every fixed command is a prediction, and the world rarely matches the prediction exactly.
+
+The cure is **feedback**: measure where the arm actually is, compare it with where it should be, and correct the command, over and over, many times a second. This lesson builds that loop for a simulated robot joint, starting with the oldest and still most widely used feedback law, **PID**. It shows what each of the three terms does, how engineers tune them, the details that separate a classroom formula from firmware that runs on a real robot, and how real robot joints stack three such loops inside each other.
+
+The frequency-domain theory of feedback (transfer functions, Bode plots, gain and phase margins) belongs to Lumenary EE's [feedback control](/en/ee/feedback-control/) and [Laplace and stability](/en/ee/laplace-and-stability/) lessons. Here we stay in the time domain, with a simulated motor and a clock, which is how a robot engineer meets the loop first.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Open loop and closed loop">
+
+An **open-loop** controller computes its command from the goal alone: "to turn the wheel at 2 rad/s, apply 4 V". A **closed-loop** controller also looks at the result: "the wheel is turning at 1.8 rad/s, which is too slow, so add some voltage". The difference is one wire, from the sensor back to the controller, and it changes everything.
+
+<Figure caption="Top: open-loop control computes the command from the reference alone, so disturbances and model errors pass straight through to the output. Bottom: closed-loop control subtracts the measured output from the reference, and the controller acts on the error.">
+<svg viewBox="0 0 520 250" role="img" aria-label="Two block diagrams. In the open-loop diagram, a reference r enters a controller, whose command u enters the plant, whose output y leaves; a disturbance d enters the plant from above. In the closed-loop diagram, the reference enters a summing junction marked plus, the measured output from a sensor enters it marked minus, the error e goes to the controller, the command u goes to the plant, and the output y is fed back through the sensor to the junction." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="pid-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fontFamily="sans-serif" fontSize="13" fill="currentColor">
+    <text x="10" y="22" fontWeight="bold">Open loop</text>
+    <text x="10" y="140" fontWeight="bold">Closed loop</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="150" y="45" width="100" height="40" rx="4" />
+    <rect x="320" y="45" width="100" height="40" rx="4" />
+    <rect x="150" y="165" width="100" height="40" rx="4" />
+    <rect x="320" y="165" width="100" height="40" rx="4" />
+    <rect x="320" y="215" width="100" height="28" rx="4" />
+    <circle cx="100" cy="185" r="12" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#pid-arrow)">
+    <line x1="40" y1="65" x2="148" y2="65" />
+    <line x1="250" y1="65" x2="318" y2="65" />
+    <line x1="420" y1="65" x2="500" y2="65" />
+    <line x1="370" y1="22" x2="370" y2="43" />
+    <line x1="40" y1="185" x2="86" y2="185" />
+    <line x1="112" y1="185" x2="148" y2="185" />
+    <line x1="250" y1="185" x2="318" y2="185" />
+    <line x1="420" y1="185" x2="500" y2="185" />
+    <line x1="370" y1="142" x2="370" y2="163" />
+    <polyline points="460,185 460,229 422,229" />
+    <polyline points="318,229 100,229 100,199" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="13" fill="currentColor" textAnchor="middle">
+    <text x="200" y="70">controller</text>
+    <text x="370" y="70">plant</text>
+    <text x="200" y="190">controller</text>
+    <text x="370" y="190">plant</text>
+    <text x="370" y="233">sensor</text>
+    <text x="55" y="58">r</text>
+    <text x="284" y="58">u</text>
+    <text x="480" y="58">y</text>
+    <text x="382" y="20">d</text>
+    <text x="55" y="178">r</text>
+    <text x="130" y="178">e</text>
+    <text x="284" y="178">u</text>
+    <text x="480" y="178">y</text>
+    <text x="382" y="140">d</text>
+    <text x="84" y="176">+</text>
+    <text x="90" y="212">−</text>
+  </g>
+</svg>
+</Figure>
+
+In the diagram, $r$ is the **reference** (what we want), $y$ the **output** (what we get), $u$ the **command** the controller sends to the **plant** (the motor, gearbox and arm), $d$ a **disturbance** (a load, a slope, a sagging battery), and $e = r - y$ the **error**. In the open loop, $d$ goes straight to $y$. In the closed loop, $d$ moves $y$, which changes $e$, which changes $u$, which pushes back.
+
+<Analogy>
+
+Steering a bicycle with your eyes shut is open-loop control: you can aim well at the start, but a gust of wind or a bump will take you off course and you will not know. With your eyes open you correct a little, constantly, without thinking. You are not better at predicting the wind; you are measuring its effect and undoing it.
+
+</Analogy>
+
+Here is the difference in numbers. A small gearmotor turns a robot's wheel, and we want 2 rad/s. The open-loop controller applies the 4 V that gives 2 rad/s on the nominal motor. The closed-loop controllers add a correction proportional to the speed error (P) or also to its accumulated history (PI), both measured by an encoder 100 times a second. Then we change the world: a ramp, a tired battery, cold grease in the gearbox.
+
+```python run
+import numpy as np
+
+# A small gearmotor turning a wheel. Output-shaft model:  J*dw/dt = k*s*u - c*w - tau_load
+J, k, c = 0.02, 0.25, 0.5      # kg m^2, N m per volt, N m s/rad
+T = 0.01                       # the controller runs at 100 Hz
+
+def speed_after(controller, s=1.0, c_true=c, tau_load=0.0, seconds=3.0):
+    """Simulate; s scales the voltage the driver really delivers (a sagging battery)."""
+    w, integral = 0.0, 0.0
+    for _ in range(int(seconds / T)):
+        u, integral = controller(w, integral)
+        u = min(max(u, -12.0), 12.0)            # the driver cannot exceed its supply
+        for _ in range(10):                     # integrate the motor in 1 ms substeps
+            w += (T / 10) * (k * s * u - c_true * w - tau_load) / J
+    return w
+
+w_ref = 2.0                       # wanted: 2 rad/s
+u_ff = w_ref * c / k              # the voltage that gives 2 rad/s on the nominal motor: 4 V
+
+open_loop = lambda w, i: (u_ff, i)
+p_ctrl = lambda w, i: (u_ff + 10.0 * (w_ref - w), i)
+def pi_ctrl(w, i):
+    e = w_ref - w
+    i += e * T
+    return u_ff + 10.0 * e + 40.0 * i, i
+
+cases = [("nominal", {}), ("up a ramp: 0.3 N m load", {"tau_load": 0.3}),
+         ("battery sagged to 85 %", {"s": 0.85}), ("cold grease: c +40 %", {"c_true": 0.7})]
+print(f"{'case':26} {'open loop':>10} {'P':>8} {'PI':>8}   (rad/s; wanted 2.000)")
+for name, kw in cases:
+    print(f"{name:26} {speed_after(open_loop, **kw):10.3f} "
+          f"{speed_after(p_ctrl, **kw):8.3f} {speed_after(pi_ctrl, **kw):8.3f}")
+```
+
+The open loop is perfect only when the world matches its model, and loses 15 to 30 per cent of the speed otherwise. Proportional feedback cuts each of those errors by a factor of between four and six, and the PI controller removes them completely.
+
+<Narrator who="margaret">
+
+The factor of six is predictable. In steady state the P controller adds $10 \times$ (speed error) volts, each volt buys $k/c = 0.5$ rad/s, so the **loop gain** is $10 \times 0.5 = 5$, and any open-loop error is divided by $1 + 5 = 6$: the ramp's $0.6$ rad/s shortfall becomes $0.1$ rad/s. The weak battery and the cold grease also lower the loop gain itself, to $4.25$ and $3.6$, which is why their errors shrink a little less. Doubling the gain would divide by about eleven, but never by infinity.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The PID law">
+
+<Definition term="PID controller">
+
+A **PID controller** computes the command from the error $e(t) = r(t) - y(t)$ as
+
+$$
+u(t) = K_p\, e(t) + K_i \int_0^t e(\tau)\, d\tau + K_d\, \frac{de}{dt}(t),
+$$
+
+with three non-negative **gains**: proportional $K_p$, integral $K_i$ and derivative $K_d$. Dropping terms gives the P, PI and PD controllers. An equivalent "standard" form writes $u = K_p\big(e + \tfrac{1}{T_i}\int e + T_d\, \dot e\big)$, with **integral time** $T_i = K_p/K_i$ and **derivative time** $T_d = K_d/K_p$.
+
+</Definition>
+
+Each term looks at the error at a different time. The **P** term reacts to the present error. The **I** term remembers the past: it keeps growing as long as any error remains. The **D** term looks at the trend: if the error is shrinking fast, it eases off the command before the output overshoots.
+
+<Definition term="step response measures">
+
+After a step change in the reference, the **overshoot** is how far the output goes past the new reference, as a percentage of the step; the **settling time** is when the output enters, and stays inside, a band around the reference (here $\pm 0.01$ rad, or a percentage of the step); the **steady-state error** is what remains after everything has settled.
+
+</Definition>
+
+<Definition term="saturation">
+
+Real actuators have limits. A motor driver on a 24 V supply cannot apply 60 V however loudly the controller asks. The controller's output is **saturated** when it is clipped to such a limit; while it is, the loop is effectively open.
+
+</Definition>
+
+</Section>
+
+<Section id="joint" kind="examples" title="P, PI, PD and PID on a robot joint">
+
+Now the forearm from the opening. Take $\theta$ as its angle above horizontal and $\omega = \dot\theta$. With the motor's electrical dynamics neglected (its current settles within about a millisecond, far faster than the arm moves), a geared DC motor turns voltage $u$ into torque $k u$, loses $c\,\omega$ to back-EMF and friction, and the link's weight pulls with torque $\tau_g \cos\theta$ (the gravity term of <LessonLink slug="robot-dynamics">the dynamics lesson</LessonLink>, for a link of mass $m$ whose centre of mass is a distance $r$ from the joint):
+
+$$
+J\,\dot\omega = k\,u - c\,\omega - \tau_g \cos\theta,\qquad \tau_g = m g r .
+$$
+
+We use $J = 0.02$ kg·m², $k = 0.25$ N·m/V, $c = 0.5$ N·m·s/rad and a 0.3 kg link with its centre 0.15 m out, so $\tau_g = 0.44$ N·m. The supply is 24 V. The controller runs on a microcontroller at a fixed **100 Hz**: every 10 ms it samples the encoder, computes, and applies the new voltage at the next tick, so there is one sample of delay, as in many real loops. The arm starts at rest $0.5$ rad below horizontal, $\theta = -0.5$, and is asked to go to $0$.
+
+```python run
+import numpy as np
+
+# One joint of a small arm moving in a vertical plane (theta = 0 is horizontal).
+J, k, c = 0.02, 0.25, 0.5          # inertia, N m per volt, damping
+TAU_G = 0.3 * 9.81 * 0.15          # gravity torque of the link when horizontal: 0.44 N m
+U_MAX, T = 24.0, 0.01              # 24 V supply; the loop runs at 100 Hz
+
+def joint_step(th, w, u):
+    """Advance the joint by one control period with voltage u held (ten 1 ms substeps)."""
+    for _ in range(10):
+        w += 0.001 * (k * u - c * w - TAU_G * np.cos(th)) / J
+        th += 0.001 * w
+    return th, w
+
+def step_response(kp, ki, kd, th0=-0.5, target=0.0, seconds=3.0):
+    th, w, integral, prev_e, u_next = th0, 0.0, 0.0, target - th0, 0.0
+    ths, us = [], []
+    for _ in range(int(seconds / T)):
+        u = u_next                          # voltage computed last tick is applied now
+        e = target - th                     # sample the encoder
+        integral += e * T
+        deriv = (e - prev_e) / T
+        prev_e = e
+        u_next = min(max(kp * e + ki * integral + kd * deriv, -U_MAX), U_MAX)
+        ths.append(th); us.append(u)
+        th, w = joint_step(th, w, u)
+    return np.array(ths), np.array(us)
+
+print("step from -0.50 rad to 0 rad (horizontal); settled = within 0.01 rad for good")
+print(f"{'controller':24} {'overshoot':>9} {'settled at':>10} {'final error':>11} {'peak volts':>10}")
+for name, gains in [("P   Kp=15", (15, 0, 0)), ("P   Kp=40", (40, 0, 0)),
+                    ("PD  Kp=40 Kd=0.8", (40, 0, 0.8)), ("PI  Kp=15 Ki=30", (15, 30, 0)),
+                    ("PID Kp=40 Ki=40 Kd=0.8", (40, 40, 0.8))]:
+    th, u = step_response(*gains)
+    outside = np.nonzero(np.abs(th) > 0.01)[0]
+    settled = "never" if outside[-1] == len(th) - 1 else f"{(outside[-1] + 1) * T:.2f} s"
+    print(f"{name:24} {max(th.max(), 0) / 0.5 * 100:8.1f}% {settled:>10} "
+          f"{round(-th[-1], 3) + 0.0:11.3f} {np.abs(u).max():10.1f}")
+```
+
+The table tells the story of the three terms.
+
+**P alone droops.** With $K_p = 15$ V/rad the arm stops $0.117$ rad (almost 7°) below horizontal. To hold the link up, the motor needs $\tau_g/k = 1.77$ V, and a P controller only produces voltage when there is an error, so it *must* settle where $K_p\,e = 1.77$ V. Raising $K_p$ to 40 shrinks the droop to $0.044$ rad but makes the arm overshoot: more gain means more push, and the arm arrives with more speed.
+
+**D adds damping.** The PD controller keeps $K_p = 40$ and adds $K_d = 0.8$ V·s/rad. As the arm rushes towards the target, the error falls fast, $\dot e$ is large and negative, and the D term brakes. The overshoot disappears, but the droop does not: at rest $\dot e = 0$ and D contributes nothing.
+
+**I removes the droop.** The PI controller settles exactly on target. While any error remains, the integral grows and so does the voltage, until the integral term alone supplies the 1.77 V that gravity needs.
+
+**PID does all three:** fast, little overshoot, no droop, settled in a quarter of a second.
+
+<Figure caption="Simulated step responses of the joint from −0.5 rad to horizontal (0 rad), with the same gains as the table. P control (Kp = 40) overshoots and then settles 0.044 rad short; PID (Kp = 40, Ki = 40, Kd = 0.8) overshoots by 4 % and settles on the target.">
+<svg viewBox="0 0 440 240" role="img" aria-label="A graph of joint angle against time from 0 to 1.5 seconds. Both curves start at minus 0.5 radians. The P-controlled curve rises steeply, overshoots above zero, and settles at about minus 0.044 radians, below the dashed target line at zero. The PID curve rises as quickly, overshoots slightly, and settles on the target line." xmlns="http://www.w3.org/2000/svg">
+  <g stroke="currentColor" strokeWidth="1" fill="none">
+    <line x1="50" y1="30" x2="50" y2="210" />
+    <line x1="50" y1="210" x2="415" y2="210" />
+    <line x1="50" y1="68.6" x2="415" y2="68.6" strokeDasharray="5 4" />
+  </g>
+  <polyline fill="none" stroke="currentColor" strokeWidth="2" points="50,197.1 55,194.8 60,176.4 64,147.9 69,116.7 74,88.7 79,67.3 84,54.2 88,49.0 93,50.2 98,55.7 103,63.6 108,71.7 112,78.8 117,84.0 122,87.1 127,88.1 132,87.5 136,85.9 141,83.8 146,81.7 151,79.9 156,78.6 160,77.9 165,77.8 170,78.0 194,80.3 218,80.1 242,79.8 266,79.9 290,79.9 314,79.9 338,79.9 362,79.9 386,79.9 410,79.9" />
+  <polyline fill="none" stroke="var(--gold)" strokeWidth="2.5" points="50,197.1 55,194.7 60,176.2 64,148.6 69,120.8 74,97.7 79,81.0 84,70.5 88,65.0 93,63.1 98,63.4 103,64.7 108,66.4 112,67.9 117,69.1 122,69.9 127,70.4 132,70.6 136,70.6 141,70.5 146,70.4 151,70.3 156,70.2 160,70.1 165,70.0 170,69.9 194,69.8 218,69.7 242,69.6 266,69.5 290,69.4 314,69.3 338,69.2 362,69.2 386,69.1 410,69.0" />
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor">
+    <text x="44" y="72.6" textAnchor="end">0</text>
+    <text x="44" y="201" textAnchor="end">−0.5</text>
+    <text x="44" y="137" textAnchor="end">−0.25</text>
+    <text x="50" y="226" textAnchor="middle">0</text>
+    <text x="170" y="226" textAnchor="middle">0.5</text>
+    <text x="290" y="226" textAnchor="middle">1.0</text>
+    <text x="410" y="226" textAnchor="middle">1.5 s</text>
+    <text x="300" y="60">target</text>
+    <text x="250" y="98">P: settles 0.044 rad low</text>
+    <text x="115" y="58" fill="var(--gold)">PID</text>
+    <text x="8" y="20">θ (rad)</text>
+  </g>
+</svg>
+</Figure>
+
+<Narrator who="chloe">
+
+Why does the integral term always reach zero error, whatever the load? Because at a steady state nothing changes, so the integral must have stopped changing, and the only way $\int e$ stops changing is $e = 0$. The argument never mentions the load, the gearbox or the gains — only that the loop settles. This is the simplest case of the *internal model principle*: to cancel a constant disturbance exactly, the controller must contain an integrator.
+
+</Narrator>
+
+Faster responses also ask for more voltage: the PID run touches 20.5 V of the 24 available, and a larger step would hit the limit, with consequences we meet below.
+
+</Section>
+
+<Section id="tuning" kind="human" title="Tuning by experiment and by rule">
+
+The gains above did not fall from the sky. There are three common ways to find them.
+
+### By experiment
+
+The manual recipe that most engineers learn first, best done in simulation or on a small, slow, current-limited joint with the arm clear of people and a hand on the stop button:
+
+1. Start with $K_i = K_d = 0$ and a small $K_p$. Raise $K_p$ until the response is brisk with a little overshoot.
+2. Add $K_d$ until the overshoot is damped. Too much $K_d$ makes the motor buzz, because it amplifies sensor noise.
+3. Add $K_i$ until the steady-state error disappears in an acceptable time. Too much $K_i$ brings back overshoot and slow oscillation.
+4. Test with large steps, with loads, and at the limits of the motion range, not just the one small step you tuned on.
+
+### By rule: Ziegler and Nichols
+
+In 1942 John Ziegler and Nathaniel Nichols, engineers at an instrument maker in Rochester, New York, proposed rules that turn a single experiment into gains. Use P control only and raise $K_p$ until the loop oscillates steadily, neither growing nor dying away. That gain is the **ultimate gain** $K_u$, and the oscillation's period is the **ultimate period** $T_u$. Then set
+
+$$
+K_p = 0.6\,K_u, \qquad T_i = T_u/2, \qquad T_d = T_u/8 .
+$$
+
+Pushing a real robot into sustained oscillation can shake loose bolts and wear gearboxes, so let us do it in simulation, with a small nudge so the motor never saturates.
+
+```python run
+import numpy as np
+
+J, k, c = 0.02, 0.25, 0.5
+TAU_G = 0.3 * 9.81 * 0.15
+U_MAX, T = 24.0, 0.01
+
+def joint_step(th, w, u):
+    for _ in range(10):
+        w += 0.001 * (k * u - c * w - TAU_G * np.cos(th)) / J
+        th += 0.001 * w
+    return th, w
+
+def simulate(kp, ki, kd, th0, target, seconds, holding=True):
+    u_hold = TAU_G * np.cos(th0) / k if holding else 0.0  # start at rest, held at th0 by
+    integral = u_hold / ki if ki else 0.0                 # the integrator, as after a long wait
+    th, w, prev_e, u_next = th0, 0.0, target - th0, u_hold
+    ths = []
+    for _ in range(int(seconds / T)):
+        u = u_next
+        e = target - th
+        integral += e * T
+        deriv = (e - prev_e) / T
+        prev_e = e
+        u_next = min(max(kp * e + ki * integral + kd * deriv, -U_MAX), U_MAX)
+        ths.append(th)
+        th, w = joint_step(th, w, u)
+    return np.array(ths)
+
+# The experiment: P control only, a small 0.02 rad nudge, and watch whether the swing grows.
+def growth(kp):
+    th = simulate(kp, 0, 0, -0.02, 0.0, 6.0, holding=False)
+    swing = lambda a, b: np.ptp(th[int(a / T):int(b / T)])
+    return swing(4.0, 6.0) / swing(2.0, 4.0)
+
+lo, hi = 10.0, 400.0                    # growth(lo) < 1 (dies out), growth(hi) > 1 (grows)
+for _ in range(40):
+    mid = 0.5 * (lo + hi)
+    lo, hi = (mid, hi) if growth(mid) < 1 else (lo, mid)
+Ku = 0.5 * (lo + hi)
+th = simulate(Ku, 0, 0, -0.02, 0.0, 6.0, holding=False)
+x = th[300:] - th[300:].mean()
+ups = np.nonzero((x[:-1] < 0) & (x[1:] >= 0))[0]       # upward zero crossings
+Tu = (ups[-1] - ups[0]) * T / (len(ups) - 1)
+print(f"ultimate gain Ku = {Ku:.0f} V/rad, oscillation period Tu = {Tu:.3f} s")
+
+# Ziegler and Nichols' classic PID rule: Kp = 0.6 Ku, Ti = Tu/2, Td = Tu/8
+kp, ki, kd = 0.6 * Ku, 0.6 * Ku / (Tu / 2), 0.6 * Ku * Tu / 8
+print(f"Ziegler-Nichols gains: Kp = {kp:.0f}, Ki = {ki:.0f}, Kd = {kd:.2f}")
+
+print(f"\n{'a step of 0.05 rad':22} {'overshoot':>9} {'within 5 %':>10}")
+for name, g in [("Ziegler-Nichols", (kp, ki, kd)), ("hand-tuned 40/40/0.8", (40, 40, 0.8))]:
+    th = simulate(*g, -0.05, 0.0, 3.0)
+    outside = np.nonzero(np.abs(th) > 0.0025)[0]
+    print(f"{name:22} {max(th.max(), 0) / 0.05 * 100:8.0f}% {(outside[-1] + 1) * T:8.2f} s")
+```
+
+The experiment finds $K_u \approx 147$ V/rad and $T_u \approx 0.16$ s, and the rule gives $K_p = 88$, $K_i = 1104$, $K_d = 1.75$. The result is fast, settling sooner than our hand-tuned gains, but it overshoots by 74 per cent. That is not a bug in the simulation. Ziegler and Nichols tuned process plants (temperatures, pressures, flows), aiming for a response in which each swing is about a quarter of the one before. For a robot arm that is far too lively. Treat the rule as a starting point: it tells you the scale of the gains in one experiment, and then you detune, typically lowering $K_i$ a lot and $K_p$ somewhat.
+
+<Narrator who="gideon">
+
+In the continuous-time model, P control of this joint is stable for *every* gain: the closed loop is a damped second-order system whose damping only falls as $K_p$ rises. The finite $K_u$ comes entirely from what the model leaves out — here, sampling at 100 Hz and the one-tick delay between measuring and acting. On a real joint, gearbox flexibility and sensor filtering lower it further, which is why $K_u$ must be measured on the machine rather than computed from a tidy model.
+
+</Narrator>
+
+Two refinements are worth knowing. Karl Johan Åström and Tore Hägglund's **relay method** (1984) lets a relay switch the command between two small values; the loop settles into a small, controlled oscillation whose amplitude and period give $K_u$ and $T_u$ without pushing the loop to the edge of instability. Many "autotune" buttons use it. And modern rules such as Sigurd Skogestad's SIMC rules start from a simple fitted model (a gain, a time constant and a delay) and give gentler, more robust settings.
+
+### By model
+
+When you know the model, you can choose the closed-loop behaviour directly. Linearised near horizontal, the joint is $\ddot\theta = -a\dot\theta + b\,u + \ldots$ with $a = c/J = 25$ s⁻¹ and $b = k/J = 12.5$ rad/s² per volt. PD control turns it into $\ddot\theta + (a + bK_d)\dot\theta + bK_p\theta = \ldots$, a mass–spring–damper whose natural frequency is $\omega_n = \sqrt{bK_p}$ and damping ratio $\zeta = (a + bK_d)/(2\omega_n)$. Our $K_p = 40$, $K_d = 0.8$ give $\omega_n = 22.4$ rad/s and $\zeta = 0.78$: a quick response with almost no overshoot, which is what the PD row showed. Turning that idea into a systematic design method for many states at once is the subject of <LessonLink slug="state-space-and-lqr">the next lesson</LessonLink>; the frequency-domain view of the same choices is in Lumenary EE's [feedback control](/en/ee/feedback-control/).
+
+</Section>
+
+<Section id="implementation" kind="computation" title="From formula to firmware: windup, kick and noise">
+
+The PID formula is three lines. The PID loops inside real robots are a few dozen, and every extra line fixes a problem that the formula ignores.
+
+### A fixed rate
+
+A digital controller runs on a clock. Every period $T$ it reads the sensor, computes, and writes the actuator. In discrete time the integral becomes a running sum and the derivative a difference:
+
+$$
+u_k = K_p e_k + K_i T \sum_{j \le k} e_j + K_d\,\frac{e_k - e_{k-1}}{T}.
+$$
+
+The rate matters: the discrete $K_i T$ and $K_d/T$ are only right for the $T$ they assume, and an irregular period (a loop run "as fast as it can" by an operating system that sometimes pauses it) acts like noise injected into the integral and derivative. Real-time loops run from a hardware timer or a real-time scheduler, and good code logs the actual period.
+
+### Integral windup
+
+When the output saturates, the plant receives less than the controller asks for, the error stays large for longer, and the integral keeps accumulating. When the output finally reaches the target, the integral holds a large stored value, which drives the output far past the target before it unwinds. This is **integral windup**, and it is a classic surprise: the loop tuned perfectly on small steps overshoots badly on a big one.
+
+The simplest fix, **conditional integration** or **clamping**, stops integrating while the output is saturated *and* the error would push it further into saturation. Another, **back-calculation**, feeds the difference between the requested and the actual output back into the integrator, bleeding it off at a chosen rate.
+
+### Derivative kick and noise
+
+If the reference jumps, so does the error, and $\dot e$ is enormous for one sample: a **derivative kick** that slams the actuator. Since $\dot e = \dot r - \dot y$ and $\dot r$ is zero except at the jumps, the standard fix is to differentiate the **measurement** only, using $-\dot y$ instead of $\dot e$. The response to disturbances is unchanged.
+
+The derivative also amplifies noise. A sensor with noise of standard deviation $\sigma$, differenced over one period, gives derivative noise of about $\sqrt 2\,\sigma/T$, which grows as the loop gets faster. So the derivative is always **low-pass filtered**, typically with a time constant of a fraction of $T_d$ (a common choice is $T_d/N$ with $N$ between 5 and 20), but never shorter than a sample or two.
+
+The block below implements all three fixes, each switchable, and tests them on the joint.
+
+```python run
+import numpy as np
+
+J, k, c = 0.02, 0.25, 0.5
+TAU_G = 0.3 * 9.81 * 0.15
+U_MAX, T = 24.0, 0.01
+
+def joint_step(th, w, u):
+    for _ in range(10):
+        w += 0.001 * (k * u - c * w - TAU_G * np.cos(th)) / J
+        th += 0.001 * w
+    return th, w
+
+class PID:
+    """A PID loop called once per tick (every T seconds). Options switch on the three fixes."""
+    def __init__(self, kp, ki, kd, anti_windup=False, d_on_measurement=False, tf=0.0):
+        self.kp, self.ki, self.kd, self.tf = kp, ki, kd, tf
+        self.anti_windup, self.d_on_measurement = anti_windup, d_on_measurement
+        self.integral, self.prev, self.d = 0.0, None, 0.0
+
+    def update(self, target, y):
+        e = target - y
+        x = -y if self.d_on_measurement else e          # differentiate -y or e
+        if self.prev is not None:
+            raw = (x - self.prev) / T
+            self.d += T / (self.tf + T) * (raw - self.d)  # first-order filter (none if tf = 0)
+        self.prev = x
+        u = self.kp * e + self.ki * self.integral + self.kd * self.d
+        u_sat = min(max(u, -U_MAX), U_MAX)
+        if not self.anti_windup or u == u_sat or e * u < 0:
+            self.integral += e * T                      # clamping: freeze while pushing the limit
+        return u_sat
+
+def run(pid, th0, target, t_step=0.5, seconds=4.0, noise=0.0):
+    """Hold th0 until t_step, then jump the target. The sensor adds Gaussian noise (rad rms)."""
+    rng = np.random.default_rng(7)
+    pid.integral = TAU_G * np.cos(th0) / k / pid.ki      # already holding th0 at rest
+    th, w, u_next, ths, us = th0, 0.0, TAU_G * np.cos(th0) / k, [], []
+    for i in range(int(seconds / T)):
+        u = u_next
+        y = th + noise * rng.standard_normal()
+        u_next = pid.update(th0 if i * T < t_step else target, y)
+        ths.append(th); us.append(u)
+        th, w = joint_step(th, w, u)
+    return np.array(ths), np.array(us)
+
+gains = (40, 40, 0.8)
+print("A big move, -0.5 -> 1.0 rad: the voltage saturates at 24 V for a while")
+for name, opts in [("no anti-windup", {}), ("with anti-windup", {"anti_windup": True})]:
+    th, u = run(PID(*gains, **opts), -0.5, 1.0)
+    late = np.nonzero(np.abs(th - 1.0) > 0.01)[0][-1] + 1
+    print(f"  {name:17} overshoot {(th.max() - 1.0) / 1.5 * 100:5.1f}%   settled {late * T - 0.5:.2f} s after the step"
+          f"   saturated for {np.sum(np.abs(u) >= U_MAX) * T:.2f} s")
+
+print("A small step, 0 -> 0.05 rad, with 1 mrad of sensor noise")
+for name, opts in [("D on error", {}), ("D on measurement", {"d_on_measurement": True}),
+                   ("  + 30 ms filter", {"d_on_measurement": True, "tf": 0.03})]:
+    th, u = run(PID(*gains, anti_windup=True, **opts), 0.0, 0.05, noise=0.001)
+    kick = np.abs(np.diff(u[45:60])).max()                 # around the step at t = 0.5 s
+    print(f"  {name:17} biggest jump {kick:5.2f} V   noise in u after settling {np.std(u[-100:]):.3f} V rms")
+```
+
+Read the output line by line. Saturated for only an eighth of a second, the integrator without anti-windup still stores enough to nearly triple the overshoot (16.1 % against 5.9 %) and to double the settling time. With the derivative on the error, the 0.05 rad step produces a one-tick jump of 6.35 V, of which about 4 V is the kick ($K_d \times 0.05/0.01$); differentiating the measurement removes it. And the 30 ms filter halves the voltage noise that the sensor's 1 mrad of noise causes, at the cost of a little phase lag.
+
+<Narrator who="margaret">
+
+The remaining slow tail after the big move (1.5 s to settle even with anti-windup) is the integrator re-learning the load: holding the arm at $1.0$ rad needs only $\cos 1.0 = 54$ per cent of the voltage it needed at $-0.5$ rad, and $K_i = 40$ unlearns the difference slowly. Computing $\tau_g \cos\theta / k$ and adding it to the command, **gravity feedforward**, removes that tail almost entirely; <LessonLink slug="trajectories-and-tracking">trajectories and tracking</LessonLink> builds it in.
+
+</Narrator>
+
+On a microcontroller the same loop is written in C and called from a hardware timer interrupt. The sketch below is for illustration and is not run here; real firmware adds fault checks (encoder lost, over-current, over-temperature) that stop the motor safely.
+
+```c
+/* Not run here: a 1 kHz position PID for a microcontroller, called by a timer interrupt. */
+static float integral = 0.0f, d_filt = 0.0f, y_prev = 0.0f;
+
+void control_tick(void)                       /* called every T seconds by a timer */
+{
+    const float T = 0.001f, KP = 40.0f, KI = 40.0f, KD = 0.8f, TF = 0.005f, UMAX = 24.0f;
+    float y = encoder_angle_rad();            /* read the sensor first, at a fixed time */
+    float e = target_rad - y;
+    d_filt += T / (TF + T) * (-(y - y_prev) / T - d_filt);   /* filtered -dy/dt */
+    y_prev = y;
+    float u = KP * e + KI * integral + KD * d_filt;
+    float u_sat = u > UMAX ? UMAX : (u < -UMAX ? -UMAX : u);
+    if (u == u_sat || e * u < 0.0f)           /* clamping anti-windup */
+        integral += e * T;
+    motor_set_volts(u_sat);
+}
+```
+
+</Section>
+
+<Section id="cascade" kind="human" title="Loops inside loops: how a real joint is controlled">
+
+The joint above uses one loop from position error straight to voltage. Real robot joints, from collaborative arms to quadruped legs, almost never do. Instead they **cascade** three loops, each feeding the reference of the one inside it.
+
+<Figure caption="A cascaded joint controller. The position loop outputs a velocity reference, the velocity loop outputs a current (torque) reference, and the current loop sets the motor voltage through the power stage. Each inner loop runs faster than the one around it; typical rates are shown.">
+<svg viewBox="0 0 560 230" role="img" aria-label="Three controllers in a row: position controller, velocity controller and current controller, followed by a power stage and motor with gearbox. A position reference enters the first; its output, a velocity reference, enters the second; its output, a current reference, enters the third; its output, a voltage, drives the motor. Feedback lines return measured current from a current sensor to the current controller, and measured velocity and position from the encoder to the velocity and position controllers. Labels give typical rates: position about 1 kilohertz, velocity about 4 to 10 kilohertz, current about 10 to 40 kilohertz." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="pid-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="40" y="60" width="95" height="44" rx="4" />
+    <rect x="175" y="60" width="95" height="44" rx="4" />
+    <rect x="310" y="60" width="95" height="44" rx="4" stroke="var(--gold)" />
+    <rect x="445" y="60" width="100" height="44" rx="4" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#pid-arrow2)">
+    <line x1="5" y1="82" x2="38" y2="82" />
+    <line x1="135" y1="82" x2="173" y2="82" />
+    <line x1="270" y1="82" x2="308" y2="82" />
+    <line x1="405" y1="82" x2="443" y2="82" />
+    <polyline points="480,104 480,135 357,135 357,106" />
+    <polyline points="510,104 510,165 222,165 222,106" />
+    <polyline points="525,104 525,195 87,195 87,106" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor" textAnchor="middle">
+    <text x="87" y="80">position</text>
+    <text x="87" y="95">P or PD</text>
+    <text x="222" y="80">velocity</text>
+    <text x="222" y="95">PI</text>
+    <text x="357" y="80">current</text>
+    <text x="357" y="95">PI (FOC)</text>
+    <text x="495" y="80">power stage</text>
+    <text x="495" y="95">+ motor</text>
+    <text x="20" y="74">θ*</text>
+    <text x="154" y="74">ω*</text>
+    <text x="289" y="74">i*</text>
+    <text x="424" y="74">u</text>
+    <text x="87" y="40">≈ 1 kHz</text>
+    <text x="222" y="40">≈ 4–10 kHz</text>
+    <text x="357" y="40">≈ 10–40 kHz</text>
+    <text x="420" y="130">current sensor</text>
+    <text x="360" y="160">encoder: velocity</text>
+    <text x="300" y="190">encoder: position</text>
+  </g>
+</svg>
+</Figure>
+
+- The **current loop** is innermost. Motor torque is proportional to current, so a fast current loop turns the motor into a clean **torque source**: it cancels the effect of the winding's inductance and resistance, of back-EMF and of supply voltage changes. For brushless motors this loop is **field-oriented control** (FOC), which transforms the three phase currents into a rotating frame where torque-producing current is a single number that a PI loop can regulate. It runs at the PWM rate of the power stage, typically 10 to 40 kHz. Lumenary EE's [magnetism and motors](/en/ee/magnetism-and-motors/) and [power electronics](/en/ee/power-electronics/) explain the motor and the switching stage.
+- The **velocity loop**, usually PI, asks for current to reach a commanded speed. It handles friction and load changes before they become position errors.
+- The **position loop**, often just P or PD because the velocity loop already has integral action, asks for speed.
+
+Why bother? Each loop deals with the fast disturbances at its own level, so the outer loops see a simpler, better-behaved plant: to the velocity loop, a motor with a fast current loop looks like a pure inertia driven by torque. Each loop can also be limited separately, so the current limit protects the motor and gearbox no matter what the outer loops ask for. And the loops can be tuned one at a time, from the inside out.
+
+The rule that makes it work: **each inner loop must be considerably faster than the loop around it**, typically by a factor of 5 to 10 in bandwidth. Then the outer loop sees the inner one as nearly instantaneous. If they are similar in speed, they interact and the cascade can oscillate even though each loop is stable on its own.
+
+A cascade also builds some knowledge of the plant into the controller without writing a model down: the velocity loop works out, by measurement, the torque that a requested speed takes. The next lessons make that knowledge explicit: state feedback uses position and velocity together, and computed-torque control writes the arm's dynamics into the command.
+
+In a robot arm, the drive at each joint runs the current and often the velocity and position loops, and the robot's central controller sends position, velocity or torque set-points to every joint at a fixed rate, commonly 0.5 to 1 kHz, over a real-time fieldbus such as EtherCAT. Open-source drives used in research robots, such as [moteus](https://github.com/mjbots/moteus) and [ODrive](https://odriverobotics.com/), expose all three loops and let the robot's computer send a position, a velocity and a feedforward torque together: the drive turns them into a PD loop with torque feedforward, computed at high rate, while the computer updates the set-points more slowly.
+
+</Section>
+
+<Section id="professional" kind="human" title="PID in industry and research">
+
+PID is a century old and still everywhere. Surveys of process plants have long found that the great majority of their thousands of loops are PI or PID. In robotics:
+
+- **Robot joints and drives** use the cascade above. Industrial servo drives can identify the load inertia and set their own gains, often adding notch filters so the loops do not excite the arm's structural resonances.
+- **Drones.** The open-source [PX4](https://docs.px4.io/) and ArduPilot autopilots control multicopters with a cascade: position, velocity, attitude, and an inner angular-rate loop running at hundreds of hertz to a few kilohertz, with PID at the rate level.
+- **Robot software frameworks.** In ROS 2, [ros2_control](https://control.ros.org/) provides PID controllers and a joint-trajectory controller that adds PID feedback around a planned trajectory.
+
+What PID cannot do well is also clear. It treats each output separately, so a strongly coupled system (a fast two-link arm, a balancing robot) is hard to tune joint by joint; it has no notion of constraints except by clipping; and it does not use a model, so it reacts to errors instead of anticipating them. The rest of this level addresses exactly these limits: <LessonLink slug="state-space-and-lqr">state feedback and LQR</LessonLink> for coupled systems, <LessonLink slug="trajectories-and-tracking">feedforward and computed torque</LessonLink> for anticipation, <LessonLink slug="force-and-impedance-control">impedance control</LessonLink> for contact, and <LessonLink slug="model-predictive-control">model predictive control</LessonLink> for constraints.
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Feedback control is older than electronics: float valves regulated the water level in ancient water clocks. The centrifugal governor that Boulton and Watt fitted to steam engines from 1788 opened the throttle as the engine slowed and closed it as it sped up, proportional control in brass. Governors sometimes "hunted", oscillating instead of settling, and in 1868 James Clerk Maxwell explained why in *On Governors*, the first mathematical study of a feedback loop's stability.
+
+In 1922 Nicolas Minorsky, working on automatic ship steering for the United States Navy, watched experienced helmsmen and noticed that they responded to the heading error, to how long it had persisted and to how fast it was changing. His analysis of that three-term law is the origin of PID. Pneumatic PID controllers spread through chemical plants in the 1930s, and the same law later moved into electronics, then microprocessors, then the drive of every robot joint.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"More gain is always better."** More gain reduces steady-state error and speeds up the response, up to a point. Beyond it, the loop overshoots, saturates, amplifies sensor noise and finally oscillates; on a real robot, unmodelled delay and flexibility set that limit much lower than a tidy model suggests.
+
+</Misconception>
+
+<Misconception>
+
+**"The integral term makes a controller accurate, so make $K_i$ large."** The integral removes *constant* errors, slowly and with a cost: a large $K_i$ adds overshoot, slow oscillation and windup. Much of a constant load can instead be predicted and fed forward (gravity, for example), leaving the integral only the small, unknown remainder.
+
+</Misconception>
+
+<Misconception>
+
+**"The D term predicts the future, so always use it."** It extrapolates the present slope, which works only if the measurement is clean. Many loops are PI because their sensor is too noisy for a useful derivative, or because the plant (like a motor's current) does not need one. When velocity is measured directly, by a tachometer, a gyroscope or the drive's own estimate, use it instead of differentiating position.
+
+</Misconception>
+
+<Misconception>
+
+**"Gains tuned in simulation will work on the robot."** A simulation contains only what you put in it. Real joints have friction that sticks and slips, gearbox backlash, flexible links, cable forces, sensor delays and temperature drift. Simulation gives a good starting point; the final tuning happens, carefully, on the machine.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

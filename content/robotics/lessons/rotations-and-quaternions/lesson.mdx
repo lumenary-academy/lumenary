@@ -1,0 +1,636 @@
+---
+title: Rotations in 3-D and quaternions
+subtitle: Nine numbers, three degrees of freedom, and many ways to write them down. Rotation matrices, Euler angles and their gimbal lock, axis–angle, and the quaternions that most robot software uses.
+minutes: 70
+objectives:
+  - Define SO(3), build rotations about the coordinate axes, and show numerically that 3-D rotations do not commute
+  - Convert between roll–pitch–yaw angles and rotation matrices, and demonstrate gimbal lock as a loss of rank
+  - Derive Rodrigues' formula and recover the axis and angle of a rotation matrix
+  - Compose rotations and rotate vectors with unit quaternions, convert to and from matrices, and avoid the (w, x, y, z) versus (x, y, z, w) trap
+  - Interpolate orientations with slerp, and measure why naive interpolation of quaternions or matrices fails
+  - Keep integrated rotations valid by re-normalising, and choose a representation for a given job
+narrators: [chloe, margaret, gideon]
+prerequisites: [frames-and-transforms]
+related: [math.algebra.linear-algebra, math.geom.matrix-groups, math.number.complex-numbers, math.geom.lie-groups, math.geom.fundamental-group]
+references:
+  - title: Quaternion kinematics for the error-state Kalman filter
+    author: Joan Solà
+    year: 2017
+    url: https://arxiv.org/abs/1711.02508
+    note: A careful, free reference on quaternion conventions (Hamilton and JPL), conversions and integration.
+  - title: A micro Lie theory for state estimation in robotics
+    author: Joan Solà, Jeremie Deray and Dinesh Atchuthan
+    year: 2018
+    url: https://arxiv.org/abs/1812.01537
+    note: The Lie-group view of SO(3) and SE(3) that modern estimators use, in under forty pages.
+  - title: On the continuity of rotation representations in neural networks
+    author: Yi Zhou, Connelly Barnes, Jingwan Lu, Jimei Yang and Hao Li
+    year: 2019
+    url: https://arxiv.org/abs/1812.07035
+    note: Why networks that output Euler angles or quaternions struggle, and the 6-D alternative.
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 3 covers rotation matrices, exponential coordinates and the matrix logarithm.
+  - title: "REP 103: Standard Units of Measure and Coordinate Conventions"
+    url: https://www.ros.org/reps/rep-0103.html
+    note: How ROS represents orientation, and its preference for quaternions.
+---
+
+<Section id="motivation" kind="motivation" title="Why rotations are the hard part">
+
+In <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink> the rotation block of a pose was a $2\times2$ matrix described by one angle. Angles in the plane add, commute and interpolate without fuss. In three dimensions every one of those comforts goes away.
+
+Hold a book flat in front of you, spine to the left. Turn it 90° about a vertical axis, then 90° about the axis pointing at you. Now start again and do the same two turns in the opposite order. The book ends up in two different orientations. Order matters, as it did for transforms, but now it matters even for rotations alone.
+
+A drone's flight controller updates its estimate of its own orientation a thousand times a second from a gyroscope. A robot arm must turn its gripper smoothly from "pointing down" to "pointing at the shelf". A camera's orientation must be stored in a file, sent over a network, averaged across measurements and optimised in SLAM. Each of these jobs is easier in a different representation, and each representation has a trap: Euler angles have gimbal lock, matrices drift away from being rotations, axis–angle is ambiguous near 180°, and quaternions come with two multiplication conventions, two storage orders and two signs for every rotation. This lesson walks through all of them, measures their failures in NumPy, and ends with a table of which to use when.
+
+</Section>
+
+<Section id="so3" kind="definitions" title="Rotation matrices and SO(3)">
+
+<Definition term="SO(3)">
+
+A **rotation matrix** is a $3\times3$ real matrix $R$ with $R^{\mathsf T}R = I$ and $\det R = +1$. The set of all of them, with matrix multiplication, is the **special orthogonal group** $SO(3)$. As in the plane, the columns of ${}^{A}R_{B}$ are the axes of frame B written in frame A, and $R^{-1} = R^{\mathsf T}$.
+
+</Definition>
+
+The rotations about the coordinate axes are the building blocks:
+
+$$
+R_x(a) = \begin{pmatrix} 1 & 0 & 0 \\ 0 & \cos a & -\sin a \\ 0 & \sin a & \cos a \end{pmatrix},\quad
+R_y(a) = \begin{pmatrix} \cos a & 0 & \sin a \\ 0 & 1 & 0 \\ -\sin a & 0 & \cos a \end{pmatrix},\quad
+R_z(a) = \begin{pmatrix} \cos a & -\sin a & 0 \\ \sin a & \cos a & 0 \\ 0 & 0 & 1 \end{pmatrix}.
+$$
+
+Each leaves its own axis fixed and turns the other two by the right-hand rule: with your right thumb along the axis, your fingers curl in the positive direction. (The minus sign in $R_y$ sits below the diagonal, not above it; that is the right-hand rule, not a typo, because $z \times x = y$.)
+
+<Theorem name="Euler's rotation theorem">
+
+Every $R \in SO(3)$ leaves some line through the origin fixed: there is a unit vector $\mathbf{k}$ with $R\mathbf{k} = \mathbf{k}$. So every rotation is a rotation by some angle about some axis.
+
+</Theorem>
+
+<Proof>
+
+We show that 1 is an eigenvalue of $R$, that is, $\det(R - I) = 0$. Using $R^{\mathsf T}R = I$ and $\det R = 1$:
+$\det(R - I) = \det(R - RR^{\mathsf T}) = \det R\,\det(I - R^{\mathsf T}) = \det\big((I - R)^{\mathsf T}\big) = \det(I - R) = (-1)^3\det(R - I)$.
+A number equal to its own negative is zero. The odd dimension is essential: in the plane the same argument gives nothing, and indeed a 2-D rotation fixes only the origin.
+
+</Proof>
+
+Nine entries, six constraints ($R^{\mathsf T}R = I$ is a symmetric equation), three degrees of freedom: so we expect three numbers to suffice. They do, locally, but as you will see no choice of three numbers works everywhere without a flaw.
+
+</Section>
+
+<Section id="euler" kind="computation" title="Euler angles and gimbal lock">
+
+The most familiar three numbers are **Euler angles**: describe a rotation as three successive rotations about coordinate axes. Robotics and aviation mostly use **roll, pitch and yaw** ($\phi, \theta, \psi$):
+
+$$
+R = R_z(\psi)\,R_y(\theta)\,R_x(\phi).
+$$
+
+Read right to left, this rolls about the fixed $x$ axis, then pitches about the fixed $y$ axis, then yaws about the fixed $z$ axis. Read left to right, it yaws about the body's $z$, then pitches about the body's *new* $y$, then rolls about the body's newest $x$. Both readings describe the same matrix: right-multiplication applies a rotation in the moving body frame, exactly as in the last lesson. This "$ZYX$" convention is the one ROS and URDF use for their `rpy` values.
+
+<Figure caption="Roll, pitch and yaw for a vehicle in the ROS convention: x forward, y to the left, z up. Roll turns about x, pitch about y, yaw about z, each positive by the right-hand rule. In this lesson R = Rz(yaw) Ry(pitch) Rx(roll).">
+<svg viewBox="0 0 380 230" role="img" aria-label="Three coordinate axes drawn in perspective from one origin: x pointing right labelled forward, y pointing back and up to the right labelled left, and z pointing up. A curved arrow around each axis is labelled roll around x, pitch around y and yaw around z.">
+  <defs>
+    <marker id="rq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="2" markerEnd="url(#rq-arrow)">
+    <line x1="150" y1="150" x2="320" y2="150" />
+    <line x1="150" y1="150" x2="230" y2="90" />
+    <line x1="150" y1="150" x2="150" y2="25" />
+  </g>
+  <g fill="none" stroke="var(--sky)" strokeWidth="1.6" markerEnd="url(#rq-arrow)">
+    <path d="M 290 128 A 8 22 0 1 1 286 171.5" />
+    <path d="M 186 98 A 8 20 -37 1 1 212.4 128.2" />
+    <path d="M 128 62 A 24 8 0 1 0 170 64" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="326" y="154">x</text>
+    <text x="236" y="86">y</text>
+    <text x="146" y="18">z</text>
+    <text x="268" y="196">roll (φ)</text>
+    <text x="232" y="122">pitch (θ)</text>
+    <text x="180" y="52">yaw (ψ)</text>
+    <text x="314" y="170" fontSize="10">forward</text>
+    <text x="196" y="80" fontSize="10">left</text>
+    <text x="158" y="38" fontSize="10">up</text>
+  </g>
+</svg>
+</Figure>
+
+There are twelve axis sequences in use ($XYZ$, $ZYX$, $ZXZ$, $ZYZ$ and so on), each of which can be read with fixed or moving axes. Aerospace and ROS share the yaw–pitch–roll sequence above, the classical mechanics of spinning tops favours $ZXZ$, and graphics and animation tools offer several. Whenever you read Euler angles, find out which sequence they mean.
+
+The code below builds roll–pitch–yaw matrices, recovers the angles, shows two rotations failing to commute, and then looks for trouble at pitch $= 90°$.
+
+```python run
+import numpy as np
+
+def Rx(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+def Ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+def Rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+def rpy_to_matrix(roll, pitch, yaw):
+    """Roll about x, then pitch about y, then yaw about z, all about the fixed axes."""
+    return Rz(yaw) @ Ry(pitch) @ Rx(roll)
+
+def matrix_to_rpy(R):
+    pitch = np.arcsin(np.clip(-R[2, 0], -1.0, 1.0))
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    return roll, pitch, yaw
+
+d = np.radians
+A, B = Rx(d(90)), Rz(d(90))
+print("Rx(90) Rz(90) sends the x axis to", (A @ B @ [1, 0, 0]).round(3))
+print("Rz(90) Rx(90) sends the x axis to", (B @ A @ [1, 0, 0]).round(3))
+
+R = rpy_to_matrix(d(10), d(-20), d(135))
+print("round trip (deg):", np.degrees(matrix_to_rpy(R)).round(6))
+
+# Gimbal lock: at pitch = 90 degrees, roll and yaw stop being independent.
+R1 = rpy_to_matrix(d(30), d(90), d(50))
+R2 = rpy_to_matrix(d(10), d(90), d(30))
+print("(30, 90, 50) and (10, 90, 30) give the same matrix:", np.allclose(R1, R2))
+
+def jacobian(roll, pitch, yaw, h=1e-6):
+    """How the 9 entries of R change with each angle: a 9 x 3 matrix, by central differences."""
+    cols = []
+    for k in range(3):
+        e = np.zeros(3)
+        e[k] = h
+        a, b = np.array([roll, pitch, yaw]) + e, np.array([roll, pitch, yaw]) - e
+        cols.append((rpy_to_matrix(*a) - rpy_to_matrix(*b)).ravel() / (2 * h))
+    return np.array(cols).T
+
+print("pitch (deg)   singular values of dR/d(roll, pitch, yaw)")
+for p in [0, 45, 80, 89, 89.9, 90]:
+    sv = np.linalg.svd(jacobian(d(20), d(p), d(40)), compute_uv=False)
+    print(f"{p:10}    {sv.round(4)}")
+```
+
+The book experiment, in numbers: the same two 90° turns send the body's $x$ axis to $(0, 0, 1)$ in one order and to $(0, 1, 0)$ in the other.
+
+Then the trouble. At pitch $90°$ the angles $(30°, 90°, 50°)$ and $(10°, 90°, 30°)$ give the *same* matrix: only the difference between yaw and roll matters, because pitching by $90°$ has swung the body's $x$ axis onto the world's vertical, so roll and yaw now turn about the same line. One degree of freedom has vanished from the parameterisation. That is **gimbal lock**.
+
+The last table measures it. The $9\times3$ matrix of derivatives of $R$ with respect to the three angles tells you how far the rotation moves when each angle moves. Away from the singularity it has three healthy singular values. As pitch approaches $90°$ the smallest falls to $0.0175$ at $89°$, $0.0017$ at $89.9°$ and exactly zero at $90°$: some direction of rotation can no longer be reached by small changes of the angles, and near there, small changes of orientation demand huge changes of roll and yaw. A controller or estimator working in Euler angles sees this as angle rates exploding.
+
+<Narrator who="gideon">
+
+Gimbal lock is a property of the coordinates, not of the motion. The vehicle can rotate in every direction perfectly well at pitch $90°$; it is the three-angle description that has a hole there, as longitude has at the North Pole. In a *mechanical* gimbal, three nested rings carrying a gyroscope, the hole is physical: the Apollo spacecraft's three-gimbal inertial platform could lock, and its crews were warned when the spacecraft approached that attitude.
+
+</Narrator>
+
+Euler angles are excellent for humans (a pilot or an operator understands "pitch up 5°"), for configuration files, and for vehicles that never approach the singularity, such as cars. They are a poor choice for anything that integrates, interpolates or optimises over all orientations.
+
+</Section>
+
+<Section id="axis-angle" kind="definitions" title="Axis–angle and Rodrigues' formula">
+
+Euler's theorem suggests a more geometric description: a unit axis $\mathbf{k}$ and an angle $\theta$. Packing them into one vector gives the **rotation vector** $\boldsymbol{\omega} = \theta\mathbf{k}$, three numbers, which is also what a gyroscope measures per unit time.
+
+<Definition term="Skew-symmetric matrix">
+
+For $\mathbf{k} = (k_x, k_y, k_z)$, let $[\mathbf{k}] = \begin{pmatrix} 0 & -k_z & k_y \\ k_z & 0 & -k_x \\ -k_y & k_x & 0 \end{pmatrix}$, so that $[\mathbf{k}]\,\mathbf{v} = \mathbf{k} \times \mathbf{v}$ for every $\mathbf{v}$.
+
+</Definition>
+
+<Theorem name="Rodrigues' formula">
+
+The rotation by angle $\theta$ about the unit axis $\mathbf{k}$ is
+$$
+R = I + \sin\theta\,[\mathbf{k}] + (1 - \cos\theta)\,[\mathbf{k}]^2.
+$$
+
+</Theorem>
+
+<Proof>
+
+Split any vector into a part along the axis and a part perpendicular to it: $\mathbf{v} = \mathbf{v}_\parallel + \mathbf{v}_\perp$ with $\mathbf{v}_\parallel = (\mathbf{k}\cdot\mathbf{v})\,\mathbf{k}$. The rotation leaves $\mathbf{v}_\parallel$ alone and turns $\mathbf{v}_\perp$ by $\theta$ within the plane perpendicular to $\mathbf{k}$. That plane has the perpendicular pair $\mathbf{v}_\perp$ and $\mathbf{k} \times \mathbf{v}$ (the latter is $\mathbf{v}_\perp$ turned by $90°$, with the same length), so the rotated vector is
+$$
+R\mathbf{v} = \mathbf{v}_\parallel + \cos\theta\,\mathbf{v}_\perp + \sin\theta\,(\mathbf{k} \times \mathbf{v}).
+$$
+Now $[\mathbf{k}]^2\mathbf{v} = \mathbf{k} \times (\mathbf{k} \times \mathbf{v}) = -\mathbf{v}_\perp$, so $\mathbf{v}_\perp = -[\mathbf{k}]^2\mathbf{v}$ and $\mathbf{v}_\parallel = \mathbf{v} + [\mathbf{k}]^2\mathbf{v}$. Substituting gives $R\mathbf{v} = \mathbf{v} + \sin\theta\,[\mathbf{k}]\mathbf{v} + (1 - \cos\theta)\,[\mathbf{k}]^2\mathbf{v}$ for every $\mathbf{v}$.
+
+</Proof>
+
+<Figure caption="Rodrigues' formula in a picture. The part of v along the axis k is unchanged; the perpendicular part turns by θ in the plane spanned by v⊥ and k × v, tracing a circle around the axis. Here v is carried to v′.">
+<svg viewBox="0 0 360 230" role="img" aria-label="A vertical axis k rises from an origin. A vector v goes from the origin up and to the right. A horizontal ellipse around the axis at the height of v's tip shows the circle that the tip moves along. The perpendicular part of v runs from the axis to v's tip. A second vector v prime goes from the origin to another point on the same ellipse, turned by the angle theta.">
+  <defs>
+    <marker id="rq-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <line x1="150" y1="205" x2="150" y2="25" stroke="currentColor" strokeWidth="2" markerEnd="url(#rq-arrow2)" />
+  <ellipse cx="150" cy="90" rx="90" ry="24" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="4 3" />
+  <g strokeWidth="2" markerEnd="url(#rq-arrow2)">
+    <line x1="150" y1="205" x2="238" y2="94" stroke="currentColor" />
+    <line x1="150" y1="205" x2="111" y2="68" stroke="var(--sky)" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.2" markerEnd="url(#rq-arrow2)">
+    <line x1="150" y1="90" x2="234" y2="94.6" />
+  </g>
+  <path d="M 195.1 92.4 A 46 12 0 0 0 130.1 79.2" fill="none" stroke="currentColor" strokeWidth="1" markerEnd="url(#rq-arrow2)" />
+  <circle cx="150" cy="90" r="2.5" fill="currentColor" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="158" y="30">k</text>
+    <text x="246" y="100">v</text>
+    <text x="92" y="64">v′</text>
+    <text x="192" y="110" fontSize="11">v⊥</text>
+    <text x="168" y="74" fontSize="11">θ</text>
+    <text x="128" y="152" fontSize="11">v∥</text>
+  </g>
+</svg>
+</Figure>
+
+Going back, from a matrix to axis and angle (the **matrix logarithm**), uses two facts you can check from the formula: $\operatorname{tr} R = 1 + 2\cos\theta$, and $R - R^{\mathsf T} = 2\sin\theta\,[\mathbf{k}]$. So $\theta = \arccos\big((\operatorname{tr}R - 1)/2\big)$ and the axis can be read from the off-diagonal entries of $R - R^{\mathsf T}$, divided by $2\sin\theta$. That division fails at $\theta = 0$ (any axis will do, which is harmless) and at $\theta = 180°$ (where $R - R^{\mathsf T} = 0$ and the axis must be found another way, for example from $R + I$). Robust code treats both cases separately.
+
+The map from rotation vectors to matrices, $\boldsymbol{\omega} \mapsto R$, is the **exponential map** of the Lie group $SO(3)$: Rodrigues' formula is exactly $e^{[\boldsymbol{\omega}]}$, summed in closed form. Lumenary Math's <TopicLink id="math.geom.lie-groups">Lie groups and Lie algebras</TopicLink> develops this; for us it means that small rotations behave like vectors (they can be added, scaled and averaged), which is why estimators and optimisers express *corrections* to an orientation as rotation vectors.
+
+</Section>
+
+<Section id="quaternions" kind="definitions" title="Unit quaternions">
+
+In 1843 William Rowan Hamilton was looking for a way to multiply triples of numbers, as complex numbers multiply pairs. He found that it works with four: a **quaternion** is $q = w + x\,\mathbf{i} + y\,\mathbf{j} + z\,\mathbf{k}$ with
+
+$$
+\mathbf{i}^2 = \mathbf{j}^2 = \mathbf{k}^2 = \mathbf{i}\mathbf{j}\mathbf{k} = -1,
+$$
+
+from which $\mathbf{i}\mathbf{j} = \mathbf{k}$, $\mathbf{j}\mathbf{i} = -\mathbf{k}$, and so on: multiplication does not commute, which is just what rotations need. Writing $q = (w, \mathbf{v})$ with a scalar part $w$ and a vector part $\mathbf{v} = (x, y, z)$, the product is
+
+$$
+(p_w, \mathbf{p})\,(q_w, \mathbf{q}) = \big(p_w q_w - \mathbf{p}\cdot\mathbf{q},\ \ p_w\mathbf{q} + q_w\mathbf{p} + \mathbf{p}\times\mathbf{q}\big).
+$$
+
+The **conjugate** is $q^{*} = (w, -\mathbf{v})$, and $q\,q^{*} = |q|^2$, so a **unit quaternion** ($|q| = 1$) has inverse $q^{*}$.
+
+<Definition term="Rotation quaternion">
+
+The rotation by angle $\theta$ about the unit axis $\mathbf{k}$ is represented by the unit quaternion
+$$
+q = \big(\cos\tfrac{\theta}{2},\ \sin\tfrac{\theta}{2}\,\mathbf{k}\big).
+$$
+It rotates a vector $\mathbf{v}$ by the "sandwich" $(0, \mathbf{v}') = q\,(0, \mathbf{v})\,q^{*}$, and the rotation $R_1R_2$ corresponds to the product $q_1q_2$. Both $q$ and $-q$ represent the same rotation.
+
+</Definition>
+
+Expanding the sandwich with the product rule gives back Rodrigues' formula, the half-angles turning into whole angles through $\sin\theta = 2\sin\frac{\theta}{2}\cos\frac{\theta}{2}$ and $1 - \cos\theta = 2\sin^2\frac{\theta}{2}$. The sign ambiguity comes from the half-angle too: $\theta$ and $\theta + 360°$ are the same rotation, but $\cos\frac{\theta}{2}$ changes sign between them.
+
+<Note>
+
+**Conventions, again.** This course uses **Hamilton's** quaternions, with $\mathbf{i}\mathbf{j} = \mathbf{k}$ and $q_1q_2 \leftrightarrow R_1R_2$, and *writes* them $(w, x, y, z)$, scalar first. Many libraries **store** them scalar-last: ROS messages (`geometry_msgs/Quaternion` has fields `x`, `y`, `z`, `w`), tf2's `Quaternion(x, y, z, w)` constructor, and SciPy's `Rotation` by default. Eigen's constructor takes `(w, x, y, z)` but stores `(x, y, z, w)` internally; MuJoCo uses `(w, x, y, z)`. Some aerospace and visual-inertial navigation code uses the **JPL** convention, in which the product is defined the other way round. When orientations look wrong, check storage order and convention before anything else.
+
+</Note>
+
+<Narrator who="chloe">
+
+Why does it take half-angles and a sign ambiguity to describe rotations? Unit quaternions form the 3-sphere $S^3$ in $\mathbb{R}^4$, and $q \mapsto R(q)$ wraps it twice around $SO(3)$. That reflects a real topological fact: in $SO(3)$, one full turn is a loop that cannot be shrunk to nothing, but two full turns can (the "plate trick": turn a book held flat on your palm through two full turns and your arm comes back untwisted, while after one turn it is still twisted). Lumenary Math's <TopicLink id="math.geom.fundamental-group">fundamental group</TopicLink> lesson has the theory: $\pi_1(SO(3))$ has two elements.
+
+</Narrator>
+
+</Section>
+
+<Section id="quat-code" kind="computation" title="Quaternions and conversions in NumPy">
+
+The program implements Rodrigues' formula, the logarithm, the quaternion product, rotation of a vector, and conversions in both directions, then checks them against each other on a known rotation and on a thousand random ones (random unit quaternions are easy to make: normalise four independent normal samples).
+
+```python run
+import numpy as np
+
+def skew(v):
+    """The matrix [v] with [v] @ u == np.cross(v, u)."""
+    x, y, z = v
+    return np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+
+def rodrigues(axis, angle):
+    k = np.asarray(axis, float) / np.linalg.norm(axis)
+    K = skew(k)
+    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
+
+def log_so3(R):
+    """Axis and angle of a rotation matrix (for angles away from 0 and 180 degrees)."""
+    angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0))
+    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) / (2 * np.sin(angle))
+    return axis, angle
+
+# Quaternions in Hamilton's convention, stored here as (w, x, y, z).
+def quat_from_axis_angle(axis, angle):
+    k = np.asarray(axis, float) / np.linalg.norm(axis)
+    return np.concatenate([[np.cos(angle / 2)], np.sin(angle / 2) * k])
+
+def qmul(p, q):
+    """Hamilton product p q."""
+    pw, pv, qw, qv = p[0], p[1:], q[0], q[1:]
+    return np.concatenate([[pw * qw - pv @ qv], pw * qv + qw * pv + np.cross(pv, qv)])
+
+def qconj(q):
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+def qrotate(q, v):
+    """Rotate the 3-vector v by the unit quaternion q: q (0, v) q*."""
+    return qmul(qmul(q, np.concatenate([[0.0], v])), qconj(q))[1:]
+
+def quat_to_matrix(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)]])
+
+def matrix_to_quat(R):
+    """Robust conversion: pick the largest of 4w^2, 4x^2, 4y^2, 4z^2 to divide by."""
+    t = np.trace(R)
+    cands = [t, R[0, 0], R[1, 1], R[2, 2]]
+    i = int(np.argmax(cands))
+    if i == 0:
+        s = 2 * np.sqrt(1 + t)
+        q = [s / 4, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s]
+    elif i == 1:
+        s = 2 * np.sqrt(1 + R[0, 0] - R[1, 1] - R[2, 2])
+        q = [(R[2, 1] - R[1, 2]) / s, s / 4, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s]
+    elif i == 2:
+        s = 2 * np.sqrt(1 + R[1, 1] - R[0, 0] - R[2, 2])
+        q = [(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, s / 4, (R[1, 2] + R[2, 1]) / s]
+    else:
+        s = 2 * np.sqrt(1 + R[2, 2] - R[0, 0] - R[1, 1])
+        q = [(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, s / 4]
+    q = np.array(q)
+    return q if q[0] >= 0 else -q          # choose the representative with w >= 0
+
+def show(a):
+    return np.round(a, 6) + 0.0           # + 0.0 turns -0.0 into 0.0 for printing
+
+axis, angle = [1, 1, 1], np.radians(120)
+R = rodrigues(axis, angle)
+q = quat_from_axis_angle(axis, angle)
+print("R(120 deg about (1,1,1)) =\n", show(R))
+print("q =", show(q), " |q| =", round(float(np.linalg.norm(q)), 12))
+v = np.array([1.0, 0.0, 0.0])
+print("R v =", show(R @ v), "  q v q* =", show(qrotate(q, v)))
+print("quat_to_matrix(q) == R:", np.allclose(quat_to_matrix(q), R), "  and for -q:", np.allclose(quat_to_matrix(-q), R))
+k, a = log_so3(R)
+print("log: axis", show(k / np.linalg.norm(k)), "angle", round(float(np.degrees(a)), 6))
+
+rng = np.random.default_rng(7)
+worst = 0.0
+for _ in range(1000):
+    q1, q2 = rng.normal(size=4), rng.normal(size=4)
+    q1, q2 = q1 / np.linalg.norm(q1), q2 / np.linalg.norm(q2)
+    worst = max(worst,
+                np.abs(quat_to_matrix(qmul(q1, q2)) - quat_to_matrix(q1) @ quat_to_matrix(q2)).max(),
+                min(np.abs(matrix_to_quat(quat_to_matrix(q1)) - q1).max(),
+                    np.abs(matrix_to_quat(quat_to_matrix(q1)) + q1).max()))
+print("1000 random checks of q1 q2 <-> R1 R2 and matrix -> quaternion: worst error", f"{worst:.1e}")
+```
+
+The rotation by $120°$ about $(1, 1, 1)$ is a tidy example: it permutes the axes, $x \to y \to z \to x$, so its matrix is a permutation matrix, and its quaternion is $(\cos 60°, \sin 60° \cdot \tfrac{1}{\sqrt3}(1,1,1)) = (0.5, 0.5, 0.5, 0.5)$. The matrix and the quaternion sandwich agree on where $x$ goes, $q$ and $-q$ give the same matrix, and on a thousand random pairs the product of quaternions matches the product of matrices to about $10^{-15}$, which is rounding error.
+
+The matrix-to-quaternion function deserves a word. The obvious formula, $w = \frac12\sqrt{1 + \operatorname{tr}R}$ and then divide the off-diagonal differences by $4w$, loses accuracy badly when $w$ is near zero (rotations near $180°$). The robust version, usually credited to Shepperd (1978), first finds which of $w, x, y, z$ is largest and divides by that one.
+
+</Section>
+
+<Section id="interpolation" kind="computation" title="Interpolation: slerp against lerp">
+
+A robot arm should turn its gripper from orientation $p$ to orientation $q$ at a steady rate; an animation, a camera path, a trajectory generator all need the in-between orientations. With quaternions the natural answer is **spherical linear interpolation** (slerp), introduced to computer graphics by Ken Shoemake in 1985: move along the great circle from $p$ to $q$ on the unit sphere at constant speed,
+
+$$
+\operatorname{slerp}(p, q, t) = \frac{\sin\big((1-t)\Omega\big)}{\sin\Omega}\,p + \frac{\sin(t\Omega)}{\sin\Omega}\,q, \qquad \cos\Omega = p\cdot q.
+$$
+
+$\Omega$ is the angle between $p$ and $q$ as 4-D vectors, half of the rotation angle between the two orientations. Two details matter in practice. If $p\cdot q \lt 0$, replace $q$ by $-q$ first, or the interpolation goes the long way round. And if $p\cdot q$ is very close to 1, $\sin\Omega$ is nearly zero; fall back to the simpler formula below.
+
+The tempting alternatives are **lerp**, $(1-t)p + tq$, which is not even a unit quaternion in between, and **nlerp**, lerp divided by its length, which is a valid rotation but moves at a varying speed. The code measures all three for a turn of $170°$, and then tries averaging rotation matrices directly.
+
+```python run
+import numpy as np
+
+def quat_from_axis_angle(axis, angle):
+    k = np.asarray(axis, float) / np.linalg.norm(axis)
+    return np.concatenate([[np.cos(angle / 2)], np.sin(angle / 2) * k])
+
+def angle_between(p, q):
+    """Rotation angle (degrees) taking unit quaternion p to unit quaternion q."""
+    return np.degrees(2 * np.arccos(np.clip(abs(p @ q), -1.0, 1.0)))
+
+def slerp(p, q, t):
+    d = p @ q
+    if d < 0:                       # q and -q are the same rotation: take the short way round
+        q, d = -q, -d
+    if d > 0.9995:                  # nearly identical: fall back to normalised lerp
+        r = p + t * (q - p)
+        return r / np.linalg.norm(r)
+    theta = np.arccos(d)            # angle between p and q on the 4-D unit sphere
+    return (np.sin((1 - t) * theta) * p + np.sin(t * theta) * q) / np.sin(theta)
+
+def lerp(p, q, t):
+    return (1 - t) * p + t * q
+
+def nlerp(p, q, t):
+    r = lerp(p, q, t)
+    return r / np.linalg.norm(r)
+
+p = quat_from_axis_angle([0, 0, 1], 0.0)
+q = quat_from_axis_angle([1, 2, 2], np.radians(170))
+print("  t    slerp angle   nlerp angle   |lerp|")
+for t in [0, 0.25, 0.5, 0.75, 1]:
+    print(f"{t:4}   {angle_between(p, slerp(p, q, t)):9.2f}   {angle_between(p, nlerp(p, q, t)):11.2f}   {np.linalg.norm(lerp(p, q, t)):6.3f}")
+
+ts = np.linspace(0, 1, 21)
+for name, f in [("slerp", slerp), ("nlerp", nlerp)]:
+    path = [f(p, q, t) for t in ts]
+    steps = [angle_between(a, b) for a, b in zip(path, path[1:])]
+    print(f"{name}: 20 equal time steps turn between {min(steps):.2f} and {max(steps):.2f} degrees")
+
+# Interpolating rotation *matrices* entry by entry is worse: the halfway matrix is not a rotation.
+def quat_to_matrix(q):
+    w, x, y, z = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+M = 0.5 * quat_to_matrix(p) + 0.5 * quat_to_matrix(q)
+print("halfway matrix: det =", round(float(np.linalg.det(M)), 4), " largest error in M^T M - I =", round(float(np.abs(M.T @ M - np.eye(3)).max()), 4))
+```
+
+<Figure caption="Why normalised lerp is uneven. The arc stands for the great circle from p to q on the unit sphere (drawn in 2-D). Lerp moves at constant speed along the straight chord (squares); normalising pushes each chord point out along its ray to the circle (open circles), bunching them towards the middle of the arc. Slerp moves at constant speed along the arc itself (filled circles).">
+<svg viewBox="0 0 440 240" role="img" aria-label="A circular arc from point p on the left to point q on the right, with the straight chord between them dashed. Three small squares divide the chord into four equal parts. Thin rays from the circle's centre pass through each square to open circles on the arc, which are closer together near the middle. Filled circles on the arc are evenly spaced.">
+  <path d="M 89.8 110.7 A 170 170 0 0 1 350.2 110.7" fill="none" stroke="currentColor" strokeWidth="1.8" />
+  <line x1="89.8" y1="110.7" x2="350.2" y2="110.7" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" />
+  <g stroke="currentColor" strokeWidth="0.7" strokeDasharray="2 3">
+    <line x1="220" y1="220" x2="133.0" y2="73.9" />
+    <line x1="220" y1="220" x2="220" y2="50" />
+    <line x1="220" y1="220" x2="307.0" y2="73.9" />
+  </g>
+  <g fill="currentColor">
+    <rect x="151" y="107" width="7" height="7" />
+    <rect x="216.5" y="107" width="7" height="7" />
+    <rect x="281.5" y="107" width="7" height="7" />
+    <circle cx="220" cy="220" r="2.5" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="133.0" cy="73.9" r="5" />
+    <circle cx="307.0" cy="73.9" r="5" />
+  </g>
+  <g fill="var(--gold)" stroke="currentColor" strokeWidth="1">
+    <circle cx="148.2" cy="65.9" r="4.5" />
+    <circle cx="220" cy="50" r="4.5" />
+    <circle cx="291.8" cy="65.9" r="4.5" />
+    <circle cx="89.8" cy="110.7" r="4.5" />
+    <circle cx="350.2" cy="110.7" r="4.5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="70" y="128">p</text>
+    <text x="360" y="128">q</text>
+    <text x="196" y="132">lerp (chord)</text>
+    <text x="232" y="40">slerp and nlerp agree at the middle</text>
+    <text x="40" y="60">nlerp</text>
+    <text x="150" y="44">slerp</text>
+  </g>
+</svg>
+</Figure>
+
+Slerp's angles go up in exact steps of $170°/4 = 42.5°$, and twenty equal time steps each turn exactly $8.50°$. Nlerp agrees at the endpoints and at the middle (by symmetry) but reaches only $35.77°$ at $t = 0.25$, and its steps range from $5.98°$ to $10.47°$: the gripper would speed up through the middle of the motion by a factor of 1.75. Plain lerp's halfway quaternion has length $0.737$, so it is not a rotation at all until normalised. Averaging the two *matrices* is worse still: the result has determinant $0.0076$ and is nowhere near orthogonal; it squashes space almost flat.
+
+<Narrator who="margaret">
+
+Nlerp is not useless; it is cheap and commutes nicely, and for small turns its unevenness is tiny. Measured the same way, a $30°$ turn has nlerp steps that vary by only 1.6%, a $90°$ turn by 15%, and the $170°$ turn above by 75%. Animation engines that interpolate many small changes per frame often use nlerp; a robot executing one large reorientation should use slerp.
+
+</Narrator>
+
+</Section>
+
+<Section id="drift" kind="computation" title="Numerical drift and re-normalisation">
+
+An IMU-based orientation estimator integrates the gyroscope: every millisecond it composes the current orientation with a tiny rotation $\boldsymbol{\omega}\,\Delta t$. Each multiplication rounds, and the result slowly stops being a rotation. The program integrates a constant rotation rate at 1 kHz for 20 seconds, in 32-bit floats (common on microcontrollers; Lumenary CS's [Representing data](/en/cs/bits-and-bytes/) explains floating point) and 64-bit floats, both as a matrix and as a quaternion, and then repairs the 32-bit results.
+
+```python run
+import numpy as np
+
+def rodrigues(w_dt):
+    """Rotation matrix for the small rotation vector w_dt (axis times angle)."""
+    a = np.linalg.norm(w_dt)
+    x, y, z = w_dt / a
+    K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
+    return np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K
+
+def qmul(p, q):
+    pw, pv, qw, qv = p[0], p[1:], q[0], q[1:]
+    out = np.empty(4, dtype=p.dtype)
+    out[0] = pw * qw - pv @ qv
+    out[1:] = pw * qv + qw * pv + np.cross(pv, qv)
+    return out
+
+omega = np.array([0.3, -0.2, 0.5])      # a gyroscope reading in rad/s, held constant
+dt = 0.001                               # a 1 kHz update loop
+w_dt = omega * dt
+a = np.linalg.norm(w_dt)
+
+final = {}
+for dtype in (np.float32, np.float64):
+    dR = rodrigues(w_dt).astype(dtype)
+    dq = np.concatenate([[np.cos(a / 2)], np.sin(a / 2) * w_dt / a]).astype(dtype)
+    R, q = np.eye(3, dtype=dtype), np.array([1, 0, 0, 0], dtype=dtype)
+    print(f"{np.dtype(dtype).name}:  steps   max|R^T R - I|    |q| - 1")
+    for step in range(1, 20001):
+        R = R @ dR                       # body-frame increments compose on the right
+        q = qmul(q, dq)
+        if step in (100, 1000, 5000, 20000):
+            orth = np.abs(R.T @ R - np.eye(3)).max()
+            print(f"         {step:6}   {orth:11.2e}   {float(np.linalg.norm(q)) - 1:9.2e}")
+    final[np.dtype(dtype).name] = (R, q)
+
+def nearest_rotation(M):
+    """The rotation matrix closest to M, from its singular value decomposition."""
+    U, _, Vt = np.linalg.svd(M)
+    D = np.diag([1.0, 1.0, np.linalg.det(U @ Vt)])
+    return U @ D @ Vt
+
+R32, q32 = final["float32"]
+R_fixed = nearest_rotation(R32.astype(np.float64))
+q_fixed = q32.astype(np.float64) / np.linalg.norm(q32.astype(np.float64))
+print("float32 R after re-orthonormalising: max|R^T R - I| =", f"{np.abs(R_fixed.T @ R_fixed - np.eye(3)).max():.1e}")
+print("float32 q after dividing by |q|:     |q| - 1        =", f"{np.linalg.norm(q_fixed) - 1:.1e}")
+```
+
+In 64-bit arithmetic the matrix stays orthogonal to about $10^{-12}$ after 20,000 steps, and nobody need worry. In 32-bit arithmetic, after 20 seconds, the matrix's columns are off by $3\times10^{-4}$ and the quaternion's length has shrunk by $5.7\times10^{-4}$. The errors do not cancel like a random walk: they drift steadily, partly because the increment itself, rounded to 32 bits, is about one part in $10^8$ too short, and that shortfall compounds at every step. Left alone for an hour of flight, such a matrix would scale and shear every vector it touches.
+
+The repairs are cheap. A quaternion is re-normalised by dividing by its length, four multiplications and a square root. A matrix is replaced by the nearest rotation matrix, computed from its singular value decomposition $M = U\Sigma V^{\mathsf T}$ as $UV^{\mathsf T}$ (with a sign fix if the determinant would be $-1$), or more cheaply by re-orthogonalising its columns with Gram–Schmidt. Real estimators do this every step or every few steps; it costs almost nothing and removes a whole class of slow failures.
+
+<Narrator who="gideon">
+
+Re-normalising fixes the *length*; it cannot fix the *direction* error that rounding has already introduced, and neither can it fix a biased gyroscope. A residual gyro bias of just $0.01°$ per second, plausible for an inexpensive MEMS gyroscope even after calibration, becomes $36°$ of heading error after an hour. Correcting that needs other sensors, the job of the <LessonLink slug="kalman-filters">Kalman filter</LessonLink>.
+
+</Narrator>
+
+</Section>
+
+<Section id="which" kind="human" title="Which representation, when">
+
+There is no best representation, only the best for a job. A topological theorem says so: no continuous, one-to-one description of $SO(3)$ by three numbers exists, so every 3-number representation has a singularity somewhere, and the 4-number quaternion pays for smoothness with the double cover.
+
+| Representation | Numbers | Good for | Watch out for |
+| --- | --- | --- | --- |
+| Rotation matrix | 9 | Rotating many points; composing with translations in $4\times4$ transforms; clear meaning (columns are axes) | Drifts off $SO(3)$; 9 numbers to store and send |
+| Unit quaternion | 4 | Composing, storing and sending orientations; interpolation (slerp); IMU filters | $q$ and $-q$; storage order $(w, x, y, z)$ or $(x, y, z, w)$; Hamilton or JPL |
+| Rotation vector (axis–angle) | 3 | Small increments, gyro integration, corrections in estimators and optimisers | Axis undefined at $0°$; ambiguous at $180°$ |
+| Euler angles (roll, pitch, yaw) | 3 | Human input and display; configuration files and URDF; vehicles far from the singularity | Gimbal lock; twelve sequences; never interpolate or average them |
+
+A common professional pattern combines them: **store** orientations as quaternions, **compute** with matrices when transforming points, **update** with rotation vectors (the estimator's state includes a small 3-vector error, applied through the exponential map), and **show** Euler angles to people. The "micro Lie theory" paper in the references describes this pattern for estimation, and libraries such as Eigen (C++), SciPy's `spatial.transform.Rotation` (Python), Sophus and manif (C++ Lie-group libraries) implement it.
+
+Machine learning added a new requirement. A neural network that outputs a rotation needs a representation in which nearby rotations have nearby outputs everywhere. Zhou and colleagues showed in 2019 that every 3- and 4-number representation fails this somewhere, and proposed outputting **six numbers**, two columns of the matrix, then completing them to a rotation with Gram–Schmidt and a cross product. Many pose-estimation networks and robot policies now do exactly that.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Interpolating or averaging Euler angles is fine."** It works only for small angles about a single axis. Averaging yaw $179°$ and $-179°$ gives $0°$, the opposite direction, and near gimbal lock the angles can jump by tens of degrees between orientations that are almost the same. Interpolate with slerp; average quaternions with a method designed for it (for example, the principal eigenvector of the sum of $qq^{\mathsf T}$).
+
+</Misconception>
+
+<Misconception>
+
+**"$q$ and $-q$ are different rotations, so two estimates that differ in sign disagree."** They are the same rotation. Comparisons should use $|p\cdot q|$, and code that interpolates or averages must first flip signs so that all quaternions lie in the same hemisphere.
+
+</Misconception>
+
+<Misconception>
+
+**"Gimbal lock means the robot cannot rotate that way."** The robot can; the three-angle *description* is singular there. Switch representation and the problem disappears, unless your hardware is a three-ring mechanical gimbal, where it is physical.
+
+</Misconception>
+
+<Misconception>
+
+**"A quaternion read from a ROS message can be passed straight to my maths library."** Only if both agree on the order. A ROS message stores a 90° yaw as `x = 0, y = 0, z = 0.7071, w = 0.7071`; read as $(w, x, y, z)$, the same four numbers mean a $180°$ turn about the axis $(0, 1, 1)/\sqrt2$. Convert field by field, by name.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Leonhard Euler proved in 1775 that every rotation of a rigid body about a fixed point is a rotation about some axis, and introduced the angles that carry his name to describe spinning bodies. Olinde Rodrigues published his formula, and a set of four parameters for composing rotations, in 1840. Hamilton discovered quaternions on 16 October 1843 while walking along the Royal Canal in Dublin and scratched the multiplication rule into Broome Bridge as he passed; a plaque marks the place today. Quaternions then lost ground to the vector algebra of Gibbs and Heaviside for most of physics, but returned in the 1960s and 1970s in spacecraft attitude control, where they avoided gimbal lock and were cheaper than matrices on small flight computers, and in 1985 in computer graphics, through Ken Shoemake's slerp. Today they are the default orientation format of ROS, of most game engines and of nearly every drone's flight controller.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

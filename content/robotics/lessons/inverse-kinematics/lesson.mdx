@@ -1,0 +1,547 @@
+---
+title: Inverse kinematics
+subtitle: Working backwards from where the hand must be to how every joint must turn — and why the answer may be none, two, eight or infinitely many.
+minutes: 75
+objectives:
+  - Explain why inverse kinematics is harder than forward kinematics, and recognise when a target has no solution, finitely many or infinitely many
+  - Solve the planar two-link arm exactly, in both elbow-up and elbow-down form, and check every answer with forward kinematics
+  - Contrast geometric and algebraic methods, and explain how a spherical wrist lets a six-axis arm be solved in closed form
+  - Implement numerical IK by Newton's method with a finite-difference Jacobian, and make it robust with damped least squares
+  - Handle redundancy and joint limits, choose sensibly among several solutions, and describe how industrial and research software does IK
+prerequisites: [frames-and-transforms, rotations-and-quaternions, forward-kinematics]
+related: [math.geom.trigonometry, math.algebra.linear-algebra, math.analysis.multivariable-calculus, math.comp.numerical-methods, math.applied.optimisation]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 6 treats analytic and numerical inverse kinematics in the product-of-exponentials notation; free preprint and videos.
+  - title: "Introduction to Inverse Kinematics with Jacobian Transpose, Pseudoinverse and Damped Least Squares methods"
+    author: Samuel R. Buss
+    url: https://mathweb.ucsd.edu/~sbuss/ResearchWeb/ikmethods/iksurvey.pdf
+    note: A short, clear survey of the three classic iterative methods, analysed with the singular value decomposition.
+  - title: "Inverse Kinematic Solutions With Singularity Robustness for Robot Manipulator Control"
+    author: Yoshihiko Nakamura and Hideo Hanafusa
+    year: 1986
+    url: https://doi.org/10.1115/1.3143764
+    note: One of the two papers that introduced damped least squares to robotics.
+  - title: "Manipulator Inverse Kinematic Solutions Based on Vector Formulations and Damped Least-Squares Methods"
+    author: Charles W. Wampler
+    year: 1986
+    url: https://doi.org/10.1109/TSMC.1986.289285
+  - title: "Inverse Kinematics of the General 6R Manipulator and Related Linkages"
+    author: Madhusudan Raghavan and Bernard Roth
+    year: 1993
+    url: https://doi.org/10.1115/1.2919218
+    note: The algebraic solution of the general six-revolute arm, by elimination to a degree-16 polynomial.
+  - title: "Efficient inverse kinematics for general 6R manipulators"
+    author: Dinesh Manocha and John F. Canny
+    year: 1994
+    url: https://doi.org/10.1109/70.326569
+    note: Turns the elimination into an eigenvalue problem, fast enough for real time.
+  - title: "TRAC-IK: An Open-Source Library for Improved Solving of Generic Inverse Kinematics"
+    author: Patrick Beeson and Barrett Ames
+    year: 2015
+    url: https://doi.org/10.1109/HUMANOIDS.2015.7363472
+  - title: "IK-Geo: Unified Robot Inverse Kinematics Using Subproblem Decomposition"
+    author: Alexander J. Elias and John T. Wen
+    year: 2022
+    url: https://arxiv.org/abs/2211.05737
+    note: Geometric subproblems that return every solution of a 6R arm; code at github.com/rpiRobotics/ik-geo.
+  - title: "cuRobo: Parallelized Collision-Free Minimum-Jerk Robot Motion Generation"
+    author: Balakumar Sundaralingam et al.
+    year: 2023
+    url: https://arxiv.org/abs/2310.17274
+    note: Collision-free IK and motion generation by running many optimisations in parallel on a GPU.
+  - title: "Orocos Kinematics and Dynamics Library (KDL)"
+    url: https://github.com/orocos/orocos_kinematics_dynamics
+  - title: "Pinocchio"
+    url: https://github.com/stack-of-tasks/pinocchio
+    note: Fast rigid-body kinematics and dynamics in C++ and Python; Pink and mink build task-based IK on Pinocchio and MuJoCo.
+  - title: "MoveIt"
+    url: https://moveit.ai/
+    note: The ROS motion-planning framework, whose kinematics plugins include KDL, TRAC-IK and IKFast-generated solvers.
+---
+
+<Section id="motivation" kind="motivation" title="From where the hand must be to how the joints must turn">
+
+A camera above a pharmacy counter in Nairobi finds a box of tablets and reports its pose in the robot's base frame: centre at $(0.42, 0.18, 0.05)$ m, lying flat, rotated $30°$ about the vertical. A welding cell in Ulsan is told that the torch tip must follow a seam at a fixed angle to the steel. A surgeon in São Paulo moves a hand controller, and the instrument tip inside the patient must move the same way, scaled down. In every case the task is stated where the work happens, in **task space**: a position and an orientation of the tool. But a robot arm cannot be told "go to $(0.42, 0.18, 0.05)$". It can only be told how far to turn each of its motors.
+
+<LessonLink slug="forward-kinematics">Forward kinematics</LessonLink> answered the easy direction: given the joint angles $q$, multiply the link transforms together to get the tool pose ${}^{0}T_{E}(q)$. **Inverse kinematics** (IK) asks the opposite question: given a desired pose ${}^{0}T_{E}^{*}$, which joint angles produce it? Every pick, place, weld, and every step of a walking robot's foot needs this answer, often hundreds of times a second.
+
+The surprise is how different the two directions are. Forward kinematics always has exactly one answer, computed in a few dozen multiplications. Inverse kinematics may have **no** answer (the box is out of reach), **several** (reach it with the elbow up or the elbow down), or **infinitely many** (your own arm can touch a cup and still swing its elbow). This lesson shows why, solves the classic arm exactly, builds the numerical solver that general-purpose software uses, and ends with how industry and research labs actually do it.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Running forward kinematics backwards">
+
+Take the simplest arm that is not trivial: two links in a plane, of lengths $l_1 = 0.5$ m and $l_2 = 0.4$ m, joined by revolute joints at the shoulder and the elbow. Its forward kinematics is a pair of trigonometric sums:
+
+$$
+x = l_1 \cos q_1 + l_2 \cos(q_1 + q_2), \qquad y = l_1 \sin q_1 + l_2 \sin(q_1 + q_2).
+$$
+
+Now ask for the hand to be at $(0.6, 0.3)$. Picture it: the shoulder and the target are two fixed points, $0.67$ m apart, and the two links must bridge them. There is a triangle with sides $0.5$, $0.4$ and $0.67$, and you can build it on either side of the line from shoulder to target. One triangle puts the elbow above that line, the other below. That is the whole story of the two solutions.
+
+<Figure caption="A planar two-link arm reaching the target (0.6, 0.3) m in its two ways. The hand can reach every point between the dashed inner circle (radius 0.1 m) and the outer arc (radius 0.9 m); outside that ring there is no solution at all.">
+<svg viewBox="0 0 420 310" role="img" aria-label="A shoulder joint at the lower left. Two arms reach the same target point: one with the elbow raised above the line from shoulder to target, labelled elbow up, and one with the elbow below it, labelled elbow down. A small dashed circle around the shoulder marks the unreachable hole of radius 0.1 metres, and a large arc marks the outer reach of 0.9 metres." xmlns="http://www.w3.org/2000/svg">
+  <path d="M 298.2 293.8 A 252 252 0 0 0 115.2 6.6" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="6 5" />
+  <circle cx="50" cy="250" r="28" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 4" />
+  <line x1="50" y1="250" x2="218" y2="166" stroke="currentColor" strokeWidth="1" strokeDasharray="2 4" opacity="0.6" />
+  <polyline points="50,250 113.7,125.3 218,166" fill="none" stroke="currentColor" strokeWidth="5" strokeLinejoin="round" />
+  <polyline points="50,250 187.9,273.9 218,166" fill="none" stroke="var(--gold)" strokeWidth="5" strokeLinejoin="round" />
+  <rect x="34" y="256" width="32" height="10" fill="currentColor" opacity="0.35" />
+  <circle cx="50" cy="250" r="7" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <circle cx="113.7" cy="125.3" r="6" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <circle cx="187.9" cy="273.9" r="6" fill="var(--card)" stroke="var(--gold)" strokeWidth="2" />
+  <circle cx="218" cy="166" r="5" fill="var(--gold)" stroke="currentColor" strokeWidth="1.5" />
+  <text x="226" y="160" fill="currentColor" fontSize="13">target (0.6, 0.3) m</text>
+  <text x="122" y="112" fill="currentColor" fontSize="13">elbow up (q₂ &lt; 0)</text>
+  <text x="200" y="292" fill="currentColor" fontSize="13">elbow down (q₂ &gt; 0)</text>
+  <text x="308" y="240" fill="currentColor" fontSize="12">reach 0.9 m</text>
+  <text x="58" y="300" fill="currentColor" fontSize="12">hole: 0.1 m</text>
+</svg>
+</Figure>
+
+The same picture explains the other cases. Move the target farther away and the triangle flattens; at exactly $l_1 + l_2 = 0.9$ m the arm must be straight, and the two solutions merge into one. Beyond that, no triangle exists. Move the target very close to the shoulder and the same happens on the inside: a point nearer than $|l_1 - l_2| = 0.1$ m cannot be reached, because the arm folded back on itself still holds the hand $0.1$ m away. Add a third link and the hand position no longer pins down the arm: there is a whole curve of arm shapes ending at the same point.
+
+<Narrator who="chloe">
+
+Forward kinematics is a function $f$ from joint space to task space. Inverse kinematics asks for the **preimage** $f^{-1}(x^*)$, and preimages of a point under a smooth nonlinear map can be empty, a finite set, or a whole curve or surface. That single observation predicts every difficulty in this lesson.
+
+</Narrator>
+
+<Analogy>
+
+Put a fingertip on a spot on the table and keep it there. Your elbow can still swing in a circle, and your wrist can still tilt. Your arm has about seven degrees of freedom that matter here (three at the shoulder, one at the elbow, and three in the forearm and wrist), but a fingertip position fixes only three numbers, so you have four "spare" degrees of freedom for comfort, reach and avoiding the coffee cup. Robot designers copy this: many research arms have seven joints for the same reason.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="inverse kinematics">
+
+Given forward kinematics $T(q) = {}^{0}T_{E}(q)$ for joint vector $q \in \mathbb{R}^n$ and a desired pose $T^*$ (or a desired position, if orientation does not matter), the **inverse kinematics problem** is to find every $q$, or a suitable one, with $T(q) = T^*$ and $q$ inside the joint limits.
+
+</Definition>
+
+<Definition term="workspace">
+
+The **reachable workspace** is the set of tool positions some $q$ can produce. The **dexterous workspace** is the smaller set reachable in *every* orientation. For the two-link arm the reachable workspace is the ring $|l_1 - l_2| \le r \le l_1 + l_2$, and the dexterous workspace is empty, since a two-joint arm cannot choose its hand's angle as well as its position.
+
+</Definition>
+
+<Definition term="solution branch">
+
+The distinct solutions of a non-redundant arm come in **branches** (or *configurations*): elbow up or down, shoulder left or right, wrist flipped or not. Inside the workspace, each branch varies smoothly with the target; branches meet only at singular configurations, such as the fully stretched arm.
+
+</Definition>
+
+<Definition term="redundancy">
+
+An arm with $n$ joints doing a task with $m$ independent coordinates is **redundant** when $n > m$. Its degree of redundancy is $n - m$, and generically its solutions form a set of dimension $n - m$, the **self-motion manifold**. A 6-axis arm placing a tool in full 3-D pose ($m = 6$) is not redundant; a 7-axis arm doing the same task has one spare degree of freedom; a 6-axis arm whose tool is a drill symmetric about its own axis ($m = 5$) is redundant too.
+
+</Definition>
+
+</Section>
+
+<Section id="two-link" kind="examples" title="The planar two-link arm, solved exactly">
+
+Let the target be $(x, y)$ at distance $r = \sqrt{x^2 + y^2}$ from the shoulder. The triangle formed by the shoulder, the elbow and the hand has sides $l_1$, $l_2$ and $r$, and the angle at the elbow is $\pi - q_2$. The law of cosines gives
+
+$$
+r^2 = l_1^2 + l_2^2 - 2 l_1 l_2 \cos(\pi - q_2) = l_1^2 + l_2^2 + 2 l_1 l_2 \cos q_2,
+\qquad\text{so}\qquad
+\cos q_2 = \frac{x^2 + y^2 - l_1^2 - l_2^2}{2 l_1 l_2} =: c_2 .
+$$
+
+If $|c_2| \le 1$, set $s_2 = \pm\sqrt{1 - c_2^2}$ and $q_2 = \operatorname{atan2}(s_2, c_2)$: the plus sign is the elbow-down branch, the minus sign elbow-up. For the shoulder, the direction to the target is $\operatorname{atan2}(y, x)$, and the arm's own bend tilts the hand away from the first link by $\operatorname{atan2}(l_2 \sin q_2,\, l_1 + l_2 \cos q_2)$, so
+
+$$
+q_1 = \operatorname{atan2}(y, x) - \operatorname{atan2}(l_2 \sin q_2,\; l_1 + l_2 \cos q_2).
+$$
+
+<Theorem name="Solutions of the planar 2R arm">
+
+Let $l_1, l_2 > 0$, let the target be at distance $r$ from the shoulder, and suppose $r > 0$ or $l_1 \ne l_2$. Then the arm has exactly two solutions when $|l_1 - l_2| < r < l_1 + l_2$, exactly one when $r = l_1 + l_2$ or $r = |l_1 - l_2|$, and none otherwise (angles counted modulo $2\pi$).
+
+</Theorem>
+
+<Proof>
+
+Every solution satisfies $\cos q_2 = c_2$, and $c_2$ is an increasing function of $r$ that equals $1$ at $r = l_1 + l_2$ and $-1$ at $r = |l_1 - l_2|$. So for $r$ outside the closed ring $|c_2| > 1$ and there is no $q_2$. On the boundary $c_2 = \pm 1$ gives the single value $q_2 = 0$ or $q_2 = \pi$; inside, $|c_2| < 1$ gives two values $\pm\arccos c_2$. For each $q_2$, the hand's position relative to the shoulder is the vector $(l_1 + l_2\cos q_2,\ l_2 \sin q_2)$ rotated by $q_1$; this vector has length $r > 0$ (when $r = 0$ it is zero only if $l_1 = l_2$ and $q_2 = \pi$, which the hypothesis excludes), so exactly one $q_1$ modulo $2\pi$ rotates it onto $(x, y)$. That $q_1$ is the formula above.
+
+</Proof>
+
+<Narrator who="gideon">
+
+The excluded case is real: if $l_1 = l_2$ and the target is the shoulder itself, the folded arm reaches it for *every* $q_1$, so a non-redundant arm can still have infinitely many solutions at a special point. And in floating point, a target exactly at full stretch can give $c_2 = 1.0000000000000002$; `arccos` or `sqrt` of that returns NaN, which is why solvers clamp $c_2$ to $[-1, 1]$ within a small tolerance before going on.
+
+</Narrator>
+
+<Example title="Reaching (0.6, 0.3) with l₁ = 0.5 m and l₂ = 0.4 m">
+
+$c_2 = (0.36 + 0.09 - 0.25 - 0.16)/(2 \cdot 0.5 \cdot 0.4) = 0.04/0.4 = 0.1$, so $q_2 = \pm\arccos 0.1 = \pm 84.26°$. With $q_2 = +84.26°$: $\operatorname{atan2}(0.3, 0.6) = 26.57°$, and $\operatorname{atan2}(0.4 \sin 84.26°,\ 0.5 + 0.4 \cdot 0.1) = \operatorname{atan2}(0.398, 0.54) = 36.39°$, so $q_1 = -9.83°$. With $q_2 = -84.26°$ the second angle flips sign and $q_1 = 26.57° + 36.39° = 62.96°$. Both are checked by forward kinematics below.
+
+</Example>
+
+Always use the two-argument `atan2`, never `arctan(y/x)` or `arccos` alone: `arctan` loses the quadrant (it cannot tell $(1, 1)$ from $(-1, -1)$), and `arccos` returns only one sign, silently discarding a branch. And always check an IK answer by running forward kinematics on it, as the code does.
+
+```python run
+import numpy as np
+
+L1, L2 = 0.5, 0.4                       # link lengths in metres
+
+def fk_2r(q):
+    """Forward kinematics: joint angles (rad) -> hand position (m)."""
+    q1, q2 = q
+    return np.array([L1 * np.cos(q1) + L2 * np.cos(q1 + q2),
+                     L1 * np.sin(q1) + L2 * np.sin(q1 + q2)])
+
+def ik_2r(x, y, tol=1e-12):
+    """Every solution (q1, q2) that puts the hand at (x, y): a list of 0, 1 or 2 pairs."""
+    c2 = (x * x + y * y - L1**2 - L2**2) / (2 * L1 * L2)
+    if c2 > 1 + tol or c2 < -1 - tol:
+        return []                                   # outside the ring: unreachable
+    c2 = min(1.0, max(-1.0, c2))                    # clean up rounding at the boundary
+    s2 = np.sqrt(1 - c2 * c2)
+    solutions = []
+    for sign in (+1, -1):                           # +1: elbow down (q2 > 0), -1: elbow up
+        q2 = np.arctan2(sign * s2, c2)
+        q1 = np.arctan2(y, x) - np.arctan2(L2 * np.sin(q2), L1 + L2 * np.cos(q2))
+        q = (q1, q2)
+        if not any(np.allclose(q, p) for p in solutions):
+            solutions.append(q)
+    return solutions
+
+print(f"reach: from {abs(L1 - L2):.1f} m to {L1 + L2:.1f} m from the shoulder")
+for target in [(0.6, 0.3), (0.0, 0.9), (0.95, 0.0), (0.05, 0.0)]:
+    sols = ik_2r(*target)
+    print(f"\ntarget {target}: {len(sols)} solution(s)")
+    for q1, q2 in sols:
+        err = np.linalg.norm(fk_2r((q1, q2)) - target)
+        print(f"  q1 = {np.degrees(q1):8.3f} deg   q2 = {np.degrees(q2):8.3f} deg   FK error = {err:.1e} m")
+```
+
+The interior target has two solutions, the target at full stretch one ($q_2 = 0$), and the two outside the ring none. The forward-kinematics errors are around $10^{-16}$ m: the solutions are exact up to rounding.
+
+</Section>
+
+<Section id="methods" kind="human" title="Geometric and algebraic methods, and the six-axis arm">
+
+What we just did is a **geometric** method: draw the arm, spot a triangle, apply the law of cosines. It is quick and gives insight, but it relies on spotting the right picture. The **algebraic** method is mechanical. Write the forward kinematics equations, substitute $u_i = \tan(q_i/2)$ so that $\cos q_i = (1 - u_i^2)/(1 + u_i^2)$ and $\sin q_i = 2u_i/(1 + u_i^2)$, and the trigonometric equations become polynomial ones. Elimination then reduces the system to one polynomial in one unknown, whose real roots are the solutions.
+
+For a general arm with six revolute joints this is hard, and it took decades. Raghavan and Roth presented the elimination for the general 6R arm around 1990 (journal version 1993): it ends in a polynomial of degree 16, so a general 6R arm has **at most 16** solutions, and examples are known where all 16 are real. Manocha and Canny (1994) recast the elimination as an eigenvalue problem, fast enough for real-time use.
+
+Industrial arms avoid all this by design. In his 1968 Stanford thesis Donald Pieper showed that if three consecutive joint axes meet in a point, the IK of a six-axis arm separates into two small problems. Most industrial arms put that point in the wrist: the last three axes intersect at the **wrist centre**, forming a **spherical wrist**. Then:
+
+1. **Position.** The wrist centre is a fixed distance $d$ behind the tool along the tool's approach axis $z_E$: $p_w = p^* - d\, R^* z_E$. It depends only on the first three joints, which form an arm much like our 2R arm with a rotating base. Solve them geometrically: up to **four** solutions (shoulder front or back, elbow up or down).
+2. **Orientation.** With $q_1, q_2, q_3$ known, the rotation the wrist must supply is $R_{3}^{\top} R^*$, where $R_3$ is the orientation of frame 3. Three intersecting axes realise it as a set of Euler angles, which <LessonLink slug="rotations-and-quaternions">the rotations lesson</LessonLink> showed how to extract: **two** solutions (wrist flipped or not), merging when the middle wrist joint is at zero.
+
+So a typical six-axis industrial arm, such as the Lumen-6 of <LessonLink slug="forward-kinematics">forward kinematics</LessonLink>, has up to $4 \times 2 = 8$ solutions for a reachable pose. The planar 3R arm with a target orientation, in the exercises, is the same idea in miniature: step back from the tool along the last link to find the wrist point, solve the 2R arm, then set the last joint to get the angle right.
+
+Modern geometric solvers make Pieper's insight systematic. A handful of **subproblems** with closed-form solutions (rotate one vector onto another about one axis; about two axes; rotate to a given distance from a point), named after Paden and Kahan, who catalogued them in the 1980s, cover most practical arms. IK-Geo (Elias and Wen, 2022) extends the catalogue so that every 6R arm with three intersecting or parallel axes is solved in closed form, and any other 6R arm by searching over one or two joint angles, returning every solution.
+
+</Section>
+
+<Section id="numerical" kind="computation" title="Numerical IK: Newton's method and damped least squares">
+
+Closed forms exist only for special geometries, and they say nothing about which of eight answers you want or about joint limits. The general-purpose alternative is to *iterate*: start from a guess $q_0$, usually the robot's current configuration, and improve it.
+
+Near the current guess, forward kinematics is almost linear. If the joints move by a small $\Delta q$, the hand moves by about $J(q)\,\Delta q$, where $J$ is the **Jacobian**, the matrix of partial derivatives $J_{ij} = \partial f_i / \partial q_j$. <LessonLink slug="jacobians-and-velocity">The next lesson</LessonLink> derives $J$ exactly from the arm's geometry; for now, estimate each column by wiggling one joint: $J_{:,j} \approx \big(f(q + h e_j) - f(q - h e_j)\big)/2h$ with $h = 10^{-6}$ rad. To make the error $e = x^* - f(q)$ vanish, solve the linear system $J\,\Delta q = e$ and update $q \leftarrow q + \Delta q$. This is **Newton's method** for the equation $f(q) = x^*$, the same method as for roots of one equation in <TopicLink id="math.comp.numerical-methods">numerical methods</TopicLink>, now with a matrix in place of the derivative.
+
+```python run
+import numpy as np
+
+L1, L2 = 0.5, 0.4
+
+def fk(q):
+    return np.array([L1 * np.cos(q[0]) + L2 * np.cos(q[0] + q[1]),
+                     L1 * np.sin(q[0]) + L2 * np.sin(q[0] + q[1])])
+
+def jacobian_fd(f, q, h=1e-6):
+    """Central finite differences: column j is how the hand moves per radian of joint j."""
+    q = np.asarray(q, dtype=float)
+    cols = []
+    for j in range(len(q)):
+        dq = np.zeros_like(q)
+        dq[j] = h
+        cols.append((f(q + dq) - f(q - dq)) / (2 * h))
+    return np.column_stack(cols)
+
+def newton_ik(f, q0, target, iters=8):
+    q = np.array(q0, dtype=float)
+    for k in range(iters):
+        e = target - f(q)                       # task-space error (m)
+        print(f"  iter {k}: |error| = {np.linalg.norm(e):.3e} m   q = {np.round(np.degrees(q), 3)} deg")
+        if np.linalg.norm(e) < 1e-12:
+            break
+        J = jacobian_fd(f, q)
+        q = q + np.linalg.solve(J, e)           # the Newton step: J dq = e
+    return q
+
+target = np.array([0.6, 0.3])
+print("start near elbow down:")
+newton_ik(fk, np.radians([0.0, 60.0]), target)
+print("start near elbow up:")
+newton_ik(fk, np.radians([90.0, -60.0]), target)
+```
+
+Each start converges to the solution on its own branch: the same two answers as the closed form, to every printed digit.
+
+<Narrator who="margaret">
+
+Watch the error column of the first run: $4.3 \times 10^{-4}$, then $1.8 \times 10^{-7}$, then $2.9 \times 10^{-14}$ m. Each error is roughly the square of the one before (in suitable units), so the number of correct digits doubles per step. That is Newton's quadratic convergence, and it is why a numerical IK call on a modern computer typically costs microseconds once the guess is close.
+
+</Narrator>
+
+Newton's method has two weaknesses, and both come from the Jacobian. If $J$ is not square (a redundant arm, or a task with fewer coordinates than joints), $J\,\Delta q = e$ has no unique solution; the standard choice is the smallest step that does the job, $\Delta q = J^{+} e$, using the **Moore–Penrose pseudoinverse** $J^{+}$. Worse, near a **singular** configuration, where $J$ loses rank, such as our arm at full stretch, the system is nearly unsolvable and $\Delta q$ becomes enormous. An unreachable target is even nastier: the arm stretches towards it, becomes singular, and the steps explode.
+
+The cure, introduced to robotics by Wampler and by Nakamura and Hanafusa in 1986, is **damped least squares** (DLS), also called the Levenberg–Marquardt step. Instead of insisting that $J\,\Delta q = e$ exactly, choose the step that best balances the two wishes "reduce the error" and "don't move much":
+
+$$
+\Delta q = \arg\min_{\Delta q}\ \|J\,\Delta q - e\|^2 + \lambda^2 \|\Delta q\|^2
+= J^{\top}\left(J J^{\top} + \lambda^2 I\right)^{-1} e .
+$$
+
+The matrix $J J^{\top} + \lambda^2 I$ is always invertible for $\lambda > 0$, so the step always exists. Writing $J$ through its singular value decomposition shows what damping does: a direction in which the arm can move at rate $\sigma$ per radian gets gain $\sigma/(\sigma^2 + \lambda^2)$ instead of $1/\sigma$. For large $\sigma$ that is almost $1/\sigma$, so far from singularities DLS behaves like Newton; as $\sigma \to 0$ the gain falls to zero instead of exploding, and it never exceeds $1/(2\lambda)$.
+
+```python run
+import numpy as np
+
+L1, L2 = 0.5, 0.4
+
+def fk(q):
+    return np.array([L1 * np.cos(q[0]) + L2 * np.cos(q[0] + q[1]),
+                     L1 * np.sin(q[0]) + L2 * np.sin(q[0] + q[1])])
+
+def jacobian_fd(f, q, h=1e-6):
+    cols = []
+    for j in range(len(q)):
+        dq = np.zeros(len(q))
+        dq[j] = h
+        cols.append((f(q + dq) - f(q - dq)) / (2 * h))
+    return np.column_stack(cols)
+
+def solve_ik(f, q0, target, damping=0.0, iters=100, tol=1e-10):
+    """Newton with the pseudoinverse (damping = 0) or damped least squares (damping > 0)."""
+    q = np.array(q0, dtype=float)
+    biggest_step = 0.0
+    for k in range(1, iters + 1):
+        e = target - f(q)
+        if np.linalg.norm(e) < tol:
+            return q, k - 1, np.linalg.norm(e), biggest_step
+        J = jacobian_fd(f, q)
+        if damping == 0.0:
+            dq = np.linalg.pinv(J) @ e
+        else:                                   # dq = J^T (J J^T + lambda^2 I)^-1 e
+            dq = J.T @ np.linalg.solve(J @ J.T + damping**2 * np.eye(len(e)), e)
+        biggest_step = max(biggest_step, np.degrees(np.abs(dq)).max())
+        q = q + dq
+    return q, iters, np.linalg.norm(target - f(q)), biggest_step
+
+cases = [("reachable, ordinary start", [0.0, 1.0], [0.6, 0.3]),
+         ("reachable, start stretched", [0.0, 0.0], [0.6, 0.3]),
+         ("unreachable, 1.3 m away", [0.3, 0.5], [1.2, 0.5])]
+print(f"{'case':27} {'method':11} {'iterations':>10} {'final error':>12} {'largest step':>13}")
+for name, q0, target in cases:
+    for label, lam in [("Newton", 0.0), ("DLS 0.05", 0.05), ("DLS 0.2", 0.2)]:
+        q, k, err, step = solve_ik(fk, q0, np.array(target), damping=lam)
+        print(f"{name:27} {label:11} {k:10d} {err:10.1e} m {step:9.1f} deg")
+
+q, *_ = solve_ik(fk, [0.3, 0.5], np.array([1.2, 0.5]), damping=0.2)
+print("\nDLS 0.2, unreachable target: q =", np.round(np.degrees(q), 2), "deg;",
+      "the target lies at", round(float(np.degrees(np.arctan2(0.5, 1.2))), 2), "deg")
+```
+
+The table shows the trade-off honestly. From an ordinary start, plain Newton is fastest (4 iterations) and heavier damping is slower (21 iterations at $\lambda = 0.2$): damping costs speed. Starting from the stretched, singular arm, Newton still gets there but on the way takes a step of almost $500°$, a wild spin no real controller should command. On the unreachable target, Newton and lightly damped DLS thrash for all 100 iterations, with steps of more than a thousand degrees. DLS with $\lambda = 0.2$ calmly settles on the **closest** reachable point: arm straight ($q_2 = 0$), pointing at the target ($q_1 = 22.62°$), $0.4$ m short, which is exactly $1.3 - 0.9$. Practical solvers therefore damp more near singularities and less away from them, cap the size of each step, and report "closest point, not reached" instead of failing silently.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Redundancy, joint limits and choosing a solution">
+
+A solver that returns *a* solution has done half the job. Real software must choose *which* solution, and the right choice depends on the task.
+
+- **Stay close.** When following a path, pick the solution nearest the current configuration (in a weighted joint distance), so that the arm moves a little rather than flipping its elbow mid-weld. Numerical IK seeded with the current joints does this naturally; analytic solvers compute all branches and pick the nearest.
+- **Respect joint limits.** Every real joint has a range, set by cables, hard stops or the motor's design. A solution with $q_3 = 134°$ on a joint that stops at $120°$ is useless.
+- **Avoid collisions** with the robot itself, the table and people, and keep a margin from singularities, where small hand motions demand large joint motions (next lesson).
+- **Keep the branch.** Moving between two branches of a non-redundant arm along a path means passing through a singular configuration. Industrial controllers therefore store a **configuration flag** with each taught pose (ABB calls it *confdata*, KUKA uses *Status* and *Turn* bits) and refuse to switch branches implicitly.
+
+For a redundant arm the solutions form a continuous family, and the spare freedom can be put to work. Take a planar arm with three links ($0.4$, $0.3$ and $0.2$ m) reaching the point $(0.35, 0.45)$: one equation per coordinate, three unknowns, a one-parameter family of answers.
+
+<Figure caption="Two of the infinitely many ways a planar three-link arm can put its tip on the same point. They differ in the angle of the last link: 45° (solid) and 135° (gold).">
+<svg viewBox="0 0 300 280" role="img" aria-label="A planar three-link arm drawn twice from the same base. Both versions end at the same target point, but the elbow and wrist are in different places: one arm's last link points up and to the right, the other's up and to the left." xmlns="http://www.w3.org/2000/svg">
+  <polyline points="50,250 168,228.3 112.6,157.4 155,115" fill="none" stroke="currentColor" strokeWidth="5" strokeLinejoin="round" />
+  <polyline points="50,250 169.8,243.1 197.4,157.4 155,115" fill="none" stroke="var(--gold)" strokeWidth="5" strokeLinejoin="round" />
+  <rect x="34" y="256" width="32" height="10" fill="currentColor" opacity="0.35" />
+  <circle cx="50" cy="250" r="7" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <circle cx="168" cy="228.3" r="5" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <circle cx="112.6" cy="157.4" r="5" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <circle cx="169.8" cy="243.1" r="5" fill="var(--card)" stroke="var(--gold)" strokeWidth="2" />
+  <circle cx="197.4" cy="157.4" r="5" fill="var(--card)" stroke="var(--gold)" strokeWidth="2" />
+  <circle cx="155" cy="115" r="5" fill="var(--gold)" stroke="currentColor" strokeWidth="1.5" />
+  <text x="150" y="100" fill="currentColor" fontSize="13">target (0.35, 0.45) m</text>
+  <text x="20" y="150" fill="currentColor" fontSize="12">last link at 45°</text>
+  <text x="210" y="175" fill="currentColor" fontSize="12">at 135°</text>
+</svg>
+</Figure>
+
+Two techniques exploit the family. The first is **null-space projection**. The matrix $I - J^{+}J$ projects any joint motion onto the null space of $J$: the motions that, to first order, do not move the hand. So the update
+
+$$
+\Delta q = J^{+} e + \left(I - J^{+} J\right) z, \qquad z = -k\, \nabla H(q),
+$$
+
+drives the hand to the target with its first term and, with its second, slides along the family of solutions to reduce a secondary cost $H$. A common $H$ is the squared distance of each joint from the middle of its range, scaled by the range; others measure distance from obstacles or from singularities.
+
+```python run
+import numpy as np
+
+L = np.array([0.4, 0.3, 0.2])                        # a planar 3R arm: 3 joints, 2-D task
+LIMITS = np.radians([[-90, 90], [-120, 120], [-120, 120]])
+
+def fk(q):
+    a = np.cumsum(q)                                 # absolute angle of each link
+    return np.array([L @ np.cos(a), L @ np.sin(a)])
+
+def jacobian(q):
+    a = np.cumsum(q)
+    J = np.zeros((2, 3))
+    for j in range(3):                               # joint j swings links j, j+1, ...
+        J[0, j] = -L[j:] @ np.sin(a[j:])
+        J[1, j] = L[j:] @ np.cos(a[j:])
+    return J
+
+def ik_redundant(q0, target, k_null=0.0, iters=300):
+    q = np.array(q0, dtype=float)
+    mid = LIMITS.mean(axis=1)
+    half = (LIMITS[:, 1] - LIMITS[:, 0]) / 2
+    for _ in range(iters):
+        e = target - fk(q)
+        J = jacobian(q)
+        Jp = np.linalg.pinv(J)
+        grad_H = (q - mid) / half**2                 # H(q) = 1/2 sum ((q - mid) / half)^2
+        dq = Jp @ e + (np.eye(3) - Jp @ J) @ (-k_null * grad_H)
+        q = q + 0.5 * dq
+    return q
+
+def report(name, q, target):
+    inside = np.all((q >= LIMITS[:, 0]) & (q <= LIMITS[:, 1]))
+    print(f"{name:36} q = {np.round(np.degrees(q), 1)} deg  error = {np.linalg.norm(target - fk(q)):.0e} m"
+          f"  within limits: {inside}")
+
+target = np.array([0.35, 0.45])
+for q0 in ([0.2, 0.2, 0.2], [-0.5, 2.0, 0.5], [1.2, -1.0, 1.5]):
+    report(f"start {q0}", ik_redundant(q0, target), target)
+report("start [1.2, -1.0, 1.5] + null space", ik_redundant([1.2, -1.0, 1.5], target, k_null=0.5), target)
+
+# The solutions form a one-parameter family: choose the last link's absolute angle phi freely.
+print("\nphi (deg)    q1      q2      q3    within limits   (elbow-down branch)")
+for phi in range(-90, 181, 45):
+    p = np.radians(phi)
+    wx, wy = target - L[2] * np.array([np.cos(p), np.sin(p)])   # where the wrist must be
+    c2 = (wx**2 + wy**2 - L[0]**2 - L[1]**2) / (2 * L[0] * L[1])
+    if abs(c2) > 1:
+        print(f"{phi:9d}   wrist out of reach")
+        continue
+    q2 = np.arctan2(np.sqrt(1 - c2**2), c2)
+    q1 = np.arctan2(wy, wx) - np.arctan2(L[1] * np.sin(q2), L[0] + L[1] * np.cos(q2))
+    q3 = p - q1 - q2
+    q3 = (q3 + np.pi) % (2 * np.pi) - np.pi
+    q = np.array([q1, q2, q3])
+    ok = np.all((q >= LIMITS[:, 0]) & (q <= LIMITS[:, 1]))
+    print(f"{phi:9d} {np.degrees(q1):7.1f} {np.degrees(q2):7.1f} {np.degrees(q3):7.1f}    {ok}")
+```
+
+Three starting guesses give three different exact solutions, and the third breaks the limit of joint 3 ($134.4°$ against $120°$). Adding the null-space term to the same start leads to $(-1.0°, 78.6°, 47.3°)$, comfortably inside every range, with the hand still on target. The table makes the family explicit: for every angle $\varphi$ of the last link whose wrist point is reachable there is an elbow-down solution, and only some of them respect the limits.
+
+The second technique is to treat IK as **optimisation** from the start:
+
+$$
+\min_{q}\ \tfrac12\|f(q) - x^*\|^2_W + \tfrac{\mu}{2}\|q - q_{\text{rest}}\|^2 \quad \text{subject to}\quad q_{\min} \le q \le q_{\max},\ \text{collision constraints}.
+$$
+
+Nonlinear-programming solvers (sequential quadratic programming, interior-point methods) handle the bounds and constraints directly. In **differential IK**, used in real-time control, each control tick solves a small quadratic program for the joint *velocities* that best achieve several weighted or prioritised tasks — the hand pose, the gaze direction, the balance of a humanoid — subject to joint position, velocity and torque limits.
+
+<Narrator who="gideon">
+
+An IK solution is a configuration, not a motion. Two solutions that both put the tool on the target can be joined only by moving the arm between them, and that motion may sweep through the table, a person or a singularity. Choosing a solution and planning the motion to it are separate problems, and the second is the subject of the Planning level.
+
+</Narrator>
+
+</Section>
+
+<Section id="practice" kind="human" title="How industry and research solve IK">
+
+**Industrial arms.** Six-axis arms from FANUC, ABB, KUKA, Yaskawa, Kawasaki and others are built with spherical wrists (or, like Universal Robots' arms, with three parallel middle axes, another geometry with closed-form IK), so their controllers solve IK analytically in microseconds, every interpolation cycle, choosing the branch from the stored configuration flags. Offline programming tools use the same closed forms to check reachability before a cell is built.
+
+**Open-source and research software.** For arms described only by a URDF model, numerical solvers dominate.
+
+- [KDL](https://github.com/orocos/orocos_kinematics_dynamics), the Orocos Kinematics and Dynamics Library, provides Newton–Raphson and Levenberg–Marquardt position solvers; it was long the default IK plugin of [MoveIt](https://moveit.ai/).
+- **TRAC-IK** (Beeson and Ames, 2015) runs a KDL-style Newton solver with random restarts and an SQP optimiser in parallel and returns whichever succeeds first, which removed many false "no solution" failures on humanoid arms.
+- **IKFast**, part of [OpenRAVE](https://github.com/rdiankov/openrave), analyses an arm's geometry symbolically and *generates* C++ code for its closed-form solution; MoveIt can use the generated solvers as plugins. [IK-Geo](https://github.com/rpiRobotics/ik-geo) does the same job with geometric subproblems.
+- [Pinocchio](https://github.com/stack-of-tasks/pinocchio) computes kinematics and Jacobians fast, and libraries such as [Pink](https://github.com/stephane-caron/pink) (on Pinocchio) and [mink](https://github.com/kevinzakka/mink) (on [MuJoCo](https://mujoco.org/)) build quadratic-programming differential IK on top, with tasks, priorities and limits. [Drake](https://drake.mit.edu/) poses IK as a constrained nonlinear program with position, orientation, distance and collision constraints.
+- **cuRobo** (NVIDIA, 2023) runs thousands of collision-aware IK optimisations from different seeds in parallel on a GPU, trading brute force for reliability.
+
+In Pinocchio, one damped Newton update for a 6-D pose target looks like the sketch below. It is shown, not run here: it needs Pinocchio and a robot model. The error is the 6-D twist that carries the current tool frame to the target, computed with the matrix logarithm of <LessonLink slug="rotations-and-quaternions">the rotations lesson</LessonLink>.
+
+```python
+import numpy as np
+import pinocchio as pin
+
+model = pin.buildModelFromUrdf("my_arm.urdf")         # any arm described in URDF
+data = model.createData()
+tool = model.getFrameId("tool0")
+
+def ik_step(q, target, lam=0.05):
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+    current = data.oMf[tool]                            # pose of the tool in the world
+    err = pin.log(current.actInv(target)).vector        # 6-D error, in the tool frame
+    J = pin.computeFrameJacobian(model, data, q, tool, pin.LOCAL)
+    dq = J.T @ np.linalg.solve(J @ J.T + lam**2 * np.eye(6), err)
+    return pin.integrate(model, q, dq)                  # respects how each joint type moves
+```
+
+**Graphics and animation** use the same mathematics with different priorities: games and animation tools often use cheap heuristics such as cyclic coordinate descent, which adjusts one joint at a time, because a plausible pose every frame matters more than exactness. And learned methods — networks that propose IK seeds, or policies that output joint commands directly, as in the Learning level of this course — still lean on classical IK for checking, for labelling data and for safety limits.
+
+Whatever the method, a solution is checked before it reaches a motor: forward kinematics confirms the pose, the controller confirms the limits, and on a real robot the first test of new IK code is in simulation, then on the real arm at low speed, inside its guarded cell.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Inverse kinematics has an answer."** It may have none, a few, or infinitely many. Code that calls an IK function must handle all three: report unreachable targets, choose among branches, and resolve redundancy deliberately rather than by accident of the starting guess.
+
+</Misconception>
+
+<Misconception>
+
+**"The numerical solver failed, so the target is unreachable."** A local method can stall near a singularity, run into a joint limit, or converge to a different branch, even when a solution exists. Try several seeds, check against the workspace analytically when you can, and treat "not found" and "does not exist" as different results.
+
+</Misconception>
+
+<Misconception>
+
+**"Reaching the position is enough."** A tool has a pose: position *and* orientation. A gripper at the right point but rotated $90°$ will not grasp the box. Full IK solves for six numbers; when some orientation does not matter (a symmetric drill, a suction cup), say so explicitly and let the solver use the freedom.
+
+</Misconception>
+
+<Misconception>
+
+**"Analytic IK is always better than numerical IK."** Closed forms are exact, fast and return every branch, but they exist only for suitable geometries and know nothing of limits, collisions or secondary goals. Numerical and optimisation methods handle any arm and any constraint, at the cost of seeds and convergence checks. Real systems often combine them: analytic solutions as seeds or candidates, optimisation to choose and refine.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

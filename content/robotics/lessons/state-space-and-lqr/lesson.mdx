@@ -1,0 +1,598 @@
+---
+title: State space, LQR and observers
+subtitle: Describe a robot by its state, balance an inverted pendulum with one gain matrix, choose that matrix optimally, and estimate what you cannot measure.
+minutes: 80
+objectives:
+  - Write a robot's dynamics as a state-space model and linearise a nonlinear model about an equilibrium
+  - Test controllability and observability with the rank conditions, and explain what fails when they do not hold
+  - Place the closed-loop poles of a single-input system with Ackermann's formula
+  - Compute a discrete-time LQR gain by iterating the Riccati equation, and explain how the weights Q and R trade error against effort
+  - Build a Luenberger observer, state the separation principle, and say what a Kalman filter adds
+prerequisites: [robot-dynamics, feedback-and-pid]
+related: [math.algebra.linear-algebra, math.analysis.ordinary-differential-equations, math.analysis.dynamical-systems, math.applied.optimisation, math.applied.classical-mechanics]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Underactuated Robotics"
+    author: Russ Tedrake
+    url: https://underactuated.mit.edu/
+    note: A free online textbook; its chapters on the cart-pole, LQR and time-varying LQR are the natural next step after this lesson.
+  - title: "Feedback Systems: An Introduction for Scientists and Engineers"
+    author: Karl Johan Åström and Richard M. Murray
+    year: 2021
+    url: https://fbswiki.org/
+    note: Free textbook chapters on state feedback, reachability, observability and output feedback.
+  - title: "Contributions to the theory of optimal control"
+    author: Rudolf E. Kálmán
+    year: 1960
+    note: The paper that posed and solved the linear-quadratic regulator and introduced controllability. Boletín de la Sociedad Matemática Mexicana 5.
+  - title: "A New Approach to Linear Filtering and Prediction Problems"
+    author: Rudolf E. Kálmán
+    year: 1960
+    url: https://doi.org/10.1115/1.3662552
+    note: The Kalman filter, the optimal observer for linear systems with Gaussian noise.
+  - title: "Observing the state of a linear system"
+    author: David G. Luenberger
+    year: 1964
+    note: The observer that reconstructs a full state from a few measurements. IEEE Transactions on Military Electronics 8.
+  - title: "Guaranteed margins for LQG regulators"
+    author: John C. Doyle
+    year: 1978
+    note: A one-page paper whose abstract reads, in full, "There are none." Why an observer can destroy LQR's robustness. IEEE Transactions on Automatic Control 23.
+  - title: "python-control"
+    url: https://python-control.readthedocs.io/
+    note: An open-source Python library with lqr, dlqr, place and observer design, for checking your own code.
+  - title: "SciPy: scipy.linalg.solve_discrete_are"
+    url: https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.solve_discrete_are.html
+    note: A direct (non-iterative) solver for the discrete Riccati equation.
+  - title: "Drake"
+    url: https://drake.mit.edu/
+    note: A robotics toolbox from MIT and Toyota Research Institute with LQR, time-varying LQR and trajectory optimisation built in.
+---
+
+<Section id="motivation" kind="motivation" title="Balancing a broom">
+
+Balance a broom upright on the palm of your hand. You do not watch only the angle: you feel which way it is falling and how fast, and you notice where your hand is, because you cannot walk across the room to keep it up. Four quantities matter at once (hand position, hand speed, broom angle, broom angular speed), and every correction you make affects all of them.
+
+A PID loop from <LessonLink slug="feedback-and-pid">the previous lesson</LessonLink> takes one error and produces one command. That is ideal for one motor holding one joint, but awkward here: one motor, the cart's, must hold the pendulum upright *and* bring the cart back to the middle of its track, and the two goals pull against each other. Two-wheeled delivery robots, legged robots standing on one foot, a rocket landing on its exhaust and a quadrotor hovering in wind all have the same structure: several quantities, coupled, controlled through few inputs.
+
+The tool for such systems is the **state-space model**: describe the system by a vector of numbers, its **state**, and the control law by a matrix. This lesson builds that model for the inverted pendulum on a cart, the classic test bench of control, and balances it in simulation three ways: by placing the closed-loop poles where we choose, by the **linear-quadratic regulator** (LQR), which chooses the gains optimally, and by feedback from an **observer** that estimates the velocities nobody measures.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="What a state is">
+
+The **state** of a system is the smallest set of numbers that, together with the future inputs, determines its future. For a pendulum it is the angle *and* the angular velocity: knowing only that the pendulum hangs at 10° does not tell you whether it is about to swing left or right. For a rigid robot arm it is the joint angles and joint velocities, $x = (q, \dot q)$, because <LessonLink slug="robot-dynamics">the equations of motion</LessonLink> give accelerations from them and the torques.
+
+So a robot's dynamics can always be written as $\dot x = f(x, u)$: the rate of change of the state is a function of the state and the input $u$. Near an operating point, a smooth $f$ is close to linear, and a linear system $\dot x = A x + B u$ can be analysed completely with linear algebra. If every state can be measured, the natural controller is **state feedback**, $u = -Kx$: each input is a weighted sum of all the states, and the whole design problem is choosing the matrix $K$.
+
+<Analogy>
+
+A pilot's instrument panel is a state display: altitude, airspeed, heading, attitude, climb rate. No single dial tells the pilot what to do, but together they determine what the aircraft will do next, and the pilot's corrections on the stick and throttle are a learned function of the whole panel.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="state-space model">
+
+A **continuous-time state-space model** is $\dot x = f(x, u)$, $y = h(x)$, with state $x \in \mathbb{R}^n$, input $u \in \mathbb{R}^m$ and measured output $y \in \mathbb{R}^p$. It is **linear time-invariant** (LTI) when $\dot x = Ax + Bu$, $y = Cx$. A digital controller sees its discrete-time counterpart $x_{k+1} = A_d x_k + B_d u_k$; when $u$ is held constant over each period $T$ (a zero-order hold), $A_d = e^{AT}$ and $B_d = \int_0^T e^{As}\,ds\,B$.
+
+</Definition>
+
+<Definition term="linearisation">
+
+An **equilibrium** is a pair $(x^*, u^*)$ with $f(x^*, u^*) = 0$. The **linearisation** there uses the Jacobians $A = \partial f/\partial x$ and $B = \partial f/\partial u$, evaluated at $(x^*, u^*)$, and describes small deviations $\delta x = x - x^*$, $\delta u = u - u^*$ by $\dot{\delta x} \approx A\,\delta x + B\,\delta u$.
+
+</Definition>
+
+<Definition term="controllability">
+
+The discrete system $(A_d, B_d)$ is **controllable** if from any initial state some input sequence reaches any final state in finitely many steps. The **controllability matrix** is $\mathcal{C} = [B,\ AB,\ A^2B,\ \ldots,\ A^{n-1}B]$.
+
+</Definition>
+
+<Definition term="observability">
+
+The system $(A, C)$ is **observable** if the initial state can be recovered from the outputs $y_0, y_1, \ldots$ (and the known inputs). The **observability matrix** stacks $C, CA, \ldots, CA^{n-1}$.
+
+</Definition>
+
+</Section>
+
+<Section id="cart-pole" kind="examples" title="The inverted pendulum on a cart">
+
+A cart of mass $M = 1$ kg runs on a straight rail, pushed by a force $u$ from a motor and belt. On top, a light rod of length $l = 0.5$ m carries a bob of mass $m = 0.2$ kg, pivoting freely. The state is $x = (p, \dot p, \theta, \dot\theta)$: the cart's position and velocity, and the rod's angle from upright and its angular velocity.
+
+<Figure caption="The cart-pole. The cart (mass M) moves along the rail at position p, pushed by force u; the pendulum (bob of mass m on a rod of length l) is at angle θ from upright. Upright, θ = 0, is an equilibrium, but an unstable one.">
+<svg viewBox="0 0 420 270" role="img" aria-label="A cart with two wheels on a horizontal rail. A force arrow labelled u pushes the cart from the left. A rod rises from a pivot on top of the cart, tilted to the right of a dashed vertical line by an angle theta, and ends in a round bob labelled m. Below the rail, a dimension line from an origin mark to the cart's centre is labelled p." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ss-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <line x1="20" y1="218" x2="400" y2="218" stroke="currentColor" strokeWidth="2" />
+  <rect x="150" y="168" width="100" height="34" rx="4" fill="none" stroke="currentColor" strokeWidth="2" />
+  <circle cx="172" cy="210" r="8" fill="none" stroke="currentColor" strokeWidth="2" />
+  <circle cx="228" cy="210" r="8" fill="none" stroke="currentColor" strokeWidth="2" />
+  <line x1="200" y1="168" x2="200" y2="40" stroke="currentColor" strokeWidth="1" strokeDasharray="5 4" />
+  <line x1="200" y1="168" x2="231.1" y2="52.1" stroke="var(--gold)" strokeWidth="4" />
+  <circle cx="231.1" cy="52.1" r="12" fill="var(--gold)" stroke="currentColor" strokeWidth="1.5" />
+  <circle cx="200" cy="168" r="4" fill="currentColor" />
+  <path d="M 200 108 A 60 60 0 0 1 215.5 110" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="80" y1="185" x2="147" y2="185" stroke="currentColor" strokeWidth="2" markerEnd="url(#ss-arrow)" />
+  <line x1="120" y1="212" x2="120" y2="248" stroke="currentColor" strokeWidth="1" />
+  <line x1="122" y1="240" x2="198" y2="240" stroke="currentColor" strokeWidth="1" markerEnd="url(#ss-arrow)" />
+  <line x1="200" y1="226" x2="200" y2="248" stroke="currentColor" strokeWidth="1" strokeDasharray="2 2" />
+  <g fontFamily="sans-serif" fontSize="13" fill="currentColor">
+    <text x="96" y="178">u</text>
+    <text x="206" y="98">θ</text>
+    <text x="250" y="48">m</text>
+    <text x="222" y="118">l</text>
+    <text x="186" y="190">M</text>
+    <text x="155" y="258">p</text>
+    <text x="116" y="262">0</text>
+  </g>
+</svg>
+</Figure>
+
+The equations of motion follow from Lagrange's method, as in <LessonLink slug="robot-dynamics">the dynamics lesson</LessonLink>:
+
+$$
+(M + m)\,\ddot p + m l \cos\theta\,\ddot\theta - m l \sin\theta\,\dot\theta^2 = u, \qquad
+\cos\theta\,\ddot p + l\,\ddot\theta = g \sin\theta .
+$$
+
+Upright and at rest, $x^* = 0$ with $u^* = 0$, is an equilibrium. Near it, $\sin\theta \approx \theta$, $\cos\theta \approx 1$ and $\dot\theta^2 \approx 0$. Solving the two linear equations for the accelerations gives
+
+$$
+\ddot p = \frac{u - m g\,\theta}{M}, \qquad \ddot\theta = \frac{(M + m)\,g\,\theta - u}{M l},
+$$
+
+so
+
+$$
+A = \begin{bmatrix} 0 & 1 & 0 & 0 \\ 0 & 0 & -\frac{mg}{M} & 0 \\ 0 & 0 & 0 & 1 \\ 0 & 0 & \frac{(M+m)g}{Ml} & 0 \end{bmatrix},
+\qquad
+B = \begin{bmatrix} 0 \\ \frac{1}{M} \\ 0 \\ -\frac{1}{Ml} \end{bmatrix}.
+$$
+
+Read the signs: pushing the cart to the right ($u > 0$) makes the pendulum fall to the left ($\ddot\theta < 0$), which is why a cart can catch a falling pendulum by driving underneath it. The code checks the hand derivation against numerical differentiation of the full nonlinear model, a habit worth keeping, since sign errors in linearisations are the most common bug in this field.
+
+```python run
+import numpy as np
+
+M, m, l, g = 1.0, 0.2, 0.5, 9.81      # cart kg, pendulum bob kg, rod m, gravity
+
+def f(x, u):
+    """Nonlinear cart-pole: x = [p, p_dot, theta, theta_dot], theta = 0 upright, u = force (N)."""
+    p, v, th, w = x
+    s, c = np.sin(th), np.cos(th)
+    lhs = np.array([[M + m, m * l * c], [c, l]])
+    rhs = np.array([u + m * l * s * w**2, g * s])
+    acc, alpha = np.linalg.solve(lhs, rhs)
+    return np.array([v, acc, w, alpha])
+
+# Linearise at the upright equilibrium by central differences ...
+x0, h = np.zeros(4), 1e-6
+A_num = np.column_stack([(f(x0 + h * e, 0) - f(x0 - h * e, 0)) / (2 * h) for e in np.eye(4)])
+B_num = ((f(x0, h) - f(x0, -h)) / (2 * h)).reshape(4, 1)
+# ... and compare with the hand derivation.
+A = np.array([[0, 1, 0, 0],
+              [0, 0, -m * g / M, 0],
+              [0, 0, 0, 1],
+              [0, 0, (M + m) * g / (M * l), 0]])
+B = np.array([[0], [1 / M], [0], [-1 / (M * l)]])
+print("A =\n", np.round(A, 3))
+print("B^T =", B.ravel())
+print("hand derivation matches finite differences:",
+      np.allclose(A, A_num, atol=1e-6), np.allclose(B, B_num, atol=1e-6))
+print("eigenvalues of A:", np.round(np.sort(np.linalg.eigvals(A).real), 3))
+
+# Controllability: rank of [B, AB, A^2 B, A^3 B]
+C_mat = np.hstack([np.linalg.matrix_power(A, i) @ B for i in range(4)])
+print("rank of the controllability matrix:", np.linalg.matrix_rank(C_mat))
+```
+
+The eigenvalue $+4.85$ s⁻¹ is the falling pendulum: left alone, a small tilt grows like $e^{4.85t}$, doubling every $\ln 2/4.85 = 0.14$ s. The double eigenvalue at zero is the cart, which, unpushed, simply keeps rolling. Any controller must move the unstable eigenvalue into the left half-plane, and fast. (The eigenvalues of $A$ are the poles of the transfer function from the force to any output, which is how Lumenary EE's [Laplace and stability](/en/ee/laplace-and-stability/) lesson would describe the same instability.)
+
+</Section>
+
+<Section id="controllability" kind="human" title="Controllability: can one force do all that?">
+
+Before designing a controller, ask whether any controller can work. In discrete time, unroll the dynamics from $x_0$:
+
+$$
+x_n = A^n x_0 + \begin{bmatrix} B & AB & \cdots & A^{n-1}B \end{bmatrix} \begin{bmatrix} u_{n-1} \\ \vdots \\ u_0 \end{bmatrix}.
+$$
+
+<Theorem name="Kalman's rank condition">
+
+The discrete-time system $x_{k+1} = Ax_k + Bu_k$ with $n$ states is controllable if and only if its controllability matrix $\mathcal{C} = [B,\ AB,\ \ldots,\ A^{n-1}B]$ has rank $n$.
+
+</Theorem>
+
+<Proof>
+
+If $\operatorname{rank}\mathcal{C} = n$, its columns span $\mathbb{R}^n$, so for any $x_0$ and target $x^\dagger$ the vector $x^\dagger - A^n x_0$ is $\mathcal{C}$ times some input sequence, and the equation above reaches $x^\dagger$ in $n$ steps. Conversely, after $N$ steps the reachable states are $A^N x_0$ plus the span of $B, AB, \ldots, A^{N-1}B$. By the Cayley–Hamilton theorem, $A^n$ is a linear combination of $I, A, \ldots, A^{n-1}$, so every column $A^jB$ with $j \ge n$ lies in the column space of $\mathcal{C}$: for any $N$, the span is contained in that column space. If its rank is below $n$, some states can never be reached from $x_0 = 0$, however long we wait.
+
+</Proof>
+
+For the cart-pole the rank is 4: one force can, in principle, steer cart and pendulum anywhere near upright. (The same test with $A$ and $B$ applies in continuous time.)
+
+<Narrator who="gideon">
+
+Try balancing *two* pendulums on one cart. With different lengths the system of six states is controllable, and labs do balance double and even triple pendulums. With *equal* lengths it is not: the rank drops to 4, because the difference of the two angles obeys $\ddot\theta_1 - \ddot\theta_2 = (g/l)(\theta_1 - \theta_2)$, an equation in which the force does not appear. No controller, however clever, can stop that difference from growing.
+
+</Narrator>
+
+</Section>
+
+<Section id="pole-placement" kind="human" title="Pole placement">
+
+With state feedback $u = -Kx$, the closed loop is $x_{k+1} = (A - BK)x_k$, and its behaviour is set by the eigenvalues of $A - BK$, the **closed-loop poles**. For a single-input controllable system, *any* set of poles (in complex-conjugate pairs) can be achieved, and **Ackermann's formula** gives the unique $K$:
+
+$$
+K = \begin{bmatrix} 0 & \cdots & 0 & 1 \end{bmatrix} \mathcal{C}^{-1}\, \phi(A),
+$$
+
+where $\phi(z) = \prod_i (z - z_i)$ is the desired characteristic polynomial, evaluated with $A$ in place of $z$. The inverse of $\mathcal{C}$ appears, so the formula fails precisely when the system is not controllable.
+
+It is natural to choose poles $s_i$ in continuous time, where $\operatorname{Re} s_i$ is a decay rate and $\operatorname{Im} s_i$ a frequency, and map them to discrete time with $z_i = e^{s_i T}$. Below we pick $s = -3 \pm j$ and $-6 \pm 2j$ s⁻¹ for the cart-pole at 100 Hz. The block then designs a second controller by LQR, which the next section explains, and runs both on the **nonlinear** cart-pole, starting tilted by 0.2 rad (11°).
+
+```python run
+import numpy as np
+
+M, m, l, g = 1.0, 0.2, 0.5, 9.81
+T = 0.01                                   # controller period: 100 Hz
+
+def f(x, u):
+    """Nonlinear cart-pole dynamics, x = [p, p_dot, theta, theta_dot]."""
+    p, v, th, w = x
+    s, c = np.sin(th), np.cos(th)
+    acc, alpha = np.linalg.solve([[M + m, m * l * c], [c, l]], [u + m * l * s * w**2, g * s])
+    return np.array([v, acc, w, alpha])
+
+def rk4(x, u, h=T):
+    k1 = f(x, u); k2 = f(x + h / 2 * k1, u); k3 = f(x + h / 2 * k2, u); k4 = f(x + h * k3, u)
+    return x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+A = np.array([[0, 1, 0, 0], [0, 0, -m * g / M, 0], [0, 0, 0, 1], [0, 0, (M + m) * g / (M * l), 0]])
+B = np.array([[0], [1 / M], [0], [-1 / (M * l)]])
+
+def expm(X, terms=20):
+    """Matrix exponential by scaling and squaring a truncated Taylor series."""
+    s = max(0, int(np.ceil(np.log2(max(np.abs(X).sum(axis=0).max(), 1e-16)))) + 1)
+    Y, term, E = X / 2**s, np.eye(len(X)), np.eye(len(X))
+    for i in range(1, terms):
+        term = term @ Y / i
+        E = E + term
+    for _ in range(s):
+        E = E @ E
+    return E
+
+# Exact zero-order-hold discretisation: x[k+1] = Ad x[k] + Bd u[k]
+Z = expm(np.block([[A, B], [np.zeros((1, 5))]]) * T)
+Ad, Bd = Z[:4, :4], Z[:4, 4:]
+
+def acker(Ad, Bd, poles):
+    """Ackermann's formula: the K with eig(Ad - Bd K) = poles, for a single input."""
+    n = len(Ad)
+    Co = np.hstack([np.linalg.matrix_power(Ad, i) @ Bd for i in range(n)])
+    coeffs = np.real(np.poly(poles))                   # desired characteristic polynomial
+    phi = sum(c * np.linalg.matrix_power(Ad, n - i) for i, c in enumerate(coeffs))
+    return (np.linalg.solve(Co.T, np.eye(n)[:, -1]) @ phi).reshape(1, n)
+
+def dlqr(Ad, Bd, Q, R, iters=10000, tol=1e-10):
+    """Discrete LQR: iterate the Riccati equation from P = Q until it stops changing."""
+    P = Q.copy()
+    for i in range(iters):
+        K = np.linalg.solve(R + Bd.T @ P @ Bd, Bd.T @ P @ Ad)
+        P_new = Q + Ad.T @ P @ (Ad - Bd @ K)
+        if np.abs(P_new - P).max() < tol * max(1.0, np.abs(P).max()):
+            return K, P_new, i
+        P = P_new
+    raise RuntimeError("Riccati iteration did not converge")
+
+def balance(K, x0, seconds=10.0):
+    x, xs, us = np.array(x0, float), [], []
+    for _ in range(int(seconds / T)):
+        u = -(K @ x).item()                # full state feedback u = -K x
+        xs.append(x); us.append(u)
+        x = rk4(x, u)                      # the nonlinear plant, not the linear model
+    xs, us = np.array(xs), np.array(us)
+    busy = np.nonzero((np.abs(xs[:, 0]) > 0.01) | (np.abs(xs[:, 2]) > 0.01))[0]
+    return np.abs(us).max(), np.ptp(xs[:, 0]), (busy[-1] + 1) * T, np.sum(us**2) * T
+
+s_poles = np.array([-3 + 1j, -3 - 1j, -6 + 2j, -6 - 2j])   # chosen in continuous time ...
+K_place = acker(Ad, Bd, np.exp(s_poles * T))               # ... and mapped by z = e^(sT)
+Q, R = np.diag([10.0, 1.0, 100.0, 1.0]), np.array([[0.1]])
+K_lqr, P, iters = dlqr(Ad, Bd, Q, R)
+print("pole placement K =", np.round(K_place.ravel(), 2))
+print(f"LQR K            = {np.round(K_lqr.ravel(), 2)}   ({iters} Riccati iterations)")
+print("LQR closed-loop poles, s = ln(z)/T:", np.round(np.log(np.linalg.eigvals(Ad - Bd @ K_lqr)) / T, 2))
+
+print(f"\nstart tilted 0.2 rad   {'peak |F|':>8} {'cart travel':>11} {'settled':>8} {'effort':>7}")
+for name, K in [("pole placement", K_place), ("LQR, R = 0.1", K_lqr)]:
+    print("{:22} {:6.1f} N {:9.2f} m {:6.2f} s {:7.1f}".format(name, *balance(K, [0, 0, 0.2, 0])))
+
+def cost(K, x0, steps=3000):
+    """LQR's own score J, summed on the linear model (for which LQR is exactly optimal)."""
+    x, J = np.array(x0, float), 0.0
+    for _ in range(steps):
+        u = -(K @ x).item()
+        J += x @ Q @ x + R[0, 0] * u * u
+        x = Ad @ x + Bd.ravel() * u
+    return J
+x0 = np.array([0, 0, 0.2, 0])
+print(f"cost J: pole placement {cost(K_place, x0):.1f}, LQR {cost(K_lqr, x0):.1f}, x0' P x0 = {x0 @ P @ x0:.1f}")
+
+print("\nThe same Q, and R from cheap to expensive force:")
+for r in [0.01, 1.0, 10.0]:
+    K, _, _ = dlqr(Ad, Bd, Q, np.array([[r]]))
+    print("{:22} {:6.1f} N {:9.2f} m {:6.2f} s {:7.1f}   K = {}".format(
+        f"LQR, R = {r}", *balance(K, [0, 0, 0.2, 0]), np.round(K.ravel(), 1)))
+```
+
+Both controllers balance the pendulum from 11° and bring the cart back. Note the sign of the cart-position gain: $K_p < 0$, so if the cart is to the right of centre the controller first pushes it further *right*. That tips the pendulum to the left, and then the large angle gain drives the cart left, under the falling pendulum, back towards the centre. You do the same with a broom: to move your hand left you first jerk it right.
+
+Pole placement answers "where should the poles go?" with "wherever you like", which is both its power and its weakness. Our poles were picked by taste. Push them further left and the response gets faster but the force, which the table shows, grows quickly; and with $n$ states and $m$ inputs, there are $nm$ gains but only $n$ poles, so for multiple inputs the poles alone do not determine $K$. We need a principle for choosing.
+
+</Section>
+
+<Section id="lqr" kind="human" title="The linear-quadratic regulator">
+
+The LQR replaces "where do the poles go?" with a question an engineer can answer: **how much do errors cost, and how much does effort cost?** Choose a symmetric positive semidefinite $Q$ (penalising state errors) and a positive definite $R$ (penalising inputs), and minimise
+
+$$
+J = \sum_{k=0}^{\infty} \left( x_k^\top Q\, x_k + u_k^\top R\, u_k \right).
+$$
+
+<Theorem name="Discrete-time LQR">
+
+Let $(A, B)$ be controllable (stabilisable suffices), $R \succ 0$, $Q \succeq 0$, and let $(A, Q^{1/2})$ be observable (detectable suffices). Then the discrete algebraic Riccati equation
+
+$$
+P = Q + A^\top P A - A^\top P B\,(R + B^\top P B)^{-1} B^\top P A
+$$
+
+has a unique positive semidefinite solution $P$; the input sequence minimising $J$ from any $x_0$ is the state feedback $u_k = -K x_k$ with $K = (R + B^\top P B)^{-1} B^\top P A$; the closed loop $A - BK$ is stable; and the minimum cost is $x_0^\top P x_0$.
+
+</Theorem>
+
+<Proof>
+
+A sketch by dynamic programming. Suppose the optimal cost from state $x$ is $V(x) = x^\top P x$. Then the best first move minimises $x^\top Q x + u^\top R u + (Ax + Bu)^\top P (Ax + Bu)$ over $u$. This is a convex quadratic in $u$; setting its gradient $2Ru + 2B^\top P(Ax + Bu)$ to zero gives $u = -(R + B^\top P B)^{-1} B^\top P A\,x = -Kx$. Substituting back, the minimum is $x^\top \big(Q + A^\top P A - A^\top P B (R + B^\top P B)^{-1} B^\top P A\big) x$, and for $V$ to be self-consistent this must equal $x^\top P x$ for every $x$: that is the Riccati equation. The conditions on $(A, B)$ and $(A, Q^{1/2})$ ensure that a stabilising solution exists, is unique, and is the limit of the iteration below; a complete proof is in the references.
+
+</Proof>
+
+The proof also tells you how to compute $P$: start with $P = Q$ (the cost of a horizon of one step) and apply the right-hand side repeatedly. Each iteration adds one step to the horizon, and $P$ converges to the infinite-horizon solution. Our `dlqr` above took 773 iterations, a fraction of a second of work; libraries use faster direct methods, but the iteration is honest and short.
+
+<Narrator who="chloe">
+
+This iteration is **value iteration**: $x^\top P_j x$ is the optimal cost of a $j$-step problem, and each sweep extends the horizon by one by asking "what is the best first move, given the best way to continue?" Reinforcement learning, met in <LessonLink slug="reinforcement-learning-for-robots">a later lesson</LessonLink>, runs the same recursion when the dynamics are unknown and the cost-to-go is not a quadratic form, which is why LQR is the standard test problem for RL theory.
+
+</Narrator>
+
+### Q and R: trading error against effort
+
+The table above shows the trade. With $Q$ fixed, a **small** $R$ makes force cheap: gains grow, the response is faster, and the peak force climbs to 30.6 N. A **large** $R$ makes force expensive: gains shrink, the peak force falls to 6.1 N, but the cart wanders 0.55 m and takes 8 s to settle. LQR does not tell you which row is best; it tells you, for each weighting, the best possible behaviour, and gives you knobs that mean something physical. Whichever row you pick, the poles are placed for you, the closed loop is guaranteed stable for the linear model, and the gains of all states are chosen together.
+
+A standard starting point is **Bryson's rule**: make each weight the inverse square of the largest acceptable value. If 0.1 rad of tilt, 0.3 m of cart travel and 10 N of force are each "as much as we will tolerate", then $Q_{\theta\theta} = 1/0.1^2 = 100$, $Q_{pp} = 1/0.3^2 \approx 11$, and $R = 1/10^2 = 0.01$; then adjust by simulation.
+
+<Narrator who="margaret">
+
+Our hand-placed poles settle faster than LQR with $R = 0.1$ (1.84 s against 2.59 s), at the price of more effort ($\int u^2\,dt$ of 12.2 against 8.6 N²·s). Scored by LQR's own cost $J$, the pole-placement design totals 260.4 and LQR 231.4, which is exactly $x_0^\top P x_0$, as the theorem promises. That is what "optimal" buys: not the best behaviour by every measure, but the best behaviour for the trade-off you wrote down.
+
+</Narrator>
+
+</Section>
+
+<Section id="observers" kind="human" title="Observers: estimating what you cannot measure">
+
+State feedback needs the whole state, and robots rarely measure it. Our cart-pole has encoders on the cart's motor and on the pivot, so it measures $p$ and $\theta$, but not the velocities. Differencing positions works at a pinch but amplifies noise, as <LessonLink slug="feedback-and-pid">the PID lesson</LessonLink> showed. The better answer is to run a copy of the model alongside the robot and correct it with the measurements.
+
+<Definition term="Luenberger observer">
+
+For $x_{k+1} = Ax_k + Bu_k$, $y_k = Cx_k$, a **Luenberger observer** maintains an estimate $\hat x$ by
+
+$$
+\hat x_{k+1} = A\hat x_k + B u_k + L\,(y_k - C\hat x_k),
+$$
+
+predicting with the model and correcting by the **innovation** $y_k - C\hat x_k$, the gap between what was measured and what the estimate predicted. The estimation error $e = x - \hat x$ obeys $e_{k+1} = (A - LC)\,e_k$, so it decays whenever the eigenvalues of $A - LC$ lie inside the unit circle.
+
+</Definition>
+
+Choosing $L$ is the mirror image of choosing $K$: the eigenvalues of $A - LC$ are those of its transpose $A^\top - C^\top L^\top$, which is a state-feedback problem for the pair $(A^\top, C^\top)$. So we can place observer poles with Ackermann's formula, or compute $L$ by solving an LQR problem for the transposed system. This **duality** also gives the test: we can choose the observer poles freely exactly when $(A^\top, C^\top)$ is controllable, that is, when $(A, C)$ is observable.
+
+<Figure caption="Output feedback with an observer. The controller never sees the true state x; it applies u = −K x̂, where the observer builds x̂ from the commands u it sends and the measurements y it receives.">
+<svg viewBox="0 0 470 210" role="img" aria-label="A block labelled plant receives the input u and produces the measurement y. The measurement y and a copy of the input u both enter a block labelled observer, which outputs the estimate x-hat. The estimate passes through a block labelled minus K, whose output is the input u, closing the loop." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ss-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="190" y="30" width="110" height="46" rx="4" />
+    <rect x="190" y="130" width="110" height="46" rx="4" stroke="var(--gold)" />
+    <rect x="40" y="130" width="80" height="46" rx="4" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#ss-arrow2)">
+    <polyline points="80,130 80,53 188,53" />
+    <polyline points="300,53 400,53 400,153 302,153" />
+    <line x1="188" y1="153" x2="122" y2="153" />
+    <polyline points="140,53 140,110 245,110 245,128" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="13" fill="currentColor" textAnchor="middle">
+    <text x="245" y="51">plant</text>
+    <text x="245" y="66" fontSize="11">x, unknown</text>
+    <text x="245" y="151">observer</text>
+    <text x="245" y="166" fontSize="11">model + L</text>
+    <text x="80" y="158">−K</text>
+    <text x="160" y="45">u</text>
+    <text x="415" y="105">y</text>
+    <text x="155" y="145">x̂</text>
+  </g>
+</svg>
+</Figure>
+
+The block below checks which sensors make the cart-pole observable, designs $L$ through the dual LQR, and balances the pendulum from a tilt plus a sideways tap using only the estimate.
+
+```python run
+import numpy as np
+
+M, m, l, g = 1.0, 0.2, 0.5, 9.81
+T = 0.01                                   # controller period: 100 Hz
+
+def f(x, u):
+    """Nonlinear cart-pole dynamics, x = [p, p_dot, theta, theta_dot]."""
+    p, v, th, w = x
+    s, c = np.sin(th), np.cos(th)
+    acc, alpha = np.linalg.solve([[M + m, m * l * c], [c, l]], [u + m * l * s * w**2, g * s])
+    return np.array([v, acc, w, alpha])
+
+def rk4(x, u, h=T):
+    k1 = f(x, u); k2 = f(x + h / 2 * k1, u); k3 = f(x + h / 2 * k2, u); k4 = f(x + h * k3, u)
+    return x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+A = np.array([[0, 1, 0, 0], [0, 0, -m * g / M, 0], [0, 0, 0, 1], [0, 0, (M + m) * g / (M * l), 0]])
+B = np.array([[0], [1 / M], [0], [-1 / (M * l)]])
+
+def expm(X, terms=20):
+    """Matrix exponential by scaling and squaring a truncated Taylor series."""
+    s = max(0, int(np.ceil(np.log2(max(np.abs(X).sum(axis=0).max(), 1e-16)))) + 1)
+    Y, term, E = X / 2**s, np.eye(len(X)), np.eye(len(X))
+    for i in range(1, terms):
+        term = term @ Y / i
+        E = E + term
+    for _ in range(s):
+        E = E @ E
+    return E
+
+# Exact zero-order-hold discretisation: x[k+1] = Ad x[k] + Bd u[k]
+Z = expm(np.block([[A, B], [np.zeros((1, 5))]]) * T)
+Ad, Bd = Z[:4, :4], Z[:4, 4:]
+
+def dlqr(Ad, Bd, Q, R, iters=10000, tol=1e-10):
+    """Discrete LQR: iterate the Riccati equation from P = Q until it stops changing."""
+    P = Q.copy()
+    for i in range(iters):
+        K = np.linalg.solve(R + Bd.T @ P @ Bd, Bd.T @ P @ Ad)
+        P_new = Q + Ad.T @ P @ (Ad - Bd @ K)
+        if np.abs(P_new - P).max() < tol * max(1.0, np.abs(P).max()):
+            return K, P_new, i
+        P = P_new
+    raise RuntimeError("Riccati iteration did not converge")
+
+# Which sensors make the state observable?
+for name, C in [("angle only", [[0, 0, 1, 0]]), ("cart position only", [[1, 0, 0, 0]]),
+                ("position and angle", [[1, 0, 0, 0], [0, 0, 1, 0]])]:
+    C = np.array(C, float)
+    O = np.vstack([C @ np.linalg.matrix_power(Ad, i) for i in range(4)])
+    print(f"{name:20} rank of the observability matrix: {np.linalg.matrix_rank(O)}")
+
+C = np.array([[1.0, 0, 0, 0], [0, 0, 1.0, 0]])     # encoders on the cart and on the pivot
+K, _, _ = dlqr(Ad, Bd, np.diag([10.0, 1.0, 100.0, 1.0]), np.array([[0.1]]))
+Lt, _, _ = dlqr(Ad.T, C.T, np.diag([1e-6, 1e-3, 1e-6, 1e-2]), np.diag([2.5e-7, 1e-6]))  # dual problem
+L = Lt.T
+print("observer poles, s = ln(z)/T:", np.round(np.sort_complex(np.log(np.linalg.eigvals(Ad - L @ C)) / T), 1))
+
+def run(use_observer, seconds=4.0, show=()):
+    rng = np.random.default_rng(3)
+    x = np.array([0.0, 0.0, 0.05, 0.5])           # truth: tilted, and just tapped at 0.5 rad/s
+    xh = None
+    us = []
+    for k in range(int(seconds / T)):
+        y = C @ x + rng.normal(0, [0.0005, 0.001])    # 0.5 mm and 1 mrad of sensor noise
+        if xh is None:
+            xh = np.array([y[0], 0.0, y[1], 0.0])     # first guess: as measured, zero velocities
+        u = -(K @ (xh if use_observer else x)).item()
+        if k in show:
+            print(f"{k*T:5.2f} {x[3]:7.3f} {xh[3]:7.3f} {x[1]:7.3f} {xh[1]:7.3f} {u:7.2f}")
+        xh = Ad @ xh + Bd.ravel() * u + L @ (y - C @ xh)  # predict with the model, correct with y
+        us.append(u)
+        x = rk4(x, u)
+    return np.abs(us).max()
+
+print(f"\n{'t (s)':>5} {'omega':>7} {'est':>7} {'cart v':>7} {'est':>7} {'force':>7}")
+peak_obs = run(True, show=(0, 1, 2, 3, 5, 10, 20, 50, 100))
+peak_full = run(False)
+print(f"\npeak force: {peak_full:.2f} N with the true state, {peak_obs:.2f} N with the estimate")
+```
+
+With the angle alone the rank is 2: the cart's position and velocity never affect the linearised pendulum, so watching the pendulum reveals nothing about where the cart is, and the controller would slowly drive the cart off the end of the rail. The cart's position alone is enough, because the pendulum's swinging pushes the cart and so shows up in its motion. With both encoders, the observer starts with zero velocity estimates, is wrong by 0.5 rad/s in $\dot\theta$, and has caught up within about a tenth of a second; from then on the controller using the estimate behaves almost exactly like the one using the truth.
+
+<Theorem name="The separation principle">
+
+For a linear system with state feedback $u = -K\hat x$ from a Luenberger observer, the closed-loop poles are the eigenvalues of $A - BK$ together with those of $A - LC$. So $K$ and $L$ can be designed separately.
+
+</Theorem>
+
+<Proof>
+
+With $e = x - \hat x$, the plant is $x_{k+1} = Ax_k - BK(x_k - e_k) = (A - BK)x_k + BKe_k$, and the error is $e_{k+1} = (A - LC)e_k$. In the coordinates $(x, e)$ the closed loop matrix is block upper triangular, $\begin{bmatrix} A - BK & BK \\ 0 & A - LC \end{bmatrix}$, and the eigenvalues of a block triangular matrix are those of its diagonal blocks.
+
+</Proof>
+
+The usual guideline is to make the observer a few times faster than the controller, so the estimate converges before the controller relies on it, but not so fast that it passes sensor noise straight through. Ours, with poles at $-32$ to $-174$ s⁻¹ against the controller's $-1.3$ to $-7.7$, is on the fast side; that is affordable because the encoders are quiet.
+
+<Narrator who="gideon">
+
+The separation principle is a statement about poles of the *linear model*, and it hides a trap. With full state feedback, a continuous-time LQR is robust: it tolerates any increase of loop gain and halving it, and at least 60° of phase error (the gain and phase margins of Lumenary EE's [feedback control](/en/ee/feedback-control/)). Insert an observer and those guarantees can vanish entirely, as John Doyle showed in 1978 in a paper whose abstract is three words long. Check robustness of the complete loop, observer included, against model errors before trusting it on hardware.
+
+</Narrator>
+
+### What the Kalman filter adds
+
+Our observer's weights were half principled and half guessed: those on the measurements were the encoders' noise variances, those on the model a judgement of how much to trust it. If the model's disturbances and the sensors' noise are both random with known covariances, there is an *optimal* $L$, the one that minimises the variance of the estimation error. It comes from the same Riccati equation, with the two covariances in the places of $Q$ and $R$, and the resulting estimator is the **Kalman filter** (Rudolf Kálmán, 1960). It also handles time-varying and, in its extended forms, nonlinear models, and it is the estimator inside almost every robot's localisation and sensor fusion. The Perception level takes it up in <LessonLink slug="uncertainty-and-bayes-filters">Bayes filters</LessonLink> and <LessonLink slug="kalman-filters">Kalman filters</LessonLink>. The combination of an LQR with a Kalman filter is called **LQG** (linear-quadratic-Gaussian) control.
+
+</Section>
+
+<Section id="professional" kind="human" title="State feedback in practice">
+
+LQR's role in robotics today is less as a final controller than as a building block.
+
+- **Balancing and hovering.** Two-wheeled robots, reaction-wheel balancers, quadrotor hover and attitude loops, and standing balance on legged robots are commonly designed by LQR or pole placement about an equilibrium, and the gains are often **scheduled**, recomputed for several operating points and interpolated.
+- **Along trajectories.** Linearising about a moving trajectory rather than a fixed point gives a time-varying linear system and a **time-varying LQR** (TVLQR), solved by running the Riccati recursion backwards along the trajectory. It stabilises a planned motion such as a jump or a swing-up. Iterative LQR (iLQR) and differential dynamic programming use the same backward pass to *optimise* trajectories, as the Planning level's <LessonLink slug="trajectory-optimisation">trajectory optimisation</LessonLink> lesson shows.
+- **Constraints.** LQR knows nothing of force limits or rail ends. When they matter, <LessonLink slug="model-predictive-control">model predictive control</LessonLink> takes over, and typically uses the LQR's $P$ as its terminal cost.
+- **Tools.** You will rarely write `dlqr` by hand at work: [python-control](https://python-control.readthedocs.io/), [SciPy](https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.solve_discrete_are.html), MATLAB and [Drake](https://drake.mit.edu/) solve the Riccati equation directly. Writing it once, as here, makes those calls transparent, and comparing your gains with a library's is a good test of your model.
+
+On a real cart-pole the model is never exact: belt friction, motor dynamics, a pendulum that is not a point mass, sensor delay. Engineers identify the parameters from experiments, add an integrator or a disturbance estimate to remove the steady offset that friction causes, saturate the force, and test robustness to the model errors they could not remove. And they start in simulation, then on a small rig with soft end stops, never with a heavy machine or anyone within reach of the rail.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The linearised model is the system."** It is an approximation valid near the equilibrium. The LQR above, designed for small angles, balances the nonlinear cart-pole from 0.2 rad, but from 1 rad it will not, and nothing in the linear analysis warns you. Always test a linear design on the nonlinear model, and over the range of states it will meet.
+
+</Misconception>
+
+<Misconception>
+
+**"Optimal means best."** LQR is optimal for the cost you wrote, on the model you wrote, with no constraints. Change $Q$ and $R$ and you get a different optimum. The value of LQR is that its knobs are meaningful and that it always yields a stabilising controller for the linear model, not that its answer is uniquely right.
+
+</Misconception>
+
+<Misconception>
+
+**"Controllable means controllable with the motor I have."** Controllability is about the linear model with unlimited input. A system can be controllable but need forces far beyond the motor's limit to recover from a given tilt; near the boundary of controllability ($\mathcal{C}$ close to singular) even small corrections need huge inputs. Check the singular values of $\mathcal{C}$, not just its rank.
+
+</Misconception>
+
+<Misconception>
+
+**"An observer is a filter for noisy measurements."** Its first job is to estimate states that are *not measured at all*, using the model. It does smooth noise as a side effect, and the Kalman filter makes that trade-off optimal, but an observer on a wrong model will confidently estimate the wrong state.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

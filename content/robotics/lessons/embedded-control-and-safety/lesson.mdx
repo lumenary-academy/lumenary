@@ -1,0 +1,556 @@
+---
+title: Embedded control and functional safety
+subtitle: Below the robot's main computer sit microcontrollers, motor drives and fieldbuses running loops thousands of times a second, and a separate safety system whose only job is to stop the machine before it hurts someone.
+minutes: 75
+objectives:
+  - Explain why control loops need fixed rates, and calculate how much phase a loop loses to delay and when delay makes it unstable
+  - Describe how a motor drive turns a torque command into current, using PWM, current sensing and field-oriented control (Clarke and Park transforms)
+  - Decode a quadrature encoder and choose between count-difference and edge-timing velocity estimates
+  - Compare CAN and EtherCAT, real-time operating systems and real-time Linux, and design watchdogs and safe states
+  - Describe the main functional-safety standards for robots (IEC 61508, ISO 13849, ISO 10218, ISO/TS 15066) and the four collaborative operating modes
+  - Compute a protective separation distance for speed and separation monitoring, and the speed a robot may move at a given separation
+narrators: [chloe, margaret, gideon]
+prerequisites: [robots-and-people, feedback-and-pid, ros-2-and-robot-software]
+related: [math.algebra.linear-algebra, math.analysis.ordinary-differential-equations]
+references:
+  - title: EtherCAT Technology Group
+    url: https://www.ethercat.org/
+    note: The organisation that maintains EtherCAT, with introductions to how it works.
+  - title: CAN in Automation (CiA)
+    url: https://www.can-cia.org/
+    note: The users' and manufacturers' group for CAN, CAN FD and CANopen.
+  - title: "IEC: Functional safety"
+    url: https://www.iec.ch/functional-safety
+    note: The International Electrotechnical Commission's overview of IEC 61508 and related standards.
+  - title: International Organization for Standardization (ISO)
+    url: https://www.iso.org/
+    note: Publishes ISO 10218, ISO 13849, ISO 13855 and ISO/TS 15066; search the catalogue by number.
+  - title: "Implementing speed and separation monitoring in collaborative robot workcells"
+    author: Jeremy A. Marvel and Rick Norcross
+    year: 2017
+    url: https://doi.org/10.1016/j.rcim.2016.08.001
+    note: A NIST study of how the protective separation distance is computed and applied in practice.
+  - title: Real-time Linux (PREEMPT_RT) project
+    url: https://wiki.linuxfoundation.org/realtime/start
+    note: Documentation of the real-time patches, merged into the mainline Linux kernel in 2024.
+  - title: Zephyr Project
+    url: https://www.zephyrproject.org/
+    note: An open-source real-time operating system for microcontrollers.
+  - title: moteus
+    url: https://github.com/mjbots/moteus
+    note: An open-source brushless motor controller with field-oriented control and CAN FD, used in many research robots.
+---
+
+<Section id="motivation" kind="motivation" title="The robot below the robot">
+
+The <LessonLink slug="ros-2-and-robot-software">ROS 2 lesson</LessonLink> ended with a warning: a Python node is no place for a 1 kHz control loop. So where do the fast loops live? Open up a robot arm and you find at every joint a small board with a microcontroller, a power stage and an encoder, running loops thousands of times a second, connected by a **fieldbus** to a real-time controller, which talks to the computer running planning and perception. Alongside it all, often in a separate box, sits a **safety controller** that watches speeds, positions and emergency-stop buttons and can cut the motors' power by itself.
+
+This lesson walks down that stack: loop rates and timing; motor drives, encoders and current sensing; fieldbuses and real-time operating systems; watchdogs; and finally functional safety, the discipline (and the international standards) that make it acceptable for a machine strong enough to hurt someone to work near people. Lumenary EE's [microcontrollers](/en/ee/microcontrollers/), [real-time and low-power design](/en/ee/real-time-and-low-power/), [buses and interfaces](/en/ee/buses-and-interfaces/) and [power electronics](/en/ee/power-electronics/) cover the electronics underneath.
+
+<Note>
+
+**What is safe to try.** Everything in this lesson can be explored in simulation, or with a small hobby servo or a small brushless motor on a current-limited bench supply of a few volts. Industrial drives and arms run at hundreds of volts and can move faster than a person can react; they are installed, guarded and commissioned only by trained people following the standards described below.
+
+</Note>
+
+</Section>
+
+<Section id="stack" kind="intuition" title="Layers, rates and deadlines">
+
+A useful way to see a robot's electronics is as layers, each running a loop at its own rate, each giving the layer below a set-point and trusting it to meet it.
+
+<Figure caption="The control stack of a typical robot arm. Each layer runs about ten times faster than the one above it. The safety controller sits beside the stack, not inside it: it monitors and can remove motor power through a hard-wired safe-torque-off line, whatever the software above it is doing.">
+<svg viewBox="0 0 460 280" role="img" aria-label="Four stacked boxes. At the top, the main computer: planning, perception, ROS 2, at 10 to 100 hertz. Below it, the real-time controller: trajectory and joint control at 1 kilohertz. Below that, a fieldbus labelled EtherCAT connects to three joint drives, each running current control at 10 to 40 kilohertz and each connected to a motor with an encoder. To the right, a safety controller box receives the emergency-stop button and a person sensor, and sends a hard-wired safe-torque-off line to the drives.">
+  <defs>
+    <marker id="ecs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.5" stroke="currentColor" strokeWidth="1.3">
+    <rect x="20" y="10" width="290" height="40" rx="5" />
+    <rect x="20" y="80" width="290" height="40" rx="5" />
+    <rect x="20" y="180" width="85" height="44" rx="5" />
+    <rect x="122" y="180" width="85" height="44" rx="5" />
+    <rect x="224" y="180" width="85" height="44" rx="5" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1.3">
+    <rect x="345" y="80" width="100" height="64" rx="5" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3">
+    <line x1="20" y1="150" x2="310" y2="150" strokeWidth="2.5" />
+    <line x1="165" y1="50" x2="165" y2="78" markerEnd="url(#ecs-arrow)" />
+    <line x1="165" y1="120" x2="165" y2="148" markerEnd="url(#ecs-arrow)" />
+    <line x1="62" y1="150" x2="62" y2="178" markerEnd="url(#ecs-arrow)" />
+    <line x1="165" y1="150" x2="165" y2="178" markerEnd="url(#ecs-arrow)" />
+    <line x1="266" y1="150" x2="266" y2="178" markerEnd="url(#ecs-arrow)" />
+    <circle cx="62" cy="252" r="14" />
+    <circle cx="165" cy="252" r="14" />
+    <circle cx="266" cy="252" r="14" />
+    <line x1="62" y1="224" x2="62" y2="238" />
+    <line x1="165" y1="224" x2="165" y2="238" />
+    <line x1="266" y1="224" x2="266" y2="238" />
+  </g>
+  <path d="M 395 144 L 395 170 L 320 170 L 320 202 L 311 202" fill="none" stroke="var(--bad)" strokeWidth="1.5" strokeDasharray="5 3" markerEnd="url(#ecs-arrow)" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="165" y="27">main computer: planning, perception, ROS 2</text>
+    <text x="165" y="42">10–100 Hz</text>
+    <text x="165" y="97">real-time controller: trajectories, joint control</text>
+    <text x="165" y="112">0.5–1 kHz</text>
+    <text x="62" y="198">drive</text>
+    <text x="62" y="213">10–40 kHz</text>
+    <text x="165" y="198">drive</text>
+    <text x="165" y="213">10–40 kHz</text>
+    <text x="266" y="198">drive</text>
+    <text x="266" y="213">10–40 kHz</text>
+    <text x="62" y="256">M</text>
+    <text x="165" y="256">M</text>
+    <text x="266" y="256">M</text>
+    <text x="395" y="100">safety</text>
+    <text x="395" y="114">controller</text>
+    <text x="395" y="132" fontSize="9">e-stop, scanners</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10">
+    <text x="240" y="144">fieldbus (EtherCAT)</text>
+    <text x="324" y="166">safe torque off</text>
+    <text x="300" y="262">motor + encoder</text>
+  </g>
+</svg>
+</Figure>
+
+<Definition term="Real-time system, deadline and jitter">
+
+A **real-time** system is one whose correctness depends on *when* results are produced, not just on what they are. A **hard** deadline must never be missed (a missed current-loop update can destroy a power stage); a **soft** deadline may occasionally be missed at some cost in quality (a dropped camera frame). **Latency** is the delay from an event (a sample) to the response (a new output); **jitter** is the variation of that delay, or of the sampling instants, from one cycle to the next. "Real time" does not mean "fast"; it means **predictable**, with a known worst case.
+
+</Definition>
+
+Why a fixed rate? A digital controller's gains are designed for a particular sample period, as <LessonLink slug="feedback-and-pid">Feedback and PID</LessonLink> showed: the derivative divides by it, the integral multiplies by it. And every bit of delay between measuring and acting costs the loop **phase**.
+
+<Theorem name="Delay costs phase, not gain">
+
+A pure time delay $\tau$ has transfer function $e^{-s\tau}$. At frequency $\omega$ its gain is $|e^{-j\omega\tau}| = 1$ and its phase is $-\omega\tau$ radians. So inserting a delay into a feedback loop leaves the crossover frequency $\omega_c$ unchanged and reduces the phase margin by $\omega_c\tau$; the loop becomes unstable when the delay reaches about $\tau_{\max} = \varphi_m / \omega_c$, where $\varphi_m$ is the phase margin in radians.
+
+</Theorem>
+
+<Proof>
+
+$e^{-j\omega\tau} = \cos\omega\tau - j\sin\omega\tau$ lies on the unit circle at angle $-\omega\tau$. Multiplying the open-loop response $L(j\omega)$ by it rotates every point of the Nyquist plot clockwise by $\omega\tau$ without changing its distance from the origin. The point where $|L| = 1$ stays at $\omega_c$ and rotates towards $-1$ by $\omega_c\tau$; when the rotation equals the phase margin, the plot passes through $-1$ and the closed loop has a pole on the imaginary axis.
+
+</Proof>
+
+The program below puts numbers on this. A small joint ($J = 0.002$ kg·m²) is controlled by a digital PD loop designed for a well-damped 20 Hz response. The joint itself is simulated with 10 µs steps; the controller samples every period and its torque reaches the motor after a delay. We first compute the loop's phase margin, then command a 1 rad step under five timing set-ups.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(1)
+J, b = 0.002, 0.005                  # joint inertia (kg m^2) and viscous friction (N m s/rad)
+wn, zeta = 2 * np.pi * 20, 0.7       # PD gains designed for a 20 Hz, well-damped response
+Kp, Kd = J * wn ** 2, 2 * zeta * wn * J
+
+def step_response(period, delay, jitter=0.0, t_end=0.3, dt=1e-5):
+    """Continuous joint, digital PD loop: sample every `period`, apply the torque `delay` later (+ jitter)."""
+    th = om = tau = 0.0
+    next_sample, pending, out = 0.0, [], []
+    for i in range(int(round(t_end / dt))):
+        t = i * dt
+        if t >= next_sample - 1e-12:                          # sample the encoder and compute
+            u = Kp * (1.0 - th) - Kd * om
+            d = delay + (rng.uniform(0, jitter) if jitter else 0.0)
+            pending.append((t + d, u))
+            next_sample += period
+        while pending and pending[0][0] <= t:                 # the new torque reaches the motor
+            tau = pending.pop(0)[1]
+        om += dt * (tau - b * om) / J                          # semi-implicit Euler, 10 us steps
+        th += dt * om
+        out.append(th)
+    out = np.array(out)
+    if np.abs(out[-5000:] - 1.0).max() > 0.5:
+        return None
+    outside = np.nonzero(np.abs(out - 1.0) > 0.02)[0]
+    return 100 * (out.max() - 1.0), 1000 * (outside[-1] + 1) * dt
+
+# Phase margin of the continuous loop: how much delay it can absorb before it oscillates.
+w = np.logspace(0, 4, 200001)
+L = (Kd * 1j * w + Kp) / (J * (1j * w) ** 2 + b * 1j * w)
+wc = w[np.argmin(np.abs(np.abs(L) - 1))]
+pm = 180 + np.degrees(np.angle((Kd * 1j * wc + Kp) / (J * (1j * wc) ** 2 + b * 1j * wc)))
+print(f"PD gains Kp = {Kp:.1f} N m/rad, Kd = {Kd:.3f} N m s/rad; crossover {wc:.0f} rad/s, phase margin {pm:.0f} deg")
+print(f"each ms of delay costs {np.degrees(wc * 1e-3):.1f} deg; the loop tolerates about {1000 * np.radians(pm) / wc:.1f} ms in all")
+print("loop                                  overshoot   2% settling")
+for label, period, delay, jitter in [("1 kHz, 0.1 ms compute delay", 1e-3, 1e-4, 0.0),
+                                     ("1 kHz, delay jitters 0.1-0.9 ms", 1e-3, 1e-4, 8e-4),
+                                     ("1 kHz, 3 ms delay (slow bus)", 1e-3, 3e-3, 0.0),
+                                     ("1 kHz, 6 ms delay", 1e-3, 6e-3, 0.0),
+                                     ("200 Hz, one-sample delay", 5e-3, 5e-3, 0.0)]:
+    r = step_response(period, delay, jitter)
+    print(f"{label:36}" + ("   unstable: the joint oscillates and grows" if r is None else f" {r[0]:8.1f} %   {r[1]:8.0f} ms"))
+```
+
+The loop crosses over at 194 rad/s with a 66° phase margin, so each millisecond of delay costs 11.1° and the theorem predicts instability at about 5.9 ms. The simulation agrees: with 3 ms of delay the overshoot more than doubles (4.2% to 9.4%), and at 6 ms the joint oscillates with growing amplitude. Running at 200 Hz with a one-sample delay is worse still: 5 ms of computing delay plus, on average, half a period waiting inside the zero-order hold, about 7.5 ms in all. The same gains that work beautifully at 1 kHz destroy the robot at 200 Hz.
+
+Jitter of up to 0.8 ms, on the other hand, barely changed this response (4.2% overshoot either way). That is typical when jitter is a fraction of the period and the loop has margin. It is the **worst-case** delay that must stay inside the budget, which is why real-time systems are judged by their worst case, never their average.
+
+<Narrator who="gideon">
+
+Jitter does more damage than this simulation shows in two common situations. If velocity is estimated by differencing encoder counts and dividing by the *nominal* period, a sample taken 0.3 ms late on a 1 ms loop gives a velocity 30% too high, which the derivative term amplifies into torque noise. And if several axes must move in step (a gantry with two motors on one beam, or a coordinated arm), jitter between their sampling instants becomes a position error between axes. Both are reasons fieldbuses synchronise their devices' clocks.
+
+</Narrator>
+
+</Section>
+
+<Section id="drives" kind="definitions" title="Motor drives, field-oriented control and sensing">
+
+The innermost layer turns a torque command into motion. For a brushed DC motor, an **H-bridge** of four transistors applies the supply in either direction, and **pulse-width modulation** (PWM) at 20 kHz or more makes the average voltage anything in between. Robot joints mostly use **brushless** permanent-magnet motors, driven by a **three-phase inverter** (six transistors) whose electronics decide, thousands of times a second, how much current each phase should carry for the rotor's present angle.
+
+A motor's torque is proportional to the current component that is at right angles to the rotor's magnetic field. Three phase currents spaced 120° apart, rotating with the rotor, are awkward to control directly: they are sinusoids whose frequency changes with speed. **Field-oriented control** (FOC) changes coordinates so that they become constants.
+
+<Definition term="Clarke and Park transforms">
+
+The **Clarke transform** maps the three phase currents $(i_a, i_b, i_c)$, which sum to zero, to two orthogonal components in a frame fixed to the motor's body:
+
+$$
+i_\alpha = \tfrac{1}{3}(2i_a - i_b - i_c), \qquad i_\beta = \tfrac{1}{\sqrt 3}(i_b - i_c).
+$$
+
+The **Park transform** rotates $(i_\alpha, i_\beta)$ by the rotor's electrical angle $\theta_e$ into a frame that turns with the rotor:
+
+$$
+\begin{pmatrix} i_d \\ i_q \end{pmatrix} = \begin{pmatrix} \cos\theta_e & \sin\theta_e \\ -\sin\theta_e & \cos\theta_e \end{pmatrix} \begin{pmatrix} i_\alpha \\ i_\beta \end{pmatrix}.
+$$
+
+$i_q$ (quadrature) is the torque-producing current; $i_d$ (direct) is aligned with the magnets and is normally held at zero.
+
+</Definition>
+
+The Park transform is nothing but the frame change of <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>, ${}^{\text{rotor}}R_{\text{stator}} = R(\theta_e)^{\mathsf T}$, applied to a current vector. In the rotor's frame, steady currents look steady, so two ordinary PI controllers can regulate $i_d$ and $i_q$; the drive then transforms the resulting voltages back to three phases and sets the PWM duty cycles. The program shows both transforms, and what a small current-sensor error does.
+
+```python run
+import numpy as np
+
+def clarke(ia, ib, ic):
+    """Three phase currents -> two orthogonal components (alpha, beta), amplitude-preserving form."""
+    alpha = (2 * ia - ib - ic) / 3
+    beta = (ib - ic) / np.sqrt(3)
+    return alpha, beta
+
+def park(alpha, beta, theta_e):
+    """Rotate (alpha, beta) into the frame that turns with the rotor's magnetic field: (d, q)."""
+    c, s = np.cos(theta_e), np.sin(theta_e)
+    return c * alpha + s * beta, -s * alpha + c * beta
+
+# A motor spinning so that the electrical angle turns at 200 Hz; the drive pushes 4 A of torque current.
+theta = 2 * np.pi * 200 * np.arange(0, 0.01, 0.0005)          # 20 samples over two electrical turns
+Iq = 4.0
+ia = Iq * np.cos(theta + np.pi / 2)                             # q-axis current leads the rotor by 90 deg
+ib = Iq * np.cos(theta + np.pi / 2 - 2 * np.pi / 3)
+ic = Iq * np.cos(theta + np.pi / 2 + 2 * np.pi / 3)
+d, q = park(*clarke(ia, ib, ic), theta)
+dr, qr = np.round(d, 2) + 0.0, np.round(q, 2) + 0.0                  # + 0.0 turns -0.00 into 0.00
+print("  t (ms)    ia      ib      ic   |   d       q")
+for k in range(0, 10, 2):
+    print(f"{0.5 * k:7.1f} {ia[k]:7.2f} {ib[k]:7.2f} {ic[k]:7.2f}  | {dr[k]:6.2f}  {qr[k]:6.2f}")
+print("over two electrical turns, d = 0 and q = 4 A to within 1e-12 A:",
+      bool(np.abs(d).max() < 1e-12 and np.abs(q - Iq).max() < 1e-12))
+
+# The same motor with a 0.2 A offset error in phase a's current sensor:
+d2, q2 = park(*clarke(ia + 0.2, ib, ic), theta)
+print(f"with a 0.2 A offset on one sensor, q ripples from {q2.min():.3f} to {q2.max():.3f} A at the electrical frequency")
+```
+
+Three currents swinging between about ±4 A become a steady $i_d = 0$, $i_q = 4$ A. But a 0.2 A offset in one current sensor, a few per cent of full scale, puts a ripple of about ±0.13 A on $i_q$ at the electrical frequency, which the motor turns into **torque ripple**: a vibration you can feel in a robot joint moving slowly. This is why drives calibrate their current sensors' offsets at every power-up, with the power stage off.
+
+### Measuring current and angle
+
+**Current** is measured with a small **shunt resistor** (a few milliohms) and an amplifier, or with a Hall-effect sensor, and sampled by the microcontroller's analogue-to-digital converter at a carefully chosen moment in the PWM cycle, when the switching noise has died down (Lumenary EE's [sensors and data conversion](/en/ee/sensors-and-data-conversion/) covers the converters). **Angle** comes from an **encoder**. An **incremental** encoder outputs two square waves, A and B, a quarter-cycle apart; counting every edge of both ("quadrature" decoding) gives four counts per line, and which channel leads tells the direction. An **absolute** encoder reports the angle as a number, so the robot knows where it is at power-up without a homing move. Many joints have two: one on the motor for commutation and control, one on the output after the gearbox, to measure what the gearbox and its flexibility did.
+
+```python run
+import numpy as np
+
+CPR = 4096                       # counts per revolution: a 1024-line encoder decoded in quadrature
+
+# Quadrature: channels A and B are square waves 90 degrees apart. Encode the state as 2*A + B.
+# Moving forward the states run 0 -> 1 -> 3 -> 2 -> 0; backwards in the opposite order.
+STEP = np.zeros((4, 4), dtype=int)
+for a, b in [(0, 1), (1, 3), (3, 2), (2, 0)]:
+    STEP[a, b], STEP[b, a] = +1, -1
+
+def channels(angle):
+    """A and B outputs of the encoder at a mechanical angle (rad)."""
+    phase = (np.floor(angle / (2 * np.pi) * CPR).astype(int)) % 4    # which quarter of a line cycle
+    A = np.isin(phase, (2, 3)).astype(int)
+    B = np.isin(phase, (1, 2)).astype(int)
+    return 2 * A + B
+
+# A motor turns forwards, slows, reverses and comes back; sampled at 100 kHz by the decoder.
+t = np.arange(0, 0.2, 1e-5)
+angle = 0.6 * np.sin(2 * np.pi * 5 * t) + 0.3 * t
+states = channels(angle)
+count = int(np.sum(STEP[states[:-1], states[1:]]))
+true_count = int(np.floor(angle[-1] / (2 * np.pi) * CPR)) - int(np.floor(angle[0] / (2 * np.pi) * CPR))
+print(f"decoded count {count}, true count {true_count}, illegal jumps (two edges at once): "
+      f"{int(np.sum((states[:-1] ^ states[1:]) == 3))}")
+
+# Velocity from counts: difference the count every 1 ms, and see the quantisation.
+quantum = 2 * np.pi / CPR / 1e-3
+print(f"one count per 1 ms is {quantum:.3f} rad/s = {quantum * 60 / (2 * np.pi):.1f} rpm")
+for rpm in (3000, 30, 3):
+    w = rpm * 2 * np.pi / 60
+    ticks = np.floor(w * np.arange(0, 0.051, 1e-3) / (2 * np.pi) * CPR)  # count read every 1 ms
+    est = np.diff(ticks) * quantum * 60 / (2 * np.pi)
+    seen = sorted({float(round(e, 1)) for e in est})
+    print(f"true {rpm:5d} rpm: 1 ms count differences read {seen} rpm")
+
+# At low speed, time the edges instead: a 1 MHz timer measures the gap between two counts.
+w = 3 * 2 * np.pi / 60
+gap = (2 * np.pi / CPR) / w                                   # seconds between counts at 3 rpm
+gap_measured = np.round(gap * 1e6) / 1e6                       # quantised to the 1 us timer tick
+print(f"true     3 rpm: edge gap {gap * 1000:.4f} ms, timed to 1 us -> {2 * np.pi / CPR / gap_measured * 60 / (2 * np.pi):.4f} rpm")
+```
+
+The state-table decoder follows the motor forwards, backwards and forwards again and ends on exactly the right count. In hardware this table is built into most microcontrollers' timer peripherals, so the processor only reads a register. Velocity is subtler: one count per millisecond is 14.6 rpm, so at 3000 rpm the 1 ms differences are accurate to 0.5%, but at 30 rpm they jump between 29.3 and 43.9 rpm, and at 3 rpm between 0 and 14.6. A derivative term fed with that would hammer the joint. At low speed drives instead **time the edges**: with a 1 MHz timer, the 4.88 ms gap between counts gives 2.9999 rpm. Real drives blend the two, or use an observer (a small model-based filter) that estimates velocity from position and commanded torque.
+
+<Narrator who="margaret">
+
+Fieldbus traffic is smaller than you might fear. EtherCAT runs at 100 Mbit/s, so one byte takes 80 ns on the wire. Six joint drives each exchanging about 20 bytes of commands and 20 bytes of feedback is roughly 300 bytes per cycle with headers, or 24 µs, plus well under a microsecond of forwarding in each drive: a 1 kHz cycle leaves the bus idle about 97% of the time, which is why 4 kHz or faster cycles are practical.
+
+</Narrator>
+
+</Section>
+
+<Section id="buses-rtos" kind="human" title="Fieldbuses, real-time operating systems and watchdogs">
+
+### CAN and EtherCAT
+
+Two fieldbuses dominate robots in 2026.
+
+- **CAN** (Controller Area Network), introduced by Bosch in 1986 for cars, is a two-wire bus on which every node sees every message. Messages carry an identifier, and when two nodes transmit at once the lower identifier wins without corruption, so priorities are built into the wire. Classic CAN runs at up to 1 Mbit/s with 8-byte payloads; **CAN FD** (2012) allows 64-byte payloads and a faster data phase. It is cheap, robust and everywhere, from cars to small robots and open-source drives; **CANopen** adds a standard device model, including a profile for motor drives.
+- **EtherCAT**, introduced by Beckhoff in Germany in 2003 and now an IEC standard, sends one Ethernet frame per cycle **through** every device in a line; each device reads its commands and inserts its feedback as the frame flies past, delaying it by well under a microsecond. **Distributed clocks** synchronise all devices to better than a microsecond, so every joint samples and acts at the same instant. Most industrial arms and many research robots use it, at 1–4 kHz.
+
+Factories also use PROFINET, EtherNet/IP and Sercos, and **time-sensitive networking** (TSN) adds scheduled, bounded-latency traffic to ordinary switched Ethernet.
+
+### Real-time operating systems and real-time Linux
+
+On a microcontroller, the control loop usually runs in a **timer interrupt** or under a **real-time operating system** (RTOS) such as FreeRTOS, Zephyr or ThreadX, whose scheduler always runs the highest-priority ready task and whose worst-case response time can be measured in microseconds. Safety-certified commercial RTOSs, such as QNX (Canada) and VxWorks (United States), are used where certification evidence is required. Lumenary EE's [real-time and low-power design](/en/ee/real-time-and-low-power/) covers scheduling and priority inversion.
+
+The 1 kHz controller in the middle layer often runs on a multicore PC with **real-time Linux**. The PREEMPT_RT work makes almost all of the kernel pre-emptible, so that a high-priority thread runs within a bounded time of becoming ready; after two decades as a separate patch set it was merged into mainline Linux in 2024 (version 6.12). With careful configuration (isolated CPU cores, no deep sleep states, memory locked in RAM), worst-case latencies of tens of microseconds are routine, measured with the `cyclictest` tool over hours under load. [ros2_control](https://control.ros.org/) runs its controllers in such a thread.
+
+Here is the skeleton of such a loop, in C. Note what it does *not* do inside the loop: allocate memory, take locks shared with non-real-time code, log to disk, or wait for the network.
+
+```c
+/* Real-time loop on Linux with PREEMPT_RT: shown for reading, not run here. */
+#include <time.h>
+#include <sched.h>
+#include <sys/mman.h>
+
+#define PERIOD_NS 1000000L                      /* 1 kHz */
+
+void control_loop(void) {
+    struct sched_param sp = { .sched_priority = 90 };
+    sched_setscheduler(0, SCHED_FIFO, &sp);     /* real-time priority */
+    mlockall(MCL_CURRENT | MCL_FUTURE);         /* never page memory out */
+
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    for (;;) {
+        next.tv_nsec += PERIOD_NS;              /* absolute deadline: no drift */
+        if (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+
+        read_fieldbus_inputs();                 /* encoders, currents, status words */
+        compute_joint_commands();               /* bounded, allocation-free */
+        write_fieldbus_outputs();
+        kick_watchdog();                        /* prove to the hardware that we are alive */
+    }
+}
+```
+
+### Watchdogs, faults and safe states
+
+A **watchdog** is a timer that must be reset ("kicked") regularly; if it is not, because the software has hung or a loop overran, it forces a reaction. Robots have several layers of them: the microcontroller's hardware watchdog catches crashed firmware; each drive watches its fieldbus and stops the motor if set-points stop arriving; the real-time controller watches the planner's heartbeat. Every detected fault (over-current, over-temperature, encoder error, following error too large, bus lost) maps to a designed reaction and a defined **safe state**.
+
+<Narrator who="gideon">
+
+"Safe state" depends on the machine. For a robot arm it is usually "stopped, with the brakes on"; but removing motor power from a vertical axis without a holding brake lets it fall, and a walking robot that simply switches off its motors collapses. A legged robot's safe state may require active control to sit down, which means the reaction to a fault must itself be reliable. The hazard analysis has to ask, for each fault, what "stop" physically does.
+
+</Narrator>
+
+</Section>
+
+<Section id="safety" kind="human" title="Functional safety: the standards">
+
+**Functional safety** is the part of safety that depends on a control system working correctly: the light curtain that must stop the press, the monitor that must catch a runaway joint. Safety functions are engineered like any other requirement, with a target reliability derived from the risk and evidence that it is met. The <LessonLink slug="robots-and-people">Start-level lesson</LessonLink> introduced fences, cobots and emergency stops; here is the professional map, described in our own words (the standards themselves are sold by ISO and IEC).
+
+- **IEC 61508** is the general standard for safety of electrical, electronic and programmable systems. It defines four **safety integrity levels**, SIL 1 to SIL 4, each a band of tolerable probability of dangerous failure, with requirements on hardware, software and the development process. Sector standards derive from it.
+- **ISO 12100** sets out how to do the **risk assessment** for any machine: identify hazards, estimate and evaluate risk, and reduce it, first by inherently safe design, then by safeguards, and only last by warnings and training.
+- **ISO 13849** covers the safety-related parts of machine control systems, graded by **Performance Level**, PL a (lowest) to PL e (highest), achieved through architecture (categories B and 1 to 4, from a single channel to redundant, self-checking channels), component reliability, diagnostic coverage and protection against common-cause failures. **IEC 62061** is an alternative route using SIL.
+- **ISO 10218** is the robot standard: part 1 for the robot manufacturer, part 2 for integrating the robot into a cell. It was revised in 2025; the new edition brings much of the collaborative-robot guidance into the main standard. Its 2011 edition required most safety functions of an industrial robot to meet PL d with a category 3 architecture unless a risk assessment justified otherwise.
+- **ISO/TS 15066** (2016) is the technical specification for collaborative robots. Its best-known contents are the method for speed and separation monitoring, below, and limits on force and pressure for contact with different regions of the human body, for power and force limiting.
+- Related standards cover emergency stops (ISO 13850), the distance of safeguards from hazards given human approach speeds (ISO 13855), stop categories (IEC 60204-1), drive safety functions such as **safe torque off** (IEC 61800-5-2), personal-care robots (ISO 13482) and industrial mobile robots (ISO 3691-4).
+
+Countries adopt these as national standards (for example ANSI/A3 R15.06 in the United States and JIS B 8433 in Japan), and in many places the law makes them the accepted way to show a machine is safe; in the European Union, the Machinery Regulation (EU) 2023/1230 replaces the Machinery Directive from January 2027.
+
+### Stops
+
+IEC 60204-1 defines three **stop categories**. Category 0 removes power from the motors immediately (an uncontrolled stop, with brakes). Category 1 brakes under control and then removes power. Category 2 brakes under control and keeps power on, holding position. An **emergency stop** must be category 0 or 1; it is a red mushroom button on a yellow background, it latches until deliberately reset, and resetting it must not restart the machine by itself. Removing power is usually done by **safe torque off** (STO): a hard-wired, redundant input to each drive that blocks the power stage's gate signals, independent of the drive's software.
+
+### The four collaborative modes
+
+ISO 10218 and ISO/TS 15066 describe four ways a robot may share space with people.
+
+1. **Safety-rated monitored stop.** When a person enters the collaborative space, the robot stops and stays stopped with power on, while the safety system monitors that it does not move; it resumes when the person leaves. Typical use: an operator loads a part into the robot's gripper.
+2. **Hand guiding.** The operator moves the robot by hand through a guiding device with an enabling switch, at reduced speed.
+3. **Speed and separation monitoring** (SSM). Sensors track people; the robot slows as they approach and stops before contact can occur.
+4. **Power and force limiting** (PFL). Contact may happen, but the robot's design and control limit the force and pressure to values that do not cause injury for the body region concerned.
+
+</Section>
+
+<Section id="ssm" kind="computation" title="Computing a protective separation distance">
+
+Speed and separation monitoring rests on one inequality: at every moment, the measured distance between the person and the robot must be at least the **protective separation distance** $S_p$, the distance that would be used up if the person walked straight at the robot while the system noticed, reacted and braked. In our own notation, it is the sum of six terms:
+
+$$
+S_p = \underbrace{v_h\,(T_r + T_s)}_{\text{person moves}} + \underbrace{v_r\,T_r}_{\text{robot before reacting}} + \underbrace{S_s}_{\text{robot braking}} + \underbrace{C}_{\text{intrusion}} + \underbrace{Z_d + Z_r}_{\text{uncertainties}}
+$$
+
+where $v_h$ is the person's assumed approach speed (1.6 m/s for walking is the value used in ISO 13855), $T_r$ the time for the system to detect the person and start the stop, $T_s$ the robot's stopping time from speed $v_r$, $S_s$ its stopping distance, $C$ the distance a hand or arm can reach past the detection boundary before being detected, and $Z_d$, $Z_r$ the position uncertainties of the person sensor and the robot.
+
+<Figure caption="The protective separation distance as a stack of distances along the line between person and robot. If the measured separation is shorter than the stack, the robot must slow down or stop.">
+<svg viewBox="0 0 460 150" role="img" aria-label="A person on the left and a robot arm on the right. Between them, a horizontal bar divided into five segments, labelled from the person: person moves during reaction and braking, robot moves before reacting, robot braking distance, intrusion C, uncertainties Z. A bracket under the bar is labelled protective separation distance S p.">
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="30" cy="40" r="10" />
+    <line x1="30" y1="50" x2="30" y2="90" />
+    <line x1="30" y1="62" x2="14" y2="78" />
+    <line x1="30" y1="62" x2="46" y2="78" />
+    <line x1="30" y1="90" x2="18" y2="118" />
+    <line x1="30" y1="90" x2="42" y2="118" />
+    <rect x="415" y="100" width="34" height="18" />
+    <line x1="432" y1="100" x2="432" y2="62" strokeWidth="4" />
+    <line x1="432" y1="62" x2="408" y2="45" strokeWidth="4" />
+    <line x1="408" y1="45" x2="398" y2="55" />
+    <line x1="408" y1="45" x2="400" y2="38" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="60" y="66" width="140" height="20" fill="var(--sky-soft)" />
+    <rect x="200" y="66" width="45" height="20" fill="var(--gold-soft)" />
+    <rect x="245" y="66" width="60" height="20" fill="var(--gold-soft)" fillOpacity="0.6" />
+    <rect x="305" y="66" width="40" height="20" fill="var(--human-soft)" />
+    <rect x="345" y="66" width="40" height="20" fill="var(--card)" />
+  </g>
+  <path d="M 60 96 L 60 104 L 385 104 L 385 96" fill="none" stroke="currentColor" strokeWidth="1" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="130" y="60">person: v_h (T_r + T_s)</text>
+    <text x="222" y="80">v_r T_r</text>
+    <text x="275" y="80">S_s</text>
+    <text x="325" y="80">C</text>
+    <text x="365" y="80">Z</text>
+    <text x="275" y="60">robot</text>
+    <text x="222" y="120" fontSize="11">protective separation distance S_p</text>
+  </g>
+</svg>
+</Figure>
+
+The program below uses illustrative numbers for one imaginary cell (a real cell takes every value from measurement: the robot maker's stopping data, the sensor's specifications, the risk assessment). It tabulates $S_p$ against robot speed, inverts the formula to find the fastest the robot may move at a given separation, and then simulates the worst case: a person walking at 1.6 m/s straight towards a robot whose tool is moving straight towards them. The safety system's information is $T_r$ old, but the robot knows its own recent motion exactly, so it subtracts that from the stale separation.
+
+```python run
+import numpy as np
+
+# Illustrative values for one cell (a real cell takes them from measurements and the risk assessment):
+v_h = 1.6        # m/s, the approach speed assumed for a walking person
+T_r = 0.10       # s, sensing + processing + reaction time of the safety system
+a_stop = 2.0     # m/s^2, the robot's guaranteed braking deceleration (measured stopping data)
+C = 0.20         # m, how far a hand or arm can intrude before the sensor detects the person
+Z = 0.10 + 0.05  # m, position uncertainty of the person sensor plus that of the robot
+
+def protective_distance(v_r):
+    T_s = v_r / a_stop                       # time for the robot to stop
+    S_h = v_h * (T_r + T_s)                  # the person keeps walking while the system reacts and brakes
+    S_r = v_r * T_r                          # the robot keeps moving until the reaction is complete
+    S_s = v_r ** 2 / (2 * a_stop)            # the robot's braking distance
+    return S_h + S_r + S_s + C + Z
+
+def allowed_speed(S):
+    """Largest robot speed whose protective distance fits in the measured separation S."""
+    A, B, c0 = 1 / (2 * a_stop), v_h / a_stop + T_r, v_h * T_r + C + Z - S
+    if c0 >= 0:
+        return 0.0
+    return (-B + np.sqrt(B * B - 4 * A * c0)) / (2 * A)
+
+print("robot speed   protective separation distance")
+for v in (0.25, 0.5, 1.0, 1.5):
+    print(f"  {v:4.2f} m/s      {protective_distance(v):.3f} m")
+
+# A person walks towards a robot whose tool also moves towards them (the worst case).
+dt, t, gap, v_r, task_speed = 0.01, 0.0, 4.0, 1.5, 1.5
+n = int(round(T_r / dt))
+seen, moved = [gap] * n, [0.0] * n          # the sensor's data is T_r old; the robot knows its own recent motion
+log = []
+while v_r > 0 or t < 0.1:
+    estimate = seen[0] - sum(moved)          # old separation, minus how far the robot itself has come since
+    v_r = max(min(task_speed, allowed_speed(estimate)), v_r - a_stop * dt)   # it can only brake so hard
+    gap -= (v_h + v_r) * dt
+    seen, moved = seen[1:] + [gap], moved[1:] + [v_r * dt]
+    t += dt
+    log.append((t, gap, v_r))
+for t, g, v in log[::25]:
+    print(f"t = {t:4.2f} s   separation {g:5.2f} m   robot speed {v:4.2f} m/s")
+print(f"robot at rest after {log[-1][0]:.2f} s with the person still {log[-1][1]:.3f} m away "
+      f"(margins C + Z = {C + Z:.3f} m)")
+```
+
+At full speed, 1.5 m/s, this robot needs 2.42 m of clear space; at 0.25 m/s, 0.75 m. Note how quickly the distance grows: the braking terms grow with the square of the speed, and the person's term grows too, because a faster robot takes longer to stop and the person keeps walking all that time. In the simulation the robot keeps full speed for 0.57 s, until the person is about 2.2 m away, then slows smoothly and comes to rest after 1.38 s, with the person 0.351 m away: just outside the 0.35 m of margin for intrusion and uncertainty. That is not luck; it is the design. Everything else in the stack was spent on the assumed worst case, and the margins are exactly what remains. A person walking more slowly, or not straight at the robot, leaves more.
+
+<Narrator who="chloe">
+
+The inversion is worth noticing. $S_p(v_r)$ is a quadratic in $v_r$ with positive coefficients, hence increasing for $v_r \ge 0$, so "the fastest speed whose protective distance fits in the separation" has exactly one answer, the positive root. Industrial SSM systems do precisely this, many times a second, often with several speed zones rather than a continuous formula, because a few discrete zones are easier to validate.
+
+</Narrator>
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+In practice the safety functions do not run on the robot's main computer. They run on **safety-rated** hardware, a safety PLC or the robot controller's safety board, with two processors that check each other, safety-rated inputs (e-stops, light curtains, laser scanners, 3-D safety cameras) and safe outputs wired to the drives' STO inputs. A ROS node can request a slower speed; only the safety controller can promise one.
+
+Robot makers in many countries (FANUC and Yaskawa in Japan, KUKA in Germany, Universal Robots in Denmark, Doosan Robotics in South Korea, Estun and JAKA in China) ship certified safety functions with their arms: safe speed and position limits, safe zones and collaborative modes. The integrator who builds the cell does the risk assessment for the whole application. Open-source drives such as [moteus](https://github.com/mjbots/moteus) and [ODrive](https://odriverobotics.com/) are excellent for learning and small robots, but they are not safety-rated, which is why labs keep large research robots behind fences, with hardware e-stops.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Real time means fast."** It means predictable: a guaranteed worst-case response. A 10 Hz loop that never misses a deadline is real time; a 10 kHz loop that occasionally stalls for 20 ms is not.
+
+</Misconception>
+
+<Misconception>
+
+**"The emergency stop is a software command."** An e-stop acts through safety-rated hardware, typically by opening safe-torque-off circuits, and keeps working when the software has crashed. A "stop" button in a user interface is a convenience, not an emergency stop.
+
+</Misconception>
+
+<Misconception>
+
+**"If the drive loses communication, holding the last command is the safe choice."** A drive that keeps executing a stale velocity command keeps moving. Fieldbus watchdogs exist so that silence produces a controlled stop.
+
+</Misconception>
+
+<Misconception>
+
+**"A collaborative robot is safe; no assessment needed."** Collaboration is a property of the application, not the arm. A power-and-force-limited arm carrying a knife, or moving a heavy part at head height, can still injure; the risk assessment covers the robot, the tool, the workpiece and the task.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+The first industrial robot, Unimate, started work at a General Motors plant in New Jersey in 1961. As robots spread through car factories, accidents made the case for dedicated standards: ANSI/RIA R15.06 appeared in the United States in 1986 and ISO 10218 in 1992. Field-oriented control was developed in Germany around 1970, by Felix Blaschke at Siemens and Karl Hasse, but became practical in small drives only with cheap digital processors in the 1990s. IEC 61508 was published from 1998, ISO 13849-1 in its Performance Level form in 2006, collaborative operation entered ISO 10218 in its 2006 and 2011 editions, and ISO/TS 15066 followed in 2016.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

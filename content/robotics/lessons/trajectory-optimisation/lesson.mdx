@@ -1,0 +1,467 @@
+---
+title: Trajectory optimisation
+subtitle: Planning as optimisation — costs, constraints and dynamics; shooting and collocation; a CHOMP-style optimiser that pushes a path out of obstacles; the fastest way to drive a fixed path; and why the initial guess decides the answer.
+minutes: 80
+objectives:
+  - Write motion planning as an optimisation problem with a cost, constraints and dynamics, and say what makes it hard
+  - Implement a CHOMP-style optimiser that smooths a path away from obstacles by covariant gradient descent on a signed distance field
+  - Contrast single shooting, multiple shooting and direct collocation, and solve a direct collocation problem for a double integrator exactly
+  - Compute a time-optimal speed profile along a fixed path under velocity and acceleration limits
+  - Explain local minima and why initial guesses matter, and describe TrajOpt, modern solvers and global methods such as graphs of convex sets
+narrators: [chloe, margaret, gideon]
+prerequisites: [configuration-space, trajectories-and-tracking, model-predictive-control]
+related: [math.applied.optimisation, math.comp.numerical-methods, math.analysis.ordinary-differential-equations, math.analysis.multivariable-calculus, math.algebra.linear-algebra]
+references:
+  - title: "CHOMP: Gradient optimization techniques for efficient motion planning"
+    author: Nathan Ratliff, Matt Zucker, J. Andrew Bagnell and Siddhartha Srinivasa
+    year: 2009
+    url: https://doi.org/10.1109/ROBOT.2009.5152817
+    note: The covariant gradient method implemented in this lesson; an extended journal version followed in 2013.
+  - title: "Motion planning with sequential convex optimization and convex collision checking"
+    author: John Schulman and colleagues
+    year: 2014
+    note: TrajOpt, in the International Journal of Robotics Research; the first version appeared at Robotics Science and Systems in 2013.
+  - title: "An Introduction to Trajectory Optimization: How to Do Your Own Direct Collocation"
+    author: Matthew Kelly
+    year: 2017
+    url: https://doi.org/10.1137/16M1062569
+    note: A clear tutorial in SIAM Review on trapezoidal and Hermite–Simpson collocation, with worked examples.
+  - title: "Underactuated Robotics"
+    author: Russ Tedrake
+    url: https://underactuated.mit.edu/
+    note: Free online text whose trajectory optimisation chapters cover shooting, collocation and solvers, with Drake examples.
+  - title: "A New Approach to Time-Optimal Path Parameterization Based on Reachability Analysis"
+    author: Hung Pham and Quang-Cuong Pham
+    year: 2018
+    url: https://arxiv.org/abs/1707.07239
+    note: TOPP-RA, a robust and fast method for the problem solved in this lesson's third program; implemented in the open-source toppra library.
+  - title: "Motion Planning around Obstacles with Convex Optimization"
+    author: Tobia Marcucci, Mark Petersen, David von Wrangel and Russ Tedrake
+    year: 2023
+    url: https://arxiv.org/abs/2205.04422
+    note: Graphs of convex sets (GCS), a globally informed alternative to local trajectory optimisation, published in Science Robotics.
+  - title: "Ruckig"
+    author: Lars Berscheid and Torsten Kröger
+    url: https://github.com/pantor/ruckig
+    note: Open-source jerk-limited online trajectory generation, used in MoveIt 2 and by robot manufacturers.
+---
+
+<Section id="motivation" kind="motivation" title="From a path to a motion">
+
+The <LessonLink slug="sampling-based-planning">sampling-based planners</LessonLink> return collision-free paths, but nobody would want to execute them as they come: they zig-zag between random samples, pass needlessly close to obstacles, and say nothing about speed. Shortcutting helped, but only a little. What a robot needs is a **trajectory**: positions as a function of time, smooth enough for its motors, fast enough to be useful, respecting joint limits, velocity limits, torque limits and dynamics, and clear of every obstacle by a margin.
+
+All of these wishes can be written as numbers. Smoothness is a sum of squared accelerations; clearance is a penalty that grows as the robot approaches an obstacle; speed is the total time; limits are inequalities; dynamics are equations linking each instant to the next. Planning then becomes **optimisation**: choose the trajectory that minimises the cost while satisfying the constraints. This is the same idea as <LessonLink slug="model-predictive-control">model predictive control</LessonLink>, which re-solves a short trajectory optimisation many times a second; here we look at the longer, harder problems of planning a whole motion around obstacles.
+
+Optimisation has a price. These problems are almost never convex, so solvers find **local** optima: good trajectories near where they started, not necessarily the best one, and sometimes not a collision-free one at all. This lesson builds three optimisers small enough to read in full, shows where each succeeds, and shows one of them failing because of its starting point, which is the central practical fact of the field.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="A path as a flexible object">
+
+<Analogy>
+
+Lay a stretched rubber band on a table between two pins, and put a few coins on the table in its way. Each coin, if it could, would push the band aside; the band's tension pulls it back towards a straight line. The band settles where the pushes and the pull balance: short, smooth, and clear of the coins. Start it on the other side of a coin, though, and it settles on that side, even if going round the other way would be shorter. Trajectory optimisation behaves much like the band.
+
+</Analogy>
+
+Discretise a trajectory as $N$ waypoints $\xi = (q_1, \ldots, q_N)$ between a fixed start $q_0$ and goal $q_{N+1}$ (for an arm, each $q_i$ is a vector of joint angles; for our drawings, a point in the plane). Two forces act on it. A **smoothness** cost
+
+$$
+F_{\text{smooth}}(\xi) = \tfrac12 \sum_{i=0}^{N} \lVert q_{i+1} - q_i \rVert^2
+$$
+
+is small when neighbouring waypoints are close and evenly spaced, like the band's tension. An **obstacle** cost $F_{\text{obs}}(\xi) = \sum_i c\big(d(q_i)\big)$ uses the signed distance field $d$ of the <LessonLink slug="configuration-space">previous lesson</LessonLink>: $c$ is zero far from obstacles and grows as the distance falls below a margin $\varepsilon$, and keeps growing inside them. Gradient descent on $F_{\text{obs}} + \lambda F_{\text{smooth}}$ moves each waypoint downhill, and since the SDF's gradient points away from obstacles, waypoints inside an obstacle are pushed out.
+
+One subtlety makes all the difference. Plain gradient descent moves each waypoint independently: a waypoint inside an obstacle jumps outwards while its neighbours stay put, creating a kink, which the smoothness term then slowly irons out over many iterations. **CHOMP** (Nathan Ratliff, Matt Zucker, J. Andrew Bagnell and Siddhartha Srinivasa, 2009) measures the size of an update in the smoothness metric instead. Writing $F_{\text{smooth}} = \tfrac12 \xi^{\mathsf T} A \xi + b^{\mathsf T}\xi + \text{const}$, where $A$ is the finite-difference matrix of the path, it takes the step
+
+$$
+\xi \leftarrow \xi - \frac{1}{\eta} A^{-1} \nabla F(\xi).
+$$
+
+Multiplying by $A^{-1}$ spreads a push at one waypoint smoothly over the whole path, the way pressing on the middle of a rubber band moves all of it.
+
+<Narrator who="chloe">
+
+$A^{-1}$ is not arbitrary. CHOMP's step solves "minimise the linearised cost plus $\tfrac{\eta}{2}\lVert \Delta\xi \rVert_A^2$", a trust region measured in the norm $\lVert \Delta\xi\rVert_A^2 = \Delta\xi^{\mathsf T} A\, \Delta\xi$, which is small for smooth deformations and large for jagged ones. Choosing the geometry in which to take steepest descent is the idea behind preconditioning and natural gradients too (Lumenary Math's <TopicLink id="math.applied.optimisation">Optimisation</TopicLink>).
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="trajectory optimisation problem">
+
+Given dynamics $\dot x = f(x, u)$ with state $x$ and control $u$, a **trajectory optimisation problem** is
+
+$$
+\min_{x(\cdot),\, u(\cdot),\, T} \; \ell_f\big(x(T)\big) + \int_0^T \ell\big(x(t), u(t)\big)\, dt
+\quad \text{subject to} \quad \dot x = f(x, u),\; x(0) = x_0,\; g(x, u) \le 0,
+$$
+
+where $\ell$ is the running cost (effort, smoothness, time), $\ell_f$ a final cost or goal, and $g$ collects inequality constraints: joint and torque limits, and collision avoidance written as $d(x) \ge d_{\min}$. A computer solves a discretised version with finitely many variables.
+
+</Definition>
+
+<Definition term="single shooting">
+
+**Single shooting** makes the controls $u_0, \ldots, u_{N-1}$ the only decision variables; the states are obtained by simulating the dynamics forward from $x_0$. **Multiple shooting** also makes the state at the start of each of several segments a variable, simulates each segment separately, and adds constraints that each segment ends where the next begins.
+
+</Definition>
+
+<Definition term="direct collocation">
+
+**Direct collocation** makes the states and controls at all knot times $t_0, \ldots, t_N$ decision variables and imposes the dynamics as algebraic equality constraints between neighbouring knots, the **defects**, for example by the trapezoidal rule
+
+$$
+x_{k+1} - x_k - \tfrac{h}{2}\big(f(x_k, u_k) + f(x_{k+1}, u_{k+1})\big) = 0.
+$$
+
+The dynamics hold only when the solver has driven every defect to zero; during the solve, the trajectory may be dynamically impossible.
+
+</Definition>
+
+<Definition term="time parameterisation">
+
+A **time parameterisation** of a geometric path $q(s)$, $s \in [0, L]$, is a function $s(t)$ saying where along the path the robot is at each time. **Time-optimal path parameterisation** (TOPP) finds the one that traverses the path fastest while respecting velocity, acceleration or torque limits.
+
+</Definition>
+
+</Section>
+
+<Section id="chomp" kind="computation" title="A CHOMP-style optimiser">
+
+The program optimises a 40-waypoint path across a 3 m × 2 m workspace with a large round obstacle in the way and a smaller one just below it. The signed distance field is sampled on a 2 cm grid, interpolated bilinearly, and differentiated with `np.gradient`. The obstacle cost uses CHOMP's shape: $c(d) = (\varepsilon - d)^2 / 2\varepsilon$ in the margin $0 \le d \lt \varepsilon$ (here $\varepsilon = 15$ cm) and $c(d) = \varepsilon/2 - d$ inside obstacles, so its slope is continuous. It compares plain and covariant gradient descent, each with about the largest step that stays stable for it, and then starts the covariant method from two different initial guesses.
+
+```python run
+import numpy as np
+
+# Workspace 3 m x 2 m, two round obstacles; a signed distance field sampled on a 2 cm grid.
+CIRCLES = [((1.5, 1.0), 0.35), ((1.55, 0.35), 0.2)]
+RES = 0.02
+gy, gx = (np.indices((101, 151)) * RES)
+D = np.min([np.hypot(gx - cx, gy - cy) - r for (cx, cy), r in CIRCLES], axis=0)
+DY, DX = np.gradient(D, RES)                       # the field's gradient, also on the grid
+
+def sample(F, p):
+    """Bilinear interpolation of a grid field F at points p (n x 2, metres)."""
+    x, y = p[:, 0] / RES, p[:, 1] / RES
+    j, i = np.clip(x.astype(int), 0, 149), np.clip(y.astype(int), 0, 99)
+    fx, fy = x - j, y - i
+    return ((1 - fy) * ((1 - fx) * F[i, j] + fx * F[i, j + 1]) +
+            fy * ((1 - fx) * F[i + 1, j] + fx * F[i + 1, j + 1]))
+
+EPS = 0.15                                         # start paying 15 cm from obstacles
+def obstacle_cost_grad(P):
+    d = sample(D, P)
+    g = np.stack([sample(DX, P), sample(DY, P)], axis=1)
+    cost = np.where(d < 0, -d + EPS / 2, np.where(d < EPS, (EPS - d) ** 2 / (2 * EPS), 0.0))
+    dc_dd = np.where(d < 0, -1.0, np.where(d < EPS, (d - EPS) / EPS, 0.0))
+    return cost.sum(), dc_dd[:, None] * g             # chain rule: dc/dp = dc/dd * grad d
+
+N = 40                                             # interior waypoints; the ends are fixed
+start, goal = np.array([0.2, 1.0]), np.array([2.8, 1.0])
+K = np.eye(N) - np.eye(N, k=-1)                    # finite differences between neighbours
+A = K.T @ K; A[-1, -1] += 1                         # smoothness metric: sum of squared steps
+b = np.zeros((N, 2)); b[0] = -start; b[-1] = -goal
+
+def total_cost(P, lam=10.0):
+    obst, _ = obstacle_cost_grad(P)
+    full = np.vstack([start, P, goal])
+    return obst + lam * 0.5 * np.sum(np.diff(full, axis=0) ** 2)
+
+def optimise(P, iters, covariant, lam=10.0):
+    """Gradient descent; the covariant (CHOMP) version preconditions by the inverse of A.
+    Each uses roughly the largest step size that is stable for it."""
+    Ainv, eta = np.linalg.inv(A), (400.0 if covariant else 40.0)
+    for _ in range(iters):
+        _, g_obs = obstacle_cost_grad(P)
+        grad = g_obs + lam * (A @ P + b)           # gradient of obstacle + smoothness terms
+        step = Ainv @ grad if covariant else grad
+        P = P - step / eta
+    return P
+
+def report(name, P):
+    full = np.vstack([start, P, goal])
+    length = np.sum(np.linalg.norm(np.diff(full, axis=0), axis=1))
+    bend = np.max(np.linalg.norm(np.diff(full, 2, axis=0), axis=1))
+    print(f"{name:38} clearance {sample(D, P).min():+.3f} m  length {length:.3f} m  "
+          f"max bend {bend:.3f} m  cost {total_cost(P):.3f}")
+
+t = np.linspace(0, 1, N + 2)[1:-1, None]
+straight = start + t * (goal - start)
+report("straight line (initial guess)", straight)
+for iters in (10, 100):
+    report(f"plain gradient, {iters} steps", optimise(straight + [0, 0.01], iters, False))
+    report(f"covariant (CHOMP), {iters} steps", optimise(straight + [0, 0.01], iters, True))
+
+# Local minima: start from a guess bent above the big obstacle, or below it.
+bump = np.sin(np.pi * t) * [0, 0.25]
+report("covariant from a guess bent upwards", optimise(straight + bump, 100, True))
+report("covariant from a guess bent downwards", optimise(straight - bump, 100, True))
+```
+
+The straight line starts 31.8 cm deep in the obstacle. After 10 iterations, plain gradient descent is still 21.2 cm inside, with a visible kink (a "bend" of 7.3 cm between consecutive steps); the covariant method is already clear by 12.6 cm with a smooth path, and after 100 iterations it has converged (cost 0.949) while plain descent is still at 1.079. Both start from the straight line nudged upwards by 1 cm, which decides which way round the obstacle they go. That is the warning in the last two lines: started above the obstacle, the covariant method finds the cost-0.949 path; started below, it settles into the 10 cm gap between the two obstacles, at cost 1.132 and only 1.8 cm from their surfaces. Both are local minima. Gradient descent cannot know that the other side is better, because it only looks downhill from where it stands.
+
+<Narrator who="gideon">
+
+Two details in this code are simplifications. Real CHOMP weights each waypoint's obstacle cost by how fast that part of the path moves through it, and removes the part of the gradient along the direction of motion, so that waypoints are not dragged along the path. And for an arm, the field is evaluated at spheres on every link and the pushes are mapped to joint space through each sphere's Jacobian; collision is only as good as that sphere model and the field's resolution.
+
+</Narrator>
+
+</Section>
+
+<Section id="collocation" kind="computation" title="Shooting and collocation">
+
+CHOMP optimises geometry only. When dynamics matter, as for a fast arm, a drone or a walking robot, the optimiser must respect $\dot x = f(x, u)$, and there are two families of ways to do it.
+
+<Figure caption="Left: single shooting chooses only the controls and simulates; the end state is wherever the simulation lands, and the solver adjusts the controls until it hits the target. Right: collocation (and, similarly, multiple shooting) also chooses the states at the knots; each interval's dynamics are a constraint, and the gaps (defects, shown dotted) between where an interval ends and where the next knot is are driven to zero by the solver.">
+<svg viewBox="0 0 440 220" role="img" aria-label="Two panels with time across and state up. Left: one smooth curve rises from a start dot and ends below a target marked with a cross, with a dashed arrow labelled miss from the curve's end to the target. Right: five knot dots rise in steps from a start to the target. From each knot a short curve heads towards the next knot but ends slightly below it, leaving small dotted gaps labelled defects.">
+  <g stroke="currentColor" strokeWidth="1" opacity="0.6">
+    <line x1="20" y1="190" x2="205" y2="190" />
+    <line x1="20" y1="190" x2="20" y2="25" />
+    <line x1="235" y1="190" x2="425" y2="190" />
+    <line x1="235" y1="190" x2="235" y2="25" />
+  </g>
+  <path d="M 35 170 C 90 166, 130 120, 190 85" fill="none" stroke="currentColor" strokeWidth="2.4" />
+  <circle cx="35" cy="170" r="4.5" fill="currentColor" />
+  <line x1="190" y1="85" x2="190" y2="52" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 3" />
+  <g stroke="var(--gold)" strokeWidth="2.4">
+    <line x1="184" y1="40" x2="196" y2="52" />
+    <line x1="196" y1="40" x2="184" y2="52" />
+  </g>
+  <g stroke="currentColor" strokeWidth="2.4" fill="none">
+    <path d="M 250 170 C 262 165, 278 156, 290 147" />
+    <path d="M 290 140 C 302 134, 318 122, 330 112" />
+    <path d="M 330 105 C 342 98, 358 86, 370 77" />
+    <path d="M 370 70 C 382 63, 398 52, 410 46" />
+  </g>
+  <g stroke="var(--bad)" strokeWidth="2" strokeDasharray="2 2">
+    <line x1="290" y1="147" x2="290" y2="140" />
+    <line x1="330" y1="112" x2="330" y2="105" />
+    <line x1="370" y1="77" x2="370" y2="70" />
+    <line x1="410" y1="46" x2="410" y2="40" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="250" cy="170" r="4.5" /><circle cx="290" cy="140" r="4" /><circle cx="330" cy="105" r="4" /><circle cx="370" cy="70" r="4" />
+  </g>
+  <circle cx="410" cy="40" r="5" fill="var(--gold)" stroke="currentColor" />
+  <g fill="currentColor" fontSize="12">
+    <text x="20" y="18">single shooting</text>
+    <text x="235" y="18">collocation</text>
+    <text x="150" y="40">target</text>
+    <text x="196" y="74">miss</text>
+    <text x="40" y="205">time →</text>
+    <text x="300" y="205">knots: states and controls</text>
+    <text x="340" y="132">defects</text>
+    <text x="40" y="150">simulate u₀ … u_N</text>
+  </g>
+</svg>
+</Figure>
+
+Single shooting has few variables and always produces a trajectory that obeys the dynamics, but the end state depends on early controls through the whole simulation, and for unstable systems that dependence explodes. Collocation has many more variables but every constraint involves only two neighbouring knots, so its matrices are sparse and well conditioned, and the solver can start from a guess that is not dynamically consistent at all, such as a straight line in state space. Large nonlinear solvers handle the sparsity easily, which is why collocation (and its close relative, multiple shooting) dominates offline trajectory optimisation for robots.
+
+The program solves the classic test: move a double integrator ($\ddot x = u$, a mass pushed by a force) from rest at 0 to rest at 1 m in 2 s with the least effort $\int u^2\,dt$. With the trapezoidal rule, the cost is quadratic and the defects are linear, so the problem is an equality-constrained quadratic programme, solved exactly by one linear system (the KKT equations). The exact answer is known: $u(t) = 6/T^2 - 12t/T^3$, a force that falls linearly from push to brake. The program compares, then shows why shooting struggles with an unstable system.
+
+```python run
+import numpy as np
+
+# Move a 1-D double integrator (x'' = u) from rest at x = 0 to rest at x = 1 m in T = 2 s,
+# minimising the effort integral of u^2, by trapezoidal direct collocation.
+T = 2.0
+
+def collocate(n):
+    """Decision variables z = [x_0..x_n, v_0..v_n, u_0..u_n]; returns the knot values."""
+    h, m = T / n, n + 1
+    X, V, U = 0, m, 2 * m                              # where each block starts in z
+    rows, rhs = [], []
+    def row(entries, value=0.0):
+        r = np.zeros(3 * m)
+        for index, coeff in entries:
+            r[index] += coeff
+        rows.append(r); rhs.append(value)
+    for k in range(n):                                 # dynamics as equality constraints
+        row([(X + k + 1, 1), (X + k, -1), (V + k, -h / 2), (V + k + 1, -h / 2)])
+        row([(V + k + 1, 1), (V + k, -1), (U + k, -h / 2), (U + k + 1, -h / 2)])
+    row([(X, 1)], 0.0); row([(V, 1)], 0.0)             # start at rest at 0
+    row([(X + n, 1)], 1.0); row([(V + n, 1)], 0.0)     # end at rest at 1
+    C, d = np.array(rows), np.array(rhs)
+    w = np.full(m, h); w[0] = w[-1] = h / 2            # trapezoid weights for the cost
+    H = np.zeros((3 * m, 3 * m)); H[U:, U:] = 2 * np.diag(w)
+    H += 1e-12 * np.eye(3 * m)                         # x and v do not appear in the cost
+    KKT = np.block([[H, C.T], [C, np.zeros((len(d), len(d)))]])
+    sol = np.linalg.solve(KKT, np.concatenate([np.zeros(3 * m), d]))
+    z = sol[:3 * m]
+    return z[X:X + m], z[V:V + m], z[U:U + m], float(w @ z[U:U + m] ** 2)
+
+def exact(t):                                          # the minimum-effort solution
+    return 3 * t**2 / T**2 - 2 * t**3 / T**3, 6 * t / T**2 - 6 * t**2 / T**3, 6 / T**2 - 12 * t / T**3
+
+print(f"exact: effort {12 / T**3:.4f}, peak speed {exact(T / 2)[1]:.4f} m/s, u(0) = {exact(0)[2]:.4f} m/s^2")
+print(f"{'knots':>6}{'effort':>10}{'max |x error|':>15}{'max |u error|':>15}")
+for n in (4, 8, 16, 32):
+    x, v, u, J = collocate(n)
+    t = np.linspace(0, T, n + 1)
+    xe, ve, ue = exact(t)
+    print(f"{n + 1:6d}{J:10.4f}{np.abs(x - xe).max():15.2e}{np.abs(u - ue).max():15.2e}")
+
+# Why not single shooting? For an unstable system the end state is hypersensitive to early inputs.
+lam, n = 3.0, 30                                       # x' = lam * x + u, 3 s horizon
+h = 3.0 / n
+sens = [h * (1 + lam * h) ** (n - 1 - k) for k in range(n)]   # d x_n / d u_k, explicit Euler
+print(f"\nunstable system x' = 3x + u over 3 s: d x(T) / d u_k ranges from {min(sens):.2f} to {max(sens):.0f}")
+print("in collocation every constraint links only neighbouring knots, with coefficients near 1 and h")
+```
+
+The effort converges to the exact 1.5 as knots are added (1.882 with 5 knots, 1.506 with 33), and the position error falls by a factor approaching 4 with each doubling of the knots, as a second-order method's should. The control's error is largest at the two end knots, where the trapezoid rule is least accurate; higher-order schemes such as Hermite–Simpson collocation reduce it. The last lines show the shooting problem: for $\dot x = 3x + u$ over 3 s, nudging the first control moves the final state about 2000 times more than nudging the last one. A solver adjusting those controls faces a badly scaled problem, and for longer horizons or nonlinear dynamics, a simulation that diverges. Collocation never simulates over the whole horizon, so this cannot happen.
+
+<Narrator who="margaret">
+
+Count the variables. This problem with 33 knots has 99 unknowns and 68 equality constraints. A seven-joint arm with 14 states (angles and velocities) and 7 torques over 50 knots has 1050 unknowns, about 700 dynamics constraints, and collision constraints for every knot and link: large, but sparse, and solvers such as IPOPT or SNOPT handle it in well under a second for a good initial guess.
+
+</Narrator>
+
+</Section>
+
+<Section id="time-optimal" kind="computation" title="Time-optimal parameterisation">
+
+A common division of labour in industry is: plan a geometric path (by sampling, optimisation or a teach pendant), then decide **how fast** to move along it. With the path fixed, the only freedom is the speed $\dot s$ along it, and the limits become limits on $\dot s$ and $\ddot s$. For a vehicle on a planar path with curvature $\kappa(s)$, staying within a sideways acceleration $a_{\text{lat}}$ requires $\dot s^2 \kappa \le a_{\text{lat}}$, a speed limit in every bend; a tangential acceleration limit $a_{\text{tan}}$ bounds how fast $\dot s^2$ can change with distance, since $\frac{d}{ds}\big(\dot s^2\big) = 2\ddot s$.
+
+The time-optimal profile has a simple structure, found by James Bobrow, Steven Dubowsky and John Gibson, and independently by Kang Shin and Neil McKay, in 1985: at every point the robot is either accelerating as hard as it can, braking as hard as it can, or riding a speed limit. For limits of this simple kind a **forward pass** (accelerate as hard as allowed, never exceeding the limit) followed by a **backward pass** (brake in time for every slow section ahead) computes it exactly. The program applies this to a 6.7 m path with a tight bend and a wide one.
+
+```python run
+import numpy as np
+
+# A path for a mobile robot: 2 m straight, a 90-degree bend of radius 0.4 m, 1.5 m straight,
+# a 90-degree bend of radius 1.0 m the other way, then 1 m straight. Curvature along the path:
+ds = 0.005
+pieces = [(2.0, 0.0), (np.pi / 2 * 0.4, 1 / 0.4), (1.5, 0.0), (np.pi / 2 * 1.0, 1 / 1.0), (1.0, 0.0)]
+kappa = np.concatenate([np.full(int(round(L / ds)), k) for L, k in pieces])
+s = np.arange(len(kappa) + 1) * ds
+kappa = np.append(kappa, 0.0)                      # curvature at each of the len(s) points
+
+V_MAX, A_TAN, A_LAT = 1.5, 0.8, 1.0                 # m/s, m/s^2 along the path, m/s^2 sideways
+v_lim = np.minimum(V_MAX, np.sqrt(A_LAT / np.maximum(kappa, 1e-9)))
+
+v = v_lim.copy()
+v[0] = v[-1] = 0.0                                  # start and stop at rest
+for i in range(len(s) - 1):                         # forward pass: accelerate as hard as allowed
+    v[i + 1] = min(v[i + 1], np.sqrt(v[i] ** 2 + 2 * A_TAN * ds))
+for i in range(len(s) - 1, 0, -1):                  # backward pass: brake in time for what comes
+    v[i - 1] = min(v[i - 1], np.sqrt(v[i] ** 2 + 2 * A_TAN * ds))
+
+def travel_time(v):
+    return float(np.sum(2 * ds / (v[1:] + v[:-1])))
+
+print(f"path length {s[-1]:.2f} m; speed limits: {V_MAX} m/s, tight bend {np.sqrt(A_LAT * 0.4):.3f} m/s, "
+      f"wide bend {np.sqrt(A_LAT * 1.0):.3f} m/s")
+print(f"time-optimal profile: {travel_time(v):.2f} s, top speed {v.max():.2f} m/s at s = {s[v.argmax()]:.2f} m")
+
+# A simpler schedule for comparison: one speed, with the same limits for starting and stopping.
+def flat(limit):
+    w = np.full_like(s, limit); w[0] = w[-1] = 0.0
+    for i in range(len(s) - 1):
+        w[i + 1] = min(w[i + 1], np.sqrt(w[i] ** 2 + 2 * A_TAN * ds))
+    for i in range(len(s) - 1, 0, -1):
+        w[i - 1] = min(w[i - 1], np.sqrt(w[i] ** 2 + 2 * A_TAN * ds))
+    return w
+print(f"one speed everywhere, safe for the tight bend: {travel_time(flat(np.sqrt(A_LAT * 0.4))):.2f} s")
+
+print("\nspeed along the path (each row 0.25 m; '|' marks the limit, '*' the speed):")
+for i in range(0, len(s), 50):
+    bar = [" "] * 32
+    bar[min(int(v_lim[i] / V_MAX * 30), 31)] = "|"
+    bar[int(v[i] / V_MAX * 30)] = "*"
+    print(f"s = {s[i]:4.2f} m  v = {v[i]:4.2f}  " + "".join(bar))
+```
+
+The robot accelerates along the first straight and must start braking for the tight bend before reaching its 1.5 m/s limit; it takes the bend at 0.632 m/s, accelerates out of it, and reaches its top speed of 1.38 m/s on the middle straight. The whole path takes 8.13 s, against 11.38 s at a single speed safe for the tightest bend. The profile shows the three regimes, with each speed either on its limit or on a maximum acceleration or braking curve between limits.
+
+For arms the same idea applies with joint-space limits: every joint's velocity, acceleration and torque limit turns into bounds on $\dot s$ and $\ddot s$ that depend on $s$. TOPP-RA (Hung Pham and Quang-Cuong Pham, 2018) solves the general version robustly with a sequence of small linear programmes, and MoveIt applies time-optimal parameterisation to every planned path by default. Profiles that are time-optimal under acceleration limits have jumps in acceleration, which excite vibrations; production systems usually also limit **jerk** (the rate of change of acceleration), for example with the open-source Ruckig library.
+
+</Section>
+
+<Section id="practice" kind="human" title="Trajectory optimisation in practice">
+
+**TrajOpt** (John Schulman, Pieter Abbeel and colleagues, 2013–14) made optimisation a serious alternative to sampling for arms. It solves a sequence of convex subproblems (sequential convex programming), each with a trust region, and writes collision avoidance as constraints on signed distances computed by GJK and EPA between convex shapes, including the convex hull of a link's positions at consecutive waypoints, so that the motion *between* waypoints is checked as well. **STOMP** (Mrinal Kalakrishnan and colleagues, 2011) instead perturbs the trajectory with smooth random noise and keeps the improvements, which needs no gradients. CHOMP and STOMP are both available in MoveIt.
+
+**Solvers and toolkits.** Most robotics groups do not write solvers; they formulate problems in a modelling tool and pass them to a general solver. Widely used, as of 2026: [CasADi](https://web.casadi.org/) (KU Leuven) for modelling with automatic differentiation; IPOPT (an open-source interior-point solver from the COIN-OR project) and SNOPT (a commercial sequential quadratic programming solver) for large sparse nonlinear problems; OSQP for quadratic programmes; acados (University of Freiburg and partners) for fast embedded MPC; Crocoddyl (LAAS-CNRS) for differential dynamic programming on legged robots; and [Drake](https://drake.mit.edu/) (MIT and Toyota Research Institute), which wraps many solvers behind one interface. The code below shows the shape of a collocation problem in CasADi; it is not run here.
+
+```python
+# CasADi (not run here): min-effort double integrator by trapezoidal collocation.
+import casadi as ca
+N, T = 32, 2.0
+opti = ca.Opti()
+x, v, u = opti.variable(N + 1), opti.variable(N + 1), opti.variable(N + 1)
+h = T / N
+for k in range(N):
+    opti.subject_to(x[k + 1] == x[k] + h / 2 * (v[k] + v[k + 1]))
+    opti.subject_to(v[k + 1] == v[k] + h / 2 * (u[k] + u[k + 1]))
+opti.subject_to([x[0] == 0, v[0] == 0, x[N] == 1, v[N] == 0])
+opti.subject_to(opti.bounded(-2.0, u, 2.0))            # an inequality: force limits
+opti.minimize(h * ca.sumsqr(u))
+opti.solver("ipopt")
+solution = opti.solve()
+```
+
+**Parallelism and learning.** GPU tools such as NVIDIA's cuRobo run many trajectory optimisations in parallel from different initial guesses and keep the best, which attacks local minima by brute force. Learned models trained on solved problems can propose initial trajectories (including, since about 2022, diffusion models that generate whole trajectories), which an optimiser then refines and checks.
+
+**Global structure.** **Graphs of convex sets** (Tobia Marcucci, Russ Tedrake and colleagues, published in *Science Robotics* in 2023) take another route: decompose the free space into convex regions offline, then solve one convex optimisation that chooses *which* regions to pass through and the smooth trajectory within them at the same time. Its convex relaxation is often tight, so it finds near-globally-optimal trajectories without depending on an initial guess, at the cost of computing the decomposition.
+
+</Section>
+
+<Section id="local-minima" kind="human" title="Local minima, and why the initial guess matters">
+
+The rubber band and the CHOMP experiment showed the basic fact: an optimiser follows the local slope, so it converges to a minimum near where it starts. In planning, different minima usually correspond to different ways around obstacles (paths in different **homotopy classes**, which cannot be deformed into each other without crossing an obstacle), and no amount of local improvement turns one into another. Worse, a local minimum can still be in collision, if the obstacle cost's push is balanced by the smoothness pull, for example on a path through a thin wall whose SDF gradient points in opposite directions on its two sides.
+
+Practitioners use several defences, often together:
+
+- **Good seeds.** Run a sampling-based planner first and optimise its path: the sampler finds the right homotopy class, the optimiser makes it good. This is the most common combination in arm planning.
+- **Many seeds.** Start from several different guesses (straight lines through different intermediate points, random perturbations) and keep the best, which GPUs make cheap.
+- **Warm starts.** In MPC and replanning, start from the previous solution shifted forward in time: the world has changed little, so the old answer is an excellent guess.
+- **Continuation.** Solve an easier version first (large margin, no dynamics, coarse grid) and use its answer to seed the harder one.
+- **Global methods** where they fit, such as GCS or a search over homotopy classes.
+
+<Narrator who="gideon">
+
+An optimiser's "converged" means the gradient is small, not that the trajectory is safe. Every optimised trajectory should be checked afterwards by an independent collision checker at fine resolution and against the real limits, and rejected if it fails, because penalty methods can converge with small violations they consider acceptable.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Optimisation finds the best trajectory."** It finds a *locally* best one, near its starting guess, as the two CHOMP runs that went different ways round the obstacle showed. Global optimality needs global methods, many seeds, or a convex formulation.
+
+</Misconception>
+
+<Misconception>
+
+**"Collocation trajectories obey the dynamics."** Only at convergence, and only at the knots and to the accuracy of the integration rule. Between knots, and with coarse knots, the real system can deviate; check by simulating the controls, and refine the mesh where the defects or the error estimate are large.
+
+</Misconception>
+
+<Misconception>
+
+**"Time-optimal is always what you want."** Time-optimal profiles ride the limits, leaving no margin for model error, payload changes or disturbances, and their acceleration jumps shake the robot. Real systems plan with scaled-down limits and jerk limits, trading a little time for accuracy, wear and safety.
+
+</Misconception>
+
+<Misconception>
+
+**"Sampling and optimisation are competing approaches."** In practice they are layers of one pipeline: search or sampling finds a feasible route, optimisation makes it smooth and fast, and time parameterisation and a tracking controller (<LessonLink slug="trajectories-and-tracking">Trajectories and tracking</LessonLink>) execute it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises use NumPy and run in your browser.
+
+<Exercises/>
+
+</Section>

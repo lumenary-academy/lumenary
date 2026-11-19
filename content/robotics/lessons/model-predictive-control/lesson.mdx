@@ -1,0 +1,531 @@
+---
+title: Model predictive control
+subtitle: Look ahead, plan within the limits, take one step, look again — the controller behind walking robots, autonomous cars and agile drones.
+minutes: 80
+objectives:
+  - Explain receding-horizon control and why applying only the first planned input makes MPC a feedback law
+  - Write linear MPC as a quadratic program, solve the unconstrained case by least squares, and show that with the LQR's terminal cost it reproduces LQR exactly
+  - Implement a projected-gradient QP solver for input limits and use it to control a cart and a car-like robot, compared with clipped LQR
+  - Explain terminal costs, feasibility and soft constraints, and estimate the computational cost of MPC
+  - Describe how real-time solvers make MPC practical, and where it runs today in legged robots, autonomous vehicles and drones
+prerequisites: [state-space-and-lqr, trajectories-and-tracking, wheeled-robots]
+related: [math.applied.optimisation, math.algebra.linear-algebra, math.comp.numerical-analysis, math.analysis.dynamical-systems]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Model Predictive Control: Theory, Computation, and Design"
+    author: James B. Rawlings, David Q. Mayne and Moritz M. Diehl
+    year: 2017
+    url: https://sites.engineering.ucsb.edu/~jbraw/mpc/
+    note: The standard graduate textbook, with a free PDF from the authors' site.
+  - title: "Constrained model predictive control: Stability and optimality"
+    author: David Q. Mayne, James B. Rawlings, Christopher V. Rao and Pierre O. M. Scokaert
+    year: 2000
+    note: The survey that settled how terminal costs and terminal sets guarantee stability and feasibility. Automatica 36(6).
+  - title: "A survey of industrial model predictive control technology"
+    author: S. Joe Qin and Thomas A. Badgwell
+    year: 2003
+    note: How MPC spread through refineries and chemical plants from the 1970s onwards. Control Engineering Practice 11(7).
+  - title: "The explicit linear quadratic regulator for constrained systems"
+    author: Alberto Bemporad, Manfred Morari, Vivek Dua and Efstratios N. Pistikopoulos
+    year: 2002
+    note: Solving the MPC problem offline for every state, so that the online controller is a table lookup. Automatica 38(1).
+  - title: "OSQP: An operator splitting solver for quadratic programs"
+    author: Bartolomeo Stellato, Goran Banjac, Paul Goulart, Alberto Bemporad and Stephen Boyd
+    year: 2020
+    url: https://osqp.org/
+    note: An open-source QP solver widely used for embedded MPC, with code generation and warm starting.
+  - title: "acados"
+    url: https://docs.acados.org/
+    note: Open-source software for fast nonlinear MPC, with real-time iteration schemes and generated C code.
+  - title: "CasADi"
+    url: https://web.casadi.org/
+    note: Open-source symbolic framework for nonlinear optimisation and optimal control, used to formulate many MPC problems.
+  - title: "Dynamic locomotion in the MIT Cheetah 3 through convex model-predictive control"
+    author: Jared Di Carlo, Patrick M. Wensing, Benjamin Katz, Gerardo Bledt and Sangbae Kim
+    year: 2018
+    note: Ground-reaction forces chosen by a small QP over a simplified rigid-body model, fast enough for dynamic gaits. IEEE/RSJ IROS 2018.
+  - title: "OCS2: optimal control for switched systems"
+    url: https://github.com/leggedrobotics/ocs2
+    note: An open-source nonlinear MPC toolbox from ETH Zürich's Robotic Systems Lab, used on legged and mobile manipulators.
+  - title: "Drake"
+    url: https://drake.mit.edu/
+    note: Robotics toolbox whose MathematicalProgram interface formulates MPC problems and passes them to several solvers.
+---
+
+<Section id="motivation" kind="motivation" title="Controllers that know their limits">
+
+Every real robot lives inside limits. Motors deliver a maximum torque; joints stop at their end stops; a car's steering turns only so far and its passengers tolerate only so much sideways acceleration; a walking robot's feet can push on the ground but not pull, and only within a cone of friction before they slip; a drone's propellers spin between a minimum and a maximum speed. The controllers of the previous lessons ignore all of this. PID, LQR and computed torque compute a command as if any value were available, and then the actuator **clips** it. We saw in <LessonLink slug="feedback-and-pid">the PID lesson</LessonLink> what clipping does to an integrator; it does similar damage to any controller that was designed assuming the clipped value would be delivered.
+
+**Model predictive control** (MPC) builds the limits in. At every control step it uses a model to predict how the robot will move over the next second or two for any sequence of future inputs, chooses the sequence that is best according to a cost while respecting every limit, applies only the first input of that sequence, and then, at the next step, measures again and repeats. It began in oil refineries in the 1970s, where the plants are slow and the constraints valuable, and has become, with fast solvers, one of the main tools of robot control: in the 2020s it plans the footstep forces of legged robots, steers autonomous vehicles and flies racing drones.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Look ahead, commit to one move, look again">
+
+<Analogy>
+
+A good driver approaching a bend does not steer by the car's present position alone. They look ahead, imagine a path through the bend that the car can actually follow at this speed, start braking and turning at the right moment, and keep revising the plan as the road unfolds. They never execute a plan to the end: every glance replaces it with a new one.
+
+</Analogy>
+
+MPC does the same thing with a model and an optimiser.
+
+<Figure caption="Receding-horizon control. At time k the controller predicts the state over the next N steps (gold dashes) for a planned input sequence (bars), chosen to minimise a cost within the limits. It applies only the first input (solid gold bar), measures the new state at k + 1, and solves again over a horizon shifted by one step.">
+<svg viewBox="0 0 520 260" role="img" aria-label="A timeline. Left of a vertical dashed line marked now, k, a solid curve shows the measured past state rising towards a dashed horizontal reference line, and grey bars below show the inputs applied in the past. Right of the line, a gold dashed curve shows the predicted state approaching the reference over a bracket labelled prediction horizon, N steps. Below, a row of planned input bars shrinks over the horizon; the first is solid gold and labelled applied, the rest are outlined and labelled planned, then replaced." xmlns="http://www.w3.org/2000/svg">
+  <line x1="30" y1="232" x2="500" y2="232" stroke="currentColor" strokeWidth="1.2" />
+  <line x1="30" y1="60" x2="500" y2="60" stroke="currentColor" strokeWidth="1" strokeDasharray="6 4" />
+  <line x1="200" y1="30" x2="200" y2="232" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+  <polyline points="40,150 70,140 100,128 130,120 160,112 200,105" fill="none" stroke="currentColor" strokeWidth="2.2" />
+  <polyline points="200,105 230,92 260,82 290,75 320,70 350,66 380,64 410,62 440,61 470,60" fill="none" stroke="var(--gold)" strokeWidth="2.2" strokeDasharray="7 4" />
+  <circle cx="200" cy="105" r="4" fill="currentColor" />
+  <g fill="currentColor" opacity="0.35">
+    <rect x="42" y="190" width="20" height="42" /><rect x="72" y="194" width="20" height="38" />
+    <rect x="102" y="197" width="20" height="35" /><rect x="132" y="200" width="20" height="32" />
+    <rect x="162" y="203" width="20" height="29" />
+  </g>
+  <rect x="202" y="196" width="24" height="36" fill="var(--gold)" />
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="3 2">
+    <rect x="232" y="202" width="24" height="30" /><rect x="262" y="208" width="24" height="24" />
+    <rect x="292" y="213" width="24" height="19" /><rect x="322" y="217" width="24" height="15" />
+    <rect x="352" y="221" width="24" height="11" /><rect x="382" y="224" width="24" height="8" />
+    <rect x="412" y="226" width="24" height="6" /><rect x="442" y="228" width="24" height="4" />
+  </g>
+  <path d="M 200 40 L 200 34 L 470 34 L 470 40" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor">
+    <text x="335" y="26" textAnchor="middle">prediction horizon: N steps</text>
+    <text x="206" y="50">now (k)</text>
+    <text x="36" y="54">reference</text>
+    <text x="60" y="172">measured past</text>
+    <text x="300" y="100" fill="var(--gold)">predicted</text>
+    <text x="214" y="250" textAnchor="middle">applied</text>
+    <text x="360" y="196">planned, then replaced</text>
+  </g>
+</svg>
+</Figure>
+
+Three features distinguish this from the controllers so far. It is **predictive**: the cost is charged on the future, so the controller acts early when it sees trouble coming. It is **constrained**: limits are part of the problem, not an afterthought. And it is still **feedback**: because it plans again from each new measurement, a disturbance that pushes the robot off its plan is corrected at the next step.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="finite-horizon optimal control problem">
+
+Given the measured state $x_0$, a model $x_{k+1} = Ax_k + Bu_k$, weights $Q \succeq 0$, $R \succ 0$, a terminal weight $P$ and constraint sets, **linear MPC** solves
+
+$$
+\min_{u_0, \ldots, u_{N-1}} \; \sum_{k=0}^{N-1} \big( x_k^\top Q x_k + u_k^\top R u_k \big) + x_N^\top P x_N
+\quad \text{subject to} \quad u_k \in \mathcal{U},\; x_k \in \mathcal{X},
+$$
+
+where $N$ is the **horizon**. With $\mathcal{U}$ and $\mathcal{X}$ described by linear inequalities, this is a **quadratic program** (QP): a convex quadratic cost under linear constraints.
+
+</Definition>
+
+<Definition term="receding-horizon control">
+
+**Receding-horizon control** solves the problem above at every step from the newly measured state, applies the first input $u_0^\star$, and discards the rest. The resulting control law $u = \kappa(x)$ is a feedback law, in general nonlinear (piecewise affine for linear MPC with linear constraints).
+
+</Definition>
+
+<Definition term="warm start">
+
+A **warm start** initialises the solver at step $k+1$ with the previous solution shifted by one step, which is usually close to the new optimum and saves most of the iterations.
+
+</Definition>
+
+</Section>
+
+<Section id="qp" kind="human" title="Linear MPC as a least-squares problem">
+
+The states are determined by $x_0$ and the inputs, so we can eliminate them. Stacking the predictions,
+
+$$
+\begin{bmatrix} x_1 \\ x_2 \\ \vdots \\ x_N \end{bmatrix}
+= \underbrace{\begin{bmatrix} A \\ A^2 \\ \vdots \\ A^N \end{bmatrix}}_{\Phi} x_0
++ \underbrace{\begin{bmatrix} B & 0 & \cdots & 0 \\ AB & B & \cdots & 0 \\ \vdots & & \ddots & \\ A^{N-1}B & A^{N-2}B & \cdots & B \end{bmatrix}}_{\Gamma}
+\begin{bmatrix} u_0 \\ u_1 \\ \vdots \\ u_{N-1} \end{bmatrix},
+$$
+
+or $X = \Phi x_0 + \Gamma U$. With $\bar Q = \operatorname{diag}(Q, \ldots, Q, P)$ and $\bar R = \operatorname{diag}(R, \ldots, R)$, the cost (dropping the constant $x_0^\top Q x_0$) is
+
+$$
+J(U) = (\Phi x_0 + \Gamma U)^\top \bar Q\, (\Phi x_0 + \Gamma U) + U^\top \bar R\, U
+= \tfrac12 U^\top H U + (F x_0)^\top U + \text{const},
+$$
+
+with $H = 2(\Gamma^\top \bar Q \Gamma + \bar R)$ and $F = 2\Gamma^\top \bar Q \Phi$. This is the **condensed** form: only the inputs remain as variables.
+
+Without constraints, minimising $J$ is a linear **least-squares** problem: writing $\bar Q = L_q^\top L_q$, it is $\min_U \| L_q(\Phi x_0 + \Gamma U) \|^2 + \| \bar R^{1/2} U \|^2$, and its solution $U^\star = -H^{-1}F x_0$ is linear in $x_0$. So unconstrained MPC is a linear state feedback, $u_0 = -K_N x_0$. The block below computes $K_N$ for a 2 kg cart pushed by a force, sampled at 20 Hz, for several horizons, first with terminal weight $Q$ and then with the LQR's Riccati matrix $P$ from <LessonLink slug="state-space-and-lqr">the LQR lesson</LessonLink>.
+
+```python run
+import numpy as np
+
+# A cart of mass 2 kg pushed by a force: state x = [position, velocity], input u = force.
+m, T = 2.0, 0.05                                   # MPC runs at 20 Hz
+A = np.array([[1.0, T], [0.0, 1.0]])
+B = np.array([[T * T / (2 * m)], [T / m]])
+Q, R = np.diag([10.0, 1.0]), np.array([[0.01]])
+
+def prediction_matrices(A, B, N):
+    """Stack the predictions: [x_1; ...; x_N] = Phi x_0 + Gamma [u_0; ...; u_{N-1}]."""
+    n, k = B.shape
+    Phi = np.vstack([np.linalg.matrix_power(A, i + 1) for i in range(N)])
+    Gamma = np.zeros((N * n, N * k))
+    for i in range(N):
+        for j in range(i + 1):
+            Gamma[i * n:(i + 1) * n, j * k:(j + 1) * k] = np.linalg.matrix_power(A, i - j) @ B
+    return Phi, Gamma
+
+def mpc_unconstrained(x0, N, P):
+    """Minimise sum_{k<N} x'Qx + u'Ru + x_N' P x_N as one least-squares problem."""
+    Phi, Gamma = prediction_matrices(A, B, N)
+    Qbar = np.kron(np.eye(N), Q)
+    Qbar[-2:, -2:] = P                             # terminal weight on x_N
+    Lq = np.linalg.cholesky(Qbar).T                # Qbar = Lq' Lq
+    Lr = np.sqrt(R[0, 0]) * np.eye(N)
+    lhs = np.vstack([Lq @ Gamma, Lr])              # || Lq (Phi x0 + Gamma U) ||^2 + || Lr U ||^2
+    rhs = np.concatenate([-Lq @ Phi @ x0, np.zeros(N)])
+    U, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
+    return U
+
+def dare(A, B, Q, R, iters=5000):
+    P = Q.copy()
+    for _ in range(iters):
+        K = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+        P = Q + A.T @ P @ (A - B @ K)
+    return P, K
+
+P_lqr, K_lqr = dare(A, B, Q, R)
+print("LQR gain K =", np.round(K_lqr.ravel(), 3))
+# The unconstrained MPC law is linear: its first move is u_0 = -K_N x_0. Recover K_N column by column.
+for N in [3, 10, 30]:
+    for name, P in [("terminal Q", Q), ("terminal P", P_lqr)]:
+        K_N = -np.column_stack([mpc_unconstrained(e, N, P)[0:1] for e in np.eye(2)])
+        print(f"N = {N:2d}, {name}: K_N = {np.round(K_N.ravel(), 3)}")
+```
+
+With terminal weight $Q$, a short horizon gives a timid controller ($K_3$ is about a sixth of the LQR gain on position), and $K_N$ creeps towards the LQR as $N$ grows. With terminal weight $P$, the MPC gain is the LQR gain *exactly*, for every horizon, even $N = 3$.
+
+<Narrator who="chloe">
+
+Why exactly? $x^\top P x$ is the optimal infinite-horizon cost from $x$, so the MPC cost is the infinite-horizon cost with everything beyond step $N$ already optimised. By the principle of optimality, the best first move of that problem is the best first move of the infinite one. MPC with a good terminal cost is LQR in disguise until a constraint becomes active, and then it does something LQR cannot.
+
+</Narrator>
+
+</Section>
+
+<Section id="constraints" kind="computation" title="Adding limits: a projected-gradient solver">
+
+Now limit the cart's force to $|u| \le 4$ N. The QP becomes
+
+$$
+\min_U \; \tfrac12 U^\top H U + f^\top U \quad \text{subject to} \quad -u_{\max} \le U_i \le u_{\max},
+$$
+
+with $f = F x_0$. There is no closed form any more, but for limits on the inputs alone there is a beautifully simple method: take a gradient step, and if it leaves the box of allowed inputs, **project** back onto the box, which for a box just means clipping each component.
+
+<Figure caption="One step of projected gradient descent on a box-constrained QP. From the current plan U, a step against the gradient leaves the box of allowed inputs; projection (clipping each component) returns the closest point of the box. The ellipses are contours of the cost, whose unconstrained minimum lies outside the box.">
+<svg viewBox="0 0 320 220" role="img" aria-label="A square box marks the allowed inputs. Ellipse-shaped cost contours are centred at a point above and to the right of the box, outside it. From a point inside the box, an arrow labelled gradient step goes up and right to a point outside the box. A second, gold arrow labelled projection goes straight left from that point back to the box's right edge." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="mpc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1" opacity="0.55">
+    <ellipse cx="280" cy="45" rx="40" ry="22" transform="rotate(-25 280 45)" />
+    <ellipse cx="280" cy="45" rx="85" ry="46" transform="rotate(-25 280 45)" />
+    <ellipse cx="280" cy="45" rx="135" ry="72" transform="rotate(-25 280 45)" />
+  </g>
+  <circle cx="280" cy="45" r="3" fill="currentColor" />
+  <rect x="50" y="60" width="180" height="140" fill="none" stroke="currentColor" strokeWidth="2" />
+  <circle cx="120" cy="150" r="4" fill="currentColor" />
+  <line x1="120" y1="150" x2="262" y2="86" stroke="currentColor" strokeWidth="1.8" markerEnd="url(#mpc-arrow)" />
+  <line x1="266" y1="84" x2="236" y2="84" stroke="var(--gold)" strokeWidth="2.2" markerEnd="url(#mpc-arrow)" />
+  <circle cx="230" cy="84" r="4" fill="var(--gold)" />
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor">
+    <text x="104" y="168">U</text>
+    <text x="128" y="112">gradient step</text>
+    <text x="236" y="106" fill="var(--gold)">projection</text>
+    <text x="58" y="76">allowed inputs</text>
+    <text x="316" y="16" textAnchor="end">unconstrained</text>
+    <text x="316" y="30" textAnchor="end">minimum</text>
+  </g>
+</svg>
+</Figure>
+
+<Theorem name="Projected gradient for a box-constrained QP">
+
+Let $H$ be symmetric positive definite with largest eigenvalue $L$, and let $\Pi$ be the projection onto a box $\mathcal{B}$. The iteration $U_{j+1} = \Pi\big(U_j - (HU_j + f)/L\big)$ converges to the unique minimiser $U^\star$ of $\tfrac12 U^\top HU + f^\top U$ over $\mathcal{B}$, and the cost error after $j$ steps is at most $L\,\|U_0 - U^\star\|^2/(2j)$.
+
+</Theorem>
+
+<Proof>
+
+A sketch. The gradient $HU + f$ is Lipschitz with constant $L$, so the quadratic lies below its tangent plus $\tfrac L2\|\Delta U\|^2$; a step of length $1/L$ minimises that upper bound, and projection onto a convex set is non-expansive (it never increases distances to points of the set). Combining the two gives a decrease of the cost at every step and the $O(1/j)$ bound, the standard result for projected gradient methods on smooth convex problems. A fixed point satisfies the optimality conditions: each component is either interior with zero gradient, or held at a bound by a gradient pointing outward.
+
+</Proof>
+
+The rate depends on the **condition number** $L/\lambda_{\min}$ of $H$: badly conditioned problems converge slowly. Adding Nesterov's momentum (the FISTA variant used below) improves the bound to $O(1/j^2)$, and warm starting does the rest. The block compares MPC with "clipped LQR", the LQR gain with its output clipped to the limit, moving the cart 1 m with stronger weights on position.
+
+```python run
+import numpy as np
+
+m, T = 2.0, 0.05
+A = np.array([[1.0, T], [0.0, 1.0]])
+B = np.array([[T * T / (2 * m)], [T / m]])
+Q, R = np.diag([100.0, 1.0]), np.array([[0.01]])
+U_MAX, N = 4.0, 40                                 # the motor gives at most 4 N; look 2 s ahead
+
+def prediction_matrices(A, B, N):
+    n, k = B.shape
+    Phi = np.vstack([np.linalg.matrix_power(A, i + 1) for i in range(N)])
+    Gamma = np.zeros((N * n, N * k))
+    for i in range(N):
+        for j in range(i + 1):
+            Gamma[i * n:(i + 1) * n, j * k:(j + 1) * k] = np.linalg.matrix_power(A, i - j) @ B
+    return Phi, Gamma
+
+P = Q.copy()
+for _ in range(5000):                              # the LQR's P, used as terminal cost
+    K = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+    P = Q + A.T @ P @ (A - B @ K)
+
+Phi, Gamma = prediction_matrices(A, B, N)
+Qbar = np.kron(np.eye(N), Q); Qbar[-2:, -2:] = P
+H = 2 * (Gamma.T @ Qbar @ Gamma + R[0, 0] * np.eye(N))   # cost = 1/2 U'HU + f'U + const
+F = 2 * Gamma.T @ Qbar @ Phi                              # f = F x0
+L = np.linalg.eigvalsh(H).max()                           # step size 1/L is always safe
+
+def solve_qp(x0, U, tol=1e-4, max_iter=5000):
+    """Accelerated projected gradient (FISTA) for min 1/2 U'HU + f'U with |U| <= U_MAX."""
+    f = F @ x0
+    Y, t = U.copy(), 1.0
+    for it in range(1, max_iter + 1):
+        U_new = np.clip(Y - (H @ Y + f) / L, -U_MAX, U_MAX)   # gradient step, then project
+        t_new = 0.5 * (1 + np.sqrt(1 + 4 * t * t))
+        Y = U_new + (t - 1) / t_new * (U_new - U)             # momentum
+        if np.abs(U_new - U).max() < tol:
+            return U_new, it
+        U, t = U_new, t_new
+    return U, max_iter
+
+def simulate(policy, seconds=4.0):
+    x, xs, us, iters = np.array([-1.0, 0.0]), [], [], []   # start 1 m short of the target
+    U = np.zeros(N)
+    for _ in range(int(seconds / T)):
+        u, U, it = policy(x, U)
+        x = A @ x + B.ravel() * u
+        xs.append(x); us.append(u); iters.append(it)
+    return np.array(xs), np.array(us), iters
+
+def clipped_lqr(x, U):
+    return float(np.clip(-(K @ x)[0], -U_MAX, U_MAX)), U, 0
+
+def mpc(x, U):
+    U, it = solve_qp(x, np.append(U[1:], U[-1]))          # warm start: shift last plan
+    return U[0], U, it
+
+print(f"{'controller':14} {'overshoot':>9} {'within 1 cm after':>18} {'peak |u|':>9}")
+for name, policy in [("clipped LQR", clipped_lqr), ("MPC", mpc)]:
+    xs, us, iters = simulate(policy)
+    late = np.nonzero(np.abs(xs[:, 0]) > 0.01)[0][-1] + 1
+    print(f"{name:14} {max(xs[:, 0].max(), 0) * 100:7.1f} cm {late * T:16.2f} s {np.abs(us).max():7.1f} N")
+ev = np.linalg.eigvalsh(H)
+print(f"\nQP: {N} variables, Hessian condition number {ev.max() / ev.min():.0f}")
+print(f"iterations: {iters[0]} for the first (cold) solve, then {np.mean(iters[1:]):.0f} on average"
+      f" (max {max(iters[1:])}) with warm starts")
+```
+
+Both controllers push with the full 4 N, but the clipped LQR overshoots by 30 cm. Its gain was designed assuming it could always brake as hard as needed; by the time it starts braking at 4 N, the cart is going too fast. MPC sees the 4 N limit in its predictions and starts braking early enough, overshooting by only 4 cm and settling half a second sooner.
+
+<Narrator who="margaret">
+
+The iteration counts tell the practical story. From a cold start, with a Hessian whose condition number is about 4,900, the first solve took 1,280 iterations. Every later solve started from the previous plan shifted by one step and needed 13 on average. Each iteration here is essentially one 40 × 40 matrix–vector product, 1,600 multiply–adds, so a typical warm-started solve is about 20,000 operations: tens of microseconds in compiled code on a modern processor, a tiny fraction of the 50 ms control period.
+
+</Narrator>
+
+Box constraints on the inputs are the easy case. Limits on states (the cart must not pass the end of its rail, a joint must stay within its range) become general linear inequalities $G U \le h$ on the condensed variables, and projection onto them is no longer a simple clip. Practical solvers handle them with active-set, interior-point or splitting methods (next section). Often they are made **soft**: the constraint may be violated, but at a high price in the cost, so that the QP always has a solution even after a disturbance has pushed the state somewhere no feasible plan exists.
+
+</Section>
+
+<Section id="car" kind="examples" title="Example: a car-like robot changing lanes">
+
+MPC's second strength is **preview**: if the controller knows the future reference, its cost can charge for future errors, and it will act before they happen. A car-like robot (wheelbase 0.5 m) drives along a warehouse corridor at 2 m/s and must move 1 m sideways into the next lane, which begins at $x = 6$ m. Its steering is limited to $\pm 0.3$ rad. Both controllers use the same model, linearised about straight driving: the lateral offset $y$ and heading $\psi$ obey $\dot y = v\psi$ and $\dot\psi = (v/\ell)\,\delta$ for steering angle $\delta$ (the kinematic bicycle of <LessonLink slug="wheeled-robots">the wheeled-robots lesson</LessonLink>, linearised). The simulation itself runs the full nonlinear bicycle model at 10 Hz. The clipped LQR tracks the lane centre at its current position; MPC tracks the lane centre at each point it will reach over the next 2 s.
+
+```python run
+import numpy as np
+
+# A car-like robot (wheelbase 0.5 m) driving at 2 m/s along a corridor must shift 1 m sideways
+# into the next lane, which starts at x = 6 m. Steering is limited to |delta| <= 0.3 rad.
+V, WB, T, D_MAX, N = 2.0, 0.5, 0.1, 0.3, 20      # speed, wheelbase, step (10 Hz), limit, 2 s ahead
+
+def bicycle(s, delta):
+    """Nonlinear kinematic bicycle, s = [x, y, heading], integrated over one step in 10 parts."""
+    x, y, h = s
+    for _ in range(10):
+        x += T / 10 * V * np.cos(h)
+        y += T / 10 * V * np.sin(h)
+        h += T / 10 * V * np.tan(delta) / WB
+    return np.array([x, y, h])
+
+# Linearised about driving straight: z = [y, heading], z+ = A z + B delta
+A = np.array([[1.0, V * T], [0.0, 1.0]])
+B = np.array([[V * V * T * T / (2 * WB)], [V * T / WB]])
+Q, R = np.diag([10.0, 1.0]), np.array([[1.0]])
+
+P = Q.copy()
+for _ in range(5000):
+    K = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
+    P = Q + A.T @ P @ (A - B @ K)
+
+Phi = np.vstack([np.linalg.matrix_power(A, i + 1) for i in range(N)])
+Gamma = np.zeros((2 * N, N))
+for i in range(N):
+    for j in range(i + 1):
+        Gamma[2 * i:2 * i + 2, j:j + 1] = np.linalg.matrix_power(A, i - j) @ B
+Qbar = np.kron(np.eye(N), Q); Qbar[-2:, -2:] = P
+H = 2 * (Gamma.T @ Qbar @ Gamma + R[0, 0] * np.eye(N))
+L = np.linalg.eigvalsh(H).max()
+
+def lane(x):
+    return 1.0 if x >= 6.0 else 0.0
+
+def mpc(s, U):
+    """Track the lane centre the car will reach at each future step (it knows the map)."""
+    ref = np.concatenate([[lane(s[0] + V * T * (k + 1)), 0.0] for k in range(N)])
+    f = 2 * Gamma.T @ Qbar @ (Phi @ s[1:] - ref)
+    U = np.append(U[1:], U[-1])                     # warm start
+    Y, t = U.copy(), 1.0
+    for _ in range(2000):                           # accelerated projected gradient
+        U_new = np.clip(Y - (H @ Y + f) / L, -D_MAX, D_MAX)
+        t_new = 0.5 * (1 + np.sqrt(1 + 4 * t * t))
+        Y = U_new + (t - 1) / t_new * (U_new - U)
+        if np.abs(U_new - U).max() < 1e-5:
+            break
+        U, t = U_new, t_new
+    return U_new[0], U_new
+
+def lqr(s, U):
+    z = s[1:] - np.array([lane(s[0]), 0.0])         # error from the current lane centre
+    return float(np.clip(-(K @ z)[0], -D_MAX, D_MAX)), U
+
+print(f"{'controller':12} {'starts turning at x':>20} {'overshoot':>10} {'in the lane (5 cm) at x':>24} {'peak steer':>11}")
+plots = {}
+for name, ctrl in [("clipped LQR", lqr), ("MPC", mpc)]:
+    s, U, path = np.array([0.0, 0.0, 0.0]), np.zeros(N), []
+    while s[0] < 14.0:
+        delta, U = ctrl(s, U)
+        path.append((s[0], s[1], delta))
+        s = bicycle(s, delta)
+    path = np.array(path)
+    start = path[np.nonzero(np.abs(path[:, 2]) > 0.01)[0][0], 0]
+    settled = path[np.nonzero(np.abs(path[:, 1] - 1.0) > 0.05)[0][-1] + 1, 0]
+    print(f"{name:12} {start:17.1f} m {max(path[:, 1].max() - 1.0, 0) * 100:8.1f} cm {settled:21.1f} m"
+          f" {np.abs(path[:, 2]).max():8.2f} rad")
+    plots[name] = path[::2]
+
+print("\n  y (m)  lane centre '-', path '*', x from 0 to 14 m")
+for name, cols in plots.items():
+    print(f"  {name}")
+    for level in [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]:
+        row = "".join("*" if abs(y - level) < 0.1 else ("-" if abs(lane(x) - level) < 0.1 else " ")
+                      for x, y, _ in cols)
+        print(f"  {level:4.1f}  {row}")
+```
+
+MPC starts steering at 4.2 m, almost two metres before the new lane begins, and is centred in it by 6.9 m. The clipped LQR cannot see the step coming: it starts turning only when it is already 1 m off its new lane centre, saturates the steering, overshoots, and is in the lane only by 8.1 m.
+
+<Narrator who="gideon">
+
+MPC "cut the corner" because nothing told it not to: its cost rewards being near each future lane centre, and moving early lowers that cost. If the new lane is blocked until $x = 6$ m, the cost is the wrong tool; add a state constraint ($y \le 0.1$ m while $x < 6$ m), and the solver will plan a sharper but legal manoeuvre, or report that none exists. Note also that the linear model assumed a small heading angle; for large manoeuvres, MPC is usually done with a model relinearised along the predicted path, or with a fully nonlinear model.
+
+</Narrator>
+
+</Section>
+
+<Section id="theory" kind="human" title="Stability, feasibility and robustness">
+
+An optimiser that re-plans every step is not automatically stable. With a short horizon and no terminal cost, MPC can be myopic: each plan looks fine over its window, but the sequence of first moves drives the system somewhere bad, or into a state from which no plan satisfies the constraints. The theory developed in the 1990s and summarised by Mayne, Rawlings, Rao and Scokaert in 2000 gives a recipe:
+
+- a **terminal cost** $x_N^\top P x_N$ that bounds the cost-to-go beyond the horizon (the LQR's $P$ is the natural choice), and
+- a **terminal set** $x_N \in \mathcal{X}_f$, a region around the target in which the LQR alone would satisfy all constraints forever.
+
+With both, the optimal cost decreases from one step to the next, so it acts as a Lyapunov function (closed-loop stability), and a plan that was feasible at one step, shifted and extended by the LQR, remains feasible at the next (**recursive feasibility**). In practice many robot MPCs use only the terminal cost, a horizon long enough that it rarely matters, and soft state constraints. Disturbances and model errors break the guarantees, and **robust** variants handle them: tube MPC keeps the real state within a tube around the nominal plan by an extra feedback law, and stochastic MPC uses chance constraints.
+
+</Section>
+
+<Section id="computation" kind="human" title="Computational cost and real-time solvers">
+
+The price of MPC is solving an optimisation problem every control period. Its size grows with the horizon $N$, the number of states $n$ and inputs $m$:
+
+- **Condensed** QPs have $Nm$ variables but a dense Hessian; building and factorising it costs about $O(N^3 m^3)$, fine for small problems like ours.
+- **Sparse** formulations keep the states as variables too ($N(n + m)$ of them) with the dynamics as equality constraints. The matrices are block-banded, and structure-exploiting solvers (Riccati-based interior-point methods such as those in HPIPM) cost only $O(N(n + m)^3)$, linear in the horizon.
+
+Solver families each have their niche. **Active-set** solvers (qpOASES) are fast when the set of active constraints changes little between steps. **Interior-point** solvers (HPIPM) have predictable iteration counts. **Operator-splitting** methods such as [OSQP](https://osqp.org/) use cheap iterations, warm-start well and generate embedded C code. For nonlinear models, [acados](https://docs.acados.org/) implements the **real-time iteration** scheme of Moritz Diehl and colleagues: rather than solving each nonlinear problem to convergence, perform one quadratic approximation per control step, warm-started from the last, which tracks the optimum closely when the sampling is fast. [CasADi](https://web.casadi.org/) and [Drake](https://drake.mit.edu/) are widely used to formulate such problems. Commercial embedded solvers exist too, such as Embotech's FORCESPRO from Switzerland. At the other extreme, **explicit MPC** (Bemporad, Morari, Dua and Pistikopoulos, 2002) solves the QP offline for every possible state: the solution is piecewise affine over polyhedral regions, so the online controller is a lookup, practical for a handful of states.
+
+Our cart QP set up for a real solver looks like this. The sketch uses the [OSQP](https://osqp.org/) Python interface and is not run here (it needs packages this page does not have); check the documentation of the version you install.
+
+```python
+# Not run here: the cart's QP passed to OSQP (pip install osqp scipy).
+import numpy as np
+import osqp
+from scipy import sparse
+
+solver = osqp.OSQP()
+solver.setup(P=sparse.csc_matrix(H), q=F @ x0,                 # cost 1/2 U'HU + q'U
+             A=sparse.identity(N, format="csc"),                # constraint rows: U itself
+             l=-U_MAX * np.ones(N), u=U_MAX * np.ones(N),       # -U_MAX <= U <= U_MAX
+             verbose=False)                                     # warm starts by default
+while robot_is_running():
+    x = measure_state()
+    solver.update(q=F @ x)                                      # only the linear term changes
+    u0 = solver.solve().x[0]                                    # apply the first input only
+    apply_force(u0)
+```
+
+</Section>
+
+<Section id="where" kind="human" title="Where MPC runs today">
+
+- **Process industry.** MPC was born in refineries and chemical plants in the 1970s (Jacques Richalet's IDCOM in France, Charles Cutler and Brian Ramaker's dynamic matrix control at Shell in the United States), where it still runs thousands of multivariable units, with control periods of seconds to minutes.
+- **Legged robots.** In 2018 the MIT Cheetah 3 team showed that a small convex QP over a single-rigid-body model, choosing ground-reaction forces within friction cones, could control dynamic gaits in real time. Variants of this "convex MPC" and nonlinear whole-body MPC (for example ETH Zürich's [OCS2](https://github.com/leggedrobotics/ocs2) on ANYmal and mobile manipulators) are widely used in research. As of 2026 many commercial quadrupeds and humanoids rely mainly on reinforcement-learned policies for locomotion (see <LessonLink slug="reinforcement-learning-for-robots">the RL lesson</LessonLink>), while MPC remains common in research systems, for planning, and as a teacher whose behaviour learned policies imitate.
+- **Autonomous vehicles.** Lateral and longitudinal control with MPC is standard in research platforms and appears in open-source stacks such as Autoware; the constraints are steering and acceleration limits, comfort bounds and road boundaries. Sampling-based variants such as MPPI (model predictive path integral control), which evaluate thousands of random input sequences on a GPU, drive off-road and racing vehicles; <LessonLink slug="autonomous-vehicles">the autonomous-vehicles lesson</LessonLink> returns to this.
+- **Drones.** Nonlinear MPC on full quadrotor models flies agile and racing trajectories, respecting motor thrust limits, in research groups such as the University of Zurich's Robotics and Perception Group; <LessonLink slug="aerial-robots">aerial robots</LessonLink> covers the vehicle side.
+- **Manipulators.** MPC is used for constrained motion near obstacles and joint limits, and increasingly with learned dynamics models for contact-rich tasks; the Planning level's <LessonLink slug="trajectory-optimisation">trajectory optimisation</LessonLink> lesson develops the nonlinear optimisation behind it.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"MPC is LQR with the output clipped."** Clipping changes the command *after* it is chosen, without telling the controller. MPC chooses the command *knowing* the limit will hold in every future step, which is why it brakes in time. Without active constraints and with the right terminal cost they coincide; with active constraints they can behave very differently.
+
+</Misconception>
+
+<Misconception>
+
+**"A longer horizon is always better."** A longer horizon sees further and makes the terminal cost matter less, but it costs computation, and predictions far ahead are less accurate because model errors compound. With a good terminal cost, a moderate horizon is often as good as a long one.
+
+</Misconception>
+
+<Misconception>
+
+**"MPC guarantees the robot never violates its constraints."** It guarantees the *predictions* satisfy them. A wrong model, an unmeasured disturbance or a solver stopped early can let the real robot violate them. Margins, soft constraints with tight penalties, robust MPC and independent safety layers (hardware limits, safety-rated monitoring) cover that gap.
+
+</Misconception>
+
+<Misconception>
+
+**"MPC is too slow for fast robots."** Small QPs solve in microseconds to a millisecond with structure-exploiting, warm-started solvers, fast enough for 1 kHz loops in some applications. The usual design runs MPC at tens to hundreds of hertz and lets a faster inner loop (the cascades of the PID lesson, or an impedance controller) track its plan.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

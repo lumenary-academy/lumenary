@@ -1,0 +1,662 @@
+---
+title: ROS 2 and robot software
+subtitle: Many programs, many clocks, real hardware. How robot software is organised into nodes that talk through topics, services and actions, and how teams log, replay and test it.
+minutes: 70
+objectives:
+  - Explain why robot software is hard to build (concurrency, timing, many processes, real hardware) and how a publish–subscribe graph helps
+  - Use ROS 2's vocabulary precisely, nodes, topics, services, actions, parameters, launch files and tf2, and choose the right pattern for a given exchange
+  - Choose quality-of-service settings (reliability, durability, history and depth) for a stream, and predict when a publisher and a subscriber cannot connect
+  - Simulate an executor, a keep-last queue and a time-stamped transform tree, and measure the cost of a slow callback or a transform looked up at the wrong time
+  - Record and replay data with bags, and build regression tests for robot software on top of them
+  - Place ROS 2 among other robot software frameworks and middlewares
+narrators: [chloe, margaret, gideon]
+prerequisites: [frames-and-transforms, feedback-and-pid, task-planning-and-behaviour-trees]
+related: [math.discrete.graph-theory]
+references:
+  - title: "Robot Operating System 2: Design, architecture, and uses in the wild"
+    author: Steven Macenski, Tully Foote, Brian Gerkey, Chris Lalancette and William Woodall
+    year: 2022
+    url: https://doi.org/10.1126/scirobotics.abm6074
+    note: The design of ROS 2 and why it moved to DDS, by people who built it.
+  - title: ROS 2 documentation
+    url: https://docs.ros.org/en/jazzy/
+    note: Tutorials and concept guides for nodes, topics, services, actions, parameters, launch, quality of service and tf2.
+  - title: "REP 2000: ROS 2 Releases and Target Platforms"
+    url: https://www.ros.org/reps/rep-2000.html
+    note: Which ROS 2 distributions exist, which are long-term support, and when each reaches end of life.
+  - title: ROS 2 design articles
+    url: https://design.ros2.org/
+    note: The original design discussions, including quality of service, actions and the middleware interface.
+  - title: Data Distribution Service (DDS), Object Management Group
+    url: https://www.omg.org/spec/DDS/
+    note: The publish–subscribe standard underneath most ROS 2 installations.
+  - title: Eclipse Zenoh
+    url: https://zenoh.io/
+    note: A newer publish–subscribe protocol, usable as an alternative ROS 2 middleware.
+  - title: MCAP
+    url: https://mcap.dev/
+    note: The open log file format used by ROS 2 bags.
+  - title: ros2_control
+    url: https://control.ros.org/
+    note: The ROS 2 framework for hardware interfaces and real-time controllers.
+  - title: micro-ROS
+    url: https://micro.ros.org/
+    note: ROS 2 concepts on microcontrollers.
+---
+
+<Section id="motivation" kind="motivation" title="Why robot software is hard">
+
+Picture a delivery robot in a hospital in Seoul. In one second, its lidar produces 20 scans; its two cameras produce 60 images; its inertial measurement unit (IMU) produces 400 readings; its wheel encoders are read 1,000 times; its localiser corrects its position 10 times; its planner rethinks the route once or twice; and somewhere a nurse presses "go to ward 7" on a tablet. Every one of these streams is produced by a different piece of code, often written by a different team, sometimes running on a different computer, and each one has its own clock, its own rate and its own way of failing.
+
+Ordinary programs mostly do one thing at a time and wait politely for input. Robot software cannot. Four things make it hard:
+
+- **Concurrency.** Dozens of activities happen at once and share data: the controller reads the pose that the localiser is in the middle of updating.
+- **Timing.** A correct answer delivered late is a wrong answer. A wheel command that arrives 200 ms late is a command for a robot that has already moved.
+- **Many processes.** Drivers, estimators, planners and user interfaces are separate programs, so that one can crash or be restarted without taking down the rest, and so that they can run on different processors.
+- **Hardware.** Sensors unplug, give garbage, saturate in sunlight; motors overheat; batteries sag. Software must notice and degrade safely, and it can only be fully tested on a machine that can break things.
+
+**Robot middleware** is the layer that lets many programs exchange time-stamped data in a disciplined way, and **ROS 2**, the second generation of the open-source Robot Operating System, is the middleware and tool collection that most research robots and many commercial ones use as of 2026. This lesson teaches its model, simulates the parts that matter in plain Python so that you can see them work, and ends with the professional habits that make robot software trustworthy: logging, replay and testing.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="A graph of small programs">
+
+The central idea is old and simple: split the robot's software into many small programs, each doing one job, and connect them by named streams of messages. A lidar driver does not know or care who uses its scans; it publishes them on a stream called `/scan`. The localiser, the obstacle detector and a person's visualisation tool each subscribe to `/scan`. Anyone can add a fourth listener without changing the driver.
+
+<Analogy>
+
+Think of a radio station. The station broadcasts on a frequency without knowing who is listening; any number of radios can tune in, and a radio switched on late simply hears what is being broadcast from then on. A phone call is different: you ask one person a question and wait for the answer. And ordering a meal for delivery is different again: you place the order, it is accepted, you get progress updates ("your food is on its way"), you can cancel, and eventually it arrives or it doesn't. ROS 2 has all three: topics, services and actions.
+
+</Analogy>
+
+<Figure caption="A small ROS 2 computation graph for a mobile robot. Boxes are nodes (programs); rounded labels are topics. The lidar driver publishes /scan, which two nodes subscribe to; the controller publishes /cmd_vel to the motor driver. The dashed arrow is an action: a tablet app asks the navigator to go to a goal and receives feedback.">
+<svg viewBox="0 0 460 260" role="img" aria-label="A computation graph. On the left, a lidar driver node and a wheel odometry node. The lidar driver publishes the topic slash scan, which goes to a localiser node and to an obstacle detector node. The wheel odometry node publishes slash odom to the localiser. The localiser publishes slash tf. The navigator node uses slash tf and the detector's output and publishes slash cmd_vel to the motor driver node. A tablet app node is connected to the navigator by a dashed arrow labelled navigate_to_pose action.">
+  <defs>
+    <marker id="ros-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.5" stroke="currentColor" strokeWidth="1.3">
+    <rect x="10" y="40" width="90" height="30" rx="3" />
+    <rect x="10" y="170" width="90" height="30" rx="3" />
+    <rect x="200" y="30" width="90" height="30" rx="3" />
+    <rect x="200" y="110" width="90" height="30" rx="3" />
+    <rect x="200" y="200" width="90" height="30" rx="3" />
+    <rect x="360" y="110" width="90" height="30" rx="3" />
+    <rect x="360" y="200" width="90" height="30" rx="3" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1">
+    <rect x="120" y="70" width="56" height="22" rx="11" />
+    <rect x="120" y="160" width="56" height="22" rx="11" />
+    <rect x="300" y="72" width="44" height="22" rx="11" />
+    <rect x="370" y="160" width="70" height="22" rx="11" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#ros-arrow)">
+    <line x1="100" y1="58" x2="120" y2="78" />
+    <line x1="176" y1="78" x2="200" y2="50" />
+    <line x1="176" y1="84" x2="200" y2="120" />
+    <line x1="100" y1="182" x2="120" y2="174" />
+    <path d="M 176 171 L 192 171 L 192 46 L 198 46" />
+    <line x1="245" y1="60" x2="306" y2="74" />
+    <line x1="290" y1="125" x2="358" y2="125" />
+    <line x1="322" y1="94" x2="380" y2="110" />
+    <line x1="405" y1="140" x2="405" y2="158" />
+    <line x1="405" y1="182" x2="405" y2="198" />
+  </g>
+  <line x1="290" y1="215" x2="358" y2="135" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" markerEnd="url(#ros-arrow)" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="55" y="59">lidar driver</text>
+    <text x="55" y="189">wheel odometry</text>
+    <text x="245" y="49">localiser</text>
+    <text x="245" y="129">obstacle detector</text>
+    <text x="245" y="219">tablet app</text>
+    <text x="405" y="129">navigator</text>
+    <text x="405" y="219">motor driver</text>
+  </g>
+  <g fill="currentColor" fontFamily="var(--font-mono)" fontSize="10" textAnchor="middle">
+    <text x="148" y="85">/scan</text>
+    <text x="148" y="175">/odom</text>
+    <text x="322" y="87">/tf</text>
+    <text x="405" y="175">/cmd_vel</text>
+    <text x="300" y="250">navigate_to_pose (action)</text>
+  </g>
+</svg>
+</Figure>
+
+The picture is a directed graph with two kinds of vertex, programs and streams, and edges only between the two kinds. Tools such as `rqt_graph` draw exactly this picture from a running system, and reading it is the first thing an engineer does when a robot misbehaves: which node is not publishing, which subscriber is listening to the wrong name?
+
+<Narrator who="chloe">
+
+The design choice hiding here is **decoupling in space and time**. A publisher does not name its receivers, so nodes can be added, removed or moved to another computer without editing the others; and with the right settings a late-joining subscriber can still receive the last message, so nodes need not start in a particular order. Nearly every feature of ROS 2 is a way of buying that decoupling while keeping control over timing.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The ROS 2 vocabulary">
+
+<Definition term="Node">
+
+A **node** is a participant in the computation graph with a name, such as `/lidar_driver`: usually one module of functionality inside a process. It owns publishers, subscriptions, service servers and clients, action servers and clients, timers and parameters. Several nodes may share a process (to avoid copying data between them) or each have their own (to isolate crashes).
+
+</Definition>
+
+<Definition term="Topic and message">
+
+A **topic** is a named, typed, many-to-many stream: any number of publishers and subscribers, all using one **message type** such as `sensor_msgs/msg/LaserScan` or `geometry_msgs/msg/Twist`. Message types are declared in small interface files and compiled into C++, Python and other languages, so a Python node and a C++ node agree on the bytes. Most sensor messages carry a **header** with a timestamp and a `frame_id`, the tf2 frame the data is expressed in.
+
+</Definition>
+
+<Definition term="Service">
+
+A **service** is a named request–response pair: a client sends one request and one server returns one response, for example "save the current map to a file" or "switch the gripper off". Services are for short, occasional exchanges, not for streams, and a client should not block a callback while it waits.
+
+</Definition>
+
+<Definition term="Action">
+
+An **action** is a named, long-running, pre-emptible goal: the client sends a **goal**, the server accepts or rejects it, streams **feedback** while it works, and finally returns a **result**; the client may **cancel** at any time. "Navigate to this pose", "follow this arm trajectory" and "dock to the charger" are actions. Under the hood an action is built from services (send goal, cancel, get result) and topics (feedback, status).
+
+</Definition>
+
+<Definition term="Parameter, launch file and tf2">
+
+A **parameter** is a named, typed setting that belongs to a node (a gain, a frame name, a topic rate), set at start-up from a YAML file and changeable at run time through services. A **launch file** (written in Python, XML or YAML) starts a set of nodes with their parameters and **remappings** (renaming a topic for one node, so that a generic driver's `scan` becomes this robot's `front/scan`). **tf2**, met in <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>, is the library that keeps the tree of time-stamped transforms, published on the topics `/tf` and `/tf_static`.
+
+</Definition>
+
+<Figure caption="The three communication patterns as message sequences over time, read top to bottom. A topic is a stream with no reply; a service is one request and one response; an action is a goal that is accepted, reports feedback while it runs, and ends in a result (or a cancellation).">
+<svg viewBox="0 0 460 230" role="img" aria-label="Three timelines side by side. Topic: a publisher sends four messages to a subscriber over time, with no replies. Service: a client sends a request and later the server sends one response. Action: a client sends a goal, the server replies accepted, then sends three feedback messages, then a result.">
+  <defs>
+    <marker id="ros-seq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1" strokeDasharray="3 3">
+    <line x1="30" y1="40" x2="30" y2="220" />
+    <line x1="120" y1="40" x2="120" y2="220" />
+    <line x1="180" y1="40" x2="180" y2="220" />
+    <line x1="270" y1="40" x2="270" y2="220" />
+    <line x1="330" y1="40" x2="330" y2="220" />
+    <line x1="430" y1="40" x2="430" y2="220" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.3" markerEnd="url(#ros-seq)">
+    <line x1="30" y1="60" x2="118" y2="64" />
+    <line x1="30" y1="100" x2="118" y2="104" />
+    <line x1="30" y1="140" x2="118" y2="144" />
+    <line x1="30" y1="180" x2="118" y2="184" />
+    <line x1="180" y1="70" x2="268" y2="76" />
+    <line x1="270" y1="150" x2="182" y2="156" />
+    <line x1="330" y1="56" x2="428" y2="60" />
+    <line x1="430" y1="76" x2="332" y2="80" />
+    <line x1="430" y1="106" x2="332" y2="110" />
+    <line x1="430" y1="136" x2="332" y2="140" />
+    <line x1="430" y1="166" x2="332" y2="170" />
+    <line x1="430" y1="200" x2="332" y2="204" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="75" y="16" fontWeight="bold">Topic</text>
+    <text x="225" y="16" fontWeight="bold">Service</text>
+    <text x="380" y="16" fontWeight="bold">Action</text>
+    <text x="30" y="34">pub</text>
+    <text x="120" y="34">sub</text>
+    <text x="180" y="34">client</text>
+    <text x="270" y="34">server</text>
+    <text x="330" y="34">client</text>
+    <text x="430" y="34">server</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="75" y="56">message</text>
+    <text x="225" y="66">request</text>
+    <text x="225" y="146">response</text>
+    <text x="380" y="52">goal</text>
+    <text x="380" y="74">accepted</text>
+    <text x="380" y="104">feedback</text>
+    <text x="380" y="134">feedback</text>
+    <text x="380" y="164">feedback</text>
+    <text x="380" y="198">result</text>
+  </g>
+</svg>
+</Figure>
+
+### DDS and quality of service
+
+ROS 2 does not move bytes itself. Underneath sits a pluggable **middleware**, chosen through the ROS middleware interface (`rmw`). The default family is **DDS**, the Data Distribution Service, an Object Management Group standard from the 2000s used in defence, aerospace and industrial systems. DDS brings three things ROS 1 had to invent for itself: **discovery** (nodes find each other on the network without a central master), a standard wire protocol (RTPS), and **quality of service** (QoS) policies. Several implementations are supported, among them eProsima's Fast DDS (Spain, the default in recent releases), Eclipse Cyclone DDS and RTI Connext (United States); Eclipse Zenoh, a newer protocol developed largely in France, is also available as an alternative middleware. You can switch with one environment variable, `RMW_IMPLEMENTATION`, and the nodes' code does not change.
+
+<Definition term="Quality of service (QoS)">
+
+The QoS policies of a publisher or subscription describe how messages are delivered. The four that matter most:
+
+- **Reliability.** *Reliable*: lost packets are re-sent until they arrive (or the queue overflows). *Best effort*: send once; a lost message is gone.
+- **Durability.** *Volatile*: a late subscriber gets only messages published after it joined. *Transient local*: the publisher keeps its last messages and hands them to late joiners.
+- **History and depth.** *Keep last N*: hold at most $N$ unsent or unprocessed messages, discarding the oldest when full. *Keep all*: hold everything, limited only by resources.
+- **Deadline, lifespan and liveliness**: the longest allowed gap between messages, the age after which a message is discarded, and how a publisher proves it is still alive.
+
+</Definition>
+
+The choices follow from the data. A camera or lidar stream wants **best effort, keep last 1–5**: a lost image is better replaced by the next one than re-sent late, and ROS 2 ships a ready-made `qos_profile_sensor_data` for exactly this. A map, published once, wants **reliable, transient local**, so that a visualiser started ten minutes later still receives it. A stream of commands to a motor wants reliable delivery with a short queue and a **deadline**, so that silence is detected rather than mistaken for "keep going".
+
+<Narrator who="gideon">
+
+QoS settings must be **compatible**, and incompatibility fails quietly. A subscription that requests *reliable* cannot be served by a *best-effort* publisher, and one that requests *transient local* cannot be served by a *volatile* publisher: the two simply never connect. The subscriber's callback is never called; the only sign is one warning line in the log, easy to miss among hundreds (`ros2 topic info --verbose` prints each side's profile). The reverse combinations are fine, because the publisher offers at least what was requested.
+
+</Narrator>
+
+</Section>
+
+<Section id="rclpy" kind="examples" title="What ROS 2 code looks like">
+
+Here is a complete node in Python with `rclpy`, ROS 2's Python client library. It is a **speed limiter**: it passes an operator's speed command through to the wheels, but never faster than the nearest obstacle allows, and it refuses to move until it has seen a scan. The C++ library, `rclcpp`, has the same shape.
+
+```python
+# ROS 2 (rclpy) code: shown for reading, not run here (it needs a ROS 2 installation).
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+class SpeedLimiter(Node):
+    def __init__(self):
+        super().__init__("speed_limiter")
+        self.declare_parameter("stop_at", 0.5)          # metres; set from YAML or a launch file
+        self.declare_parameter("gain", 0.8)             # (m/s) per metre of free space
+        self.nearest = None                             # no scan yet: do not move
+        self.create_subscription(LaserScan, "scan", self.on_scan, qos_profile_sensor_data)
+        self.create_subscription(Twist, "cmd_vel_in", self.on_cmd, 10)   # reliable, keep last 10
+        self.pub = self.create_publisher(Twist, "cmd_vel", 10)
+
+    def on_scan(self, msg):
+        valid = [r for r in msg.ranges if msg.range_min <= r <= msg.range_max]
+        self.nearest = min(valid) if valid else msg.range_max
+
+    def on_cmd(self, msg):
+        stop_at = self.get_parameter("stop_at").value
+        gain = self.get_parameter("gain").value
+        out = Twist()
+        if self.nearest is not None:
+            out.linear.x = min(msg.linear.x, max(0.0, gain * (self.nearest - stop_at)))
+            out.angular.z = msg.angular.z
+        self.pub.publish(out)
+
+def main():
+    rclpy.init()
+    rclpy.spin(SpeedLimiter())                          # the executor: runs callbacks as data arrives
+    rclpy.shutdown()
+```
+
+Notice what is *not* there: no sockets, no threads, no knowledge of who sends `cmd_vel_in` or who reads `cmd_vel`. A launch file wires it into a particular robot, renaming its topics and setting its parameters, and also publishes the lidar's fixed mounting transform:
+
+```python
+# A ROS 2 launch file (Python): not run here.
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(package="my_robot", executable="speed_limiter",
+             parameters=[{"stop_at": 0.6}],
+             remappings=[("cmd_vel_in", "teleop/cmd_vel"), ("scan", "front/scan")]),
+        Node(package="tf2_ros", executable="static_transform_publisher",
+             arguments=["--x", "0.2", "--frame-id", "base_link", "--child-frame-id", "front_laser"]),
+    ])
+```
+
+An action client, here asking the [Nav2](https://github.com/ros-navigation/navigation2) navigation stack to drive to a point on the map, shows the goal–feedback–result pattern. (Inside, Nav2's navigator is itself a behaviour tree of the kind met in <LessonLink slug="task-planning-and-behaviour-trees">Task planning and behaviour trees</LessonLink>, whose leaves call other actions and services.)
+
+```python
+# rclpy action client for Nav2: not run here.
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+
+client = ActionClient(node, NavigateToPose, "navigate_to_pose")
+goal = NavigateToPose.Goal()
+goal.pose.header.frame_id = "map"
+goal.pose.pose.position.x, goal.pose.pose.position.y = 4.0, 1.5
+goal.pose.pose.orientation.w = 1.0                       # quaternion (w, x, y, z) = (1, 0, 0, 0): facing +x
+client.wait_for_server()
+future = client.send_goal_async(
+    goal, feedback_callback=lambda fb: node.get_logger().info(f"{fb.feedback.distance_remaining:.1f} m to go"))
+```
+
+Day to day, engineers live in the command line: `ros2 node list`, `ros2 topic echo /scan`, `ros2 topic hz /scan` (is it really 20 Hz?), `ros2 param set /speed_limiter stop_at 0.7`, `ros2 action send_goal`, and `ros2 run tf2_tools view_frames` to draw the tf tree.
+
+<Narrator who="margaret">
+
+Bandwidth decides architecture more often than elegance does. One uncompressed 1920×1080 colour image is $1920 \times 1080 \times 3 \approx 6.2$ MB; at 30 frames per second that is about 187 MB/s, or 1.5 Gbit/s, more than a gigabit Ethernet link can carry. So camera drivers and image processors are put in the **same process**, where ROS 2 can pass a pointer instead of copying bytes, and only compressed images or detections cross the network.
+
+</Narrator>
+
+</Section>
+
+<Section id="simulate-executor" kind="computation" title="Simulating an executor and a queue">
+
+Callbacks do not run by magic. Each process has an **executor**: a loop that waits for timers to fall due and messages to arrive, and then runs the matching callbacks. The default executor is **single-threaded**: one callback at a time, in the order the executor chooses. That is safe (no two callbacks race on shared data) but it means a slow callback delays everything behind it.
+
+The program below is a toy executor, small enough to read in a minute. One process hosts a **100 Hz control timer** (0.5 ms of work each time) and a **detector** subscribed to a 30 Hz camera, whose callback takes **50 ms**, longer than the 33 ms between frames. We try three set-ups: both in one executor with queue depth 1, the same with depth 10, and the detector moved to its own process.
+
+```python run
+from collections import deque
+
+class Subscription:
+    """A subscription with a keep-last queue of the given depth."""
+    def __init__(self, name, depth, cost):
+        self.name, self.cost = name, cost
+        self.queue = deque(maxlen=depth)
+        self.received = self.dropped = 0
+        self.ages = []                       # how old each message was when its callback finished
+
+    def deliver(self, stamp):
+        self.received += 1
+        if len(self.queue) == self.queue.maxlen:
+            self.dropped += 1                # keep-last: the oldest waiting message is discarded
+        self.queue.append(stamp)
+
+class Timer:
+    def __init__(self, name, period, cost):
+        self.name, self.period, self.cost = name, period, cost
+        self.next_due = period
+        self.lateness = []                   # start time minus due time, for every firing
+
+def run_executor(timers, subs, camera_period, duration):
+    """A single-threaded executor: one callback at a time; due timers first, then subscriptions."""
+    t, next_frame, frames = 0.0, 0.0, []
+    while t < duration:
+        while next_frame <= t:               # frames published (by another process) up to now
+            frames.append(next_frame)
+            next_frame += camera_period
+        for stamp in frames:
+            for s in subs:
+                s.deliver(stamp)
+        frames.clear()
+        due = [tm for tm in timers if tm.next_due <= t]
+        ready = [s for s in subs if s.queue]
+        if due:
+            tm = min(due, key=lambda x: x.next_due)
+            tm.lateness.append(t - tm.next_due)
+            tm.next_due += tm.period
+            while tm.next_due <= t:          # like ROS 2 timers, skip periods that were missed entirely
+                tm.next_due += tm.period
+            t += tm.cost
+        elif ready:
+            s = ready[0]
+            stamp = s.queue.popleft()
+            t += s.cost
+            s.ages.append(t - stamp)
+        else:                                # idle: jump to the next event
+            t = min([next_frame] + [tm.next_due for tm in timers])
+
+for title, together, depth in [("control and detector share one executor, depth 1", True, 1),
+                               ("control and detector share one executor, depth 10", True, 10),
+                               ("detector in its own process, depth 1", False, 1)]:
+    control = Timer("control 100 Hz", period=0.010, cost=0.0005)
+    detector = Subscription("detector on /image", depth=depth, cost=0.050)
+    if together:
+        run_executor([control], [detector], camera_period=1 / 30, duration=3.0)
+    else:
+        run_executor([control], [], camera_period=1 / 30, duration=3.0)
+        run_executor([], [detector], camera_period=1 / 30, duration=3.0)
+    late = [1000 * x for x in control.lateness]
+    print(title)
+    print(f"  control timer: ran {len(late)} times of 300, mean lateness {sum(late) / len(late):4.1f} ms, worst {max(late):4.1f} ms")
+    ages = [1000 * a for a in detector.ages]
+    print(f"  detector: {detector.received} frames in, {len(ages)} processed, {detector.dropped} dropped, "
+          f"mean age of a result {sum(ages) / len(ages):5.0f} ms, worst {max(ages):4.0f} ms")
+```
+
+Three lessons come out of three short tables.
+
+1. **Sharing an executor with slow work starves the control loop.** Sharing with the detector, the 100 Hz timer ran only 62 times in 3 s instead of 300, and up to 50 ms late: it gets a turn only between detector callbacks. A 100 Hz controller that actually runs at 20 Hz with 50 ms of jitter is a different, and possibly unstable, controller (<LessonLink slug="feedback-and-pid">Feedback and PID</LessonLink> showed what delay does to a loop). Moving the detector to its own process (or its own thread with a separate callback group) restored all 300 runs, exactly on time.
+2. **A slow consumer loses data whatever the queue depth.** The camera sent 90 frames and the detector can finish only 20 a second, so about 30 frames *must* be discarded. The queue only decides *which*.
+3. **A deeper queue makes results older, not better.** With depth 1 the detector always works on the newest frame and its results are on average 66 ms old. With depth 10 it works through a backlog of stale frames and its results are on average 316 ms old, with fewer frames dropped only because ten are still waiting at the end. For a robot, a detection a third of a second late is a detection of where the obstacle *was*.
+
+</Section>
+
+<Section id="simulate-tf" kind="computation" title="A transform tree with time">
+
+The second idea to make concrete is that transforms are **functions of time**. When the lidar driver stamps a scan at $t = 2.000$ s, the scan must be placed in the world using the robot's pose *at 2.000 s*, even if the code gets round to it later, when the robot has moved. tf2 stores a short history of every moving edge and interpolates between samples. Our toy version keeps each frame's parent, stores static edges as matrices and moving edges as stamped $(x, y, \theta)$ samples, and answers `lookup(target, source, t)` with ${}^{target}T_{source}$ at time $t$, walking both frames up to the root as in <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>.
+
+```python run
+import bisect
+import numpy as np
+
+def se2(x, y, th):
+    c, s = np.cos(th), np.sin(th)
+    return np.array([[c, -s, x], [s, c, y], [0, 0, 1.0]])
+
+class TfBuffer:
+    """A toy tf2: each frame has one parent; edges are static or a time series of (x, y, theta)."""
+    def __init__(self):
+        self.parent, self.static, self.series = {}, {}, {}
+
+    def set_static(self, parent, child, x, y, th):
+        self.parent[child], self.static[child] = parent, se2(x, y, th)
+
+    def set_dynamic(self, parent, child, stamp, x, y, th):
+        self.parent[child] = parent
+        self.series.setdefault(child, []).append((stamp, x, y, th))   # stamps arrive in order
+
+    def edge(self, child, t):
+        """parent_T_child at time t, interpolating between the two stamped samples around t."""
+        if child in self.static:
+            return self.static[child]
+        samples = self.series[child]
+        stamps = [s[0] for s in samples]
+        if not stamps[0] <= t <= stamps[-1]:
+            raise LookupError(f"extrapolation: {child} is known from {stamps[0]:.3f} to {stamps[-1]:.3f} s, asked {t:.3f} s")
+        i = max(1, bisect.bisect_left(stamps, t))
+        (t0, x0, y0, a0), (t1, x1, y1, a1) = samples[i - 1], samples[i]
+        u = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+        da = (a1 - a0 + np.pi) % (2 * np.pi) - np.pi                      # shortest way round
+        return se2(x0 + u * (x1 - x0), y0 + u * (y1 - y0), a0 + u * da)
+
+    def chain_to_root(self, frame, t):
+        """root_T_frame, and the list of frames from frame up to the root."""
+        T, path = np.eye(3), [frame]
+        while frame in self.parent:
+            T = self.edge(frame, t) @ T
+            frame = self.parent[frame]
+            path.append(frame)
+        return T, path
+
+    def lookup(self, target, source, t):
+        """target_T_source at time t (the pose of source expressed in target)."""
+        root_T_source, p1 = self.chain_to_root(source, t)
+        root_T_target, p2 = self.chain_to_root(target, t)
+        if p1[-1] != p2[-1]:
+            raise LookupError(f"{source} and {target} are not in one tree")
+        return np.linalg.inv(root_T_target) @ root_T_source
+
+# A robot drives a circle: 0.5 m/s forward while turning at 1 rad/s. Odometry is published at 50 Hz.
+tf = TfBuffer()
+tf.set_static("base_link", "laser", 0.20, 0.0, 0.0)          # lidar 20 cm ahead of the base
+for k in range(0, 151):                                        # t = 0.00 ... 3.00 s
+    t = k * 0.02
+    th = 1.0 * t
+    tf.set_dynamic("odom", "base_link", t, 0.5 * np.sin(th), 0.5 * (1 - np.cos(th)), th)
+
+# A scan stamped at t = 2.000 s sees a wall 4 m straight ahead of the lidar.
+# The detector gets round to it 80 ms later, at t = 2.080 s.
+p_laser = np.array([4.0, 0.0, 1.0])
+at_stamp = tf.lookup("odom", "laser", 2.000) @ p_laser
+latest = tf.lookup("odom", "laser", 2.080) @ p_laser
+print("wall point in odom, transform at the scan's stamp: ", at_stamp[:2].round(3))
+print("wall point in odom, latest transform (80 ms later):", latest[:2].round(3))
+print("error from using the wrong time: %.3f m" % np.linalg.norm(at_stamp[:2] - latest[:2]))
+print("interpolated between samples, t = 2.007 s:", (tf.lookup("odom", "laser", 2.007) @ p_laser)[:2].round(3))
+print("laser seen from odom vs odom seen from laser are inverses:",
+      np.allclose(tf.lookup("odom", "laser", 1.5) @ tf.lookup("laser", "odom", 1.5), np.eye(3)))
+try:
+    tf.lookup("odom", "laser", 3.05)
+except LookupError as err:
+    print("asking for the future ->", err)
+```
+
+Using the latest transform instead of the one at the scan's stamp misplaces the wall by **0.338 m**, though the code ran without complaint and the delay was only 80 ms. The robot was turning at 1 rad/s, so in 80 ms it turned 0.08 rad, and a point about 4.2 m from the turning centre swings by roughly $4.2 \times 0.08 \approx 0.34$ m. This is the same lever-arm effect as a mis-mounted sensor, now caused by time.
+
+The last line shows the honest failure: asked about a moment after its newest sample, the buffer refuses to extrapolate. Real tf2 behaves the same way (it raises an extrapolation exception), and the standard remedy is to wait briefly for the data rather than guess, which tf2 offers with a timeout argument and with message filters that hold a message until its transform is available.
+
+<Narrator who="gideon">
+
+Interpolating $x$, $y$ and $\theta$ separately is exact only if the robot moved in a straight line at constant rate between samples; on a curve it cuts the chord. At 50 Hz the samples are 2 cm and 0.02 rad apart and the error is negligible, but if odometry arrives at 5 Hz on a fast-turning robot it is not. Note also the angle difference is wrapped to $(-\pi, \pi]$ before interpolating: averaging $179°$ and $-179°$ naively gives $0°$, pointing exactly the wrong way.
+
+</Narrator>
+
+</Section>
+
+<Section id="bags" kind="computation" title="Logging, bags and replay">
+
+A robot's behaviour depends on data that will never come back: that afternoon's light, that person's walk, that wheel's slip. So robot engineers **record**. `ros2 bag record` subscribes to chosen topics (or all of them, `-a`) and writes every message with its timestamp to a **bag**, by default an [MCAP](https://mcap.dev/) file. `ros2 bag play` later publishes the same messages in the same order and, with `--clock`, also publishes the recorded time on `/clock`, so that nodes started with the parameter `use_sim_time:=true` believe it is that afternoon again. Bags are also how teams share bugs ("here is the 40-second bag where it hit the door"), build datasets, and look at a run in visualisers such as RViz, Foxglove or PlotJuggler.
+
+Alongside bags, every node writes **logs** through its logger (`get_logger().info(...)`, `warn`, `error`) with severity levels and timestamps; the logs are themselves published on the `/rosout` topic, so they can be recorded in the same bag as the data that caused them.
+
+Replay turns a recording into a **regression test**: feed the same bag to the old and new version of a node and compare the outputs message by message. The simulation below records a bag while an operator drives a robot towards a wall, replays it through the speed limiter of the previous section (rewritten without ROS), checks that replay is deterministic, and then catches a "harmless refactor".
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(7)
+
+# 1. Record a "bag" while an operator drives a robot by hand at 0.5 m/s towards a wall 2 m ahead.
+#    The speed command arrives at 20 Hz, the lidar's scans (nine beams ahead, 1 cm noise) at 10 Hz.
+bag = []
+for k in range(60):
+    t = round(k * 0.05, 3)
+    if k % 2 == 1:
+        ranges = 2.0 - 0.5 * t + rng.normal(0.0, 0.01, size=9)
+        bag.append((t, "/scan", ranges.round(3)))
+    bag.append((t, "/cmd_vel_in", 0.5))
+
+class SpeedLimiter:
+    """Pass the operator's speed through, but never faster than allowed by the nearest obstacle."""
+    def __init__(self, stop_at=0.5, gain=0.8, stop_until_first_scan=True):
+        self.stop_at, self.gain = stop_at, gain
+        self.nearest = None if stop_until_first_scan else float("inf")
+        self.out = []
+
+    def on_scan(self, t, ranges):
+        self.nearest = float(np.min(ranges))
+
+    def on_cmd(self, t, v):
+        if self.nearest is None:
+            limit = 0.0                                   # no scan yet: do not move
+        else:
+            limit = max(0.0, self.gain * (self.nearest - self.stop_at))
+        self.out.append((t, round(min(v, limit), 4)))
+
+def replay(bag, node):
+    """Feed recorded messages to a node in timestamp order, as `ros2 bag play` would with sim time."""
+    for t, topic, msg in sorted(bag, key=lambda m: m[0]):
+        if topic == "/scan":
+            node.on_scan(t, msg)
+        elif topic == "/cmd_vel_in":
+            node.on_cmd(t, msg)
+    return node.out
+
+golden = replay(bag, SpeedLimiter())
+print(f"bag: {len(bag)} messages, {bag[0][0]:.2f} s to {bag[-1][0]:.2f} s")
+for t, v in [golden[i] for i in (0, 1, 20, 40, 50, 59)]:
+    print(f"  t = {t:4.2f} s   /cmd_vel = {v:.4f} m/s")
+
+assert replay(bag, SpeedLimiter()) == golden, "replay must be deterministic"
+print("replaying twice gives identical output:", replay(bag, SpeedLimiter()) == golden)
+
+# 2. A "harmless refactor" drops the stop-until-first-scan rule. The regression test catches it.
+candidate = replay(bag, SpeedLimiter(stop_until_first_scan=False))
+diffs = [(a[0], a[1], b[1]) for a, b in zip(golden, candidate) if a != b]
+print(f"refactor changes {len(diffs)} of {len(golden)} commands; first at t = {diffs[0][0]:.2f} s: "
+      f"golden {diffs[0][1]} m/s, new {diffs[0][2]} m/s")
+```
+
+The limiter lets the operator's 0.5 m/s through while the wall is far away and then ramps the speed down, to 0.41 m/s at 2.0 s and almost nothing by 2.95 s, when the wall is about 0.53 m away. Replaying twice gives identical output, because the node depends only on the messages and their recorded timestamps, never on the wall clock. And the refactor, which initialised the nearest obstacle to "infinitely far" instead of "unknown", changes exactly **one** of 60 commands: the very first, sent before any scan had arrived, which becomes 0.5 m/s instead of 0. No unit test on typical data would notice; a replay test against a recording of start-up does.
+
+<Narrator who="gideon">
+
+Open-loop replay has a hard limit: the recorded world does not respond to the new code. If the new limiter had slowed the robot earlier, the recorded scans would still show the wall approaching at the old speed. Replay tests **perception and estimation** well and **closed-loop behaviour** badly; for that you need a simulator, the subject of the <LessonLink slug="simulation">next lesson</LessonLink>.
+
+</Narrator>
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view: testing, tools and other frameworks">
+
+### Testing robot software
+
+Professional teams test in layers, from cheap and fast to expensive and slow:
+
+1. **Unit tests** of pure logic, with `pytest` or GoogleTest, written so that the algorithm is separate from the ROS plumbing (as our `SpeedLimiter` class is).
+2. **Integration tests** that start several nodes with a launch file and check what they publish, using `launch_testing`; `colcon test` builds and runs them across a whole workspace.
+3. **Replay tests** on bags, as above, often with a library of recorded edge cases: start-up, sensor dropouts, sun glare, crowded corridors.
+4. **Simulation tests**, closed loop, run in continuous integration on every change (headless simulators are covered in the next lesson).
+5. **Hardware-in-the-loop** tests, where the real embedded controller talks to a simulated robot, and finally **field tests** on the real machine, at low speed first, with a person ready on the emergency stop.
+
+The open-source ROS build farm builds and tests released packages for each distribution, and most companies run the same tools in their own pipelines.
+
+### Real time and hardware
+
+Python nodes are excellent for logic, tools and prototypes, but not for a 1 kHz control loop: garbage collection and the interpreter make timing unpredictable. Fast loops live in C++ inside [ros2_control](https://control.ros.org/), which runs controllers in a dedicated real-time thread and talks to motors through hardware-interface plugins, or below ROS altogether on microcontrollers, as the <LessonLink slug="embedded-control-and-safety">lesson on embedded control</LessonLink> explains. [micro-ROS](https://micro.ros.org/) brings ROS 2's topics and services onto microcontrollers through a small agent; Lumenary EE's [microcontrollers](/en/ee/microcontrollers/) and [buses and interfaces](/en/ee/buses-and-interfaces/) cover the electronics on the other side of that link.
+
+### Releases
+
+ROS 2 publishes a new **distribution** every May. Even-year releases are long-term support with five years of updates (Humble Hawksbill from 2022, Jazzy Jalisco from 2024); odd-year releases are supported for about eighteen months. Check [REP 2000](https://www.ros.org/reps/rep-2000.html) for the current list before starting a project; most companies stay on one LTS distribution for years. The first generation, ROS 1, reached end of life with its last distribution, Noetic, in May 2025.
+
+### Other frameworks
+
+ROS 2 is the most common choice, not the only one, and robot software inside products is often a mixture.
+
+- **YARP**, from the Italian Institute of Technology, connects the software of the iCub humanoid and other research robots.
+- **OROCOS**, from KU Leuven in Belgium, is a toolchain for real-time control components, used inside industrial and research controllers.
+- **LCM**, from MIT's DARPA Urban Challenge team, is a minimal publish–subscribe library still used in legged-robot and driving research.
+- **Drake**, from MIT and Toyota Research Institute, builds robots as diagrams of connected systems with explicit state and time, which makes simulation and analysis precise.
+- In cars, **AUTOSAR** (an industry partnership) defines the software architecture of electronic control units; Baidu's open-source **Apollo** driving platform uses its own runtime, **Cyber RT**; and the open-source **Autoware** stack, which began at Nagoya University in Japan and is now stewarded by the Autoware Foundation, is built on ROS 2.
+- Newer projects such as **dora-rs**, a dataflow framework written in Rust, and NVIDIA's **Isaac ROS** packages, which move image processing onto GPUs inside ROS 2, aim at the data rates of learning-based robots.
+
+The concepts transfer: every framework has components, typed messages, some form of publish–subscribe and request–response, a clock, a transform tree, logs and replay. Learn the ideas once; the spelling changes.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"ROS is an operating system."** It runs *on* an operating system (usually Linux; also Windows and macOS with fewer packages). ROS 2 is middleware plus libraries, conventions and tools. It does not schedule processes, and by itself it does not make anything real-time.
+
+</Misconception>
+
+<Misconception>
+
+**"Publishing a message means it arrives."** With best-effort QoS it may be lost; with keep-last it may be discarded unread; with incompatible QoS it is never delivered at all. Design every subscriber for missing, late and out-of-order messages, and use deadlines or timestamps to notice silence.
+
+</Misconception>
+
+<Misconception>
+
+**"A bigger queue never hurts."** For a consumer slower than its producer, a deeper queue does not prevent loss; it only makes every result older, as the executor simulation showed (66 ms against 316 ms).
+
+</Misconception>
+
+<Misconception>
+
+**"Use the latest transform; it's close enough."** For a robot that is turning, 80 ms of delay misplaced a wall 4 m away by a third of a metre. Look transforms up at the data's own timestamp.
+
+</Misconception>
+
+<Misconception>
+
+**"A callback that waits for a service response is fine."** In a single-threaded executor the response can only be processed by the executor that is now blocked waiting for it: the node deadlocks. Use asynchronous calls (`call_async`) and handle the response in its own callback, or use a multi-threaded executor with separate callback groups.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+ROS grew out of the STAIR project at Stanford around 2007 and was developed from 2008 at Willow Garage, a robotics company in California whose PR2 robot was given to research labs around the world with ROS on board. Its first distribution, Box Turtle, appeared in 2010, and within a few years ROS was the common language of research robotics. Its weaknesses showed as robots left the lab: a single central master, no quality of service, no real-time support, and little thought for security or unreliable networks. ROS 2 was redesigned around DDS, with the first release, Ardent Apalone, in December 2017. Stewardship passed to the Open Source Robotics Foundation (now Open Robotics) and, from 2024, to the Open Source Robotics Alliance, which governs ROS, Gazebo and related projects with member companies and organisations from several continents.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

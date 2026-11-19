@@ -1,0 +1,477 @@
+---
+title: Crossing the gap from simulation to reality
+subtitle: Policies trained in simulation meet a real robot that is heavier, slower, stickier and later than the model. System identification, domain randomisation and teacher–student training — and the robots that crossed the gap.
+minutes: 75
+objectives:
+  - Define the reality gap and say which modelling errors usually matter most for learned controllers
+  - Identify a motor-and-friction model from logged data by least squares, and validate it on held-out data
+  - Train a controller with domain randomisation over masses and frictions, and evaluate it on an unseen robot and outside the randomised range
+  - Explain teacher–student training with privileged information and online adaptation, and implement a minimal adaptive student
+  - Describe landmark sim-to-real results in legged locomotion, in-hand manipulation and drone racing, and the engineering workflow behind them
+narrators: [chloe, margaret, gideon]
+prerequisites: [simulation, legged-locomotion, reinforcement-learning-for-robots, imitation-learning]
+related: [math.prob.statistics, math.applied.optimisation, math.analysis.ordinary-differential-equations]
+references:
+  - title: "Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World"
+    author: Josh Tobin et al.
+    year: 2017
+    url: https://arxiv.org/abs/1703.06907
+  - title: "Sim-to-Real Transfer of Robotic Control with Dynamics Randomization"
+    author: Xue Bin Peng et al.
+    year: 2018
+    url: https://arxiv.org/abs/1710.06537
+  - title: "Sim-to-Real: Learning Agile Locomotion For Quadruped Robots"
+    author: Jie Tan et al.
+    year: 2018
+    url: https://arxiv.org/abs/1804.10332
+    note: Google's Minitaur gaits, transferred using an identified actuator model, latency modelling and randomisation.
+  - title: "Learning agile and dynamic motor skills for legged robots"
+    author: Jemin Hwangbo et al.
+    year: 2019
+    url: https://arxiv.org/abs/1901.08652
+    note: ANYmal (ETH Zurich) with a neural-network model of its actuators learned from real data.
+  - title: "Learning quadrupedal locomotion over challenging terrain"
+    author: Joonho Lee et al.
+    year: 2020
+    url: https://arxiv.org/abs/2010.11251
+    note: Teacher–student training with privileged terrain information.
+  - title: "Learning robust perceptive locomotion for quadrupedal robots in the wild"
+    author: Takahiro Miki et al.
+    year: 2022
+    url: https://arxiv.org/abs/2201.08117
+  - title: "RMA: Rapid Motor Adaptation for Legged Robots"
+    author: Ashish Kumar, Zipeng Fu, Deepak Pathak and Jitendra Malik
+    year: 2021
+    url: https://arxiv.org/abs/2107.04034
+  - title: "Learning Dexterous In-Hand Manipulation"
+    author: OpenAI
+    year: 2018
+    url: https://arxiv.org/abs/1808.00177
+  - title: "Solving Rubik's Cube with a Robot Hand"
+    author: OpenAI
+    year: 2019
+    url: https://arxiv.org/abs/1910.07113
+    note: Automatic domain randomisation.
+  - title: "DeXtreme: Transfer of Agile In-hand Manipulation from Simulation to Reality"
+    author: Ankur Handa et al.
+    year: 2022
+    url: https://arxiv.org/abs/2210.13702
+  - title: "Visual Dexterity: In-Hand Reorientation of Novel and Complex Object Shapes"
+    author: Tao Chen et al.
+    year: 2022
+    url: https://arxiv.org/abs/2211.11744
+  - title: "Real-World Humanoid Locomotion with Reinforcement Learning"
+    author: Ilija Radosavovic et al.
+    year: 2023
+    url: https://arxiv.org/abs/2303.03381
+  - title: "Champion-level drone racing using deep reinforcement learning"
+    author: Elia Kaufmann et al.
+    year: 2023
+    url: https://doi.org/10.1038/s41586-023-06419-4
+  - title: "Closing the Sim-to-Real Loop: Adapting Simulation Randomization with Real World Experience"
+    author: Yevgen Chebotar et al.
+    year: 2019
+    url: https://arxiv.org/abs/1810.05687
+  - title: "MuJoCo Playground"
+    author: Kevin Zakka et al.
+    year: 2025
+    url: https://arxiv.org/abs/2502.08844
+    note: An open-source framework for GPU-parallel training and sim-to-real transfer on legged robots, humanoids, hands and arms.
+  - title: Isaac Lab
+    author: NVIDIA and contributors
+    url: https://github.com/isaac-sim/IsaacLab
+    note: An open-source framework for robot learning on GPU-parallel simulation.
+  - title: "System Identification: Theory for the User (2nd edition)"
+    author: Lennart Ljung
+    year: 1999
+    note: The standard reference on identifying dynamic models from data (Prentice Hall).
+---
+
+<Section id="motivation" kind="motivation" title="Brilliant in simulation">
+
+A team trains a walking policy for a quadruped in simulation. After a few hours on a GPU it runs, turns, climbs steps and recovers from shoves, thousands of times without a fall. They copy the network onto the real robot, hold it up in a safety harness, lower it to the floor — and it shudders, stamps and topples. Nothing in the network is broken. The simulator was wrong in small ways, and the policy had learned to depend on them.
+
+The <LessonLink slug="simulation">Simulation</LessonLink> lesson listed the usual culprits: contact and friction models, actuator dynamics and latency, unmodelled flexibility, sensor noise, and, for cameras, how a rendered image differs from a real one. The <LessonLink slug="reinforcement-learning-for-robots">reinforcement-learning</LessonLink> lesson showed why they bite so hard: an optimiser rewarded for performance will find any modelling error that helps and lean on it, just as it found the farmable reward in the corridor.
+
+This lesson is about getting a policy across that gap. There are three complementary tools, and every successful system uses some mix of them:
+
+1. **System identification**: measure the real robot and make the simulator more like it.
+2. **Domain randomisation**: train on many deliberately different simulators, so that the real robot is just one more variation.
+3. **Teacher–student training and adaptation**: let the policy work out, from its own recent experience, which variation it is in.
+
+You will implement each on a small problem, then see how they were combined in the results that made sim-to-real famous.
+
+</Section>
+
+<Section id="gap" kind="definitions" title="The reality gap, precisely">
+
+Write $\xi$ for the physical parameters a simulator needs: masses, inertias, friction coefficients, motor constants, delays, sensor noise levels, terrain properties. A simulator with parameters $\xi$ gives an expected return $J_\xi(\pi)$ for policy $\pi$. The real robot behaves like some unknown $\xi^\star$ — or, more honestly, like no value of $\xi$ at all, since every simulator leaves something out.
+
+<Definition term="Reality gap">
+
+For a policy $\pi$ trained in a simulator with parameters $\hat\xi$, the **reality gap** is the difference $J_{\hat\xi}(\pi) - J_{\text{real}}(\pi)$ between its performance in simulation and on the real system. A policy **transfers zero-shot** if it performs acceptably on the real system with no further training there.
+
+</Definition>
+
+The three tools attack different terms. **System identification** chooses $\hat\xi$ to make the simulator's behaviour match logged real data,
+
+$$
+\hat\xi = \arg\min_\xi \sum_{k} \big\| y_k^{\text{real}} - y_k^{\text{sim}}(\xi) \big\|^2 ,
+$$
+
+where $y_k$ are measured signals (joint velocities, positions, forces) under the same commands. **Domain randomisation** replaces the single simulator by a distribution $p(\xi)$ and trains
+
+$$
+\pi_{\text{DR}} = \arg\max_\pi \ \mathbb{E}_{\xi \sim p(\xi)} \big[ J_\xi(\pi) \big],
+$$
+
+hoping that the real system looks like a typical draw. **Adaptation** lets the policy depend on its history $h_t$ of observations and actions, $a_t = \pi(o_t, h_t)$, so that it can behave differently in different $\xi$: implicitly identifying the system while it acts.
+
+<Narrator who="gideon">
+
+Domain randomisation optimises the *average* over $p(\xi)$, which is not the same as being good everywhere in it. A policy can score well on average while failing badly on a rare corner of the range. If the corners matter (and on a real robot the worst case usually does), report the worst or a low percentile of performance across randomised robots, not only the mean.
+
+</Narrator>
+
+</Section>
+
+<Section id="sysid" kind="computation" title="System identification: fitting a joint to its log">
+
+Most of the reality gap of a legged robot or an arm sits in its **actuators**: the motor, the gearbox and the drive electronics. Catalogue values for inertia and friction are a starting point, but gearbox friction depends on lubrication, temperature and wear, and the reflected inertia of the rotor through the gearbox is easy to get wrong.
+
+Consider one joint under torque (current) control. A simple model has rotor-plus-link inertia $J$, viscous friction $b$ and Coulomb friction $\tau_c$:
+
+$$
+J \dot\omega = \tau - b\,\omega - \tau_c \operatorname{sign}(\omega).
+$$
+
+Sampled every $\Delta t$, this is linear in the unknowns $(1/J,\ b/J,\ \tau_c/J)$:
+
+$$
+\frac{\omega_{k+1} - \omega_k}{\Delta t} = \frac{1}{J}\,\tau_k - \frac{b}{J}\,\omega_k - \frac{\tau_c}{J}\operatorname{sign}(\omega_k),
+$$
+
+so logging $\tau_k$ and $\omega_k$ and solving one least-squares problem identifies all three. The program plays the role of the real joint (with a cogging ripple and encoder noise that the model does not include), excites it with a **chirp**, a sine wave sweeping from 0.2 Hz to about 3 Hz, fits the model, and then compares the catalogue model and the identified one on a *different* input, a sequence of torque steps.
+
+```python run
+import numpy as np
+
+# The real joint, which we can only log: inertia J, viscous friction b, Coulomb friction tc,
+# plus a small cogging ripple that no one put in the model.
+J_TRUE, B_TRUE, TC_TRUE, COG = 0.012, 0.03, 0.15, 0.02
+DT = 0.005                                                 # 200 Hz logging
+
+def simulate(tau, J, b, tc, cog=0.0, rng=None, noise=0.0):
+    th, w, out = 0.0, 0.0, []
+    for t in tau:
+        out.append(w + (rng.normal(0, noise) if rng is not None else 0.0))   # what the encoder reports
+        drive = t - cog * np.sin(8 * th)
+        if abs(w) < 1e-3 and abs(drive) <= tc:            # stuck: static friction holds it
+            w = 0.0
+        else:
+            w = w + DT * (drive - b * w - tc * np.sign(w if abs(w) >= 1e-3 else drive)) / J
+        th += w * DT
+    return np.array(out)
+
+rng = np.random.default_rng(0)
+time = np.arange(0, 10, DT)
+chirp = 0.5 * np.sin(2 * np.pi * (0.2 + 0.14 * time) * time)          # 0.2 Hz rising to about 3 Hz
+w_log = simulate(chirp, J_TRUE, B_TRUE, TC_TRUE, COG, rng, noise=0.05)
+
+# Equation error: (w[k+1] - w[k]) / dt = (1/J) tau - (b/J) w - (tc/J) sign(w), linear in (1/J, b/J, tc/J).
+moving = np.abs(w_log[:-1]) > 0.2
+Phi = np.stack([chirp[:-1], -w_log[:-1], -np.sign(w_log[:-1])], axis=1)[moving]
+acc = (np.diff(w_log) / DT)[moving]
+c = np.linalg.lstsq(Phi, acc, rcond=None)[0]
+J_hat, b_hat, tc_hat = 1 / c[0], c[1] / c[0], c[2] / c[0]
+print(f"identified: J = {J_hat:.4f} kg m^2 (true {J_TRUE}), b = {b_hat:.4f} N m s (true {B_TRUE}), "
+      f"tc = {tc_hat:.3f} N m (true {TC_TRUE})")
+
+# Validate on an input the fit never saw: a sequence of torque steps.
+steps = np.repeat([0.4, 0.0, -0.3, 0.25, -0.4, 0.0], 400)
+w_real = simulate(steps, J_TRUE, B_TRUE, TC_TRUE, COG)
+for name, (J, b, tc) in [("datasheet model", (0.009, 0.015, 0.05)), ("identified model", (J_hat, b_hat, tc_hat))]:
+    pred = simulate(steps, J, b, tc)
+    print(f"{name:17s}: RMS speed error on held-out steps = {np.sqrt(np.mean((pred - w_real) ** 2)):.2f} rad/s"
+          f"  (real speeds reach {np.abs(w_real).max():.1f} rad/s)")
+```
+
+From ten seconds of data the fit recovers $J = 0.0118$ (true 0.012), $b = 0.0307$ (true 0.03) and $\tau_c = 0.150$ (true 0.15). On the held-out torque steps, the identified model predicts the joint's speed to within 0.12 rad/s RMS; the catalogue model, with friction a factor of two to three too low, is off by 8.19 rad/s — as large as the speeds themselves (up to 8.3 rad/s), because it predicts the joint spinning nearly three times too fast.
+
+Four habits of practice are visible here. **Excite the system**: a chirp exercises a range of speeds and accelerations, while a constant torque would teach you nothing about inertia. **Choose which data to believe**: the fit skips every sample slower than 0.2 rad/s, where $\operatorname{sign}(\omega)$ flips with the noise and static friction holds the joint in a way the equation does not describe. **Validate on different data**: a model that fits its own training log can still be wrong. And **know what you left out**: the cogging ripple is not in the model, which is why the identified model is good but not perfect, and in a real joint backlash, temperature-dependent friction and current-loop dynamics would add more.
+
+When the physics is too messy for a few parameters, learn it. Jemin Hwangbo and colleagues at ETH Zurich (2019) trained a small neural network on data logged from ANYmal's series-elastic actuators to predict torque from the recent history of position errors and velocities, and put that **actuator network** inside the simulator; policies trained with it transferred to the real robot where those trained with an idealised motor did not. Learned residual models, which correct a physics simulator using real data, follow the same idea.
+
+</Section>
+
+<Section id="randomisation" kind="computation" title="Domain randomisation">
+
+Identification narrows the gap but never closes it, and some parameters (the friction of every floor a robot will ever walk on, the mass of every box it will lift) cannot be measured in advance. **Domain randomisation** accepts the uncertainty and trains for all of it. Josh Tobin and colleagues (OpenAI, 2017) randomised the *visual* appearance of simulated scenes — textures, lighting, camera position — until an object detector trained only on renders worked on real camera images. Xue Bin Peng and colleagues (2018) randomised the *dynamics* — masses, friction, damping, latency — and transferred a pushing policy to a real arm.
+
+Here is the idea at small scale. A carriage on a rail must move 0.2 m and stop, under a PD policy $u = k_p(0.2 - x) - k_d v$ whose two gains are the "network" to be trained. Commands reach the motor 30 ms late, and the force is limited to 50 N. The engineers' model says the carriage has mass 1.0 kg and viscous friction 20 N s/m — the CAD model includes a heavily damped linear bearing. The real carriage, unknown to them, is 0.6 kg with friction 1.0 N s/m: the bearing was replaced with a smoother one. Both gains are trained with the **cross-entropy method**, a simple derivative-free optimiser: sample gains, score each in simulation, keep the best fifth, refit. One run trains on the nominal model only; the other on 16 robots whose mass is drawn uniformly from 0.5–2.0 kg and friction from 0.5–20 N s/m.
+
+```python run
+import numpy as np
+
+# A carriage on a rail must move 0.2 m and stop. The policy is u = kp (0.2 - x) - kd v, computed every
+# 10 ms and applied 30 ms late (sensing, computation and the bus), with a 50 N force limit.
+# Unknown to the policy: the moving mass m (kg) and the viscous friction b (N s/m).
+DT, DELAY, STEPS, UMAX, TARGET = 0.01, 3, 200, 50.0, 0.2
+
+def simulate(kp, kd, m, b):
+    """Vectorised over every argument. Returns the cost (time-weighted |error| plus a little effort)
+    and the largest position reached, for each (gains, robot) pair."""
+    kp, kd, m, b = np.broadcast_arrays(*map(np.asarray, (kp, kd, m, b)))
+    x, v, cost, peak = (np.zeros(kp.shape) for _ in range(4))
+    queue = [np.zeros(kp.shape)] * DELAY
+    for _ in range(STEPS):
+        queue.append(np.clip(kp * (TARGET - x) - kd * v, -UMAX, UMAX))
+        u = queue.pop(0)                                   # the command issued DELAY steps ago
+        v = v + DT * (u - b * v) / m
+        x = x + DT * v
+        cost += DT * (np.abs(TARGET - x) + 0.001 * np.abs(u))
+        peak = np.maximum(peak, x)
+    return cost, peak
+
+def train(sample_robots, rng, iters=25, pop=60):
+    """Cross-entropy method: sample gains, score each on the training robots, refit to the best fifth."""
+    mu, sd = np.array([100.0, 10.0]), np.array([60.0, 8.0])
+    m, b = sample_robots(rng, 16)                          # the 16 simulated robots used for training
+    for _ in range(iters):
+        G = np.abs(mu + sd * rng.standard_normal((pop, 2)))
+        score = simulate(G[:, :1], G[:, 1:], m[None, :], b[None, :])[0].mean(axis=1)
+        elite = G[np.argsort(score)[: pop // 5]]
+        mu, sd = elite.mean(axis=0), elite.std(axis=0) + 0.5
+    return mu
+
+nominal = lambda rng, n: (np.full(n, 1.0), np.full(n, 20.0))          # the CAD model: 1 kg, heavy damping
+randomised = lambda rng, n: (rng.uniform(0.5, 2.0, n), rng.uniform(0.5, 20.0, n))
+
+rng = np.random.default_rng(0)
+g_nom, g_dr = train(nominal, rng), train(randomised, rng)
+print(f"trained on the nominal model:  kp = {g_nom[0]:6.1f}, kd = {g_nom[1]:5.1f}")
+print(f"trained with randomisation:    kp = {g_dr[0]:6.1f}, kd = {g_dr[1]:5.1f}\n")
+for name, (m, b) in [("nominal model     m=1.0 b=20", (1.0, 20.0)), ("the real robot    m=0.6 b=1.0", (0.6, 1.0)),
+                     ("outside the range m=0.3 b=0.2", (0.3, 0.2))]:
+    (c1, p1), (c2, p2) = simulate(*g_nom, m, b), simulate(*g_dr, m, b)
+    print(f"{name}: cost {float(c1):.3f} vs {float(c2):.3f}   overshoot {100 * max(float(p1) / TARGET - 1, 0):5.1f}% "
+          f"vs {100 * max(float(p2) / TARGET - 1, 0):5.1f}%")
+m_test, b_test = randomised(np.random.default_rng(5), 500)                # 500 robots never seen in training
+for name, g in [("nominal-trained", g_nom), ("randomised", g_dr)]:
+    c = simulate(g[0], g[1], m_test, b_test)[0]
+    print(f"{name:15s} on 500 unseen robots: mean cost {c.mean():.3f}, worst {c.max():.3f}")
+```
+
+The policy trained on the nominal model learned to lean on the simulated bearing: its derivative gain is only 8.9, because 20 N s/m of friction did most of the braking for it. In simulation it is excellent (cost 0.026). On the real carriage it overshoots the target by 92% and rings, at almost ten times its cost in simulation. The randomised policy doubles its derivative gain to 18.0, accepts a slightly slower response on the nominal model (cost 0.038 instead of 0.026 — the **price of robustness**), and on the real carriage overshoots by 20% with a cost of 0.049. Across 500 robots it never saw, its worst case (0.162) is less than half the nominal policy's (0.371).
+
+<Figure caption="The space of simulated robots. The nominal model is a single point; domain randomisation trains on the shaded box (dots: the 16 robots actually sampled). The real carriage lies inside the box, though at lower friction than any training robot; the third test robot lies outside it, where neither policy is safe. Friction is on a logarithmic scale.">
+
+<svg viewBox="0 0 400 240" role="img" aria-label="A plot with mass in kilograms on the horizontal axis and friction on a logarithmic vertical axis. A shaded rectangle spans mass 0.5 to 2 and friction 0.5 to 20. Sixteen dots, mostly in the upper part of the rectangle, mark the training robots. A square on the top edge at mass 1 marks the nominal model. A star inside the rectangle near its lower left marks the real robot. A cross outside the rectangle at lower left marks a robot outside the randomised range.">
+  <rect x="122.7" y="32.9" width="218.2" height="116.4" fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1" />
+  <line x1="50" y1="200" x2="370" y2="200" stroke="currentColor" strokeWidth="1.2" />
+  <line x1="50" y1="200" x2="50" y2="20" stroke="currentColor" strokeWidth="1.2" />
+  <path d="M291.0 40.8h0 M186.6 41.0h0 M220.3 101.1h0 M324.1 97.4h0 M207.6 40.9h0 M225.5 55.3h0 M151.1 38.1h0 M268.7 62.5h0 M172.1 47.1h0 M158.6 72.4h0 M312.4 60.6h0 M161.3 54.1h0 M251.3 84.4h0 M180.8 61.7h0 M228.3 64.1h0 M322.9 75.5h0" stroke="currentColor" strokeWidth="5" strokeLinecap="round" />
+  <rect x="189.4" y="26.9" width="12" height="12" fill="var(--gold)" stroke="currentColor" />
+  <text x="206" y="24" fontSize="11" fill="currentColor">nominal model</text>
+  <polygon points="137.3,119.4 139.6,124.8 145.3,125.3 141.0,129.0 142.3,134.6 137.3,131.6 132.3,134.6 133.6,129.0 129.3,125.3 135.0,124.8" fill="var(--human)" stroke="currentColor" strokeWidth="0.5" />
+  <text x="150" y="131" fontSize="11" fill="currentColor">real carriage</text>
+  <path d="M88.6 173.1 L98.6 183.1 M98.6 173.1 L88.6 183.1" stroke="currentColor" strokeWidth="2" />
+  <text x="104" y="186" fontSize="11" fill="currentColor">outside the range</text>
+  <text x="50" y="215" fontSize="10" textAnchor="middle" fill="currentColor">0</text>
+  <text x="122.7" y="215" fontSize="10" textAnchor="middle" fill="currentColor">0.5</text>
+  <text x="195.4" y="215" fontSize="10" textAnchor="middle" fill="currentColor">1.0</text>
+  <text x="268.2" y="215" fontSize="10" textAnchor="middle" fill="currentColor">1.5</text>
+  <text x="340.9" y="215" fontSize="10" textAnchor="middle" fill="currentColor">2.0</text>
+  <text x="210" y="233" fontSize="11" textAnchor="middle" fill="currentColor">mass m (kg)</text>
+  <text x="44" y="203" fontSize="10" textAnchor="end" fill="currentColor">0.1</text>
+  <text x="44" y="130" fontSize="10" textAnchor="end" fill="currentColor">1</text>
+  <text x="44" y="58" fontSize="10" textAnchor="end" fill="currentColor">10</text>
+  <text x="14" y="110" fontSize="11" textAnchor="middle" fill="currentColor" transform="rotate(-90 14 110)">friction b (N s/m)</text>
+</svg>
+
+</Figure>
+
+The third test is a warning. A carriage of 0.3 kg with almost no friction lies outside the randomised range, and *both* policies overshoot badly (323% and 80%). Randomisation buys robustness over the range you randomise, and a little beyond it — note that none of the 16 training robots had friction as low as the real carriage — but not everywhere. Choosing the ranges is the real engineering: too narrow and reality falls outside; too wide and the policy becomes timid, giving up performance on every robot to survive implausible ones. OpenAI's **automatic domain randomisation** (2019) widened each range gradually, only as far as the policy could still succeed, while Chebotar and colleagues (2019) went the other way, using a few real trials to adjust the randomisation distribution towards reality.
+
+<Narrator who="margaret">
+
+What to randomise, in roughly the order that pays off for legged robots: actuator strength and **latency** (a policy that has only ever seen zero delay is likely to oscillate on hardware with 10–20 ms of it), ground friction, payload mass and centre of mass, motor and sensor noise, terrain shape, and external pushes. For camera-based policies add textures, lighting and camera pose. A few dozen randomised quantities is typical.
+
+</Narrator>
+
+</Section>
+
+<Section id="teacher-student" kind="computation" title="Teacher, student and privileged information">
+
+A randomised policy that cannot tell which robot it is on must use one compromise behaviour for all of them. A better policy would *notice*: the carriage accelerates more than expected, so it is light; slow down. Two ideas make this practical.
+
+**Privileged information.** In simulation, everything is known: the true mass and friction, the exact terrain height under each foot, contact forces, the positions of objects behind the camera. A **teacher** policy given this privileged information is much easier to train with RL, because its problem is fully observed.
+
+**Distillation into a student.** A **student** policy receives only what the real robot will have — proprioception, a camera, the recent history of its own commands and sensor readings — and is trained, still in simulation, to reproduce the teacher. The training is the <LessonLink slug="imitation-learning">imitation learning</LessonLink> of the previous lesson, and because the teacher can be queried in any simulated state, DAgger works perfectly: run the student, label its states with the teacher's actions, retrain. Joonho Lee and colleagues used this to take ANYmal over rubble, mud and streams (2020); RMA (Ashish Kumar and colleagues, UC Berkeley and Carnegie Mellon, 2021) trained an **adaptation module** to estimate, from the last half-second of joint states and actions, a compact latent code of the environment that the teacher had been given directly, and ran a Unitree A1 on sand, oily surfaces and hiking trails.
+
+<Figure caption="Teacher–student training. In simulation, the teacher is trained with RL using privileged information the real robot will never have. The student sees only onboard sensors and its recent history, and is trained to match the teacher (or the teacher's latent description of the environment). Only the student goes to the real robot.">
+
+<svg viewBox="0 0 400 210" role="img" aria-label="Two rows. Top row, labelled simulation only: privileged state such as true friction, mass and terrain feeds a teacher policy, trained by reinforcement learning, which outputs actions. Bottom row: a history of onboard sensors and past actions feeds an adaptation module, then the student policy, which outputs actions. A dashed arrow from the teacher's actions to the student's actions is labelled supervised: match the teacher. A label says only the student is deployed.">
+  <text x="10" y="18" fontSize="11" fill="currentColor">simulation only</text>
+  <rect x="10" y="28" width="110" height="46" rx="6" fill="var(--gold-soft)" stroke="currentColor" />
+  <text x="65" y="47" fontSize="11" textAnchor="middle" fill="currentColor">privileged state</text>
+  <text x="65" y="62" fontSize="10" textAnchor="middle" fill="currentColor">true m, b, terrain</text>
+  <rect x="160" y="28" width="110" height="46" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="215" y="47" fontSize="12" textAnchor="middle" fill="currentColor">teacher</text>
+  <text x="215" y="62" fontSize="10" textAnchor="middle" fill="currentColor">trained by RL</text>
+  <text x="330" y="55" fontSize="11" fill="currentColor">action</text>
+  <line x1="120" y1="51" x2="154" y2="51" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="160,51 152,47 152,55" fill="currentColor" />
+  <line x1="270" y1="51" x2="320" y2="51" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="326,51 318,47 318,55" fill="currentColor" />
+  <rect x="10" y="130" width="110" height="46" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="65" y="149" fontSize="11" textAnchor="middle" fill="currentColor">sensor history</text>
+  <text x="65" y="164" fontSize="10" textAnchor="middle" fill="currentColor">joints, IMU, past actions</text>
+  <rect x="140" y="130" width="70" height="46" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="175" y="149" fontSize="10" textAnchor="middle" fill="currentColor">adaptation</text>
+  <text x="175" y="163" fontSize="10" textAnchor="middle" fill="currentColor">module</text>
+  <rect x="225" y="130" width="70" height="46" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="260" y="157" fontSize="12" textAnchor="middle" fill="currentColor">student</text>
+  <text x="330" y="157" fontSize="11" fill="currentColor">action</text>
+  <line x1="120" y1="153" x2="134" y2="153" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="140,153 132,149 132,157" fill="currentColor" />
+  <line x1="210" y1="153" x2="219" y2="153" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="225,153 217,149 217,157" fill="currentColor" />
+  <line x1="295" y1="153" x2="320" y2="153" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="326,153 318,149 318,157" fill="currentColor" />
+  <line x1="345" y1="62" x2="345" y2="138" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 3" />
+  <polygon points="345,144 341,136 349,136" fill="currentColor" />
+  <text x="352" y="96" fontSize="10" fill="currentColor">match</text>
+  <text x="352" y="109" fontSize="10" fill="currentColor">the</text>
+  <text x="352" y="122" fontSize="10" fill="currentColor">teacher</text>
+  <text x="10" y="200" fontSize="11" fill="currentColor">deployed on the real robot: the bottom row only</text>
+</svg>
+
+</Figure>
+
+The program below builds a minimal version on the carriage. The **teacher** is told $m$ and $b$ and chooses its gains to give every robot the same closed-loop behaviour: matching $m s^2 + (b + k_d) s + k_p$ to $m(s^2 + 2\zeta\omega s + \omega^2)$ gives $k_p = m\omega^2$ and $k_d = 2\zeta\omega m - b$. The **student** is not told; its adaptation module looks at the last 15 commands and velocities it has seen, fits $u = m a + b v$ to them by least squares, and plugs its estimates into the teacher's formula. The **robust** policy is the randomised one from above.
+
+```python run
+import numpy as np
+
+# The same carriage as above: move 0.2 m and stop, 30 ms delay, 50 N limit, unknown mass and friction.
+DT, DELAY, STEPS, UMAX, TARGET = 0.01, 3, 200, 50.0, 0.2
+W, ZETA = 14.0, 0.8                        # desired closed loop: natural frequency 14 rad/s, damping 0.8
+DR_GAINS = (210.9, 18.0)                   # the robust gains found by domain randomisation above
+
+def teacher_gains(m, b):
+    """The teacher is told m and b (privileged information, available only in simulation) and places
+    the closed-loop poles exactly: m s^2 + (b + kd) s + kp = m (s^2 + 2 zeta W s + W^2)."""
+    return m * W ** 2, max(2 * ZETA * W * m - b, 0.0)
+
+def run(m, b, who, window=15):
+    x = v = cost = 0.0
+    queue = [0.0] * DELAY
+    us, vs = [], []
+    m_hat, b_hat = 1.0, 5.0                # the student's guess before it has seen anything
+    for k in range(STEPS):
+        if who == "teacher":
+            kp, kd = teacher_gains(m, b)
+        elif who == "student":
+            if len(vs) > window:           # adaptation module: estimate (m, b) from recent history only
+                a = np.diff(vs[-window - 1:]) / DT                    # accelerations it caused
+                vv, uu = np.array(vs[-window - 1:-1]), np.array(us[-window - 1:-1])
+                # least squares for u = m a + b v, via the 2x2 normal equations
+                M = np.array([[a @ a, a @ vv], [a @ vv, vv @ vv]])
+                if np.linalg.det(M) > 1e-6 * np.trace(M) ** 2:       # only when the data is informative
+                    m_hat, b_hat = np.linalg.solve(M, [a @ uu, vv @ uu])
+                    m_hat, b_hat = max(m_hat, 0.2), max(b_hat, 0.0)
+            kp, kd = teacher_gains(m_hat, b_hat)
+        else:
+            kp, kd = DR_GAINS
+        queue.append(float(np.clip(kp * (TARGET - x) - kd * v, -UMAX, UMAX)))
+        u = queue.pop(0)
+        us.append(u); vs.append(v)
+        v += DT * (u - b * v) / m
+        x += DT * v
+        cost += DT * (abs(TARGET - x) + 0.001 * abs(u))
+    return cost, (m_hat, b_hat)
+
+print("on the real robot (m = 0.6 kg, b = 1.0 N s/m):")
+for who in ["teacher", "student", "robust"]:
+    cost, est = run(0.6, 1.0, who)
+    extra = f"   student's final estimate m = {est[0]:.2f}, b = {est[1]:.2f}" if who == "student" else ""
+    print(f"  {who:8s} cost {cost:.3f}{extra}")
+
+rng = np.random.default_rng(5)
+robots = list(zip(rng.uniform(0.5, 2.0, 200), rng.uniform(0.5, 20.0, 200)))
+print("\non 200 random robots from the training range:")
+for who in ["teacher", "student", "robust"]:
+    c = np.array([run(m, b, who)[0] for m, b in robots])
+    print(f"  {who:8s} mean cost {c.mean():.3f}, worst {c.max():.3f}")
+```
+
+On the real carriage the student's estimates converge to $m = 0.60$, $b = 1.00$, and its cost (0.029) is close to the teacher's (0.024) and well below the robust policy's (0.049). Over 200 random robots the student's worst case is 0.038 against the robust policy's 0.158: knowing *which* robot you are on beats being merely tolerable on all of them.
+
+<Narrator who="gideon">
+
+Two caveats keep this honest. Our simulated sensors are noiseless, so the 15-sample fit is exact; with real encoder noise the module needs longer windows or regularisation, and it is fooled whenever the robot is not accelerating (the determinant check skips those moments). And the physics here is linear in the unknowns, so plain least squares *is* the ideal adaptation module. In RMA and its successors the module is a neural network trained by regression in simulation, because a legged robot's history is related to friction, payload and terrain in ways no one can write down.
+
+</Narrator>
+
+<Narrator who="chloe">
+
+Look at the structure rather than the details. The teacher solves the control problem; the adaptation module solves the identification problem; and history substitutes for the state the student cannot see. That is the partially observable MDP of the reinforcement-learning lesson, solved by learning a filter from simulated ground truth instead of deriving one.
+
+</Narrator>
+
+</Section>
+
+<Section id="landmarks" kind="human" title="The robots that crossed the gap">
+
+A few results, chosen because their papers are open and their ideas recur, show how the tools combine on real machines.
+
+**Legged locomotion (ETH Zurich and others, from 2019).** ANYmal's learned controllers began with Hwangbo's actuator network plus dynamics randomisation (2019); Lee's teacher–student policies crossed rough natural terrain blind (2020); Miki and colleagues (2022) added perception, fusing a height map built from depth cameras or lidar with proprioception through a learned module that decides how far to trust the map — enough to finish an alpine hiking route in Switzerland. RMA showed rapid adaptation on a low-cost commercial quadruped from Unitree. As described in <LessonLink slug="legged-locomotion">Legged locomotion</LessonLink>, RL policies trained this way now run on commercial quadrupeds, and on humanoids: Ilija Radosavovic and colleagues (UC Berkeley, 2023) trained a transformer policy for Agility Robotics' Digit entirely in simulation, with heavy randomisation, and deployed it zero-shot outdoors.
+
+**In-hand manipulation (OpenAI, 2018–2019).** A Shadow Dexterous Hand learned to reorient a block to commanded faces, using a policy trained entirely in a randomised simulator, with vision networks trained on randomised renders to estimate the block's pose. The follow-up solved a Rubik's Cube one-handed, using **automatic domain randomisation** and a recurrent policy whose memory let it adapt to perturbations it had never seen, including a glove on the hand and objects poking it. NVIDIA's DeXtreme (2022) reproduced cube reorientation on the cheaper Allegro hand with GPU simulation, and Tao Chen and colleagues at MIT (2022) reoriented previously unseen object shapes with a single depth camera, even with the hand facing downwards.
+
+**Drone racing (University of Zurich, 2023).** The Swift system's policy was trained in simulation with RL, but the team did not trust the simulator blindly: they measured the gap on the real drone and fitted data-driven residual models of the perception and dynamics errors, which were added to the simulator for training. The result raced three human champions and won most of its races against them.
+
+<Note>
+
+What these projects have in common is less glamorous than the videos: weeks of careful actuator and latency measurement, randomisation ranges chosen and re-chosen, a second simulator used as a sanity check, and a staged route to hardware — first a robot on a stand, then in a harness or gantry that catches falls, then free. Whenever you test a learned policy for the first time, use the same staging on a small, slow robot, with a person at the emergency stop; <LessonLink slug="embedded-control-and-safety">Embedded control and safety</LessonLink> describes the protective layers underneath.
+
+</Note>
+
+As of 2026 the tooling has become standard. GPU-parallel simulators — NVIDIA's Isaac Lab, Google DeepMind's MuJoCo with its MJX and [Playground](https://arxiv.org/abs/2502.08844) frameworks, the open-source Genesis project and others — train locomotion policies for quadrupeds and humanoids in hours, and ship with randomisation and teacher–student recipes. The open problems are elsewhere: contact-rich manipulation of soft, articulated or unfamiliar objects, where simulators are least trustworthy; vision, where rendered and real images still differ in subtle ways; and evaluation, since you cannot know a policy has crossed the gap until you have tested it on the real robot many times (<LessonLink slug="robot-data-at-scale">next lesson</LessonLink>). Building simulations *from* real scans, so-called real-to-sim, is an active response to all three.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A more accurate simulator makes randomisation unnecessary."** Identification shrinks the gap but cannot remove it, and many parameters vary in deployment (floors, payloads, wear, temperature). Good systems identify what can be measured and randomise what cannot.
+
+</Misconception>
+
+<Misconception>
+
+**"Randomise everything as widely as possible, to be safe."** Wider ranges cost performance on every robot, can make the task impossible to learn, and still offer no guarantee outside the ranges. The carriage policy paid 46% extra cost on the nominal model for its robustness, and both policies failed on the robot outside the range.
+
+</Misconception>
+
+<Misconception>
+
+**"If it works in simulation across thousands of randomised robots, it will work on the real one."** Only if reality is inside what was randomised *and* the simulator's structure is right. Unmodelled effects — a flexible link, a sensor that saturates, cable drag — are not covered by randomising the parameters of a model that lacks them.
+
+</Misconception>
+
+<Misconception>
+
+**"The student is just a smaller copy of the teacher."** It solves a harder problem: acting well without the privileged information. Its history-processing module is doing implicit system identification, and a student can never be better than what its observations allow it to infer.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

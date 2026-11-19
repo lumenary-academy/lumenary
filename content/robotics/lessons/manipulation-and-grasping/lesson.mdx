@@ -1,0 +1,428 @@
+---
+title: Manipulation and grasping
+subtitle: Picking things up is the oldest job in robotics and still one of the hardest. Grippers, friction cones, a test for whether a grasp can resist any push, and the pipeline that turns a cluttered bin into a stream of successful picks.
+minutes: 70
+objectives:
+  - Choose between parallel-jaw, suction, soft and multi-fingered grippers for a task, and estimate a suction cup's holding force
+  - Model contacts with friction cones and turn contact forces into wrenches on the object
+  - Define force closure, prove the convex-hull test, and implement it for planar grasps, together with the Ferrari–Canny quality measure
+  - Apply the two-finger antipodal condition and use it to select a grasp under a gripper's constraints
+  - Describe the pick-and-place pipeline (perception, grasp selection, motion planning, execution, verification) and why verification pays
+  - Summarise learning-based grasp prediction and how bin picking is done in logistics in 2026
+narrators: [chloe, margaret, gideon]
+prerequisites: [inverse-kinematics, force-and-impedance-control, depth-and-point-clouds, sampling-based-planning, simulation]
+related: [math.algebra.linear-algebra, math.applied.optimisation, math.applied.classical-mechanics]
+references:
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 12 treats grasping and manipulation, including form and force closure; the preprint is free.
+  - title: "Dex-Net 2.0: Deep Learning to Plan Robust Grasps with Synthetic Point Clouds and Analytic Grasp Metrics"
+    author: Jeffrey Mahler and colleagues
+    year: 2017
+    url: https://arxiv.org/abs/1703.09312
+    note: Training a grasp-quality network on millions of synthetic examples labelled by analytic metrics.
+  - title: "Supersizing Self-supervision: Learning to Grasp from 50K Tries and 700 Robot Hours"
+    author: Lerrel Pinto and Abhinav Gupta
+    year: 2016
+    url: https://arxiv.org/abs/1509.06825
+    note: Learning grasps from a robot's own trial and error.
+  - title: "Learning Hand-Eye Coordination for Robotic Grasping with Deep Learning and Large-Scale Data Collection"
+    author: Sergey Levine, Peter Pastor, Alex Krizhevsky, Julian Ibarz and Deirdre Quillen
+    year: 2018
+    url: https://arxiv.org/abs/1603.02199
+    note: Hundreds of thousands of grasp attempts collected on a group of real robots.
+  - title: "Contact-GraspNet: Efficient 6-DoF Grasp Generation in Cluttered Scenes"
+    author: Martin Sundermeyer, Arsalan Mousavian, Rudolph Triebel and Dieter Fox
+    year: 2021
+    url: https://arxiv.org/abs/2103.14127
+    note: Predicting full 6-D grasps directly from a depth image of clutter.
+  - title: GraspNet
+    url: https://graspnet.net/
+    note: The GraspNet-1Billion benchmark and dataset from Shanghai Jiao Tong University.
+  - title: MoveIt
+    url: https://moveit.ai/
+    note: The open-source motion-planning framework for ROS used in many pick-and-place systems.
+---
+
+<Section id="motivation" kind="motivation" title="Why is picking things up so hard?">
+
+A three-year-old can pick a toy out of a toy box without looking very carefully. A warehouse robot facing a tote of 40 different items, a shampoo bottle on its side, a bag of socks, a boxed phone charger and a book wedged against the wall, has to solve a chain of problems in about a second: *what* is in the bin, *where* exactly each item is, *how* to hold the one it wants so that it will not slip or swing, *which* path brings the gripper there without hitting the bin or the other items, and finally *whether* it actually has the item. Each step fails a few per cent of the time, and the failures multiply.
+
+From 2015 to 2017 Amazon ran an open competition, the Amazon Picking Challenge (later the Amazon Robotics Challenge), to push exactly this problem; the winning teams came from TU Berlin (2015), TU Delft (2016) and the Australian Centre for Robotic Vision (2017), and the leading entries relied heavily on suction. Since then, picking robots have moved from contests into warehouses in many countries, and grasping has become one of the main proving grounds for robot learning.
+
+This lesson builds the core ideas from the contact upwards: grippers, the friction cone, **force closure** with an implemented test and a quality score, the pick-and-place pipeline with a simulation of why verification matters, and the learned grasp predictors used in 2026.
+
+</Section>
+
+<Section id="grippers" kind="intuition" title="Grippers">
+
+The end effector shapes everything downstream. Four families cover most robots.
+
+- **Parallel-jaw grippers**: two fingers that close along a slide, driven electrically or pneumatically. Simple, strong, precise and easy to model (a grasp is two contacts and a width), they are the default in research and on machine-tending arms. Makers in many countries build them, for example Schunk in Germany, Robotiq in Canada and SMC in Japan.
+- **Suction grippers**: one or more vacuum cups, evacuated by a pump or by an ejector that uses compressed air. They need only one accessible flat-ish face, which makes them the workhorse of logistics, where most items are boxes, bottles and sealed bags. They fail on porous, very curved, dusty or tiny items.
+- **Soft grippers**: fingers made of rubber-like materials, often inflated with air, or fin-shaped fingers that wrap around an object when pressed, or a bag of granules that flows around an object and then stiffens when the air is pumped out ("jamming"). They are forgiving of uncertainty and gentle with food and fruit, at the cost of precision and strength.
+- **Multi-fingered hands**: three to five articulated fingers, such as the Shadow Dexterous Hand (United Kingdom), the Allegro Hand (South Korea) and the low-cost open-source LEAP Hand from Carnegie Mellon University (2023). They can reorient objects in the hand, not just hold them, and are the subject of <LessonLink slug="dexterous-manipulation">Dexterous manipulation</LessonLink>.
+
+<Narrator who="margaret">
+
+A suction cup's holding force is the pressure difference times its area. A 30 mm cup with the air pressure inside reduced by 60 kPa (a typical vacuum level, about 60% below atmospheric) holds with $60\,000 \times \pi \times 0.015^2 \approx 42$ N, enough for a 4 kg box in a perfectly straight, gentle lift. Engineers then divide by a safety factor of two to four, more if the cup will be swung sideways, because accelerations and leaks around a poor seal eat into that margin fast.
+
+</Narrator>
+
+</Section>
+
+<Section id="contact" kind="definitions" title="Contacts, friction cones and wrenches">
+
+To reason about a grasp we model each finger's touch as a **contact** at a point $p_i$ on the object's surface, with inward unit normal $\hat n_i$. What forces can the finger apply there?
+
+<Definition term="Contact models and the friction cone">
+
+- A **frictionless point contact** can only push along the normal: $f_i = c\,\hat n_i$ with $c \ge 0$.
+- A **point contact with friction** (a "hard finger") can push with any force inside the **friction cone**: the normal component $f_n \ge 0$ and the tangential component $\lVert f_t \rVert \le \mu f_n$, where $\mu$ is the Coulomb friction coefficient. The cone's half-angle is $\arctan\mu$.
+- A **soft-finger contact** adds a limited torque about the normal, from the area of a squashed fingertip.
+
+In the plane, the friction cone is a wedge spanned by two **edge forces**, $\hat n_i + \mu \hat t_i$ and $\hat n_i - \mu \hat t_i$ (with $\hat t_i$ the tangent), and every allowed force is a non-negative combination of them. In 3-D, the round cone is often replaced by a pyramid of 4 to 8 edges.
+
+</Definition>
+
+A force $f$ applied at $p$ acts on the object as a **wrench**: the force together with its torque about the object's reference point, $\tau = p \times f$. In the plane a wrench has three components, $w = (f_x, f_y, \tau)$, with $\tau = p_x f_y - p_y f_x$; in space it has six. Stacking the contacts' contributions gives the **grasp map** $w = G f$, from all the contact forces to the net wrench on the object.
+
+<Figure caption="A two-finger grasp of a box, seen from above. Each finger can push with any force inside its friction cone (shaded wedge, half-angle arctan μ). The dashed line joins the contacts; because it lies inside both cones, the fingers can squeeze along it, and this grasp is force closure.">
+<svg viewBox="0 0 440 220" role="img" aria-label="A rectangle representing a box, with a finger touching its left face and another touching its right face at the same height. At each contact a shaded wedge opens into the box, centred on the inward normal. A dashed line joins the two contacts and lies inside both wedges. Labels mark the normal n, the friction cone and the angle arctan mu.">
+  <rect x="120" y="50" width="200" height="120" fill="var(--sky-soft)" fillOpacity="0.4" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="var(--gold-soft)" fillOpacity="0.8" stroke="currentColor" strokeWidth="0.8">
+    <path d="M 120 110 L 200 70 L 200 150 Z" />
+    <path d="M 320 110 L 240 70 L 240 150 Z" />
+  </g>
+  <g fill="currentColor" stroke="currentColor" strokeWidth="1.2">
+    <rect x="70" y="100" width="50" height="20" fill="var(--card)" />
+    <rect x="320" y="100" width="50" height="20" fill="var(--card)" />
+  </g>
+  <line x1="120" y1="110" x2="320" y2="110" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="60" y="95">finger 1</text>
+    <text x="330" y="95">finger 2</text>
+    <text x="205" y="66">friction cone</text>
+    <text x="150" y="104">n₁</text>
+    <text x="280" y="104">n₂</text>
+    <text x="150" y="190">half-angle arctan μ</text>
+  </g>
+  <path d="M 160 90 A 45 45 0 0 1 165 110" fill="none" stroke="currentColor" strokeWidth="1" />
+</svg>
+</Figure>
+
+<Definition term="Force closure">
+
+A grasp is in **force closure** if the fingers, by applying suitable forces inside their friction cones, can balance **any** external wrench on the object: for every $w_{\text{ext}}$ there are allowed contact forces with $G f = -w_{\text{ext}}$. (When the contacts are frictionless and this still holds, the grasp is in **form closure**: the geometry alone pins the object.)
+
+</Definition>
+
+Force closure is what lets a grasp hold an object whatever the motion: gravity in any direction, the jolt of a fast move, a collision with the bin wall. The fingers do not need to know the disturbance in advance; they need only be *able* to resist it.
+
+<Theorem name="Convex-hull test for force closure">
+
+Let $w_1, \dots, w_m$ be the wrenches of all the friction-cone edges of a grasp, each with unit normal component. The grasp is in force closure if and only if the origin lies in the **interior** of the convex hull of $\{w_1, \dots, w_m\}$.
+
+</Theorem>
+
+<Proof>
+
+Every allowed contact force is a non-negative combination of its cone's edges, and the wrench is linear in the forces, so the set of wrenches the grasp can produce is the **cone** $\{\sum_j \lambda_j w_j : \lambda_j \ge 0\}$. Force closure says this cone is the whole wrench space.
+
+If the origin is interior to the hull, some ball of radius $\varepsilon > 0$ around it lies in the hull, so every wrench of size at most $\varepsilon$ is a convex (hence non-negative) combination of the $w_j$; any other wrench is a positive multiple of one of those, so it is produced too. Conversely, if the origin is not interior, a supporting hyperplane separates it from the hull's interior: there is a direction $d \ne 0$ with $d \cdot w_j \ge 0$ for all $j$ (because each $w_j$ lies on the hull's side of the plane). Then every producible wrench has $d \cdot w \ge 0$, so the wrench $-d$ cannot be produced, and the grasp is not force closure.
+
+</Proof>
+
+<Narrator who="chloe">
+
+The theorem turns grasping into convex geometry, and counting follows. A set of vectors that positively spans $\mathbb R^k$ needs at least $k + 1$ of them, so with frictionless contacts a planar grasp ($k = 3$) needs at least **four** fingers and a spatial one ($k = 6$) at least **seven**. Friction is what lets two fingers do the job in the plane, because each contact then contributes two edge wrenches instead of one.
+
+</Narrator>
+
+</Section>
+
+<Section id="force-closure-code" kind="computation" title="Testing force closure in code">
+
+The program builds the edge wrenches of a planar grasp and then measures how far inside the convex hull the origin sits. With a few points we can find the hull's faces by brute force: a triangle of points is a face if every other point lies on one side of its plane. The smallest distance from the origin to a face is the **Ferrari–Canny quality** $\varepsilon$ (1992): the largest disturbance wrench, in the worst direction, that the grasp can resist with a total normal force of 1. Positive $\varepsilon$ means force closure; larger is more robust. Torques are divided by a characteristic length $\rho$ (here 5 cm) so that forces and torques can be compared.
+
+```python run
+import itertools
+import numpy as np
+
+def contact_wrenches(points, normals, mu, rho):
+    """Edges of each planar friction cone, as wrenches (fx, fy, torque / rho).
+    Each edge force is n + mu t or n - mu t: unit normal component, the most tangential force allowed."""
+    W = []
+    for p, n in zip(np.asarray(points, float), np.asarray(normals, float)):
+        n = n / np.linalg.norm(n)
+        t = np.array([-n[1], n[0]])                        # the tangent direction
+        for f in (n + mu * t, n - mu * t) if mu > 0 else (n,):
+            W.append([f[0], f[1], (p[0] * f[1] - p[1] * f[0]) / rho])
+    return np.array(W)
+
+def grasp_quality(W, tol=1e-12):
+    """Distance from the origin to the boundary of conv(W), negative or zero if the origin is not
+    strictly inside. Positive means force closure; the value is the Ferrari-Canny epsilon."""
+    if np.linalg.matrix_rank(W - W.mean(axis=0), tol=1e-9) < 3:
+        return 0.0                                          # a flat hull has no interior
+    best = np.inf
+    for i, j, k in itertools.combinations(range(len(W)), 3):
+        n = np.cross(W[j] - W[i], W[k] - W[i])
+        if np.linalg.norm(n) < 1e-12:
+            continue
+        n /= np.linalg.norm(n)
+        s = W @ n - n @ W[i]
+        if np.all(s <= tol):                                # every point on one side: a facet
+            best = min(best, n @ W[i])
+        elif np.all(s >= -tol):
+            best = min(best, -(n @ W[i]))
+    return best
+
+rho = 0.05                                                  # torques are divided by a 5 cm lever
+grasps = {
+    "two fingers, opposite faces, mu = 0.5": ([(-0.05, 0), (0.05, 0)], [(1, 0), (-1, 0)], 0.5),
+    "the same, frictionless (mu = 0)":       ([(-0.05, 0), (0.05, 0)], [(1, 0), (-1, 0)], 0.0),
+    "two fingers offset 6 cm, mu = 0.5":     ([(-0.05, 0.03), (0.05, -0.03)], [(1, 0), (-1, 0)], 0.5),
+    "two fingers offset 6 cm, mu = 0.8":     ([(-0.05, 0.03), (0.05, -0.03)], [(1, 0), (-1, 0)], 0.8),
+    "three fingers on a disc, mu = 0.2":     ([(0.04 * np.cos(a), 0.04 * np.sin(a)) for a in (0, 2.0944, 4.1888)],
+                                              [(-np.cos(a), -np.sin(a)) for a in (0, 2.0944, 4.1888)], 0.2),
+    "three fingers on a disc, mu = 0":       ([(0.04 * np.cos(a), 0.04 * np.sin(a)) for a in (0, 2.0944, 4.1888)],
+                                              [(-np.cos(a), -np.sin(a)) for a in (0, 2.0944, 4.1888)], 0.0),
+    "four frictionless fingers on a box":    ([(-0.05, 0.03), (0.05, 0.01), (0.0, 0.05), (0.02, -0.05)],
+                                              [(1, 0), (-1, 0), (0, -1), (0, 1)], 0.0),
+}
+for name, (pts, nrm, mu) in grasps.items():
+    q = grasp_quality(contact_wrenches(pts, nrm, mu, rho))
+    print(f"{name:40} quality {q:+.4f}  ->  {'force closure' if q > 1e-9 else 'NOT force closure'}")
+```
+
+Each line teaches something:
+
+- Two fingers squeezing opposite faces with $\mu = 0.5$ are in force closure ($\varepsilon = 0.333$). Without friction they are not: they can only push along one line, so they cannot resist a sideways push or a twist.
+- Offset the fingers so that the line between them is tilted by $\arctan(0.06/0.10) = 31°$ from the faces' normals, and it fails at $\mu = 0.5$ (friction angle 26.6°) but succeeds at $\mu = 0.8$ (38.7°). Friction must be able to cover the tilt.
+- Three fingers at 120° around a disc are force closure with even modest friction, but frictionless they cannot resist twisting, because every normal passes through the centre.
+- Four frictionless fingers, placed on a box so that their normals do *not* all meet, achieve form closure, matching Chloe's count of $k + 1 = 4$.
+
+<Theorem name="Two-finger planar force closure (Nguyen, 1988)">
+
+A planar grasp with two point contacts with friction is in force closure if and only if the segment joining the two contacts lies strictly inside both friction cones, that is, it makes an angle smaller than $\arctan\mu$ with each inward normal.
+
+</Theorem>
+
+The idea of the proof: if the segment lies inside both cones, the fingers can squeeze along it with any internal force, and adding small extra forces within the cones (which have room around the segment) resists any small wrench; if it lies outside a cone, one finds a twist or push that neither finger can oppose. The **antipodal** grasps that parallel-jaw grippers make are the case where the two normals are opposite and aligned with the segment.
+
+### Choosing a grasp
+
+Grasp selection combines quality with what the hardware allows. Below, a parallel-jaw gripper that opens to 9 cm must hold an oval object 12 cm by 6 cm (a bar of soap, say) with $\mu = 0.4$. We try pairs of opposite points around the oval, compute the angle between the finger line and the normal (Nguyen's condition), the quality, and the opening width required.
+
+```python run
+import itertools
+import numpy as np
+
+def contact_wrenches(points, normals, mu, rho):
+    W = []
+    for p, n in zip(np.asarray(points, float), np.asarray(normals, float)):
+        n = n / np.linalg.norm(n)
+        t = np.array([-n[1], n[0]])
+        for f in (n + mu * t, n - mu * t) if mu > 0 else (n,):
+            W.append([f[0], f[1], (p[0] * f[1] - p[1] * f[0]) / rho])
+    return np.array(W)
+
+def grasp_quality(W, tol=1e-12):
+    if np.linalg.matrix_rank(W - W.mean(axis=0), tol=1e-9) < 3:
+        return 0.0
+    best = np.inf
+    for i, j, k in itertools.combinations(range(len(W)), 3):
+        n = np.cross(W[j] - W[i], W[k] - W[i])
+        if np.linalg.norm(n) < 1e-12:
+            continue
+        n /= np.linalg.norm(n)
+        s = W @ n - n @ W[i]
+        if np.all(s <= tol):
+            best = min(best, n @ W[i])
+        elif np.all(s >= -tol):
+            best = min(best, -(n @ W[i]))
+    return best
+
+# An oval object (a bar of soap, 12 cm x 6 cm); a parallel-jaw gripper that opens to 9 cm; mu = 0.4.
+a, b, mu, rho, max_open = 0.06, 0.03, 0.4, 0.05, 0.09
+print(" angle   width   line-vs-normal   friction angle   quality   verdict")
+best = None
+for deg in range(0, 91, 15):
+    t = np.radians(deg)
+    p1 = np.array([a * np.cos(t), b * np.sin(t)])
+    p2 = -p1                                               # the opposite point through the centre
+    n1 = -np.array([np.cos(t) / a, np.sin(t) / b])        # inward normals
+    n1 /= np.linalg.norm(n1)
+    n2 = -n1
+    width = np.linalg.norm(p1 - p2)
+    u = (p2 - p1) / width
+    off = np.degrees(np.arccos(np.clip(u @ n1, -1, 1)))    # angle between the finger line and the normal
+    q = grasp_quality(contact_wrenches([p1, p2], [n1, n2], mu, rho))
+    ok = q > 1e-9 and width <= max_open
+    verdict = "ok" if ok else ("too wide" if q > 1e-9 else "slips")
+    print(f"{deg:5d}   {100 * width:4.1f} cm   {off:8.1f} deg     {np.degrees(np.arctan(mu)):8.1f} deg   {q:+.4f}   {verdict}")
+    if ok and (best is None or q > best[1]):
+        best = (deg, q)
+print(f"chosen grasp: contacts at {best[0]} deg, quality {best[1]:.4f}")
+```
+
+The two tests agree line by line: wherever the finger line is within the 21.8° friction angle the quality is positive, and wherever it is not (33° and 36.9°) the grasp slips. The best grasp by quality, across the long axis ($\varepsilon = 0.294$), needs a 12 cm opening the gripper does not have; the chosen grasp is across the short axis, at 6 cm. The grasps at 15° and 75° are force closure only just ($\varepsilon \approx 0.01$–$0.02$): legal, but a little error in where the fingers land, or a slightly lower $\mu$, and they slip. Real grasp planners therefore prefer grasps whose quality is robust to the perception error they expect.
+
+<Narrator who="gideon">
+
+The quality number depends on a choice you made: the length $\rho$ that converts torques into force units. Divide torques by 1 cm instead of 5 cm and the ranking of grasps can change, because resisting twists suddenly counts for more. Report $\rho$ with any quality score, and remember the whole analysis assumes rigid point contacts, a known $\mu$ and fingers that can push as hard as needed; force closure says a grasp *can* resist a wrench, not that your motors are strong enough to.
+
+</Narrator>
+
+</Section>
+
+<Section id="pipeline" kind="examples" title="The pick-and-place pipeline">
+
+An industrial picking cell runs the same loop thousands of times a day.
+
+<Figure caption="The pick-and-place pipeline. Verification closes the loop: a failed grasp or a dropped item sends the robot back to look again, instead of letting an empty gripper complete the motion.">
+<svg viewBox="0 0 460 170" role="img" aria-label="Five boxes in a row joined by arrows: perceive, select grasp, plan motion, execute, verify. From verify, an arrow labelled success leads out to the right, and an arrow labelled failure, retry curves back to perceive.">
+  <defs>
+    <marker id="mg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.5" stroke="currentColor" strokeWidth="1.3">
+    <rect x="10" y="50" width="70" height="44" rx="5" />
+    <rect x="96" y="50" width="70" height="44" rx="5" />
+    <rect x="182" y="50" width="70" height="44" rx="5" />
+    <rect x="268" y="50" width="70" height="44" rx="5" />
+  </g>
+  <rect x="354" y="50" width="70" height="44" rx="5" fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1.3" />
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" markerEnd="url(#mg-arrow)">
+    <line x1="80" y1="72" x2="94" y2="72" />
+    <line x1="166" y1="72" x2="180" y2="72" />
+    <line x1="252" y1="72" x2="266" y2="72" />
+    <line x1="338" y1="72" x2="352" y2="72" />
+    <line x1="424" y1="72" x2="452" y2="72" />
+    <path d="M 389 94 L 389 140 L 45 140 L 45 96" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="45" y="70">perceive</text>
+    <text x="45" y="84" fontSize="9">segment, pose</text>
+    <text x="131" y="70">select</text>
+    <text x="131" y="84">grasp</text>
+    <text x="217" y="70">plan</text>
+    <text x="217" y="84">motion</text>
+    <text x="303" y="70">execute</text>
+    <text x="303" y="84" fontSize="9">approach, grip</text>
+    <text x="389" y="77">verify</text>
+    <text x="217" y="158" fontSize="10">failure: retry</text>
+    <text x="440" y="62" fontSize="10">done</text>
+  </g>
+</svg>
+</Figure>
+
+1. **Perceive.** Cameras and depth sensors over the bin produce images and point clouds (<LessonLink slug="depth-and-point-clouds">Depth and point clouds</LessonLink>); a segmentation network separates the items; for known items, a pose estimator finds each one's 6-D pose. Shiny, transparent and black items are hard for depth sensors, and clutter hides most surfaces.
+2. **Select a grasp.** Candidate grasps are generated (suction points on flat patches, antipodal pairs for jaws), filtered by reachability and collisions, and ranked by an analytic quality like the one above or by a learned predictor.
+3. **Plan the motion.** A collision-free path to a pre-grasp pose above the item, then a straight approach, is found with inverse kinematics and a planner (<LessonLink slug="inverse-kinematics">Inverse kinematics</LessonLink>, <LessonLink slug="sampling-based-planning">Sampling-based planning</LessonLink>); open-source systems often use [MoveIt](https://moveit.ai/).
+4. **Execute.** The robot approaches, makes contact under force or impedance control (<LessonLink slug="force-and-impedance-control">Force and impedance control</LessonLink>) so that a few millimetres of perception error do not become a crash, grips, lifts and transports.
+5. **Verify.** Did it work? Suction systems read the vacuum pressure; jaw grippers check the finger width and motor current; a wrist force sensor or a scale under the destination weighs the item; a camera checks the place.
+
+Each stage succeeds most of the time, so why spend time on step 5? The simulation below compares two versions of one illustrative suction cell, over 5000 order lines: one that trusts every pick, and one that checks the vacuum after gripping and again at the drop-off, retrying up to three times.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(2026)
+
+# Stage times (s) and success probabilities for one suction-gripper bin-picking cell (illustrative).
+T_SEE, T_PLAN, T_GRASP, T_MOVE, T_CHECK = 0.4, 0.3, 1.2, 1.5, 0.1
+P_SEE, P_GRASP, P_HOLD = 0.97, 0.92, 0.98   # find a target; seal and lift; keep it in transit
+
+def pick_one(verify, max_tries=3):
+    """Time spent and whether the item really arrived, for one order line."""
+    t = 0.0
+    for _ in range(max_tries if verify else 1):
+        t += T_SEE
+        while rng.random() > P_SEE:                    # nothing pickable seen: look again
+            t += T_SEE
+        t += T_PLAN + T_GRASP
+        grasped = rng.random() < P_GRASP
+        if verify:
+            t += T_CHECK                               # vacuum sensor: is something on the cup?
+            if not grasped:
+                continue                               # retry at once, without moving
+        held = grasped and rng.random() < P_HOLD
+        t += T_MOVE
+        if verify:
+            t += T_CHECK                               # still holding at the drop-off?
+            if held:
+                return t, True
+            continue                                   # dropped on the way: try again
+        return t, held                                 # no checks: the robot never knows
+    return t, False
+
+for verify in (False, True):
+    results = [pick_one(verify) for _ in range(5000)]
+    total = sum(t for t, _ in results)
+    good = sum(ok for _, ok in results)
+    print(f"{'with checks + retries' if verify else 'no verification':22}: mean {total / len(results):.2f} s per line, "
+          f"{100 * good / len(results):6.2f}% delivered, {3600 * good / total:6.0f} good picks per hour, "
+          f"{len(results) - good} lines wrong")
+```
+
+The cell without checks is slightly faster per line (3.41 s against 3.85 s) and delivers almost the same number of *good* picks per hour (948 against 935). But 506 of its 5000 order lines are silently wrong, about one in ten, each discovered later by a person packing an incomplete order or, worse, by a customer. With two 0.1 s vacuum checks and retries, only 1 line in 5000 fails, and that one is *known* to have failed, so it can be sent to a person. In logistics, a detected failure is cheap and an undetected one is expensive; verification is what turns a 92% grasp into a 99.98% process.
+
+</Section>
+
+<Section id="learning" kind="human" title="Learning to grasp, and grasping in industry">
+
+The analytic approach of this lesson needs a model of the object: its shape, its contacts, its friction. For a warehouse with millions of different products, most never seen before, that model does not exist. Since the mid-2010s the dominant approach has been to **learn** which grasps work, directly from images or point clouds.
+
+- **Learning from real attempts.** Pinto and Gupta at Carnegie Mellon (2016) trained a network on 50,000 grasp attempts collected by a robot over 700 hours. A Google team (Levine and colleagues, 2018) collected about 800,000 attempts on a group of up to 14 robots and learned closed-loop grasping from camera images; QT-Opt (Kalashnikov and colleagues, 2018) used reinforcement learning on similar data.
+- **Learning from simulation and analytic labels.** Dex-Net 2.0 (Mahler and colleagues at Berkeley, 2017) labelled millions of synthetic depth images with a robust version of the analytic quality you computed above, and trained a network to predict it for new objects.
+- **Grasps in clutter, in full 3-D.** Later systems predict complete 6-D gripper poses directly from a scene's point cloud, among them 6-DOF GraspNet and Contact-GraspNet from NVIDIA's robotics lab, and the GraspNet-1Billion benchmark and AnyGrasp from Shanghai Jiao Tong University.
+- **Generalist policies.** In 2025–2026, vision-language-action models trained on large multi-robot datasets treat grasping as one skill among many, chosen by language ("pick up the blue mug by its handle"). They are covered in <LessonLink slug="vision-language-action-models">Vision-language-action models</LessonLink>; for high-throughput picking of a single kind of task, specialised grasp predictors remain common in 2026.
+
+Bin picking is now a mature industry, with suppliers in many countries: Amazon Robotics (United States) deploys picking robots such as Sparrow, announced in 2022, in its own warehouses; Ocado Technology (United Kingdom) builds picking arms for automated grocery warehouses; Mujin (Japan) sells controllers for picking and depalletising; Fizyr (Netherlands) and Mech-Mind Robotics (China) supply the vision and grasp-detection software that many integrators use. Typical cells combine suction (often several cups of different sizes, swapped automatically) with careful verification, exception handling that hands awkward items to people, and continuous retraining on the failures they log.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Squeeze harder and any grasp will hold."** Squeezing harder raises the friction *available*, but if the line between two fingers lies outside the friction cones, the squeeze itself pushes the object out sideways, as when a wet bar of soap shoots out of your hand. Force closure is about geometry and $\mu$, not grip strength.
+
+</Misconception>
+
+<Misconception>
+
+**"Force closure means the grasp is good."** It means the grasp can resist every wrench *in principle*. A grasp with a tiny quality, like the 15° grasp of the oval, resists only small disturbances for a given grip force and fails with small errors in contact position or friction. Robust grasp planning maximises quality under the expected uncertainty.
+
+</Misconception>
+
+<Misconception>
+
+**"Suction is a universal gripper."** It needs a sealable surface and enough area for the load. Porous fabric, perforated boxes, very curved small items and dusty surfaces defeat it, which is why logistics cells keep jaws or people for the exceptions.
+
+</Misconception>
+
+<Misconception>
+
+**"If the robot completed the motion, it delivered the item."** Without a check, an empty gripper completes the motion just as smoothly. The pipeline simulation shows the cost: one order line in ten silently wrong.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Mechanicians studied how fixtures immobilise parts long before robots; Franz Reuleaux discussed closure of kinematic pairs in the 1870s. Robotic grasp analysis took its modern form in the 1980s: Kenneth Salisbury's work on articulated hands at Stanford and MIT, Matthew Mason's on the mechanics of pushing and grasping at MIT and Carnegie Mellon, and Van-Duc Nguyen's 1988 conditions for force-closure grasps. In 1992 Carlo Ferrari and John Canny at Berkeley defined the quality measure used above. Suction and parallel jaws dominated factories throughout; the shift to learned grasping came in the 2010s with deep learning, cheap depth cameras and large datasets, accelerated by the Amazon Picking Challenge and by the growth of online retail.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

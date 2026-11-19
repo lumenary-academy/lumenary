@@ -1,0 +1,609 @@
+---
+title: Configuration space and collision checking
+subtitle: Turning a robot with a shape into a point in a space of its own — the configuration space of an arm, Minkowski sums, and the bounding volumes, separating axes, GJK and distance fields that answer "does it touch?" millions of times a second.
+minutes: 75
+objectives:
+  - Define a robot's configuration space, its dimension and its shape (plane, circle, torus, SE(2), SE(3)), and the free and obstacle regions within it
+  - Compute and draw the configuration-space obstacles of a planar two-link arm among circles, and plan a path in them that wraps around the torus
+  - Compute the C-obstacle of a translating polygonal robot as a Minkowski sum, and prove why it works
+  - Organise collision checking into broad and narrow phases with bounding volumes and hierarchies, and implement the separating axis test for 2-D boxes
+  - Explain what GJK computes and why, and build and use a signed distance field
+narrators: [chloe, margaret, gideon]
+prerequisites: [sampling-based-planning, forward-kinematics]
+related: [math.geom.point-set-topology, math.geom.smooth-manifolds, math.geom.matrix-groups, math.geom.vectors, math.applied.optimisation]
+references:
+  - title: "Spatial Planning: A Configuration Space Approach"
+    author: Tomás Lozano-Pérez
+    year: 1983
+    url: https://doi.org/10.1109/TC.1983.1676196
+    note: The paper that made configuration space the standard way to think about motion planning.
+  - title: "A fast procedure for computing the distance between complex objects in three-dimensional space"
+    author: Elmer G. Gilbert, Daniel W. Johnson and S. Sathiya Keerthi
+    year: 1988
+    url: https://doi.org/10.1109/56.2083
+    note: The GJK algorithm.
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 10 introduces configuration-space obstacles and collision checking; the preprint and videos are free.
+  - title: "Planning Algorithms"
+    author: Steven M. LaValle
+    year: 2006
+    url: https://lavalle.pl/planning/
+    note: Chapter 4 treats the topology of configuration spaces carefully; chapter 5 covers collision detection.
+  - title: "FCL: The Flexible Collision Library"
+    url: https://github.com/flexible-collision-library/fcl
+    note: The collision and distance library used by MoveIt by default; built on bounding volume hierarchies and GJK.
+  - title: "Coal (formerly HPP-FCL)"
+    url: https://github.com/coal-library/coal
+    note: An extension of FCL from LAAS-CNRS and Inria, with accelerated GJK and EPA, used by Pinocchio and other planners.
+  - title: "Voxblox"
+    author: Helen Oleynikova and colleagues, ETH Zürich
+    url: https://github.com/ethz-asl/voxblox
+    note: Incremental signed distance fields built from depth sensors, for planning on micro aerial vehicles.
+---
+
+<Section id="motivation" kind="motivation" title="Turning a robot into a point">
+
+The last two lessons planned for a point. A* moved a point through a grid of cells; RRT grew a tree of points. But robots have shapes: a vacuum cleaner is a disc, a warehouse robot is a rectangle carrying a shelf, an arm is a chain of links shaped like tubes and boxes. The collision question is about shapes overlapping, and it seems to need geometry in every step of every planner.
+
+The trick that makes planning tractable is to **change the space**, not the planner. Describe the robot completely by a short list of numbers, its **configuration**: $(x, y)$ for a disc, $(x, y, \theta)$ for a rectangle that can turn, the joint angles for an arm. Each configuration is a point in a space of such lists, and each point is either free (the robot placed there touches nothing) or not. In that space the robot *is* a point, and the obstacles become regions with new, often strange shapes. Tomás Lozano-Pérez made this idea the foundation of motion planning in a 1983 paper; every planner in this level works in configuration space, whether it builds the regions explicitly or only samples them.
+
+This lesson does three things. It looks at configuration spaces themselves: their dimension, their shape, and the obstacles in them, computed for a two-link arm and, exactly, for a polygon sliding in the plane. It then opens the black box the planners called "collision checker", which in practice consumes most of a planner's time, and builds its main parts: bounding volumes, hierarchies and the separating axis test. Finally it builds a signed distance field, the data structure that tells a robot not just *whether* it collides but *how far* it is from collision, which the <LessonLink slug="trajectory-optimisation">next lesson</LessonLink> uses to push paths away from obstacles.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Configurations, and the shapes of the spaces they live in">
+
+Start with the simplest robot, a disc of radius $\rho$ moving in the plane without turning. Its configuration is its centre $(x, y)$, and it touches an obstacle exactly when its centre is within $\rho$ of it. So its configuration-space obstacles are the real obstacles **grown by $\rho$**: the costmap inflation of <LessonLink slug="graph-search-planning">Planning on graphs and grids</LessonLink> was configuration space all along.
+
+A rectangle that can also turn has configuration $(x, y, \theta)$: three numbers. Picture its configuration space as a stack of slices, one per angle $\theta$, each slice being the obstacles grown by the rectangle *at that angle*. The slices change as $\theta$ turns, and the top of the stack ($\theta = 2\pi$) is glued to the bottom ($\theta = 0$), because a full turn brings the robot back to where it started.
+
+An arm with two revolute joints that turn without limits has configuration $(q_1, q_2)$. Each angle lives on a circle, so the configuration space is a circle times a circle: a **torus**, the surface of a ring doughnut. Drawn flat it is a square whose left and right edges are the same place ($q_1 = -180°$ and $q_1 = 180°$), and likewise its top and bottom. A path that runs off one edge comes back on the opposite one.
+
+<Figure caption="Left: the workspace of a planar two-link arm (links 1.0 m and 0.8 m) with three round obstacles; the arm is drawn at its start configuration (solid, q₁ = 110°, q₂ = −30°) and its goal (gold, dashed, q₁ = 170°, q₂ = 60°), and the dashed circle marks its reach. Right: the same problem in configuration space, computed by the first program below at 10° resolution. Shaded cells are configurations in collision; the line is the path breadth-first search finds. Opposite edges of the square are the same place (marked by matching arrows), so the square is really a torus: the path leaves through the left edge and re-enters at the right, next to the goal.">
+<svg viewBox="0 0 460 260" role="img" aria-label="Two panels. On the left, a two-link arm with its base at the centre of a dashed reach circle, three shaded circular obstacles around it, and the arm drawn twice: once pointing up and slightly left, once pointing left and bent down. On the right, a square plot with q1 across and q2 up, containing shaded regions: a vertical band near the right edge and several diagonal bands. A path starts beside the vertical band, climbs, runs left across the top part, drops, and exits at the left edge; the goal sits at the right edge at the same height.">
+  <defs>
+    <marker id="cs-arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <circle cx="128" cy="130" r="108" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="4 4" opacity="0.6" />
+  <g fill="currentColor" opacity="0.35">
+    <circle cx="200" cy="88" r="15" />
+    <circle cx="74" cy="76" r="18" />
+    <circle cx="140" cy="208" r="15" />
+  </g>
+  <polyline points="128,130 107.5,73.6 115.8,26.3" fill="none" stroke="currentColor" strokeWidth="5" strokeLinejoin="round" strokeLinecap="round" />
+  <polyline points="128,130 68.9,119.6 38.1,156.3" fill="none" stroke="var(--gold)" strokeWidth="4" strokeDasharray="7 4" strokeLinejoin="round" />
+  <circle cx="128" cy="130" r="6" fill="var(--card)" stroke="currentColor" strokeWidth="2" />
+  <g fill="currentColor" fontSize="12">
+    <text x="10" y="252">workspace (metres)</text>
+    <text x="122" y="22">start</text>
+    <text x="16" y="172">goal</text>
+    <text x="138" y="146">base</text>
+  </g>
+  <rect x="262" y="40" width="180" height="180" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g fill="currentColor" opacity="0.35">
+    <rect x="417" y="215" width="10" height="5" />
+    <rect x="417" y="210" width="10" height="5" />
+    <rect x="417" y="205" width="10" height="5" />
+    <rect x="417" y="200" width="10" height="5" />
+    <rect x="417" y="195" width="10" height="5" />
+    <rect x="417" y="190" width="10" height="5" />
+    <rect x="417" y="185" width="10" height="5" />
+    <rect x="262" y="180" width="10" height="5" />
+    <rect x="332" y="180" width="10" height="5" />
+    <rect x="417" y="180" width="25" height="5" />
+    <rect x="262" y="175" width="10" height="5" />
+    <rect x="327" y="175" width="15" height="5" />
+    <rect x="387" y="175" width="10" height="5" />
+    <rect x="417" y="175" width="25" height="5" />
+    <rect x="262" y="170" width="5" height="5" />
+    <rect x="317" y="170" width="25" height="5" />
+    <rect x="382" y="170" width="15" height="5" />
+    <rect x="417" y="170" width="25" height="5" />
+    <rect x="262" y="165" width="5" height="5" />
+    <rect x="317" y="165" width="20" height="5" />
+    <rect x="377" y="165" width="15" height="5" />
+    <rect x="417" y="165" width="25" height="5" />
+    <rect x="312" y="160" width="20" height="5" />
+    <rect x="372" y="160" width="20" height="5" />
+    <rect x="417" y="160" width="25" height="5" />
+    <rect x="312" y="155" width="20" height="5" />
+    <rect x="372" y="155" width="15" height="5" />
+    <rect x="417" y="155" width="25" height="5" />
+    <rect x="312" y="150" width="15" height="5" />
+    <rect x="372" y="150" width="15" height="5" />
+    <rect x="417" y="150" width="20" height="5" />
+    <rect x="312" y="145" width="15" height="5" />
+    <rect x="367" y="145" width="15" height="5" />
+    <rect x="417" y="145" width="20" height="5" />
+    <rect x="312" y="140" width="10" height="5" />
+    <rect x="367" y="140" width="15" height="5" />
+    <rect x="417" y="140" width="15" height="5" />
+    <rect x="307" y="135" width="15" height="5" />
+    <rect x="367" y="135" width="10" height="5" />
+    <rect x="417" y="135" width="15" height="5" />
+    <rect x="307" y="130" width="15" height="5" />
+    <rect x="367" y="130" width="10" height="5" />
+    <rect x="417" y="130" width="15" height="5" />
+    <rect x="307" y="125" width="15" height="5" />
+    <rect x="362" y="125" width="15" height="5" />
+    <rect x="412" y="125" width="20" height="5" />
+    <rect x="307" y="120" width="10" height="5" />
+    <rect x="362" y="120" width="15" height="5" />
+    <rect x="412" y="120" width="15" height="5" />
+    <rect x="307" y="115" width="10" height="5" />
+    <rect x="362" y="115" width="10" height="5" />
+    <rect x="412" y="115" width="15" height="5" />
+    <rect x="302" y="110" width="15" height="5" />
+    <rect x="357" y="110" width="15" height="5" />
+    <rect x="412" y="110" width="15" height="5" />
+    <rect x="302" y="105" width="15" height="5" />
+    <rect x="357" y="105" width="15" height="5" />
+    <rect x="407" y="105" width="20" height="5" />
+    <rect x="297" y="100" width="20" height="5" />
+    <rect x="352" y="100" width="20" height="5" />
+    <rect x="407" y="100" width="20" height="5" />
+    <rect x="297" y="95" width="20" height="5" />
+    <rect x="352" y="95" width="15" height="5" />
+    <rect x="402" y="95" width="25" height="5" />
+    <rect x="292" y="90" width="20" height="5" />
+    <rect x="347" y="90" width="20" height="5" />
+    <rect x="402" y="90" width="25" height="5" />
+    <rect x="292" y="85" width="20" height="5" />
+    <rect x="347" y="85" width="15" height="5" />
+    <rect x="397" y="85" width="30" height="5" />
+    <rect x="287" y="80" width="20" height="5" />
+    <rect x="342" y="80" width="15" height="5" />
+    <rect x="397" y="80" width="30" height="5" />
+    <rect x="287" y="75" width="15" height="5" />
+    <rect x="342" y="75" width="10" height="5" />
+    <rect x="392" y="75" width="35" height="5" />
+    <rect x="287" y="70" width="5" height="5" />
+    <rect x="392" y="70" width="35" height="5" />
+    <rect x="417" y="65" width="10" height="5" />
+    <rect x="417" y="60" width="10" height="5" />
+    <rect x="417" y="55" width="10" height="5" />
+    <rect x="417" y="50" width="10" height="5" />
+    <rect x="417" y="45" width="10" height="5" />
+    <rect x="417" y="40" width="10" height="5" />
+  </g>
+  <polyline points="409.5,142.5 409.5,137.5 409.5,132.5 409.5,127.5 409.5,122.5 409.5,117.5 409.5,112.5 404.5,112.5 404.5,107.5 404.5,102.5 399.5,102.5 399.5,97.5 399.5,92.5 394.5,92.5 394.5,87.5 394.5,82.5 389.5,82.5 389.5,77.5 389.5,72.5 389.5,67.5 384.5,67.5 379.5,67.5 374.5,67.5 369.5,67.5 364.5,67.5 359.5,67.5 354.5,67.5 349.5,67.5 344.5,67.5 339.5,67.5 334.5,67.5 329.5,67.5 324.5,67.5 319.5,67.5 314.5,67.5 309.5,67.5 304.5,67.5 299.5,67.5 294.5,67.5 289.5,67.5 284.5,67.5 284.5,72.5 284.5,77.5 284.5,82.5 284.5,87.5 284.5,92.5 284.5,97.5 279.5,97.5 274.5,97.5 269.5,97.5 264.5,97.5" fill="none" stroke="var(--gold)" strokeWidth="2.5" />
+  <line x1="264.5" y1="97.5" x2="258" y2="97.5" stroke="var(--gold)" strokeWidth="2.5" strokeDasharray="2 2" />
+  <line x1="446" y1="97.5" x2="439.5" y2="97.5" stroke="var(--gold)" strokeWidth="2.5" strokeDasharray="2 2" />
+  <circle cx="409.5" cy="142.5" r="4" fill="var(--gold)" stroke="currentColor" />
+  <circle cx="439.5" cy="97.5" r="4" fill="var(--gold)" stroke="currentColor" />
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="262" y1="136" x2="262" y2="124" markerEnd="url(#cs-arrow)" />
+    <line x1="442" y1="136" x2="442" y2="124" markerEnd="url(#cs-arrow)" />
+    <line x1="344" y1="40" x2="356" y2="40" markerEnd="url(#cs-arrow)" />
+    <line x1="350" y1="40" x2="362" y2="40" markerEnd="url(#cs-arrow)" />
+    <line x1="344" y1="220" x2="356" y2="220" markerEnd="url(#cs-arrow)" />
+    <line x1="350" y1="220" x2="362" y2="220" markerEnd="url(#cs-arrow)" />
+  </g>
+  <g fill="currentColor" fontSize="12">
+    <text x="300" y="20">configuration space</text>
+    <text x="340" y="250">q₁</text>
+    <text x="240" y="134">q₂</text>
+    <text x="256" y="236" fontSize="10">−180°</text>
+    <text x="428" y="236" fontSize="10">180°</text>
+    <text x="226" y="222" fontSize="10">−180°</text>
+    <text x="234" y="46" fontSize="10">180°</text>
+    <text x="396" y="160">S</text>
+    <text x="446" y="88">G</text>
+  </g>
+</svg>
+</Figure>
+
+The figure shows the arm in its world and its configuration space side by side. One obstacle is close enough to the base that the upper arm hits it at a range of shoulder angles *whatever the elbow does*: that is the vertical band near $q_1 = 135°$, cutting the torus all the way round. The arm's start is just on one side of that band and its goal just on the other, so the only way from one to the other is the long way round: the shoulder turns through 300°, past $\pm 180°$, while the elbow folds to keep the forearm out of the other obstacles. In the workspace this is surprising; in configuration space it is obvious.
+
+<Narrator who="chloe">
+
+The shape of the space matters as much as the obstacles in it. On a flat square the band near $q_1 = 135°$ would split the space into two pieces with no path between them. On the torus, cutting along one circle leaves a cylinder, still in one piece. Which loops on a surface can be cut without disconnecting it is a question for topology (Lumenary Math's <TopicLink id="math.geom.fundamental-group">Homotopy and the fundamental group</TopicLink> studies the torus's two independent loops).
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="configuration space">
+
+The **configuration** of a robot is a minimal set of numbers that fixes the position of every point of the robot. The set of all configurations is the **configuration space** $\mathcal{C}$, and its dimension is the robot's number of **degrees of freedom**. For a robot with geometry $\mathcal{A}(q)$ at configuration $q$ (the region of space it occupies) among obstacles $\mathcal{O}$, the **configuration-space obstacle** is $\mathcal{C}_{\text{obs}} = \{ q \in \mathcal{C} : \mathcal{A}(q) \cap \mathcal{O} \ne \emptyset \}$ and the **free space** is $\mathcal{C}_{\text{free}} = \mathcal{C} \setminus \mathcal{C}_{\text{obs}}$. A collision-free path is a continuous curve in $\mathcal{C}_{\text{free}}$.
+
+</Definition>
+
+The common configuration spaces have names and shapes worth knowing:
+
+| Robot | Configuration | $\mathcal{C}$ | Dimension |
+| --- | --- | --- | --- |
+| Disc or point in the plane | $(x, y)$ | $\mathbb{R}^2$ | 2 |
+| One joint turning without limit | $q$ | circle $S^1$ | 1 |
+| Planar arm with $n$ unlimited revolute joints | $(q_1, \ldots, q_n)$ | torus $T^n = S^1 \times \cdots \times S^1$ | $n$ |
+| Rigid body in the plane | $(x, y, \theta)$ | $SE(2) \cong \mathbb{R}^2 \times S^1$ | 3 |
+| Rigid body in space (a drone, a free-floating object) | position and orientation | $SE(3) \cong \mathbb{R}^3 \times SO(3)$ | 6 |
+| Wheeled base carrying a 7-joint arm | base pose and joint angles | $SE(2) \times$ (7 joint ranges) | 10 |
+
+Joints with limits (most real ones) turn circles into intervals, so a six-axis industrial arm's space is close to a box in $\mathbb{R}^6$, with the joint limits as walls. Orientation in 3-D is the subtle one: $SO(3)$ is not a torus of three angles, as <LessonLink slug="rotations-and-quaternions">Rotations and quaternions</LessonLink> showed, and planners that sample orientations must sample it uniformly (with random unit quaternions) rather than drawing three Euler angles uniformly. Distances matter too: in $SE(2)$ a planner must decide how many metres a radian is worth, and the choice changes which configurations count as "nearest".
+
+<Definition term="Minkowski sum">
+
+The **Minkowski sum** of two sets in the plane is $A \oplus B = \{ a + b : a \in A,\ b \in B \}$, and $-B = \{ -b : b \in B \}$.
+
+</Definition>
+
+<Theorem name="C-obstacles of a translating robot">
+
+Let a robot occupy the region $R$ when its reference point is at the origin, and let it translate without turning, so at configuration $t \in \mathbb{R}^2$ it occupies $R + t$. Then its configuration-space obstacle for an obstacle $O$ is $\mathcal{C}_{\text{obs}} = O \oplus (-R)$. If $R$ and $O$ are convex polygons with $m$ and $n$ edges, $\mathcal{C}_{\text{obs}}$ is a convex polygon with at most $m + n$ edges.
+
+</Theorem>
+
+<Proof>
+
+The robot at $t$ touches $O$ exactly when some point of the robot coincides with some point of the obstacle: $r + t = o$ for some $r \in R$ and $o \in O$. That says $t = o + (-r)$, which is exactly the statement $t \in O \oplus (-R)$. For convex polygons, the sum is convex (a sum of convex combinations is a convex combination of sums), and walking around its boundary, the edges appear in order of direction, each edge of $O$ and each edge of $-R$ appearing once (parallel ones merge), so there are at most $m + n$ of them.
+
+</Proof>
+
+</Section>
+
+<Section id="arm-cspace" kind="computation" title="The configuration space of a two-link arm">
+
+The first program computes the right-hand side of the figure. For every pair of joint angles on a 10° grid it places the arm by forward kinematics, treats each link as a segment thickened by 5 cm, and tests it against each circle by the distance from the circle's centre to the segment. Then it runs breadth-first search on the grid with **wrap-around** neighbours (the index arithmetic is modulo 36), and prints the map with the path.
+
+```python run
+from collections import deque
+import numpy as np
+
+L1, L2, LINK_R = 1.0, 0.8, 0.05            # link lengths and link half-thickness (m)
+CIRCLES = [((1.2, 0.7), 0.25),             # obstacles in the workspace: (centre, radius)
+           ((-0.9, 0.9), 0.30),
+           ((0.2, -1.3), 0.25)]
+
+def seg_point_dist(a, b, p):
+    ab, ap = b - a, p - a
+    t = np.clip(ap @ ab / (ab @ ab), 0.0, 1.0)
+    return np.linalg.norm(ap - t * ab)
+
+def collides(q1, q2):
+    base = np.zeros(2)
+    elbow = np.array([L1 * np.cos(q1), L1 * np.sin(q1)])
+    hand = elbow + [L2 * np.cos(q1 + q2), L2 * np.sin(q1 + q2)]
+    return any(seg_point_dist(a, b, np.array(c)) <= r + LINK_R
+               for c, r in CIRCLES for a, b in ((base, elbow), (elbow, hand)))
+
+STEP = 10                                   # degrees per grid cell
+angles = np.radians(np.arange(-180, 180, STEP))
+N = len(angles)                              # 36 values per joint
+cobs = np.array([[collides(a1, a2) for a1 in angles] for a2 in angles])   # rows: q2, cols: q1
+print(f"{N} x {N} grid, {cobs.mean():.1%} of configurations collide")
+
+def bfs(start, goal):
+    """Breadth-first search on the torus: angles wrap round at +-180 degrees."""
+    prev, queue = {start: None}, deque([start])
+    while queue:
+        cell = queue.popleft()
+        if cell == goal:
+            break
+        r, c = cell
+        for nr, nc in ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1)):
+            nxt = (nr % N, nc % N)
+            if not cobs[nxt] and nxt not in prev:
+                prev[nxt] = cell
+                queue.append(nxt)
+    path, cell = [], goal
+    while cell is not None:
+        path.append(cell); cell = prev.get(cell)
+    return path[::-1] if path[-1] == start else None
+
+idx = lambda deg: (deg + 180) // STEP
+start, goal = (idx(-30), idx(110)), (idx(60), idx(170))   # (q2 index, q1 index)
+path = bfs(start, goal)
+print(f"start q = (110, -30) deg, goal q = (170, 60) deg: path of {len(path) - 1} grid steps")
+crosses = sum(abs(a[1] - b[1]) > 1 or abs(a[0] - b[0]) > 1 for a, b in zip(path, path[1:]))
+print("times the path wraps round through +-180 degrees:", crosses)
+
+canvas = np.where(cobs, "##", "  ").astype(object)
+for cell in path:
+    canvas[cell] = "<>"
+canvas[start], canvas[goal] = "SS", "GG"
+print("q1 across, q2 down, both from -180 to +170 degrees in 10-degree cells; ## = collision")
+for row in canvas:
+    print("|" + "".join(row) + "|")
+```
+
+About a fifth of all configurations collide (20.8%). The search finds a path of 51 steps of 10° that wraps round once through $\pm 180°$, as in the figure. Notice the shapes: the obstacle close to the base gives the full-height band, while the two farther obstacles, which only the forearm can reach, give **diagonal** bands. The forearm's direction is $q_1 + q_2$, so it points at a given obstacle along lines where $q_1 + q_2$ is roughly constant, slanting across the map.
+
+<Narrator who="margaret">
+
+This map cost $36 \times 36 = 1296$ collision tests. At 1° resolution it would cost 129 600, and for a six-joint arm at 10° it would cost $36^6 \approx 2.2 \times 10^9$. Explicit configuration-space maps are a teaching tool and a practical tool for two or three degrees of freedom; beyond that, planners sample, exactly as the <LessonLink slug="sampling-based-planning">previous lesson</LessonLink> did.
+
+</Narrator>
+
+</Section>
+
+<Section id="minkowski" kind="computation" title="Minkowski sums: exact C-obstacles for a sliding polygon">
+
+When the robot translates without turning, the theorem above gives its C-obstacles exactly. The program builds $O \oplus (-R)$ for a triangular robot and a rectangular obstacle by adding every vertex of $O$ to every vertex of $-R$ and taking the convex hull (simple, if not the fastest way). Then it checks the theorem on 5000 random positions of the robot: at each, it tests the actual triangle against the actual rectangle with the separating axis test (next section), and compares the answer with "is the reference point inside the C-obstacle?".
+
+```python run
+import numpy as np
+
+def hull(points):
+    """Convex hull by Andrew's monotone chain, anticlockwise, without repeated points."""
+    pts = sorted(set(map(tuple, np.round(points, 12))))
+    cross = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1])
+
+def area(P):
+    x, y = P[:, 0], P[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+def overlap(A, B):
+    """Separating axis test for two convex polygons: they overlap unless some edge normal separates them."""
+    for P in (A, B):
+        for i in range(len(P)):
+            edge = P[(i + 1) % len(P)] - P[i]
+            axis = np.array([-edge[1], edge[0]])
+            a, b = A @ axis, B @ axis
+            if a.max() < b.min() or b.max() < a.min():
+                return False
+    return True
+
+def inside(p, P):
+    """Is p inside the anticlockwise convex polygon P (boundary counts as inside)?"""
+    for i in range(len(P)):
+        e, d = P[(i + 1) % len(P)] - P[i], p - P[i]
+        if e[0] * d[1] - e[1] * d[0] < -1e-12:
+            return False
+    return True
+
+robot = np.array([[-0.2, -0.1], [0.3, -0.1], [0.0, 0.3]])     # reference point at (0, 0)
+obstacle = np.array([[1.0, 0.5], [1.6, 0.5], [1.6, 1.0], [1.0, 1.0]])
+cobs = hull(np.array([o - r for o in obstacle for r in robot]))  # O + (-R)
+print("C-obstacle vertices:", [tuple(map(float, v.round(3))) for v in cobs])
+print(f"areas: obstacle {area(obstacle):.3f}, robot {area(robot):.3f}, C-obstacle {area(cobs):.3f} m^2")
+
+rng = np.random.default_rng(3)
+trials = rng.uniform([0.4, 0.0], [2.2, 1.6], size=(5000, 2))   # robot positions to test
+agree = sum(overlap(robot + t, obstacle) == inside(t, cobs) for t in trials)
+hits = sum(inside(t, cobs) for t in trials)
+print(f"{agree} of {len(trials)} random positions agree ({hits} of them in collision)")
+```
+
+The C-obstacle is a hexagon spanning $(0.7, 0.2)$ to $(1.8, 1.1)$: the rectangle has 4 edges and the triangle 3, and two of those 7 edge directions coincide (the rectangle's top edge and the base of the reflected triangle are both horizontal), leaving 6. Its area, 0.890 m², is much more than the sum of the two areas (0.300 + 0.100 m²): growing an obstacle by a robot's shape adds area all around its boundary. All 5000 positions agree, 1523 of them in collision.
+
+Two cautions. The C-obstacle depends on the reference point and on the robot's orientation: rotate the triangle and the hexagon changes, which is why the configuration space of a turning polygon is a stack of different slices. And non-convex shapes are handled by splitting them into convex pieces, because the sum of unions is the union of the pieces' sums.
+
+</Section>
+
+<Section id="collision-checking" kind="human" title="How collision checkers work">
+
+A planner may ask millions of collision questions per second, and a real robot and scene are made of meshes with thousands to millions of triangles. Testing every triangle against every other is hopeless. Collision libraries answer quickly by doing as little exact geometry as possible, in two phases:
+
+- **Broad phase**: cheap tests on simple **bounding volumes** (spheres, axis-aligned boxes, oriented boxes) wrapped around each object, to discard pairs that are obviously apart. Organised in a **bounding volume hierarchy** (BVH), a tree in which every node's volume encloses its children's, a query that misses a node discards its whole subtree.
+- **Narrow phase**: exact tests on the few pairs that survive, with algorithms specialised to convex shapes: the separating axis test for boxes and polygons, and GJK for general convex shapes.
+
+<Theorem name="Separating axis theorem (convex polygons)">
+
+Two convex polygons are disjoint if and only if their projections onto some line are disjoint, and that line can always be chosen perpendicular to one of the polygons' edges. So two rectangles need at most 4 axes tested, and two convex polygons with $m$ and $n$ edges at most $m + n$.
+
+</Theorem>
+
+<Proof>
+
+If projections onto some line are disjoint, the polygons are clearly disjoint. Conversely, $A$ and $B$ are disjoint exactly when the origin is not in $A \oplus (-B)$, by the same reasoning as for C-obstacles. That set is a convex polygon whose edges are parallel to edges of $A$ or of $B$, and a point lies outside a convex polygon exactly when it is on the outer side of one of its edges. The normal of that edge is an axis on which the projections of $A$ and $B$ do not overlap.
+
+</Proof>
+
+Bounding volumes trade tightness for speed. A sphere test is a single distance comparison but fits a long, thin link badly; an axis-aligned box (AABB) is almost as cheap but loose for tilted objects; an oriented box (OBB) fits tightly but needs the separating axis test. The program compares the three on a tilted thin box, then builds a small BVH of axis-aligned boxes over 400 boxes scattered on a floor and checks a robot's footprint against it.
+
+```python run
+import math
+import numpy as np
+
+def box(cx, cy, hx, hy, theta):
+    """An oriented box: centre, half-lengths along its own axes, and its angle."""
+    return {"c": np.array([cx, cy]), "h": np.array([hx, hy]),
+            "u": np.array([[math.cos(theta), -math.sin(theta)],      # columns: the box's axes
+                           [math.sin(theta),  math.cos(theta)]])}
+
+def sat(A, B):
+    """Separating axis test for two oriented boxes: only the 4 face normals need checking."""
+    d = B["c"] - A["c"]
+    for axis in (*A["u"].T, *B["u"].T):
+        rA = np.sum(A["h"] * np.abs(A["u"].T @ axis))   # half-width of A's shadow on the axis
+        rB = np.sum(B["h"] * np.abs(B["u"].T @ axis))
+        if abs(d @ axis) > rA + rB:
+            return False                                  # found a separating axis
+    return True
+
+def aabb(B):
+    """Axis-aligned bounding box of an oriented box: (min corner, max corner)."""
+    ext = np.abs(B["u"]) @ B["h"]
+    return B["c"] - ext, B["c"] + ext
+
+def circle_hit(A, B):                                     # bounding circles
+    return np.linalg.norm(A["c"] - B["c"]) <= np.linalg.norm(A["h"]) + np.linalg.norm(B["h"])
+
+def aabb_hit(A, B):
+    (a0, a1), (b0, b1) = aabb(A), aabb(B)
+    return bool(np.all(a0 <= b1) and np.all(b0 <= a1))
+
+A = box(0.0, 0.0, 1.0, 0.2, math.radians(45))             # a long thin box, tilted
+for name, B in [("overlapping", box(0.6, 0.6, 0.3, 0.3, 0.0)),
+                ("beside the thin box", box(0.9, -0.5, 0.3, 0.3, 0.0)),
+                ("off its end", box(1.25, 0.0, 0.3, 0.3, 0.0)),
+                ("far away", box(3.0, 0.0, 0.3, 0.3, 0.0))]:
+    print(f"{name:20} circles {circle_hit(A, B)!s:5}  AABBs {aabb_hit(A, B)!s:5}  exact (SAT) {sat(A, B)}")
+
+# A bounding volume hierarchy over 400 random boxes on a 40 m x 40 m floor.
+rng = np.random.default_rng(1)
+scene = [box(*rng.uniform(0, 40, 2), *rng.uniform(0.2, 0.8, 2), rng.uniform(0, math.pi)) for _ in range(400)]
+
+def build(items):
+    lo = np.min([aabb(scene[i])[0] for i in items], axis=0)
+    hi = np.max([aabb(scene[i])[1] for i in items], axis=0)
+    if len(items) <= 4:
+        return {"lo": lo, "hi": hi, "leaf": items}
+    axis = int(np.argmax(hi - lo))                         # split the longer side at the median
+    items = sorted(items, key=lambda i: scene[i]["c"][axis])
+    mid = len(items) // 2
+    return {"lo": lo, "hi": hi, "kids": [build(items[:mid]), build(items[mid:])]}
+
+def query(node, R, count):
+    r0, r1 = aabb(R)
+    count["aabb"] += 1
+    if np.any(r1 < node["lo"]) or np.any(node["hi"] < r0):
+        return []                                          # prune the whole subtree
+    if "leaf" in node:
+        count["sat"] += len(node["leaf"])
+        return [i for i in node["leaf"] if sat(R, scene[i])]
+    return query(node["kids"][0], R, count) + query(node["kids"][1], R, count)
+
+tree = build(list(range(len(scene))))
+robot = box(20.0, 20.0, 1.2, 0.6, math.radians(30))
+count = {"aabb": 0, "sat": 0}
+hits = query(tree, robot, count)
+brute = [i for i in range(len(scene)) if sat(robot, scene[i])]
+print(f"\nrobot vs 400 boxes: {len(hits)} collisions (brute force agrees: {sorted(hits) == brute})")
+print(f"brute force: 400 SAT tests; hierarchy: {count['aabb']} box-box bound tests + {count['sat']} SAT tests")
+```
+
+The table shows each level of tightness rejecting more: a box beside the thin one fools both circles and AABBs, while one off its end fools only the circles. In the scene, the hierarchy finds the same 4 collisions as brute force with 39 cheap box-bound tests and 13 exact tests, instead of 400 exact tests. Because the tree halves the set at each level, the work grows roughly with the logarithm of the number of objects, plus the number of near misses.
+
+In three dimensions the same ideas apply with more axes: two oriented boxes need 15 (3 face normals of each, plus the 9 cross products of an edge of one with an edge of the other). For general convex shapes, the **GJK algorithm** (Elmer Gilbert, Daniel Johnson and Sathiya Keerthi, 1988) avoids listing axes at all. It works on the same Minkowski difference $A \oplus (-B)$, never building it, but asking only for its **support point** in a given direction (the farthest point of $A$ in direction $d$ minus the farthest point of $B$ in direction $-d$). It grows a small simplex (a point, segment, triangle or tetrahedron) inside the difference towards the origin; if the simplex encloses the origin the shapes intersect, otherwise the closest point of the difference to the origin gives the **distance** between the shapes and the witness points on each. Once shapes overlap, its companion **EPA** (expanding polytope algorithm) estimates how deeply. Because GJK needs only support functions, it handles spheres, capsules, cylinders and convex meshes with the same code.
+
+<Narrator who="gideon">
+
+Every check here is at a single configuration. A planner checking a motion by testing configurations every few millimetres can miss a thin obstacle between two checks, and a fast-moving robot can "tunnel" through a wall. **Continuous collision detection** checks the volume swept between two configurations instead (conservative advancement, built on GJK distances, is one way), and safety-critical planners use it or choose the discrete resolution from a bound on how far any point of the robot can move between checks.
+
+</Narrator>
+
+</Section>
+
+<Section id="sdf" kind="computation" title="Signed distance fields">
+
+A collision checker answers yes or no. Many planners, especially the trajectory optimisers of the next lesson, need more: **how far** from collision, and **which way** is away. A **signed distance field** (SDF) stores, at every point of a grid, the distance to the nearest obstacle surface, positive outside obstacles and negative inside (minus the penetration depth). Its gradient points away from the nearest obstacle and has length about 1 almost everywhere.
+
+Robots then approximate their links by a few **spheres** (circles in 2-D), so that a link's clearance is the SDF at each sphere's centre minus its radius: one array lookup per sphere, no geometry at all. The program builds an SDF on a 5 cm grid for a round column and a crate, prints it in tenths of a metre, checks it against the exact distance to the column, and then nudges a link, modelled as 7 circles, a little way along the gradient at each step.
+
+```python run
+import numpy as np
+
+RES = 0.05                                       # 5 cm cells, a 3 m x 2 m workspace
+ny, nx = 40, 60
+ys, xs = (np.indices((ny, nx)) + 0.5) * RES      # cell-centre coordinates (y, x) in metres
+occ = ((xs - 1.0) ** 2 + (ys - 1.2) ** 2 <= 0.3 ** 2)            # a round column ...
+occ |= (xs >= 1.9) & (xs <= 2.5) & (ys >= 0.3) & (ys <= 0.8)     # ... and a crate
+
+def sdf(occ):
+    """Signed distance between cell centres: positive outside obstacles, negative inside."""
+    pts = np.stack([ys.ravel(), xs.ravel()], axis=1)
+    def dist_to(mask):
+        tgt = pts[mask.ravel()]
+        d = np.full(len(pts), np.inf)
+        for chunk in np.array_split(tgt, 20):
+            d = np.minimum(d, np.min(np.linalg.norm(pts[:, None] - chunk[None], axis=2), axis=1))
+        return d.reshape(occ.shape)
+    return np.where(occ, -dist_to(~occ), dist_to(occ))
+
+D = sdf(occ)
+
+def lookup(p):
+    """Bilinear interpolation of the field at a point p = (x, y) in metres."""
+    gx, gy = p[0] / RES - 0.5, p[1] / RES - 0.5
+    i, j = int(np.floor(gy)), int(np.floor(gx))
+    fy, fx = gy - i, gx - j
+    return ((1 - fy) * ((1 - fx) * D[i, j] + fx * D[i, j + 1]) +
+            fy * ((1 - fx) * D[i + 1, j] + fx * D[i + 1, j + 1]))
+
+def gradient(p, h=RES / 2):
+    return np.array([lookup(p + [h, 0]) - lookup(p - [h, 0]),
+                     lookup(p + [0, h]) - lookup(p - [0, h])]) / (2 * h)
+
+print("signed distance field, top row = y near 2 m ('#' inside; digits = distance in tenths of a metre)")
+for row in D[::-2, ::2]:
+    print("".join("#" if d < 0 else str(min(int(d / 0.1), 9)) for d in row))
+
+p = np.array([1.5, 1.2])                         # 0.5 m from the column's centre: 0.2 m outside it
+print(f"\nat (1.5, 1.2): field {lookup(p):.3f} m, exact {np.linalg.norm(p - [1.0, 1.2]) - 0.3:.3f} m, "
+      f"gradient {np.round(gradient(p), 3)}")
+
+# A robot link approximated by 7 circles of radius 0.08 m, from (0.4, 0.7) to (1.6, 1.1).
+centres = np.linspace([0.4, 0.7], [1.6, 1.1], 7)
+for step in range(5):
+    clear = [lookup(c) - 0.08 for c in centres]
+    k = int(np.argmin(clear))
+    print(f"step {step}: worst clearance {clear[k]:+.3f} m at circle {k}")
+    centres = centres + 0.05 * np.array([gradient(c) for c in centres])  # nudge away from obstacles
+```
+
+The field is 0.225 m at a point whose exact distance to the column is 0.200 m: an error of half a cell, because distances are measured between cell centres. The link starts 8 cm into the column (worst clearance $-0.080$ m). The first 5 cm step gains 12.5 cm, because this cell-centre field jumps by about a cell's width across the obstacle's surface; after that, each 5 cm step gains 5 cm, because the gradient has length 1, and after four steps the link is 0.195 m clear. Moving circles independently is only a sketch: for a real arm, each sphere's push must be turned into joint motions through the arm's Jacobian (<LessonLink slug="jacobians-and-velocity">Jacobians and velocity</LessonLink>), which is exactly what the CHOMP optimiser in the <LessonLink slug="trajectory-optimisation">next lesson</LessonLink> does.
+
+<Narrator who="chloe">
+
+An exact signed distance function satisfies $\lVert \nabla d \rVert = 1$ wherever it is differentiable, the **eikonal equation**. That is why one step of size $\alpha$ along the gradient gains about $\alpha$ of clearance, and why fast SDF algorithms are really solvers for that equation (a first-order equation of the kind studied in Lumenary Math's <TopicLink id="math.analysis.pde-intro">Partial differential equations</TopicLink>). It fails where two obstacles are equally near, on the **medial axis**, where the gradient jumps and descent can stall.
+
+</Narrator>
+
+</Section>
+
+<Section id="practice" kind="human" title="Collision checking in practice">
+
+**Libraries.** MoveIt checks collisions with [FCL](https://github.com/flexible-collision-library/fcl) by default (Bullet is an alternative), using BVHs of oriented boxes or sphere-swept volumes over meshes and GJK-based narrow phases. [Coal](https://github.com/coal-library/coal), developed from FCL at LAAS-CNRS and Inria in France, speeds up GJK and EPA and is used with the Pinocchio dynamics library. Physics engines (MuJoCo, Bullet, PhysX, Drake's geometry engine) contain their own, tuned for contact simulation rather than planning queries; the <LessonLink slug="simulation">Simulation lesson</LessonLink> returns to them.
+
+**Robot models.** Manufacturers' meshes are detailed and non-convex, so they are simplified for collision: convex hulls per link, convex decompositions (tools such as V-HACD and CoACD split a mesh into a few dozen convex pieces), or sets of spheres for GPU planners like cuRobo. Pairs of links that can never touch, or always touch (neighbours at a joint), are listed once in an **allowed collision matrix** and never checked, which removes most self-collision work.
+
+**Maps from sensors.** Mobile robots and drones build distance fields directly from depth data: ETH Zürich's [Voxblox](https://github.com/ethz-asl/voxblox) and NVIDIA's nvblox integrate depth images into a truncated SDF and derive a Euclidean distance field from it, and OctoMap (from the University of Freiburg) stores probabilistic occupancy in an octree that collision checkers can query (the <LessonLink slug="depth-and-point-clouds">Depth and point clouds</LessonLink> lesson introduced the sensors).
+
+**Margins and safety.** Collision checking certifies a model, not the world. Models get a **padding** of a few millimetres to centimetres to cover calibration and tracking errors, and the safety of people around a robot is never left to the planner's collision model alone: standards and certified safety functions (speed and separation monitoring, force limits) do that job, as the <LessonLink slug="embedded-control-and-safety">embedded control and safety lesson</LessonLink> explains.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Configuration space is just the workspace with fatter obstacles."** Only for a robot that translates. As soon as the robot can rotate or has joints, the configuration space has more dimensions than the workspace and a different shape (a torus, $SE(2)$, $SE(3)$), and obstacles become bands, slanted strips and twisted tubes, as the arm's map shows.
+
+</Misconception>
+
+<Misconception>
+
+**"Joint angles can be treated as ordinary numbers."** For a joint without limits, $-179°$ and $179°$ are 2° apart, not 358°. Distance functions, interpolation and nearest-neighbour searches must wrap angles, or a planner will send the arm the long way round, or miss paths that wrap. Conversely, a joint *with* limits must never be wrapped.
+
+</Misconception>
+
+<Misconception>
+
+**"If the bounding volumes overlap, the objects collide."** Bounding volumes are conservative: disjoint bounds prove that objects are apart, but overlapping bounds prove nothing. The narrow phase must still decide, as the thin tilted box shows.
+
+</Misconception>
+
+<Misconception>
+
+**"A signed distance field gives exact distances."** A grid SDF is accurate to about half a cell, and only as good as the map it was built from. Robots add a margin at least that large, and treat unknown space with care.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises use NumPy and run in your browser.
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,528 @@
+---
+title: Kalman filters
+subtitle: When beliefs are Gaussian, the Bayes filter becomes a few lines of linear algebra. Tracking, tuning, nonlinear sensors, consistency checks and fusing an IMU with wheel odometry.
+minutes: 75
+objectives:
+  - Describe a Gaussian belief by its mean and covariance, and push it through a linear map
+  - State the Kalman filter's predict and correct equations and explain the gain as a ratio of uncertainties
+  - Implement a constant-velocity tracker and tune its process noise Q and measurement noise R
+  - Build an extended Kalman filter for a robot that measures range and bearing to landmarks
+  - Explain the unscented transform and when it beats linearisation
+  - Check a filter's consistency with the normalised innovation squared, and use it to reject outliers when fusing a gyroscope with wheel odometry
+narrators: [chloe, margaret, gideon]
+prerequisites: [wheeled-robots, state-space-and-lqr, uncertainty-and-bayes-filters]
+related: [math.prob.probability-theory, math.algebra.linear-algebra, math.prob.statistics, math.prob.stochastic-processes, math.analysis.multivariable-calculus]
+references:
+  - title: "A New Approach to Linear Filtering and Prediction Problems"
+    author: Rudolf E. Kálmán
+    year: 1960
+    url: https://doi.org/10.1115/1.3662552
+    note: The original paper.
+  - title: "Unscented Filtering and Nonlinear Estimation"
+    author: Simon J. Julier and Jeffrey K. Uhlmann
+    year: 2004
+    url: https://doi.org/10.1109/JPROC.2003.823141
+    note: The unscented transform and the UKF, explained by their inventors.
+  - title: "Quaternion kinematics for the error-state Kalman filter"
+    author: Joan Solà
+    year: 2017
+    url: https://arxiv.org/abs/1711.02508
+    note: How IMU-based estimators handle orientation inside a Kalman filter in practice.
+  - title: "A Multi-State Constraint Kalman Filter for Vision-aided Inertial Navigation"
+    author: Anastasios I. Mourikis and Stergios I. Roumeliotis
+    year: 2007
+    url: https://doi.org/10.1109/ROBOT.2007.364024
+    note: The MSCKF, a filter for camera plus IMU that underlies many visual-inertial odometry systems.
+  - title: robot_localization
+    url: https://github.com/cra-ros-pkg/robot_localization
+    note: The ROS package with EKF and UKF nodes that fuse wheel odometry, IMUs and GNSS.
+  - title: "Using PX4's Navigation Filter (EKF2)"
+    url: https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html
+    note: The open-source drone autopilot's estimator, including its innovation consistency checks.
+  - title: Bayesian Filtering and Smoothing (2nd edition, free pre-publication PDF)
+    author: Simo Särkkä and Lennart Svensson
+    year: 2023
+    url: https://users.aalto.fi/~ssarkka/pub/bfs_book_2023_online.pdf
+---
+
+<Section id="motivation" kind="motivation" title="From a grid to two numbers">
+
+The histogram localiser of <LessonLink slug="uncertainty-and-bayes-filters">the previous lesson</LessonLink> stored one probability per cell, which is fine for a rail of 40 cells and hopeless for a drone whose state has position, velocity, orientation and sensor biases: fifteen numbers or more. The way out is to assume the belief has a fixed *shape* and keep only the numbers that describe it. If the shape is a Gaussian (a bell curve), the whole belief is a **mean** (the best guess) and a **covariance** (how unsure, and in which directions), and if the robot's models are linear, the Bayes filter's sums become matrix products. That is the **Kalman filter**.
+
+It was published by Rudolf Kálmán in 1960, and within a few years an extended version, worked out largely by Stanley Schmidt's group at NASA's Ames Research Center, was navigating the Apollo spacecraft to the Moon. Today Kalman filters run in phones (fusing GNSS with motion sensors), drone autopilots, cars, aircraft and nearly every mobile robot. It is the same predict–correct loop as the observer of <LessonLink slug="state-space-and-lqr">State-space models and LQR</LessonLink>, $\hat{x} \leftarrow A\hat{x} + Bu + L(y - C\hat{x})$, with one difference: the Kalman filter computes the gain $L$ from the noise, step by step, and carries an honest measure of its own uncertainty.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Fusing two noisy numbers">
+
+Two sensors measure the distance to a wall. A lidar says 2.0 m and has a standard deviation of 0.8 m (it is a cheap one, and the wall is dark); an ultrasonic sensor says 3.0 m with a standard deviation of 0.5 m. What should the robot believe?
+
+Neither average nor "trust the better one" is right. The best combination weights each reading by its **precision**, the inverse of its variance: the more certain reading pulls harder. Writing $\sigma_1^2 = 0.64$ and $\sigma_2^2 = 0.25$,
+
+$$
+\hat{x} = \frac{z_1/\sigma_1^2 + z_2/\sigma_2^2}{1/\sigma_1^2 + 1/\sigma_2^2},
+\qquad
+\frac{1}{\hat{\sigma}^2} = \frac{1}{\sigma_1^2} + \frac{1}{\sigma_2^2}.
+$$
+
+Rearranged, this is the form the Kalman filter uses: start from the first estimate and move towards the second by a fraction $K$ of the disagreement,
+
+$$
+\hat{x} = z_1 + K\,(z_2 - z_1), \qquad K = \frac{\sigma_1^2}{\sigma_1^2 + \sigma_2^2}, \qquad \hat{\sigma}^2 = (1 - K)\,\sigma_1^2.
+$$
+
+Here $K = 0.64/0.89 \approx 0.72$, so $\hat{x} \approx 2.72$ m and $\hat{\sigma} \approx 0.42$ m: closer to the better sensor, and more certain than either. If the first number is a *prediction* rather than a reading, this is exactly one correct step of a Kalman filter, and $K$ is the **Kalman gain**.
+
+<Figure caption="Fusing a prior N(2.0, 0.8²) with a reading N(3.0, 0.5²). The product of the two bell curves, renormalised, is the posterior N(2.72, 0.42²): narrower than both, and nearer the more certain one.">
+<svg viewBox="0 0 420 220" role="img" aria-label="Three bell curves over a distance axis from 0 to 5 metres. A wide, low curve centred at 2 is the prior. A narrower curve centred at 3 is the reading. The tallest, narrowest curve, centred at about 2.7, is the fused posterior.">
+  <line x1="40" y1="180" x2="390" y2="180" stroke="currentColor" strokeWidth="1" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="40" y="196">0</text><text x="108" y="196">1</text><text x="176" y="196">2</text><text x="244" y="196">3</text><text x="312" y="196">4</text><text x="380" y="196">5 m</text>
+  </g>
+  <g fill="none" strokeWidth="2">
+    <path stroke="var(--sky)" strokeDasharray="6 4" d="M40 176.9 L51.3 174.9 L62.7 172.0 L74.0 168.0 L85.3 162.6 L96.7 155.9 L108.0 148.0 L119.3 139.4 L130.7 130.7 L142.0 122.6 L153.3 116.0 L164.7 111.7 L176.0 110.2 L187.3 111.7 L198.7 116.0 L210.0 122.6 L221.3 130.7 L232.7 139.4 L244.0 148.0 L255.3 155.9 L266.7 162.6 L278.0 168.0 L289.3 172.0 L300.7 174.9 L312.0 176.9 L323.3 178.2 L334.7 179.0 L346.0 179.5 L357.3 179.7 L380.0 179.9" />
+    <path stroke="var(--gold)" strokeDasharray="2 3" d="M40 180 L130.7 179.6 L142.0 178.8 L153.3 176.8 L164.7 172.7 L176.0 164.9 L187.3 152.1 L198.7 134.1 L210.0 112.2 L221.3 90.6 L232.7 74.3 L244.0 68.3 L255.3 74.3 L266.7 90.6 L278.0 112.2 L289.3 134.1 L300.7 152.1 L312.0 164.9 L323.3 172.7 L334.7 176.8 L346.0 178.8 L357.3 179.6 L380.0 180.0" />
+    <path stroke="currentColor" d="M40 180 L119.3 179.8 L130.7 179.4 L142.0 177.9 L153.3 173.9 L164.7 165.1 L176.0 148.7 L187.3 123.6 L198.7 92.9 L210.0 64.7 L215.7 54.9 L221.3 49.3 L227.0 48.6 L232.7 53.0 L238.3 61.8 L249.7 88.9 L261.0 119.9 L272.3 146.0 L283.7 163.5 L295.0 173.1 L306.3 177.6 L317.7 179.3 L329.0 179.8 L380.0 180.0" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="11" fill="currentColor">
+    <text x="70" y="104">prior: 2.0 ± 0.8</text>
+    <text x="268" y="66">reading: 3.0 ± 0.5</text>
+    <text x="232" y="38">posterior: 2.72 ± 0.42</text>
+  </g>
+</svg>
+</Figure>
+
+<Narrator who="margaret">
+
+Two equally good sensors, each with standard deviation $\sigma$, fuse to $\sigma/\sqrt{2}$: about 29% better, not twice as good. Ten of them give $\sigma/\sqrt{10}$. This is the same square root you met when averaging readings, and it is why adding a fifth camera to a robot rarely buys as much as fixing the calibration of the first one.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Gaussians, linear maps and the filter">
+
+<Definition term="Multivariate Gaussian">
+
+A random vector $x \in \mathbb{R}^n$ is **Gaussian** with mean $\mu$ and covariance $\Sigma$ (symmetric, positive definite), written $x \sim \mathcal{N}(\mu, \Sigma)$, if its density is
+
+$$
+p(x) = \frac{1}{\sqrt{(2\pi)^n \det \Sigma}}\, \exp\!\Big(-\tfrac{1}{2}(x - \mu)^{\mathsf T}\Sigma^{-1}(x - \mu)\Big).
+$$
+
+The diagonal of $\Sigma$ holds the variances of the components; the off-diagonal entries say how errors in different components move together. Its level sets are ellipses (ellipsoids), whose axes are the eigenvectors of $\Sigma$.
+
+</Definition>
+
+The quantity $d^2 = (x - \mu)^{\mathsf T}\Sigma^{-1}(x - \mu)$ in the exponent is the squared **Mahalanobis distance**: distance measured in standard deviations, along each direction. It will return as the consistency test.
+
+<Theorem name="Linear maps preserve Gaussians">
+
+If $x \sim \mathcal{N}(\mu, \Sigma)$ and $y = Ax + b$, then $y \sim \mathcal{N}(A\mu + b,\; A\Sigma A^{\mathsf T})$. If, moreover, $w \sim \mathcal{N}(0, Q)$ is independent of $x$, then $Ax + w \sim \mathcal{N}(A\mu, A\Sigma A^{\mathsf T} + Q)$.
+
+</Theorem>
+
+<Proof>
+
+The mean is linear: $\mathbb{E}[Ax + b] = A\mu + b$. The covariance: $\mathbb{E}[(Ax - A\mu)(Ax - A\mu)^{\mathsf T}] = A\,\mathbb{E}[(x - \mu)(x - \mu)^{\mathsf T}]\,A^{\mathsf T} = A\Sigma A^{\mathsf T}$. Covariances of independent terms add. That the result is again Gaussian follows from a change of variables in the density (or from characteristic functions); Lumenary Math's <TopicLink id="math.prob.probability-theory">Probability theory</TopicLink> has the details.
+
+</Proof>
+
+This theorem is the reason the Kalman filter exists. Suppose the state evolves and is observed linearly, with Gaussian noise:
+
+$$
+x_t = F x_{t-1} + B u_t + w_t,\quad w_t \sim \mathcal{N}(0, Q);
+\qquad
+z_t = H x_t + v_t,\quad v_t \sim \mathcal{N}(0, R).
+$$
+
+$Q$ is the **process noise** covariance (how much the world departs from the motion model in one step) and $R$ the **measurement noise** covariance (how noisy the sensor is). Then a Gaussian belief stays Gaussian forever, and the Bayes filter only has to track its mean $\hat{x}$ and covariance $P$.
+
+<Definition term="The Kalman filter">
+
+**Predict:** $\quad \hat{x}^- = F\hat{x} + Bu_t, \qquad P^- = FPF^{\mathsf T} + Q.$
+
+**Correct:** with the reading $z_t$,
+
+$$
+y = z_t - H\hat{x}^-, \qquad S = HP^-H^{\mathsf T} + R, \qquad K = P^-H^{\mathsf T}S^{-1},
+$$
+
+$$
+\hat{x} = \hat{x}^- + K y, \qquad P = (I - KH)\,P^-.
+$$
+
+$y$ is the **innovation** (the surprise: what the sensor said minus what the filter expected), $S$ its predicted covariance, and $K$ the gain.
+
+</Definition>
+
+Compare the one-dimensional fusion above: there $H = 1$, $P^- = \sigma_1^2$, $R = \sigma_2^2$, and $K = \sigma_1^2/(\sigma_1^2 + \sigma_2^2)$. The matrix gain $K = P^-H^{\mathsf T}S^{-1}$ is the same ratio, "my uncertainty divided by the total uncertainty of the disagreement", with $H^{\mathsf T}$ carrying the correction from measurement space back to state space. It also spreads a correction to quantities the sensor never sees: a position-only reading corrects velocity through the off-diagonal terms of $P^-$, which remember that a velocity error causes position errors.
+
+<Theorem name="Optimality of the Kalman filter">
+
+For the linear–Gaussian model above, with a Gaussian prior, the Kalman filter's $\mathcal{N}(\hat{x}, P)$ is *exactly* the Bayes filter's belief $p(x_t \mid u_{1:t}, z_{1:t})$. If the noises are not Gaussian but have the stated means and covariances, $\hat{x}$ is still the best estimate among all *linear* functions of the data, in the sense of minimum mean squared error.
+
+</Theorem>
+
+The proof multiplies two Gaussian densities (prediction and likelihood) and completes the square in the exponent; the one-dimensional fusion above is the scalar case, and Särkkä and Svensson's book in the references gives the general one in a page.
+
+<Narrator who="gideon">
+
+The update $P = (I - KH)P^-$ is exact in real arithmetic, but in floating point it can lose symmetry, or even positive definiteness, after thousands of steps. Production filters use the "Joseph form" $P = (I - KH)P^-(I - KH)^{\mathsf T} + KRK^{\mathsf T}$, which is a sum of positive semidefinite terms, or propagate a square root of $P$ instead of $P$ itself. If your filter's variances ever go negative, this is the first thing to check.
+
+</Narrator>
+
+</Section>
+
+<Section id="tracking" kind="computation" title="Tracking at constant velocity, and tuning Q and R">
+
+A delivery robot waits to cross a cycle path and must predict when a cyclist will pass. Its lidar's person-and-cyclist detector reports the cyclist's position along the path ten times a second, with a standard deviation of 0.3 m. The state is position and velocity, $x = (p, v)$; the motion model is "velocity stays the same, apart from random accelerations":
+
+$$
+F = \begin{pmatrix} 1 & \Delta t \\ 0 & 1 \end{pmatrix}, \qquad
+Q = q\begin{pmatrix} \Delta t^3/3 & \Delta t^2/2 \\ \Delta t^2/2 & \Delta t \end{pmatrix}, \qquad
+H = \begin{pmatrix} 1 & 0 \end{pmatrix}, \qquad R = \sigma_z^2.
+$$
+
+This $Q$ is what a random acceleration of intensity $q$ (in $\text{m}^2/\text{s}^3$), integrated over one step, does to position and velocity; it has one number to tune instead of three. The simulation generates a cyclist with $q = 0.1$, then runs filters with five different values of $q$ to see what mistuning does.
+
+```python run
+import numpy as np
+
+dt, steps = 0.1, 400                         # 10 Hz for 40 s
+F = np.array([[1.0, dt], [0.0, 1.0]])        # constant velocity: p <- p + v dt
+H = np.array([[1.0, 0.0]])                   # we measure position only
+def Q_of(q):                                 # random acceleration of intensity q (m^2/s^3)
+    return q * np.array([[dt**3 / 3, dt**2 / 2], [dt**2 / 2, dt]])
+
+# Simulate a person strolling along a station platform, seen by a lidar person-detector.
+rng = np.random.default_rng(1)
+q_true, sigma_z = 0.1, 0.30
+truth = np.zeros((steps, 2))
+x = np.array([0.0, 1.2])
+for k in range(steps):
+    x = F @ x + rng.multivariate_normal([0, 0], Q_of(q_true))
+    truth[k] = x
+z = truth[:, 0] + rng.normal(0, sigma_z, steps)
+
+def kalman(q, r):
+    x, P = np.array([z[0], 0.0]), np.diag([r, 4.0])     # start at the first reading, unsure of speed
+    Q, R = Q_of(q), np.array([[r]])
+    est, nis = np.zeros((steps, 2)), []
+    for k in range(steps):
+        x, P = F @ x, F @ P @ F.T + Q                   # predict
+        y = z[k] - H @ x                                # innovation
+        S = H @ P @ H.T + R                             # its predicted covariance
+        K = P @ H.T @ np.linalg.inv(S)                  # Kalman gain
+        x, P = x + K @ y, (np.eye(2) - K @ H) @ P       # correct
+        est[k] = x
+        nis.append(float(y @ np.linalg.inv(S) @ y))
+    return est, np.mean(nis[50:])
+
+rms = lambda e: float(np.sqrt(np.mean(e[50:] ** 2)))   # skip the first 5 s while the filter settles
+print(f"raw readings: position RMS error {rms(z - truth[:, 0]):.3f} m")
+print(f"{'q (filter)':>10} {'pos RMS (m)':>12} {'vel RMS (m/s)':>14} {'mean NIS':>9}")
+for q in [0.001, 0.01, 0.1, 1.0, 10.0]:
+    est, nis = kalman(q, sigma_z**2)
+    print(f"{q:10.3f} {rms(est[:, 0] - truth[:, 0]):12.3f} {rms(est[:, 1] - truth[:, 1]):14.3f} {nis:9.2f}")
+est, nis = kalman(0.1, 0.1**2)
+print(f"right q, but R assumes sigma 0.1 m: pos RMS {rms(est[:, 0] - truth[:, 0]):.3f} m, mean NIS {nis:.2f}")
+```
+
+The raw readings are off by 0.31 m (RMS). The filter tuned with the true $q = 0.1$ is off by 0.16 m, half as much, and it also estimates the speed, which no sensor measured, to within 0.3 m/s.
+
+- **$q$ too small** (0.001): the filter believes cyclists hardly change speed, trusts its prediction, and lags behind every acceleration. Its error, 0.60 m, is worse than the raw readings.
+- **$q$ too large** (10): the filter believes anything can happen, trusts each reading, and passes its noise straight through; the velocity estimate, a difference of noisy positions, is worst of all.
+- **$R$ too small**: claiming the sensor is three times better than it is makes the filter chase noise; the position error rises only slightly (0.163 m), but the last column gives it away.
+
+That last column, the mean **normalised innovation squared** (NIS), is the filter checking itself. If the model is right, each innovation $y$ is Gaussian with covariance $S$, so $y^{\mathsf T}S^{-1}y$ follows a $\chi^2$ distribution with as many degrees of freedom as the measurement has components, here one, and averages 1. A filter whose NIS averages 5.4 is constantly more surprised than it expects to be (it is overconfident); one averaging 0.87 is a little underconfident. With the true $q$, the mean NIS is 1.09. Unlike the RMS error, the NIS needs no ground truth, so it can be monitored on a real robot.
+
+<Narrator who="chloe">
+
+The gain answers one question: of the disagreement between prediction and reading, how much is the world surprising me, and how much is the sensor lying? $Q$ is your prior on the first, $R$ on the second, and only their ratio matters to the estimate. Tuning a Kalman filter is deciding, honestly, how much each can be trusted.
+
+</Narrator>
+
+</Section>
+
+<Section id="ekf" kind="computation" title="The extended Kalman filter: landmarks by range and bearing">
+
+Real robots are not linear. A wheeled robot's motion involves $\cos\theta$ and $\sin\theta$ (<LessonLink slug="wheeled-robots">Wheeled robots and odometry</LessonLink>), and a sensor that measures the range and bearing to a landmark involves a square root and an arctangent. The **extended Kalman filter** (EKF) keeps the Gaussian belief and linearises the models around the current estimate, using their Jacobians.
+
+<Definition term="Extended Kalman filter">
+
+For $x_t = f(x_{t-1}, u_t) + w_t$ and $z_t = h(x_t) + v_t$: predict with $\hat{x}^- = f(\hat{x}, u_t)$ and $P^- = F P F^{\mathsf T} + Q$, where $F = \partial f/\partial x$ at $\hat{x}$; correct with $y = z_t - h(\hat{x}^-)$ and the Kalman equations using $H = \partial h/\partial x$ at $\hat{x}^-$.
+
+</Definition>
+
+<Figure caption="A range–bearing measurement. The robot at (x, y) with heading θ, measured from the world's x direction, sees landmark L at range r and bearing φ, measured anticlockwise from the robot's own forward direction.">
+<svg viewBox="0 0 300 220" role="img" aria-label="A robot drawn as a circle near the lower left. A dotted horizontal line shows the world x direction, and an arrow shows the robot's heading, turned 20 degrees up from it, with the angle marked theta. A dashed line labelled r runs from the robot to a landmark drawn as a star near the top. The angle between the heading arrow and the dashed line is marked phi.">
+  <defs>
+    <marker id="kf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <line x1="70" y1="190" x2="200" y2="190" stroke="currentColor" strokeWidth="1" strokeDasharray="2 3" />
+  <line x1="70" y1="190" x2="164" y2="155.8" stroke="var(--sky)" strokeWidth="2" markerEnd="url(#kf-arrow)" />
+  <line x1="70" y1="190" x2="176" y2="40" stroke="currentColor" strokeWidth="1.3" strokeDasharray="6 4" />
+  <circle cx="70" cy="190" r="8" fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5" />
+  <path d="M 179.0 24.4 L 176.5 31.0 L 169.5 31.3 L 175.0 35.7 L 173.1 42.5 L 179.0 38.6 L 184.9 42.5 L 183.0 35.7 L 188.5 31.3 L 181.5 31.0 z" fill="var(--gold)" stroke="currentColor" />
+  <path d="M 105 190 A 35 35 0 0 0 102.9 178" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <path d="M 126.4 169.5 A 60 60 0 0 0 104.4 140.9" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="112" y="186">θ</text>
+    <text x="128" y="146">φ</text>
+    <text x="106" y="110">r</text>
+    <text x="194" y="38">L</text>
+    <text x="168" y="152">heading</text>
+    <text x="204" y="194">world x</text>
+    <text x="40" y="212">(x, y)</text>
+  </g>
+</svg>
+</Figure>
+
+With $\Delta x = l_x - x$, $\Delta y = l_y - y$ and $q = \Delta x^2 + \Delta y^2$,
+
+$$
+h(x, y, \theta) = \begin{pmatrix} \sqrt{q} \\ \operatorname{atan2}(\Delta y, \Delta x) - \theta \end{pmatrix},
+\qquad
+H = \begin{pmatrix} -\Delta x/\sqrt{q} & -\Delta y/\sqrt{q} & 0 \\ \Delta y/q & -\Delta x/q & -1 \end{pmatrix}.
+$$
+
+The robot below drives a 5 m circle for 90 s using wheel odometry, which has a 3% scale error and a small turn bias, as real odometry does. Once a second it measures range (standard deviation 0.1 m) and bearing (2°) to every one of five landmarks within 8 m. The odometry readings are the EKF's control input $u = (v, \omega)$; their noise enters the state through the Jacobian $F_u = \partial f / \partial u$, giving $Q = F_u M F_u^{\mathsf T}$. The filter is then run a second time believing the sensor is five times better than it is.
+
+```python run
+import numpy as np
+
+dt, steps = 0.1, 900                              # 90 s at 10 Hz
+landmarks = np.array([[-5.0, 0.0], [1.0, 4.0], [-11.0, -3.0], [-4.0, 7.0], [-2.0, -6.0]])
+sig_v, sig_w = 0.05, 0.03                         # odometry noise per step (m/s, rad/s)
+sig_r, sig_b = 0.10, np.radians(2.0)              # range-bearing sensor noise
+wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+
+def move(s, v, w):                                # unicycle motion model
+    x, y, th = s
+    return np.array([x + v * dt * np.cos(th), y + v * dt * np.sin(th), wrap(th + w * dt)])
+
+def measure(s, lm):                               # range and bearing to one landmark
+    dx, dy = lm[0] - s[0], lm[1] - s[1]
+    return np.array([np.hypot(dx, dy), wrap(np.arctan2(dy, dx) - s[2])])
+
+def run_ekf(R_assumed):
+    true = np.array([0.0, 0.0, np.pi / 2]); mu, P = true.copy(), np.diag([0.01, 0.01, 0.001])
+    dead = true.copy()
+    rng = np.random.default_rng(5)                # the same noise for every run
+    err_dr, err_ekf, nis = [], [], []
+    for k in range(steps):
+        v, w = 0.5, 0.1                           # commanded: a 5 m circle
+        true = move(true, v, w)
+        vo = 1.03 * v + rng.normal(0, sig_v)    # odometry: 3% scale error...
+        wo = w + 0.004 + rng.normal(0, sig_w)  # ...and a small turn bias
+        dead = move(dead, vo, wo)
+        # --- EKF predict ---
+        th = mu[2]
+        Fx = np.array([[1, 0, -vo * dt * np.sin(th)], [0, 1, vo * dt * np.cos(th)], [0, 0, 1]])
+        Fu = np.array([[dt * np.cos(th), 0], [dt * np.sin(th), 0], [0, dt]])
+        mu = move(mu, vo, wo)
+        P = Fx @ P @ Fx.T + Fu @ np.diag([sig_v**2, sig_w**2]) @ Fu.T
+        # --- EKF correct: once a second, every landmark within 8 m ---
+        if k % 10 == 9:
+            for lm in landmarks:
+                z = measure(true, lm) + rng.normal(0, [sig_r, sig_b])
+                if z[0] > 8.0:
+                    continue
+                zhat = measure(mu, lm)
+                dx, dy = lm[0] - mu[0], lm[1] - mu[1]; q = dx**2 + dy**2
+                H = np.array([[-dx / np.sqrt(q), -dy / np.sqrt(q), 0], [dy / q, -dx / q, -1]])
+                y = z - zhat; y[1] = wrap(y[1])
+                S = H @ P @ H.T + R_assumed
+                K = P @ H.T @ np.linalg.inv(S)
+                mu = mu + K @ y; mu[2] = wrap(mu[2])
+                P = (np.eye(3) - K @ H) @ P
+                nis.append(float(y @ np.linalg.inv(S) @ y))
+        err_dr.append(np.hypot(*(dead[:2] - true[:2])))
+        err_ekf.append(np.hypot(*(mu[:2] - true[:2])))
+    return np.array(err_dr), np.array(err_ekf), np.array(nis), P
+
+R_true = np.diag([sig_r**2, sig_b**2])
+dr, ekf, nis, P = run_ekf(R_true)
+print(f"after 90 s: dead reckoning error {dr[-1]:.2f} m (max {dr.max():.2f}),"
+      f" EKF error {ekf[-1]:.3f} m (max after 10 s {ekf[100:].max():.3f})")
+print(f"EKF's own 1-sigma position uncertainty at the end: {np.sqrt(P[0, 0]):.3f} m (x), {np.sqrt(P[1, 1]):.3f} m (y)")
+print(f"honest R:        mean NIS {nis.mean():.2f} (ideal 2.00), fraction below 5.99: {np.mean(nis < 5.99):.2f} (ideal 0.95)")
+_, ekf_bad, nis_bad, _ = run_ekf(np.diag([0.02**2, np.radians(0.4)**2]))
+print(f"overconfident R: mean NIS {nis_bad.mean():.2f}, fraction below 5.99: {np.mean(nis_bad < 5.99):.2f},"
+      f" final error {ekf_bad[-1]:.3f} m")
+```
+
+Dead reckoning has drifted 2.16 m after 90 s; the EKF is within 4 cm, and its own covariance claims about 3 cm, so it is not fooling itself. For a two-component measurement, a consistent filter's NIS averages 2 and stays below 5.99 (the 95% point of $\chi^2_2$) 95% of the time. Here it averages 2.25 and passes 92% of the time: close, with the small excess honestly reporting that the motion model ignores the odometry's systematic errors. The overconfident filter's *error* looks just as good (3.7 cm), but its NIS averages 37 and passes only 13% of the time. Its covariance is a lie, and any decision built on it (a planner choosing how close to pass a pallet, a data-association step deciding which landmark it saw) would be wrong. In simulation, with the truth known, one also checks the **normalised estimation error squared** (NEES), $(x - \hat{x})^{\mathsf T}P^{-1}(x - \hat{x})$, which should average the state dimension.
+
+Two details in the code are easy to forget and cause real bugs. The bearing innovation must be **wrapped** into $(-\pi, \pi]$: a reading of $179°$ against a prediction of $-179°$ is a 2° surprise, not 358°. And the Jacobians must be evaluated at the *current* estimate every time.
+
+</Section>
+
+<Section id="ukf" kind="computation" title="The unscented transform">
+
+Linearisation fails when the function curves noticeably within the spread of the belief. The classic case is exactly the range–bearing sensor: a landmark seen 10 m away with a precise range (5 cm) but a vague bearing (15°) lies somewhere on a curved arc, a "banana", whose centre of mass is *inside* the arc, closer than 10 m. The EKF puts the mean on the arc and believes the depth uncertainty is just the range noise.
+
+The **unscented transform** (Julier and Uhlmann, 1990s) instead picks $2n + 1$ **sigma points**: the mean and points $\pm$ one column of a matrix square root of $(n + \kappa)\Sigma$ along each axis. It pushes each through the *exact* nonlinear function and recomputes a weighted mean and covariance. No Jacobians are needed, and the result is accurate to second order where linearisation is accurate to first. The program compares both against 200,000 Monte Carlo samples.
+
+```python run
+import numpy as np
+
+# A range-bearing reading of a landmark: range 10 m (sd 0.05 m), bearing 90 deg (sd 15 deg).
+mu = np.array([10.0, np.radians(90)])
+C = np.diag([0.05**2, np.radians(15) ** 2])
+f = lambda s: np.array([s[0] * np.cos(s[1]), s[0] * np.sin(s[1])])   # polar -> Cartesian
+
+# 1. Monte Carlo: push 200,000 samples through f (the reference answer).
+rng = np.random.default_rng(0)
+S = rng.multivariate_normal(mu, C, 200_000)
+Y = np.stack([S[:, 0] * np.cos(S[:, 1]), S[:, 0] * np.sin(S[:, 1])], axis=1)
+mc_mean, mc_cov = Y.mean(axis=0), np.cov(Y.T)
+
+# 2. Linearisation (what the EKF does): mean f(mu), covariance J C J^T.
+J = np.array([[np.cos(mu[1]), -mu[0] * np.sin(mu[1])],
+              [np.sin(mu[1]),  mu[0] * np.cos(mu[1])]])
+lin_mean, lin_cov = f(mu), J @ C @ J.T
+
+# 3. Unscented transform: 2n + 1 = 5 sigma points, weights with kappa = 3 - n.
+n, kappa = 2, 1.0
+L = np.linalg.cholesky((n + kappa) * C)
+pts = [mu] + [mu + L[:, i] for i in range(n)] + [mu - L[:, i] for i in range(n)]
+w = np.array([kappa / (n + kappa)] + [1 / (2 * (n + kappa))] * (2 * n))
+fy = np.array([f(p) for p in pts])
+ut_mean = w @ fy
+ut_cov = sum(wi * np.outer(d, d) for wi, d in zip(w, fy - ut_mean))
+
+for name, m, c in [("Monte Carlo", mc_mean, mc_cov), ("linearised", lin_mean, lin_cov), ("unscented", ut_mean, ut_cov)]:
+    sd = np.sqrt(np.diag(c))
+    print(f"{name:12s} mean = ({m[0]:+.3f}, {m[1]:.3f}) m   sd = ({sd[0]:.3f}, {sd[1]:.3f}) m")
+```
+
+The linearised estimate puts the mean at 10.000 m ahead with a depth spread of 5 cm. The samples say the mean is 9.662 m ahead and the depth spread is 47 cm, nearly ten times larger. The unscented transform, with only five function evaluations, gives 9.663 m and 48 cm. An **unscented Kalman filter** (UKF) uses this transform in both the predict and correct steps. It costs a few times more than an EKF, needs no derivatives (handy when $f$ is a simulator or a lookup table), and is noticeably better when the uncertainty is large compared with the curvature; when the belief is tight, the two agree.
+
+</Section>
+
+<Section id="fusion" kind="computation" title="Fusing an IMU with wheel odometry">
+
+A gyroscope measures turning rate precisely and quickly, but every MEMS gyro has a **bias**: it reads, say, $0.01$ rad/s (about $0.6°$ per second) when perfectly still, and the bias wanders with temperature. As <LessonLink slug="rotations-and-quaternions">Rotations and quaternions</LessonLink> warned, integrating it alone drifts without bound. Wheel odometry measures turning rate from the difference of the wheel speeds: unbiased on average but noisier, and badly wrong whenever a wheel slips. Each sensor is good exactly where the other is bad, which is the ideal case for fusion.
+
+Put the bias in the state, $x = (\theta, \omega, b)$, with heading $\theta$, true yaw rate $\omega$ and gyro bias $b$. The model is linear: $\theta$ integrates $\omega$; $\omega$ changes freely (a random walk); $b$ drifts very slowly. The gyro measures $\omega + b$ and the odometry measures $\omega$, so $H_{\text{gyro}} = (0, 1, 1)$ and $H_{\text{odo}} = (0, 1, 0)$. Neither measures the bias, but their *difference* does, and the filter discovers this through the covariance. Halfway through the two-minute run, one wheel spins on a wet patch for two seconds. The last filter rejects any odometry reading whose NIS exceeds 9, a three-standard-deviation surprise.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(3)
+dt, T = 0.02, 120.0                                   # 50 Hz for two minutes
+n = int(T / dt)
+t = np.arange(1, n + 1) * dt
+omega = np.where((t % 20) < 5, 0.4, 0.0)              # true yaw rate: a 5 s turn every 20 s
+bias = 0.01                                           # gyro bias, rad/s (about 0.6 deg/s)
+gyro = omega + bias + rng.normal(0, 0.01, n)          # precise but biased
+odo = omega + rng.normal(0, 0.05, n)                  # unbiased but noisy (encoder steps)
+slip = (t > 60) & (t < 62)
+odo[slip] += 0.5                                      # a wheel spins on a wet patch for 2 s
+theta_true = np.cumsum(omega) * dt
+
+# State x = [heading, yaw rate, gyro bias]. Both sensors measure rates: gyro = w + b, odometry = w.
+F = np.array([[1, dt, 0], [0, 1, 0], [0, 0, 1]])
+Q = np.diag([0.0, 0.5**2 * dt, 1e-5**2 * dt])         # yaw rate may change fast; bias drifts very slowly
+Hg, Ho = np.array([[0.0, 1, 1]]), np.array([[0.0, 1, 0]])
+Rg, Ro = 0.01**2, 0.05**2
+
+def fuse(gate):
+    x, P = np.zeros(3), np.diag([0.0, 0.1, 0.05**2])
+    out, rejected = np.zeros(n), 0
+    for k in range(n):
+        x, P = F @ x, F @ P @ F.T + Q
+        for H, r, z, is_odo in ((Hg, Rg, gyro[k], False), (Ho, Ro, odo[k], True)):
+            y = z - (H @ x)[0]
+            s = (H @ P @ H.T)[0, 0] + r
+            if gate and is_odo and y * y / s > 9.0:    # NIS above 9: a 3-sigma surprise, reject
+                rejected += 1
+                continue
+            K = (P @ H.T / s).ravel()
+            x, P = x + K * y, P - np.outer(K, H @ P)
+        out[k] = x[0]
+    return out, x[2], rejected
+
+err = lambda th: np.degrees(th - theta_true)
+gyro_only, odo_only = np.cumsum(gyro) * dt, np.cumsum(odo) * dt
+fused, b1, _ = fuse(gate=False)
+gated, b2, nrej = fuse(gate=True)
+print("heading error (deg) at     30 s    60 s    90 s   120 s")
+for name, th in [("gyro only", gyro_only), ("odometry only", odo_only), ("KF, no gate", fused), ("KF, NIS gate", gated)]:
+    e = err(th)
+    print(f"{name:14s}       " + "  ".join(f"{e[int(s / dt) - 1]:6.2f}" for s in (30, 60, 90, 120)))
+print(f"estimated gyro bias: {b1:.4f} rad/s (no gate), {b2:.4f} rad/s (gated); true {bias}")
+print(f"odometry readings rejected by the gate: {nrej} of {n}")
+```
+
+The gyro alone drifts steadily, $0.57°$ a second, to $69°$ after two minutes. Odometry alone is good until the slip, which adds $57°$ of phantom rotation that never goes away. The plain Kalman filter does well for the first minute, and has learned the bias, but then it faithfully fuses the slip: the model says odometry is merely noisy, so a 2-second disagreement must be partly a change of bias (its estimate collapses from 0.010 to 0.0016 rad/s) and partly real rotation. The gated filter recognises the slip as impossible under its model, rejects those readings (99 of them during the slip, plus 11 ordinary readings beyond three standard deviations, close to the 0.3% expected by chance), keeps the bias at 0.0099 rad/s, and ends within one degree.
+
+<Narrator who="gideon">
+
+The gate assumes the filter's own covariance is right. If the filter becomes overconfident, its gate tightens and it begins rejecting *good* readings, which makes it more overconfident: a filter can lock itself out of reality. Production systems therefore count rejections and reset or inflate the covariance when too many arrive in a row; PX4's EKF2, for one, reports its innovation test ratios so that such failures are visible.
+
+</Narrator>
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+**Mobile robots.** The ROS package [robot_localization](https://github.com/cra-ros-pkg/robot_localization) provides EKF and UKF nodes with a 15-dimensional state (position, orientation, their velocities and linear acceleration) that fuse any number of odometry, IMU, pose and GNSS inputs, each with a configuration saying which components it measures. A typical setup runs one instance in the smooth `odom` frame (wheels plus IMU) and another in the `map` frame that also takes GNSS or a localiser, exactly the two-frame structure of <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>.
+
+**Drones and inertial navigation.** Orientation is not a vector, so IMU-based filters use an **error-state** Kalman filter: the nominal orientation is integrated as a quaternion, and the filter estimates a small 3-vector *error* in its tangent space, where the Kalman equations are valid (Solà's notes in the references explain this with care). The open-source autopilots PX4 and ArduPilot both run EKFs of this kind with more than twenty states, including sensor biases, wind and the magnetic field. **Invariant EKFs**, which exploit the Lie-group structure of poses, have better consistency guarantees and are used on legged robots.
+
+**Cameras plus IMU.** Visual-inertial odometry in phones, headsets and drones is often a filter: the MSCKF of Mourikis and Roumeliotis keeps a sliding window of past camera poses in the state, and open implementations such as OpenVINS descend from it. The alternative is to optimise over a window of poses, which leads to the factor graphs of <LessonLink slug="slam">SLAM</LessonLink>. A filter is a smoother that has decided never to revisit the past; when revisiting is affordable, optimisation is usually more accurate.
+
+**Learned components.** Research systems learn parts of a Kalman filter from data: noise covariances that depend on the situation, measurement models that read raw images, or the gain itself (KalmanNet, 2021, replaces the gain computation with a recurrent network while keeping the filter's structure). Lumenary CS's [neural networks](/en/cs/neural-networks/) lesson covers the networks involved. In deployed robots, as of 2026, the filter equations are still almost always the classical ones; learning more often supplies the measurements that feed them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"$Q$ is the noise of the motion sensors and $R$ the noise of the other sensors."** $Q$ is how far the *true state* departs from the motion model in one step: unmodelled accelerations, slip, wind. It includes, but is not limited to, the noise of whatever drives the prediction. $R$ is the noise of the measurement *as the model describes it*, which must also cover modelling errors such as a landmark that is not quite where the map says.
+
+</Misconception>
+
+<Misconception>
+
+**"$P$ tells you how big the error is."** Only if the filter is consistent. $P$ is computed from $Q$ and $R$, not from the data, so a filter with an overconfident $R$ reports a tiny $P$ whatever its real error. The NIS test is how you find out.
+
+</Misconception>
+
+<Misconception>
+
+**"The EKF is optimal."** It is the optimal filter for a linear model that happens to match the real model's slope at the current estimate. With large uncertainty or strong curvature it is biased and overconfident, as the unscented-transform example showed.
+
+</Misconception>
+
+<Misconception>
+
+**"The Kalman filter needs Gaussian noise to work at all."** Its equations need only means and covariances, and for any noise with those statistics it is the best *linear* estimator. Gaussian noise makes it the best estimator of all. Heavy-tailed noise (outliers) is the real danger, which is why gating matters.
+
+</Misconception>
+
+<Misconception>
+
+**"A Kalman filter can track several hypotheses."** A Gaussian has one peak. If the robot might be in either of two identical corridors, a Kalman filter must pick one or average them into the wall between. That is the job of the <LessonLink slug="particle-filters-and-localisation">particle filter</LessonLink>.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Carl Friedrich Gauss used least squares in 1801 to predict where the newly found dwarf planet Ceres would reappear from behind the Sun, from a few weeks of observations. Norbert Wiener and Andrey Kolmogorov developed optimal filtering of stationary signals in the 1940s. Rudolf Kálmán's 1960 paper recast the problem in state-space form, recursive and suited to digital computers, and with Richard Bucy he gave the continuous-time version in 1961. Stanley Schmidt's team at NASA Ames extended it to nonlinear systems for Apollo's navigation, which flew with a Kalman filter on board. The unscented transform was introduced by Simon Julier and Jeffrey Uhlmann in the mid-1990s. The filter has since moved from spacecraft to pockets: smartphones run them to fuse satellite positioning with their motion sensors.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

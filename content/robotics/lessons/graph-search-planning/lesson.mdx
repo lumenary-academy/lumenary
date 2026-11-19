@@ -1,0 +1,701 @@
+---
+title: Planning on graphs and grids
+subtitle: From a map to a route — occupancy grids as graphs, A* with the right heuristic, costmaps that keep a robot off the walls, replanning when the world changes, and lattices for robots that cannot turn on the spot.
+minutes: 75
+objectives:
+  - Turn an occupancy grid, a state lattice or a roadmap into a graph, choosing its connectivity and edge costs
+  - Implement Dijkstra and A* on an 8-connected occupancy grid, and compare zero, Euclidean, octile and Manhattan heuristics for admissibility, consistency and work done
+  - Build a costmap with obstacle inflation, and explain how it trades path length for clearance
+  - Explain why robots replan, and the idea behind incremental planners such as D* Lite
+  - Plan for a car-like robot with a state lattice of motion primitives, and describe the global planners in ROS 2's Nav2
+narrators: [chloe, margaret, gideon]
+prerequisites: [wheeled-robots, slam]
+related: [math.discrete.graph-theory, math.discrete.graph-basics, math.comp.algorithm-design, math.applied.optimisation]
+references:
+  - title: "A Formal Basis for the Heuristic Determination of Minimum Cost Paths"
+    author: Peter E. Hart, Nils J. Nilsson and Bertram Raphael
+    year: 1968
+    url: https://doi.org/10.1109/TSSC.1968.300136
+    note: The A* paper, written for the Shakey robot at the Stanford Research Institute.
+  - title: "D* Lite"
+    author: Sven Koenig and Maxim Likhachev
+    year: 2002
+    note: The incremental replanner described in this lesson, published at the AAAI conference; their 2005 IEEE Transactions on Robotics paper "Fast replanning for navigation in unknown terrain" applies it to robots.
+  - title: "Planning Algorithms"
+    author: Steven M. LaValle
+    year: 2006
+    url: https://lavalle.pl/planning/
+    note: A complete, free textbook on motion planning; chapter 2 covers discrete search and its robotics uses.
+  - title: "Nav2 documentation"
+    url: https://docs.nav2.org/
+    note: ROS 2's navigation stack, with guides to its costmaps and to the NavFn, Smac and Theta* planners.
+  - title: "The Marathon 2: A Navigation System"
+    author: Steve Macenski, Francisco Martín, Ruffin White and Jonatan Ginés Clavero
+    year: 2020
+    url: https://arxiv.org/abs/2003.00368
+    note: The design of Nav2, and a field test in a university building.
+  - title: "Introduction to the A* algorithm"
+    author: Amit Patel (Red Blob Games)
+    url: https://www.redblobgames.com/pathfinding/a-star/introduction.html
+    note: Interactive diagrams of breadth-first search, Dijkstra and A* on grids.
+---
+
+<Section id="motivation" kind="motivation" title="From a map to a route">
+
+A delivery robot in a hospital in Seoul has just been asked to take blood samples from a ward to the laboratory. Its SLAM system (<LessonLink slug="slam">the last lesson of the Perception level</LessonLink>) has given it a map: a grid of 5 cm cells, each marked free, occupied or unknown. Its localiser knows where it is on that map to within a few centimetres. What it does not yet have is a **route**: a sequence of places to drive through that avoids the walls, the trolleys and the people, and is not absurdly long.
+
+You have met the core of the answer in Lumenary CS: a map is a [graph](/en/cs/graphs/), and a route is a [shortest path](/en/cs/shortest-paths/) in it, which Dijkstra's algorithm or A* finds. A* was in fact invented for a robot: Peter Hart, Nils Nilsson and Bertram Raphael published it in 1968 while working on Shakey, the Stanford Research Institute's mobile robot. This lesson does not repeat those algorithms. It asks what changes when the graph comes from a robot's map:
+
+- **Which graph?** A grid, a lattice of headings, a roadmap of corridors: the choice decides what paths are even possible.
+- **Which heuristic?** Moving diagonally changes which distance estimates are safe to use with A*.
+- **Which cost?** The shortest path scrapes along every wall. Real robots have a size, imperfect control and people nearby, so they pay to stay clear.
+- **Which world?** The map changes while the robot drives: a door closes, a cart is parked. The planner must replan quickly, many times a second if needed.
+- **Which robot?** A car cannot turn on the spot, so a path with sharp corners is useless to it.
+
+Along the way you will plan on an occupancy grid with four heuristics, build a costmap like those of ROS 2's navigation stack, measure what a small change in the map does to a plan, and plan a U-turn for a car in a car park.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Three ways to make a graph">
+
+A planner needs a graph: vertices that stand for places (or states) the robot can be in, and edges for motions between them that it can actually perform, each with a cost. Robotics uses three main constructions.
+
+**Grids.** Cut the floor into square cells and make every free cell a vertex. Join each cell to its 4 side neighbours (**4-connected**) or also to its 4 diagonal neighbours (**8-connected**), with cost equal to the distance between cell centres: 1 cell for a side step and $\sqrt 2$ cells for a diagonal one. Grids are what SLAM produces, so they are the natural first choice for robots that can turn on the spot, such as differential-drive and omnidirectional bases.
+
+**Lattices.** A grid ignores which way the robot faces. A **state lattice** adds heading (and sometimes speed or steering angle) to the state, and replaces "step to a neighbouring cell" with a small library of **motion primitives**: short manoeuvres the robot can really perform, each starting and ending exactly on lattice states. Chaining primitives produces only paths the robot can follow.
+
+**Roadmaps.** Sometimes a few well-chosen places are enough: doorways, corridor junctions, the centre lines of corridors (a **Voronoi** roadmap keeps as far from walls as possible). Robots in large buildings often plan first on such a sparse graph, and only then on a fine grid near themselves. The <LessonLink slug="sampling-based-planning">next lesson</LessonLink> builds roadmaps from random samples, which is how planning works in high dimensions.
+
+<Figure caption="Left: the eight moves of an 8-connected grid, with their costs. The cell above is occupied, so the two upward diagonal moves are forbidden too: they would cut its corners. Right: three motion primitives of a state lattice for a car facing east, on a grid of lattice points. The turns combine a short straight piece with a 45° arc of the car's tightest radius and end exactly on lattice points, facing north-east or south-east; the dashed straight primitive shows how the next move continues from there.">
+<svg viewBox="0 0 420 250" role="img" aria-label="Two diagrams. On the left, a three by three grid of cells with the top middle cell shaded as occupied. Solid arrows go from the centre cell to the left, right, lower-left, lower and lower-right cells, labelled 1 for side moves and root 2 for diagonal moves. Dashed arrows to the upper-left and upper-right cells are crossed out. On the right, a grid of dots with three curves leaving one dot heading right: a short straight line, a curve bending up to a dot three across and one up, and a mirror-image curve bending down. A dashed diagonal line continues from the end of the upper curve.">
+  <defs>
+    <marker id="gsp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="20" y="40" width="120" height="120" />
+    <line x1="60" y1="40" x2="60" y2="160" />
+    <line x1="100" y1="40" x2="100" y2="160" />
+    <line x1="20" y1="80" x2="140" y2="80" />
+    <line x1="20" y1="120" x2="140" y2="120" />
+  </g>
+  <rect x="60" y="40" width="40" height="40" fill="currentColor" opacity="0.35" />
+  <circle cx="80" cy="100" r="4" fill="var(--gold)" stroke="currentColor" />
+  <g stroke="currentColor" strokeWidth="1.6" markerEnd="url(#gsp-arrow)">
+    <line x1="80" y1="100" x2="52" y2="100" />
+    <line x1="80" y1="100" x2="108" y2="100" />
+    <line x1="80" y1="100" x2="80" y2="128" />
+    <line x1="80" y1="100" x2="54" y2="126" />
+    <line x1="80" y1="100" x2="106" y2="126" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.2" strokeDasharray="3 3">
+    <line x1="80" y1="100" x2="54" y2="74" />
+    <line x1="80" y1="100" x2="106" y2="74" />
+  </g>
+  <g stroke="var(--bad)" strokeWidth="1.8">
+    <line x1="61" y1="83" x2="71" y2="93" />
+    <line x1="71" y1="83" x2="61" y2="93" />
+    <line x1="89" y1="83" x2="99" y2="93" />
+    <line x1="99" y1="83" x2="89" y2="93" />
+  </g>
+  <g fill="currentColor" fontSize="12">
+    <text x="56" y="114">1</text>
+    <text x="110" y="96">1</text>
+    <text x="84" y="138">1</text>
+    <text x="40" y="132">√2</text>
+    <text x="110" y="132">√2</text>
+    <text x="20" y="185">8-connected grid</text>
+    <text x="20" y="200" fontSize="11">occupied cell shaded</text>
+  </g>
+  <g fill="currentColor" opacity="0.55">
+    <circle cx="220" cy="100" r="2" /><circle cx="250" cy="100" r="2" /><circle cx="280" cy="100" r="2" /><circle cx="310" cy="100" r="2" /><circle cx="340" cy="100" r="2" /><circle cx="370" cy="100" r="2" />
+    <circle cx="220" cy="130" r="2" /><circle cx="250" cy="130" r="2" /><circle cx="280" cy="130" r="2" /><circle cx="310" cy="130" r="2" /><circle cx="340" cy="130" r="2" /><circle cx="370" cy="130" r="2" />
+    <circle cx="220" cy="160" r="2" /><circle cx="250" cy="160" r="2" /><circle cx="280" cy="160" r="2" /><circle cx="310" cy="160" r="2" /><circle cx="340" cy="160" r="2" /><circle cx="370" cy="160" r="2" />
+    <circle cx="220" cy="190" r="2" /><circle cx="250" cy="190" r="2" /><circle cx="280" cy="190" r="2" /><circle cx="310" cy="190" r="2" /><circle cx="340" cy="190" r="2" /><circle cx="370" cy="190" r="2" />
+    <circle cx="220" cy="220" r="2" /><circle cx="250" cy="220" r="2" /><circle cx="280" cy="220" r="2" /><circle cx="310" cy="220" r="2" /><circle cx="340" cy="220" r="2" /><circle cx="370" cy="220" r="2" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="2.2">
+    <line x1="220" y1="160" x2="250" y2="160" markerEnd="url(#gsp-arrow)" />
+    <path d="M 220 160 L 237.6 160 A 102.4 102.4 0 0 0 310 130" markerEnd="url(#gsp-arrow)" />
+    <path d="M 220 160 L 237.6 160 A 102.4 102.4 0 0 1 310 190" markerEnd="url(#gsp-arrow)" />
+  </g>
+  <line x1="310" y1="130" x2="338" y2="102" stroke="currentColor" strokeWidth="1.4" strokeDasharray="4 3" markerEnd="url(#gsp-arrow)" />
+  <rect x="207" y="153" width="16" height="14" rx="2" fill="var(--gold)" stroke="currentColor" />
+  <g fill="currentColor" fontSize="12">
+    <text x="266" y="126">(3, 1)</text>
+    <text x="318" y="200">(3, −1)</text>
+    <text x="246" y="152">(1, 0)</text>
+    <text x="210" y="40">state lattice, car facing east</text>
+    <text x="210" y="56" fontSize="11">turns: tightest radius, 45° each</text>
+  </g>
+</svg>
+</Figure>
+
+The figure shows a detail that matters on grids: an 8-connected planner must not **cut corners**, taking the robot's centre through the corner of an occupied cell. The usual rule, used in all the code below, forbids a diagonal step when either of the two side cells it passes is occupied.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="occupancy grid">
+
+An **occupancy grid** divides the plane into square cells (typically 2–10 cm across indoors), each holding the probability that it is occupied, thresholded for planning into **free**, **occupied** and **unknown**. A planner must decide what unknown means: free but costly, or occupied, depending on how cautious the robot must be.
+
+</Definition>
+
+<Definition term="admissible and consistent heuristics">
+
+For A* on a graph with goal $t$, a heuristic $h$ estimates the cost-to-go $h^*(v)$ from vertex $v$ to $t$. It is **admissible** if $h(v) \le h^*(v)$ for every $v$, and **consistent** if $h(t) = 0$ and $h(u) \le w(u, v) + h(v)$ for every edge $(u, v)$ of weight $w(u,v)$. Consistency implies admissibility; with a consistent heuristic A* never expands a vertex twice and returns an optimal path ([shortest paths](/en/cs/shortest-paths/) proves both).
+
+</Definition>
+
+<Definition term="octile distance">
+
+On an 8-connected grid with side cost 1 and diagonal cost $\sqrt 2$, the **octile distance** between cells that differ by $\Delta x$ columns and $\Delta y$ rows is
+
+$$
+h_{\text{oct}} = \max(|\Delta x|, |\Delta y|) + (\sqrt 2 - 1)\min(|\Delta x|, |\Delta y|),
+$$
+
+the length of the shortest path on the empty grid: go diagonally until one coordinate matches, then straight.
+
+</Definition>
+
+<Definition term="costmap and inflation">
+
+A **costmap** assigns every cell a traversal cost, not just free or occupied. **Inflation** grows the obstacles: cells whose distance to the nearest obstacle is at most the robot's radius are forbidden for the robot's centre, and the cost of nearby cells decays smoothly with distance, so that the planner prefers to keep clear when it can.
+
+</Definition>
+
+<Definition term="state lattice">
+
+A **state lattice** is a graph whose vertices are a regular discretisation of the robot's state (for a car, $(x, y, \theta)$ on a grid with, say, 16 headings) and whose edges are **motion primitives**: precomputed, dynamically feasible manoeuvres between lattice states, the same set repeated from every vertex because the grid is invariant under translation.
+
+</Definition>
+
+Which heuristics are safe on an 8-connected grid? The Manhattan distance $|\Delta x| + |\Delta y|$, admissible on a 4-connected grid, is **not** admissible here: one diagonal step costs $\sqrt 2 \approx 1.41$, but Manhattan charges 2. The Euclidean distance is admissible but loose, since the robot cannot move at arbitrary angles. The octile distance is exactly right.
+
+<Theorem name="The octile distance is consistent">
+
+On an 8-connected grid with side cost 1 and diagonal cost $\sqrt 2$ (with or without obstacles), the octile distance to the goal is a consistent, and therefore admissible, heuristic.
+
+</Theorem>
+
+<Proof>
+
+$h_{\text{oct}}$ is $0$ at the goal. Write $a = |\Delta x|$ and $b = |\Delta y|$, so $h_{\text{oct}} = f(a, b) = \max(a, b) + (\sqrt 2 - 1)\min(a, b)$. This $f$ is continuous and piecewise linear, with slope $1$ in its larger argument and $\sqrt 2 - 1$ in its smaller one. A side step changes one of $a, b$ by at most 1, so it changes $f$ by at most $1$, its cost. A diagonal step changes each of $a, b$ by at most 1, so it changes $f$ by at most $1 + (\sqrt 2 - 1) = \sqrt 2$, its cost. Hence $|h(u) - h(v)| \le w(u, v)$ for every edge, which includes $h(u) \le w(u, v) + h(v)$. Obstacles only remove edges, so the inequality holds for every edge that remains.
+
+</Proof>
+
+<Narrator who="chloe">
+
+The proof hides a general recipe: a heuristic is consistent when it is the exact cost-to-go of a **relaxed** problem, one with more edges or cheaper ones. The octile distance is the true cost on the grid with all the obstacles removed; the Euclidean distance is the true cost for a robot allowed to move at any angle. Relax less, and the heuristic is tighter.
+
+</Narrator>
+
+</Section>
+
+<Section id="astar-grid" kind="computation" title="A* on an occupancy grid">
+
+Here is a warehouse floor, 44 cells by 15, with two rows of shelving units and two small offices. The robot's charging dock is at the bottom left and the pick station at the top right. The code runs A* with four heuristics (with $h = 0$, A* is Dijkstra's algorithm) and weighted A* with $w = 2$, which orders the queue by $g + 2h$. It also runs Dijkstra outwards from the goal to get the true cost-to-go $h^*$ of every cell, so it can test each heuristic for admissibility directly.
+
+```python run
+import heapq, math
+import numpy as np
+
+MAP = [
+    "############################################",
+    "#..........................................#",
+    "#..####..####..####..####..................#",
+    "#..####..####..####..####.....######.......#",
+    "#..####..####..####..####.....#....#.......#",
+    "#..####..####..####..####.....#....#.......#",
+    "#.............................#....#.......#",
+    "#.............................#....###.....#",
+    "#..####..####..####..####..................#",
+    "#..####..####..####..####..................#",
+    "#..####..####..####..####........#######...#",
+    "#..####..####..####..####........#.........#",
+    "#................................#.........#",
+    "#................................#.........#",
+    "############################################",
+]
+occ = np.array([[ch == "#" for ch in row] for row in MAP])   # True = occupied
+ROWS, COLS = occ.shape
+start, goal = (13, 1), (1, 42)                              # (row, col)
+
+SQ2 = math.sqrt(2)
+MOVES = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+         (-1, -1, SQ2), (-1, 1, SQ2), (1, -1, SQ2), (1, 1, SQ2)]
+
+def neighbours(cell):
+    r, c = cell
+    for dr, dc, cost in MOVES:
+        nr, nc = r + dr, c + dc
+        if not (0 <= nr < ROWS and 0 <= nc < COLS) or occ[nr, nc]:
+            continue
+        if dr and dc and (occ[r + dr, c] or occ[r, c + dc]):
+            continue                      # no cutting a corner between two cells
+        yield (nr, nc), cost
+
+def astar(h, weight=1.0):
+    """A* with heuristic h(cell); weight > 1 gives weighted A*. Returns cost, path, expansions."""
+    g, parent, closed = {start: 0.0}, {start: None}, set()
+    heap = [(weight * h(start), 0, start)]
+    tie = 0
+    while heap:
+        _, _, cell = heapq.heappop(heap)
+        if cell in closed:
+            continue
+        closed.add(cell)
+        if cell == goal:
+            path = [cell]
+            while parent[path[-1]] is not None:
+                path.append(parent[path[-1]])
+            return g[cell], path[::-1], len(closed)
+        for nxt, cost in neighbours(cell):
+            new = g[cell] + cost
+            if new < g.get(nxt, math.inf) - 1e-12:
+                g[nxt], parent[nxt] = new, cell
+                tie += 1
+                heapq.heappush(heap, (new + weight * h(nxt), tie, nxt))
+    return math.inf, [], len(closed)
+
+def dx_dy(cell):
+    return abs(cell[0] - goal[0]), abs(cell[1] - goal[1])
+
+heuristics = {
+    "zero (Dijkstra)": lambda c: 0.0,
+    "Euclidean":       lambda c: math.hypot(*dx_dy(c)),
+    "octile":          lambda c: max(dx_dy(c)) + (SQ2 - 1) * min(dx_dy(c)),
+    "Manhattan":       lambda c: sum(dx_dy(c)),
+}
+
+# The true cost-to-go h*(cell): Dijkstra outwards from the goal (moves are symmetric).
+hstar = {goal: 0.0}
+heap = [(0.0, goal)]
+while heap:
+    d, cell = heapq.heappop(heap)
+    if d > hstar[cell]:
+        continue
+    for nxt, cost in neighbours(cell):
+        if d + cost < hstar.get(nxt, math.inf):
+            hstar[nxt] = d + cost
+            heapq.heappush(heap, (d + cost, nxt))
+
+print(f"free cells: {(~occ).sum()}   true shortest cost: {hstar[start]:.3f}")
+print(f"{'heuristic':18}{'weight':>7}{'cost':>9}{'expanded':>10}{'admissible?':>13}")
+for name, h in heuristics.items():
+    admissible = all(h(c) <= hstar[c] + 1e-9 for c in hstar)
+    for w in ([1.0, 2.0] if name == "octile" else [1.0]):
+        cost, path, n = astar(h, w)
+        print(f"{name:18}{w:7.1f}{cost:9.3f}{n:10d}{str(admissible):>13}")
+
+cost, path, n = astar(heuristics["octile"])
+canvas = [list(row) for row in MAP]
+for r, c in path:
+    canvas[r][c] = "*"
+canvas[start[0]][start[1]], canvas[goal[0]][goal[1]] = "S", "G"
+print("\n".join("".join(row) for row in canvas))
+```
+
+All admissible heuristics find the optimal cost, 47.728 cells, and they differ only in work: Dijkstra expands 387 of the 392 free cells, Euclidean 245, octile 160. Weighted A* expands only 61 cells and returns a path 1.7% longer. Manhattan expands just 55 cells, but its path is 7.4% longer, and the program confirms that it overestimates somewhere. The printed path also shows the problem the next section fixes: it slides along the bottom row of shelving and clips the corners of the office, at a distance of zero cells.
+
+<Narrator who="margaret">
+
+Weighted A* comes with a guarantee: if $h$ is admissible, the path it returns costs at most $w$ times the optimum. Here the bound allows up to $2 \times 47.728 \approx 95.5$, and the actual cost is 48.556, far inside it. That is typical, and it is why "a slightly suboptimal path, now" is a popular setting in practice; ARA*, the anytime version, starts with a large $w$ and lowers it while time remains.
+
+</Narrator>
+
+Production planners add two details: **tie-breaking** towards larger $g$ when many cells share the same $f$ (common on open floors), and flat arrays indexed by cell number instead of dictionaries, which matters on a 4000 × 4000 cell map (200 m at 5 cm).
+
+</Section>
+
+<Section id="costmaps" kind="human" title="Costmaps and obstacle inflation">
+
+The robot is not a point. A round robot of radius $\rho$ collides with an obstacle exactly when its centre comes within $\rho$ of it, so instead of checking the whole disc against the map, we can **grow every obstacle by $\rho$** and plan for the centre as a point. This is the simplest case of a *configuration space*, the subject of the <LessonLink slug="configuration-space">third lesson of this level</LessonLink>, and on a grid it is a distance computation: mark every cell within $\rho$ of an occupied cell as forbidden.
+
+Avoiding collision is not enough: localisation is uncertain by a few centimetres, controllers do not track perfectly, and people dislike robots brushing past them. So costmaps also add a **soft** cost that decays with distance from obstacles. ROS 2's Nav2 uses a convention inherited from ROS 1: costs from 0 to 255, where 254 means occupied, 253 means "the robot's inscribed circle would touch an obstacle", 255 is unknown, and cells further out get a cost that falls exponentially with distance, out to an inflation radius. The planner adds the cost of each cell it enters to the distance.
+
+<Figure caption="The inflated cost of a cell as a function of its distance from the nearest obstacle, with the values used in the code below: robot radius 0.2 m, inflation radius 0.6 m, decay rate 6 per metre. Within the radius the robot's centre is forbidden (253); beyond it the cost falls as 252 e^(−6(d − 0.2)), and is zero beyond 0.6 m.">
+<svg viewBox="0 0 380 240" role="img" aria-label="A graph of cost against distance from an obstacle. The cost is at the maximum of 253 from 0 to 0.2 metres, then falls along a decaying exponential curve to about 23 at 0.6 metres, where it drops to zero and stays at zero.">
+  <defs>
+    <marker id="gsp-axis" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="50" y="38" width="80" height="162" fill="var(--bad)" opacity="0.15" />
+  <rect x="130" y="38" width="160" height="162" fill="var(--gold)" opacity="0.15" />
+  <g stroke="currentColor" strokeWidth="1.2" markerEnd="url(#gsp-axis)">
+    <line x1="50" y1="200" x2="350" y2="200" />
+    <line x1="50" y1="200" x2="50" y2="25" />
+  </g>
+  <polyline points="50,40.6 130,40.6 150,82.4 170,112.9 190,135.4 210,152.2 230,164.6 250,173.7 270,180.5 290,185.6 290,200 335,200" fill="none" stroke="currentColor" strokeWidth="2.4" />
+  <g stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" opacity="0.7">
+    <line x1="130" y1="40" x2="130" y2="200" />
+    <line x1="290" y1="185" x2="290" y2="200" />
+  </g>
+  <g fill="currentColor" fontSize="11">
+    <text x="20" y="44">253</text>
+    <text x="34" y="204">0</text>
+    <text x="122" y="216">0.2</text>
+    <text x="282" y="216">0.6</text>
+    <text x="250" y="232">distance d (m)</text>
+    <text x="58" y="30">cost</text>
+    <text x="58" y="120">forbidden</text>
+    <text x="58" y="134">for the</text>
+    <text x="58" y="148">centre</text>
+    <text x="196" y="96">decaying</text>
+    <text x="196" y="110">cost</text>
+    <text x="300" y="190">free</text>
+  </g>
+</svg>
+</Figure>
+
+The next program builds such a costmap for two rooms (3 m by 5 m in all, 0.1 m cells) joined by a 0.6 m doorway and a 0.3 m gap, for a robot of radius 0.2 m. It plans three times: as a point on the raw map, on the map inflated by the robot's radius, and on the full costmap with the decaying cost weighted by 3. It prints each path's length and closest approach to an obstacle, and draws the first and last paths (`1` and `3`) over the costmap (`#` occupied, `:` forbidden for the centre, `.` decaying cost). Then it asks how a plan changes when a box appears.
+
+```python run
+import heapq, math
+import numpy as np
+
+RES = 0.1                                   # metres per cell
+ROWS, COLS = 30, 50                         # a 3 m x 5 m room
+occ = np.zeros((ROWS, COLS), dtype=bool)
+occ[0, :] = occ[-1, :] = occ[:, 0] = occ[:, -1] = True     # outer walls
+occ[:, 20] = True                           # an inner wall at x = 2.0 m ...
+occ[6:9, 20] = False                        # ... with a 0.3 m gap near the top
+occ[19:25, 20] = False                      # ... and a 0.6 m doorway lower down
+occ[12:17, 30:38] = True                    # a table in the second room
+start, goal = (8, 4), (8, 45)
+ROBOT_RADIUS, INFLATE, DECAY = 0.2, 0.6, 6.0       # metres, metres, 1/metres
+
+def costmap(occ):
+    """Distance to the nearest occupied cell, and a Nav2-style inflated cost from 0 to 254."""
+    rr, cc = np.indices(occ.shape)
+    dist = np.full(occ.shape, np.inf)
+    for r, c in np.argwhere(occ):                  # brute force: fine for a small map
+        dist = np.minimum(dist, np.hypot(rr - r, cc - c) * RES)
+    cost = np.where(dist <= ROBOT_RADIUS, 253,     # 253: the robot's centre may not be here
+            np.where(dist <= INFLATE, np.floor(252 * np.exp(-DECAY * (dist - ROBOT_RADIUS))), 0))
+    cost = cost.astype(int)
+    cost[occ] = 254                                # 254: occupied
+    return dist, cost
+
+SQ2 = math.sqrt(2)
+MOVES = [(-1, 0, 1), (1, 0, 1), (0, -1, 1), (0, 1, 1),
+         (-1, -1, SQ2), (-1, 1, SQ2), (1, -1, SQ2), (1, 1, SQ2)]
+
+def dijkstra(blocked, cost, penalty, src, dst=None):
+    """8-connected Dijkstra; entering a cell costs length * (1 + penalty * cost/252).
+    With dst=None it explores everything and returns the cost of every reachable cell."""
+    g, parent = {src: 0.0}, {src: None}
+    heap = [(0.0, src)]
+    while heap:
+        d, cell = heapq.heappop(heap)
+        if d > g[cell]:
+            continue
+        if cell == dst:
+            break
+        r, c = cell
+        for dr, dc, step in MOVES:
+            nr, nc = r + dr, c + dc
+            if blocked[nr, nc] or (dr and dc and (blocked[r + dr, c] or blocked[r, c + dc])):
+                continue
+            nd = d + step * RES * (1 + penalty * cost[nr, nc] / 252)
+            if nd < g.get((nr, nc), math.inf):
+                g[(nr, nc)], parent[(nr, nc)] = nd, cell
+                heapq.heappush(heap, (nd, (nr, nc)))
+    if dst is None:
+        return g
+    path = [dst]
+    while parent[path[-1]] is not None:
+        path.append(parent[path[-1]])
+    return path[::-1]
+
+dist, cost = costmap(occ)
+
+def report(name, path):
+    length = sum(math.dist(a, b) for a, b in zip(path, path[1:])) * RES
+    print(f"{name:32} length {length:4.2f} m, closest obstacle {min(dist[p] for p in path):4.2f} m")
+    return path
+
+p1 = report("point robot, raw map", dijkstra(occ, cost, 0.0, start, goal))
+p2 = report("inflated by the robot's radius", dijkstra(cost >= 253, cost, 0.0, start, goal))
+p3 = report("inflated, with a decaying cost", dijkstra(cost >= 253, cost, 3.0, start, goal))
+
+canvas = np.full(occ.shape, " ")
+canvas[cost > 0] = "."
+canvas[cost >= 253] = ":"
+canvas[occ] = "#"
+for path, mark in ((p1, "1"), (p3, "3")):
+    for p in path:
+        canvas[p] = mark
+print("\n".join("".join(row) for row in canvas))
+
+# Replanning: a box appears. How much of the cost-to-goal field does it change?
+# (Costs are symmetric here except for the cell entered, so search outwards from the goal
+#  and charge each step for the cell it leaves, which is the cell entered going forwards.)
+def cost_to_goal(occ):
+    dist, cost = costmap(occ)
+    flipped = np.zeros_like(cost)
+    g = {goal: 0.0}
+    heap = [(0.0, goal)]
+    blocked = cost >= 253
+    while heap:
+        d, cell = heapq.heappop(heap)
+        if d > g[cell]:
+            continue
+        r, c = cell
+        for dr, dc, step in MOVES:
+            nr, nc = r + dr, c + dc
+            if blocked[nr, nc] or (dr and dc and (blocked[r + dr, c] or blocked[r, c + dc])):
+                continue
+            nd = d + step * RES * (1 + 3.0 * cost[cell] / 252)
+            if nd < g.get((nr, nc), math.inf):
+                g[(nr, nc)] = nd
+                heapq.heappush(heap, (nd, (nr, nc)))
+    return g
+
+before = cost_to_goal(occ)
+print(f"\ncells that can reach the goal: {len(before)}")
+for name, box in [("box appears near the robot", (slice(11, 13), slice(8, 10))),
+                  ("box appears near the goal", (slice(11, 13), slice(41, 43)))]:
+    occ2 = occ.copy()
+    occ2[box] = True
+    after = cost_to_goal(occ2)
+    changed = sum(1 for k, v in before.items() if abs(after.get(k, math.inf) - v) > 1e-9)
+    print(f"{name:28} cost-to-goal changed in {changed} cells")
+```
+
+The point-robot path is the shortest, 4.10 m, and it is a collision: it threads the 0.3 m gap with its centre 0.10 m from the wall, but the robot needs 0.20 m. Inflation by the radius sends the path through the doorway instead (5.41 m), still with only 0.28 m between centre and wall at the closest point, so 8 cm of margin. The decaying cost keeps the path in the middle of the open space and around the table at a respectful distance, for 5.85 m: about 8% further than the merely collision-free path, in exchange for clearance wherever clearance is available. That trade is the costmap's whole purpose, and the weight on the cost term is the dial.
+
+<Narrator who="gideon">
+
+Look at what "distance" means in this code: from cell centre to cell centre. A real obstacle can sit anywhere inside its cell, so with 0.1 m cells the true clearance may be up to half a cell (5 cm, a little more diagonally) less than the number printed. A careful configuration adds about half a cell to the inflation radius, or uses cells several times smaller than the margin it cares about.
+
+</Narrator>
+
+</Section>
+
+<Section id="replanning" kind="human" title="When the map changes: replanning and D* Lite">
+
+A robot's map is never final: lidar sees a cart that was not there yesterday, a door is shut, a person stands in the corridor. When the costmap changes near the path, the robot must plan again. The simplest strategy is to replan from scratch, and many indoor robots do: Nav2's default behaviour tree asks for a new path about once a second, and A* on a few hundred thousand cells takes milliseconds. But on large maps, slow processors (planetary rovers), or terrain being explored for the first time, recomputing everything wastes the parts of the previous search that are still valid.
+
+**Incremental** planners reuse it. The best known is **D\* Lite** (Sven Koenig and Maxim Likhachev, 2002), a simpler successor to Anthony Stentz's D\* (1994). Its main ideas, in outline:
+
+1. **Search backwards, from the goal to the robot.** The stored values are costs-to-goal, $g(v)$, which do not depend on where the robot is, so they stay valid as it drives. The changes its sensors see are near the robot, at the far end of the search, where fewer stored values depend on them.
+2. **Keep a one-step look-ahead.** Alongside $g(v)$, D\* Lite stores $\text{rhs}(v) = \min_{v'} \big(w(v, v') + g(v')\big)$ over the successors $v'$ of $v$. A cell is **consistent** when $g(v) = \text{rhs}(v)$. When edge costs change, only the rhs values of the cells touching those edges are recomputed, and the cells that become inconsistent go into a priority queue.
+3. **Repair only what matters.** The queue is processed in an A*-like order, with a heuristic towards the robot's *current* position, and processing stops as soon as the robot's cell is consistent and nothing in the queue could improve it. Cells far from the robot's path may never be repaired, harmlessly.
+
+The last lines of the program above count how many cells' costs-to-goal change when a small box appears. Out of 870 cells that can reach the goal, a box near the robot changes 200 of them, while the same box near the goal changes 853, almost all of them, because every route to the goal passes there. An incremental planner repairs at most the affected cells, and in practice only those that matter for the robot's position; replanning from scratch recomputes all of them. The saving is largest exactly where it is needed: when the robot discovers obstacles close to itself, far from the goal.
+
+<Narrator who="chloe">
+
+D\* Lite's correctness rests on one invariant: when it stops, the robot's cell is consistent and no key left in the queue is smaller than the robot's own, so its $g$ value equals the true cost-to-goal in the new graph. It is the same argument as Dijkstra's ("nothing left in the queue can lead to a cheaper path"), applied to a search that resumes rather than restarts.
+
+</Narrator>
+
+Incremental search is not free: it costs memory and complexity, and a change near the goal (or a jump after relocalisation) can make it do as much work as a fresh search. **Anytime** planners such as ARA\* (Likhachev, Gordon and Thrun, 2003) take another route: return a quick weighted-A\* path, then improve it while time remains. Field D\* (Dave Ferguson and Anthony Stentz) interpolates costs across cell edges so that paths can leave a cell at any angle rather than only in eight directions; it was added to the onboard navigation software of NASA's Mars Exploration Rovers in the mid-2000s, where a planning cycle may run on a slow, radiation-hardened processor.
+
+</Section>
+
+<Section id="lattices" kind="human" title="Robots that cannot turn on the spot: state lattices">
+
+A differential-drive robot (<LessonLink slug="wheeled-robots">Wheeled robots</LessonLink>) can rotate in place, so a grid path with corners is acceptable: stop, turn, go. A car, a forklift or a tractor with a trailer cannot. Its state has a heading $\theta$, and its motions obey a **minimum turning radius**. A grid path that turns 90° in one cell is useless to it, and smoothing the corners afterwards may sweep the car into an obstacle.
+
+A state lattice plans directly in $(x, y, \theta)$ with primitives the vehicle can actually drive. The primitives are computed **offline**, once per vehicle, usually by solving a small boundary-value problem (find the smoothest feasible curve from one lattice state to another), and the planner only needs each primitive's end state, its cost and the cells it sweeps. The program below builds a tiny lattice: 0.5 m cells, 8 headings, and three forward primitives from each heading (straight, and a 45° turn left or right of radius $2 + \sqrt 2 = 3.41$ cells, or 1.71 m, with a short straight piece so that the turn ends exactly on a lattice point, as in the figure above). It then plans a **U-turn** in a car park: the car starts facing east and must end 3 m further along, facing west.
+
+```python run
+import heapq, math
+import numpy as np
+
+# A state lattice: states are (x, y, heading) with x, y on a grid of 0.5 m cells and
+# heading in 8 steps of 45 degrees. Every motion primitive is a feasible forward move for a
+# car whose tightest turn has radius R = 2 + sqrt(2) cells (1.71 m): a short straight piece
+# plus a 45-degree arc, chosen so that it ends exactly on another lattice state.
+CELL = 0.5
+R = 2 + math.sqrt(2)
+A = 3 - R * math.sin(math.pi / 4)            # straight part of a turning primitive (cells)
+
+def sample(x, y, th, pieces):
+    """Points along straight ('S', length) and arc ('L'/'R', angle) pieces."""
+    pts = []
+    for kind, amount in pieces:
+        n = 20
+        for i in range(n):
+            if kind == "S":
+                x += amount / n * math.cos(th); y += amount / n * math.sin(th)
+            else:
+                turn = (amount if kind == "L" else -amount) / n
+                cx, cy = x - math.copysign(R, turn) * math.sin(th), y + math.copysign(R, turn) * math.cos(th)
+                th += turn
+                x, y = cx + math.copysign(R, turn) * math.sin(th), cy - math.copysign(R, turn) * math.cos(th)
+            pts.append((x, y))
+    return pts, th
+
+def make_primitives():
+    prims = {}
+    for h in range(8):
+        th = h * math.pi / 4
+        diag = h % 2 == 1
+        moves = [("straight", [("S", math.sqrt(2) if diag else 1.0)]),
+                 ("left", [("L", math.pi / 4), ("S", A)] if diag else [("S", A), ("L", math.pi / 4)]),
+                 ("right", [("R", math.pi / 4), ("S", A)] if diag else [("S", A), ("R", math.pi / 4)])]
+        prims[h] = []
+        for name, pieces in moves:
+            pts, th_end = sample(0.0, 0.0, th, pieces)
+            dx, dy = round(pts[-1][0]), round(pts[-1][1])
+            assert math.hypot(pts[-1][0] - dx, pts[-1][1] - dy) < 1e-9, "must end on the lattice"
+            length = sum(a for k, a in pieces if k == "S") + sum(R * a for k, a in pieces if k != "S")
+            prims[h].append((name, dx, dy, round(th_end / (math.pi / 4)) % 8, length, pts))
+    return prims
+
+PRIMS = make_primitives()
+print("primitives from heading 0 (east):",
+      [(n, dx, dy, h2, round(L, 3)) for n, dx, dy, h2, L, _ in PRIMS[0]])
+print("primitives from heading 1 (north-east):",
+      [(n, dx, dy, h2, round(L, 3)) for n, dx, dy, h2, L, _ in PRIMS[1]])
+
+# A car park, 20 m x 12 m: '#' are parked cars and kerbs.
+MAP = [
+    "########################################",
+    "#......................................#",
+    "#......................................#",
+    "#...######...######...######...######..#",
+    "#...######...######...######...######..#",
+    "#......................................#",
+    "#......................................#",
+    "#......................................#",
+    "#...######...######...######...######..#",
+    "#...######...######...######...######..#",
+    "#......................................#",
+    "#......................................#",
+    "########################################",
+][::-1]                                      # row 0 at the bottom, so y points up
+occ = np.array([[ch == "#" for ch in row] for row in MAP])
+
+def free_along(x, y, pts):
+    for px, py in pts:
+        cx, cy = int(round(x + px)), int(round(y + py))
+        if occ[cy, cx]:
+            return False
+    return True
+
+def lattice_astar(start, goal):
+    gx, gy, gh = goal
+    h = lambda s: math.hypot(s[0] - gx, s[1] - gy)        # admissible: no move beats a straight line
+    g, parent = {start: 0.0}, {start: None}
+    heap, expanded = [(h(start), start)], 0
+    while heap:
+        f, s = heapq.heappop(heap)
+        if f - h(s) > g[s] + 1e-12:
+            continue
+        expanded += 1
+        if s == goal:
+            break
+        x, y, hd = s
+        for name, dx, dy, h2, length, pts in PRIMS[hd]:
+            t = (x + dx, y + dy, h2)
+            if not (0 <= t[0] < occ.shape[1] and 0 <= t[1] < occ.shape[0]) or not free_along(x, y, pts):
+                continue
+            if g[s] + length < g.get(t, math.inf):
+                g[t], parent[t] = g[s] + length, (s, name)
+                heapq.heappush(heap, (g[t] + h(t), t))
+    steps, s = [], goal
+    while parent[s] is not None:
+        s, name = parent[s]
+        steps.append((s, name))
+    return g[goal], steps[::-1], expanded
+
+start, goal = (2, 6, 0), (8, 6, 4)        # facing east; end 3 m further on, facing west
+length, steps, expanded = lattice_astar(start, goal)
+print(f"\nlattice path: {length * CELL:.1f} m, {len(steps)} primitives, {expanded} states expanded")
+print(f"straight-line distance between the two positions: {math.dist(start[:2], goal[:2]) * CELL:.1f} m")
+canvas = [["#" if o else " " for o in row] for row in occ]
+for (x, y, hd), name in steps:
+    for px, py in next(p[5] for p in PRIMS[hd] if p[0] == name):
+        canvas[int(round(y + py))][int(round(x + px))] = "o"
+canvas[start[1]][start[0]], canvas[goal[1]][goal[0]] = ">", "<"
+print("\n".join("".join(row) for row in canvas[::-1]))
+```
+
+The two lists show the primitive set: each turn is 3.267 cells (1.63 m) long and moves the car three cells forward and one across. The planner expands 867 states and returns a 29.0 m route for a 3.0 m displacement, because the aisles are 1.5 m wide and a forward U-turn needs a circle of diameter $2 \times 1.71 = 3.4$ m. The best the car can do is drive around a block of parked cars, which is what a human driver without reverse gear would do. Add reversing primitives (at a higher cost, since reversing is slower and riskier) and the same search finds three-point turns; one of the exercises counts the states of a larger lattice.
+
+<Narrator who="gideon">
+
+This planner checks only the curve traced by the car's *centre*. A real lattice planner checks the car's whole footprint along every primitive, and because the primitives are fixed, the set of cells each one sweeps (for every heading) can be precomputed once. A rectangular car's footprint also depends on its heading, which is why a car's obstacles cannot simply be inflated by one radius.
+
+</Narrator>
+
+A continuous cousin, **Hybrid A\*** (Dmitri Dolgov, Sebastian Thrun and colleagues, used by Stanford's entry in the 2007 DARPA Urban Challenge), searches the same discretised $(x, y, \theta)$ cells but stores the car's exact continuous pose in each, expands with a few steering angles, and tries to finish with an analytic Reeds–Shepp curve when the goal is near. Lattices give repeatable, resolution-complete plans; Hybrid A\* gives smoother paths with less design work.
+
+</Section>
+
+<Section id="practice" kind="human" title="How planning on graphs is done in practice">
+
+**ROS 2 navigation.** In [Nav2](https://docs.nav2.org/), ROS 2's open-source navigation stack, the global planner is a plugin that receives a costmap and returns a path. As of 2026 the main ones are:
+
+- **NavFn**, a port of ROS 1's planner: Dijkstra or A* on the costmap, robust and simple, for robots that can turn in place.
+- **Smac Planner**, a family of three: a 2-D A* on the costmap; a Hybrid-A* planner for car-like and other non-holonomic robots, with Dubins (forward only) or Reeds–Shepp (forward and reverse) motion models; and a State Lattice planner that loads a precomputed primitive file for an arbitrary vehicle, including differential and omnidirectional bases.
+- **Theta\***, an any-angle variant of A* that shortcuts paths by checking line of sight between non-adjacent cells.
+
+The costmap is built from **layers**: the static SLAM map, obstacles from live sensors, the inflation layer above, and keep-out and speed-limit zones. A separate **controller** (such as Regulated Pure Pursuit or model predictive path integral control; see <LessonLink slug="trajectories-and-tracking">Trajectories and tracking</LessonLink> and <LessonLink slug="model-predictive-control">Model predictive control</LessonLink>) follows the path at 20 Hz or more. A behaviour tree (the <LessonLink slug="task-planning-and-behaviour-trees">last lesson of this level</LessonLink>) decides when to replan, when to back up and when to give up.
+
+The configuration below is the kind of thing a Nav2 user writes. It is shown for orientation and not run here; check the parameter names against the documentation for your ROS 2 release.
+
+```yaml
+# Nav2 parameters (excerpt, not run here): a Hybrid-A* planner for a car-like robot
+planner_server:
+  ros__parameters:
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      motion_model_for_search: "REEDS_SHEPP"   # forward and reverse
+      minimum_turning_radius: 1.7              # metres
+      angle_quantization_bins: 72              # headings in the search
+```
+
+**Fleets on grids.** Warehouse systems often plan on literal grids: since Amazon bought Kiva Systems in 2012, its drive units have moved shelves over floors marked with a grid of fiducial codes; companies such as Geek+ in Beijing build similar grid-guided robots, and Ocado's warehouses in the UK run bots on rails across the top of a storage grid. With hundreds of robots sharing one grid, the problem becomes **multi-agent path finding**, planning in space *and time* so that no two robots claim the same cell at the same moment (<LessonLink slug="multi-robot-systems">Multi-robot systems</LessonLink>).
+
+**Vehicles.** Lattice and Hybrid-A* planners appear wherever vehicles manoeuvre slowly off marked lanes: car parks, ports, mines, farms. On roads, planners usually work in a frame that follows the lane (<LessonLink slug="autonomous-vehicles">Autonomous vehicles</LessonLink>).
+
+**When graphs run out.** Dense discretisation works in two or three dimensions. For a seven-joint arm, a grid with only 100 values per joint would have $10^{14}$ cells, which is why the next lesson turns to random sampling.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A grid path is something the robot can drive."** It is a sequence of cell centres with corners every few cells. A controller must follow it smoothly, a car must respect its turning radius, and every robot needs a speed profile. Grid planners hand their output to a smoother or a controller; lattice planners produce feasible paths from the start.
+
+</Misconception>
+
+<Misconception>
+
+**"Manhattan distance is a fine heuristic for any grid."** Only for 4-connected grids. On an 8-connected grid it overestimates diagonal moves, A* loses its optimality guarantee, and in the experiment above it returned a path 7.4% longer than optimal. Use the octile distance.
+
+</Misconception>
+
+<Misconception>
+
+**"Inflate obstacles by the robot's radius and collisions are impossible."** That is exact only for a round robot whose centre is tracked perfectly on an exact map. Rectangular robots need their footprint checked along the path (or inflation by the circumscribed radius, which is conservative and may close doorways). Localisation error, tracking error and moving people all need margin on top, which is what the decaying cost provides.
+
+</Misconception>
+
+<Misconception>
+
+**"The shortest path is the best path."** For a robot, a path that hugs walls and corners is fragile and unfriendly. Costmaps make "best" mean shortest *plus* a price for being close to obstacles, unknown space, keep-out zones or busy areas, and that price is a design decision.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises run in your browser. Use NumPy and the standard library.
+
+<Exercises/>
+
+</Section>

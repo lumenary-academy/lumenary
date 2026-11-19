@@ -1,0 +1,648 @@
+---
+title: Sampling-based planning
+subtitle: When the space is too big to grid — probabilistic roadmaps, rapidly-exploring random trees, RRT-Connect and RRT*, measured in code, with the narrow passages that defeat them and the libraries that run them on real arms.
+minutes: 75
+objectives:
+  - Explain why grid search fails for robots with many joints, and what a collision checker contributes as a black box
+  - Implement a probabilistic roadmap (PRM) and answer several queries from one roadmap
+  - Implement RRT and RRT-Connect, and smooth their paths by shortcutting
+  - Define probabilistic completeness and asymptotic optimality, and measure RRT*'s path cost approaching the optimum as samples grow
+  - Explain why narrow passages are hard for uniform sampling, and how biased samplers such as the bridge test help
+  - Describe how OMPL, MoveIt and GPU or SIMD planners are used for real manipulators in 2026
+narrators: [chloe, margaret, gideon]
+prerequisites: [graph-search-planning, forward-kinematics]
+related: [math.prob.probability-theory, math.discrete.graph-theory, math.discrete.probabilistic-method, math.prob.random-geometry]
+references:
+  - title: "Probabilistic roadmaps for path planning in high-dimensional configuration spaces"
+    author: Lydia E. Kavraki, Petr Švestka, Jean-Claude Latombe and Mark H. Overmars
+    year: 1996
+    url: https://doi.org/10.1109/70.508439
+    note: The PRM paper, with experiments on robots with up to 16 degrees of freedom.
+  - title: "Rapidly-exploring random trees: A new tool for path planning"
+    author: Steven M. LaValle
+    year: 1998
+    note: The technical report (Iowa State University) that introduced the RRT.
+  - title: "RRT-Connect: An efficient approach to single-query path planning"
+    author: James J. Kuffner and Steven M. LaValle
+    year: 2000
+    url: https://doi.org/10.1109/ROBOT.2000.844730
+  - title: "Sampling-based algorithms for optimal motion planning"
+    author: Sertac Karaman and Emilio Frazzoli
+    year: 2011
+    url: https://arxiv.org/abs/1105.1186
+    note: Introduces RRT* and PRM*, proves their asymptotic optimality, and shows that RRT and PRM with a fixed number of neighbours are not asymptotically optimal.
+  - title: "Planning Algorithms"
+    author: Steven M. LaValle
+    year: 2006
+    url: https://lavalle.pl/planning/
+    note: Free textbook; chapter 5 treats sampling-based planning in depth.
+  - title: "The Open Motion Planning Library (OMPL)"
+    author: Kavraki Lab, Rice University
+    url: https://ompl.kavrakilab.org/
+    note: Implementations of dozens of sampling-based planners, used by MoveIt and many research groups.
+  - title: MoveIt
+    url: https://moveit.ai/
+    note: The open-source manipulation framework for ROS 2, which calls OMPL and other planners.
+  - title: "cuRobo"
+    author: NVIDIA
+    url: https://curobo.org/
+    note: GPU-parallel collision checking, inverse kinematics and trajectory optimisation for arms.
+  - title: "VAMP: Vector-Accelerated Motion Planning"
+    author: Kavraki Lab
+    url: https://github.com/KavrakiLab/vamp
+    note: Sampling-based planning with SIMD-vectorised collision checking on an ordinary CPU.
+---
+
+<Section id="motivation" kind="motivation" title="Why grids fail in high dimensions">
+
+The <LessonLink slug="graph-search-planning">last lesson</LessonLink> planned for a robot whose state was a position on the floor, perhaps with a heading: two or three numbers. A robot arm's state is its joint angles. A typical industrial arm has six joints; collaborative and research arms often have seven; a mobile manipulator, a humanoid's upper body or a two-armed robot has 10 to 30. Planning means finding a path through *that* space, from the arm's current angles to angles that put the gripper on the cup, without any link touching the table, the shelf, the person or the robot itself.
+
+Try the grid approach. With 100 values per joint (about 3.6° steps), a seven-joint arm has $100^7 = 10^{14}$ cells. Storing one bit per cell takes over 10 terabytes, and checking every cell for collision would take years. Coarser grids do not save us: even 10 values per joint for 20 joints is $10^{20}$ cells. This is the **curse of dimensionality**: the volume to cover grows exponentially with the number of dimensions, and any method that covers it systematically drowns.
+
+The way out, discovered in the early 1990s, is to stop covering the space and start **sampling** it. Pick random joint configurations, keep those that are collision-free, and connect nearby ones with short straight motions that are also collision-free. The planner never builds a picture of the obstacles in joint space at all; it only asks a **collision checker** yes-or-no questions about particular configurations and motions. The result is a graph again (a roadmap or a tree), searched with the algorithms you already know.
+
+These **sampling-based planners**, chiefly the probabilistic roadmap (PRM) and the rapidly-exploring random tree (RRT), are what plans the motions of most robot arms in research labs and many in industry today. This lesson builds them in a two-dimensional world where you can see what they do, measures their behaviour, and shows where they struggle.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Planning by asking questions">
+
+Think of the set of all joint configurations as a space, the **configuration space** (the <LessonLink slug="configuration-space">configuration space lesson</LessonLink>, two lessons on, studies it properly). Each configuration is a point. Some points are **free**, meaning the robot at those angles touches nothing; the rest are **in collision**. The free points form a region of complicated shape, impossible to write down for a real arm, and the planner needs a curve inside it from start to goal.
+
+The collision checker answers "is this point free?" by placing the robot's geometry at those angles (forward kinematics, from <LessonLink slug="forward-kinematics">Forward kinematics</LessonLink>) and testing it against the world's geometry. A second question, "is the straight segment between these two points free?", is answered by checking many points along it, or by more careful continuous methods. Everything a sampling-based planner knows about the world comes from these two questions, which is why its cost is usually measured in **collision checks**.
+
+<Analogy>
+
+Imagine exploring a large, dark warehouse with a torch whose beam shows only a few metres. You cannot map the whole building before setting off. Instead you shine the torch in random directions, walk to where the beam shows clear floor, and remember the routes that worked. A PRM is a team of explorers dropped at random spots who then check which of them can see each other; an RRT is one explorer who keeps striking out from the nearest known point towards a randomly chosen spot.
+
+</Analogy>
+
+In this lesson the robot is a point in a 10 m × 10 m square with rectangular obstacles. That is a two-dimensional configuration space, small enough to draw and to compute exact answers in, but the code never looks inside the obstacles except through a collision test, exactly as it would for a seven-joint arm.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="probabilistic roadmap (PRM)">
+
+A **PRM** has two phases. In the **learning phase** it samples $n$ collision-free configurations and joins each to nearby ones (its $k$ nearest, or all within radius $r$) whenever the straight segment between them is collision-free, producing a graph called the **roadmap**. In the **query phase** it connects a start and a goal to the roadmap in the same way and searches the graph. One roadmap answers many queries, so a PRM is a **multi-query** planner.
+
+</Definition>
+
+<Definition term="rapidly-exploring random tree (RRT)">
+
+An **RRT** grows a tree from the start. Each iteration samples a random configuration $q_{\text{rand}}$, finds the tree node $q_{\text{near}}$ nearest to it, and moves from $q_{\text{near}}$ towards $q_{\text{rand}}$ by at most a step $\eta$ to a new configuration $q_{\text{new}}$; if the segment from $q_{\text{near}}$ to $q_{\text{new}}$ is free, $q_{\text{new}}$ joins the tree with parent $q_{\text{near}}$. The search stops when a node can be connected to the goal. An RRT answers one query, so it is a **single-query** planner.
+
+</Definition>
+
+<Definition term="probabilistic completeness">
+
+A planner is **probabilistically complete** if, whenever a collision-free path exists (with some clearance around it), the probability that the planner has found a path after $n$ samples tends to 1 as $n \to \infty$.
+
+</Definition>
+
+<Definition term="asymptotic optimality">
+
+A planner is **asymptotically optimal** if the cost of the best path it has found converges to the optimal cost (with probability 1) as the number of samples grows.
+
+</Definition>
+
+<Definition term="narrow passage">
+
+A **narrow passage** is a part of the free space that every path (or every good path) must pass through but that occupies a tiny fraction of the space's volume, such as a doorway barely wider than the robot, or a gripper slipping between two close boxes.
+
+</Definition>
+
+Probabilistic completeness is weaker than it sounds. It says a path will be found eventually, not how soon, and it says nothing when no path exists: a sampling planner cannot prove that a problem is impossible, only that it has not found a path yet. Every practical planner therefore runs with a time limit, and "no path in 5 seconds" means exactly that.
+
+<Figure caption="Left: one RRT iteration. A random sample q_rand pulls the tree: the nearest node q_near takes one step of length η towards it, creating q_new if that short segment is free. Right: the bridge test for narrow passages. Two nearby random points a and b both collide, but their midpoint is free: a sign that the midpoint lies in a gap between obstacles, so it is kept as a sample.">
+<svg viewBox="0 0 430 220" role="img" aria-label="Two diagrams. On the left, a tree of dots and lines grows from a root at the lower left. A hollow circle labelled q rand is at the top right. A dashed line runs from the nearest tree node, q near, towards q rand, and a short solid segment of length eta ends at a new node, q new. A shaded obstacle sits below. On the right, two shaded blocks are separated by a thin horizontal gap. Points a and b lie inside the upper and lower blocks, joined by a dashed line whose midpoint, in the gap, is a filled dot.">
+  <rect x="140" y="125" width="55" height="60" fill="currentColor" opacity="0.3" />
+  <g stroke="currentColor" strokeWidth="1.5">
+    <line x1="30" y1="175" x2="60" y2="155" />
+    <line x1="30" y1="175" x2="55" y2="125" />
+    <line x1="60" y1="155" x2="92" y2="148" />
+    <line x1="92" y1="148" x2="110" y2="112" />
+    <line x1="55" y1="125" x2="85" y2="95" />
+    <line x1="92" y1="148" x2="122" y2="168" />
+  </g>
+  <line x1="110" y1="112" x2="180" y2="42" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 4" />
+  <line x1="110" y1="112" x2="138" y2="84" stroke="var(--gold)" strokeWidth="3" />
+  <g fill="currentColor">
+    <circle cx="30" cy="175" r="4.5" />
+    <circle cx="60" cy="155" r="3.5" /><circle cx="55" cy="125" r="3.5" /><circle cx="92" cy="148" r="3.5" />
+    <circle cx="110" cy="112" r="4" /><circle cx="85" cy="95" r="3.5" /><circle cx="122" cy="168" r="3.5" />
+  </g>
+  <circle cx="138" cy="84" r="5" fill="var(--gold)" stroke="currentColor" />
+  <circle cx="180" cy="42" r="5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="currentColor" fontSize="12">
+    <text x="150" y="36">q_rand</text>
+    <text x="64" y="112">q_near</text>
+    <text x="145" y="86">q_new</text>
+    <text x="126" y="108">η</text>
+    <text x="14" y="192">start</text>
+    <text x="148" y="160">obstacle</text>
+    <text x="20" y="20">RRT: extend one step</text>
+  </g>
+  <rect x="245" y="40" width="165" height="62" fill="currentColor" opacity="0.3" />
+  <rect x="245" y="116" width="165" height="62" fill="currentColor" opacity="0.3" />
+  <line x1="318" y1="78" x2="334" y2="140" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 3" />
+  <circle cx="318" cy="78" r="4.5" fill="none" stroke="var(--bad)" strokeWidth="2" />
+  <circle cx="334" cy="140" r="4.5" fill="none" stroke="var(--bad)" strokeWidth="2" />
+  <circle cx="326" cy="109" r="4.5" fill="var(--gold)" stroke="currentColor" />
+  <g fill="currentColor" fontSize="12">
+    <text x="296" y="72">a</text>
+    <text x="342" y="152">b</text>
+    <text x="340" y="113">midpoint: free, keep</text>
+    <text x="245" y="20">Bridge test</text>
+    <text x="245" y="200">narrow gap between two obstacles</text>
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="prm" kind="computation" title="A probabilistic roadmap">
+
+Here is the world for the whole lesson: four rectangular obstacles in a 10 m square, including two long walls that force a path from the bottom-left corner to the top-right one to zig-zag. The collision test for a segment uses the **slab method**: a segment misses an axis-aligned box exactly when the parameter intervals in which it lies within the box's $x$-range and its $y$-range do not overlap inside $[0, 1]$. It is written to test many segments against all boxes at once, the way modern planners batch their collision checks.
+
+```python run
+import heapq, math
+import numpy as np
+
+# The world: a 10 m x 10 m square with rectangular obstacles (xmin, ymin, xmax, ymax).
+# The robot is a point here: think of these as obstacles already grown by its size.
+RECTS = np.array([[2.0, 0.0, 3.0, 6.0],
+                  [5.0, 4.0, 6.0, 10.0],
+                  [7.0, 1.0, 9.0, 2.5],
+                  [3.8, 7.5, 4.6, 8.3]])
+LO, HI = RECTS[:, :2], RECTS[:, 2:]
+
+def point_free(p):
+    return not np.any(np.all((p >= LO) & (p <= HI), axis=1))
+
+def segments_free(P, Q):
+    """For k segments P[i] -> Q[i], True where the segment misses every rectangle (slab test)."""
+    P, Q = np.atleast_2d(P)[:, None, :], np.atleast_2d(Q)[:, None, :]
+    D = Q - P
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t1, t2 = (LO - P) / D, (HI - P) / D
+    tmin, tmax = np.minimum(t1, t2), np.maximum(t1, t2)
+    parallel = D == 0                                  # segment parallel to a slab
+    inside = (P >= LO) & (P <= HI)
+    tmin = np.where(parallel, np.where(inside, -np.inf, np.inf), tmin)
+    tmax = np.where(parallel, np.where(inside, np.inf, -np.inf), tmax)
+    enter = np.maximum(tmin.max(axis=2), 0.0)
+    leave = np.minimum(tmax.min(axis=2), 1.0)
+    return ~np.any(enter <= leave, axis=1)
+
+def shortest(nodes, edges, s, t):
+    """Dijkstra on a roadmap given as {i: [(j, length), ...]}."""
+    dist, heap = {s: 0.0}, [(0.0, s)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u == t:
+            return d
+        if d > dist[u]:
+            continue
+        for v, w in edges[u]:
+            if d + w < dist.get(v, math.inf):
+                dist[v] = d + w
+                heapq.heappush(heap, (d + w, v))
+    return math.inf
+
+def build_prm(n, k, rng):
+    """Sample n free points, then join each to its k nearest neighbours by free straight edges."""
+    pts = []
+    while len(pts) < n:
+        p = rng.uniform(0, 10, size=2)
+        if point_free(p):
+            pts.append(p)
+    pts = np.array(pts)
+    pairs = set()
+    for i in range(n):
+        d = np.linalg.norm(pts - pts[i], axis=1)
+        for j in np.argsort(d)[1:k + 1]:
+            pairs.add((min(i, int(j)), max(i, int(j))))
+    pairs = np.array(sorted(pairs))
+    ok = segments_free(pts[pairs[:, 0]], pts[pairs[:, 1]])      # one batch of edge checks
+    edges = {i: [] for i in range(n)}
+    for (i, j), good in zip(pairs, ok):
+        if good:
+            w = float(np.linalg.norm(pts[i] - pts[j]))
+            edges[int(i)].append((int(j), w))
+            edges[int(j)].append((int(i), w))
+    return pts, edges, len(pairs), int(ok.sum())
+
+def query(pts, edges, start, goal, k):
+    """Connect start and goal to the roadmap (temporarily) and search it."""
+    n = len(pts)
+    pts2 = np.vstack([pts, start, goal])
+    e2 = {i: list(v) for i, v in edges.items()}
+    e2[n], e2[n + 1] = [], []
+    for q in (n, n + 1):
+        d = np.linalg.norm(pts - pts2[q], axis=1)
+        nbrs = np.argsort(d)[:k]
+        ok = segments_free(np.repeat(pts2[q:q + 1], k, axis=0), pts[nbrs])
+        for j, good in zip(nbrs, ok):
+            if good:
+                e2[q].append((int(j), float(d[j])))
+                e2[int(j)].append((q, float(d[j])))
+    return shortest(pts2, e2, n, n + 1)
+
+rng = np.random.default_rng(7)
+pts, edges, checked, kept = build_prm(300, 10, rng)
+print(f"roadmap: {len(pts)} free samples, {checked} candidate edges checked, {kept} collision-free")
+for start, goal in [((1, 1), (9, 9)), ((1, 9), (9, 5)), ((4, 2), (6.5, 9.5))]:
+    L = query(pts, edges, np.array(start, float), np.array(goal, float), 10)
+    print(f"query {start} -> {goal}: path length {L:.2f} m (straight line {math.dist(start, goal):.2f} m)")
+```
+
+Three hundred samples and 1730 candidate edges are enough to answer all three queries; only 48 candidate edges were rejected, because nearest neighbours are close together and rarely straddle an obstacle. The first query's path is 17.06 m long. The true shortest path, computed exactly in a later program, is 15.758 m, so the roadmap's path is 8% longer: it can only bend at the random samples, not at the obstacles' corners. The second and third queries reused the same roadmap and cost only two small connection steps and a graph search each, which is the point of a PRM in a static environment such as a fixed work cell.
+
+<Narrator who="margaret">
+
+Count where the time goes. Sampling 300 free points took a few hundred point checks, but building the roadmap cost 1730 segment checks, and for a real arm each segment check means testing the arm's meshes at many intermediate configurations. That is why practical PRMs delay edge checks until a path search actually wants the edge ("lazy PRM"): most edges are never used.
+
+</Narrator>
+
+</Section>
+
+<Section id="rrt" kind="computation" title="RRT and RRT-Connect">
+
+A single query in a changing world does not need a whole roadmap. An RRT grows one tree from the start, as in the figure. The random samples are pulled towards large unexplored regions, because a node on the edge of a large empty region is the nearest node for every sample that lands in it: this **Voronoi bias** is what makes the tree "rapidly exploring". A small **goal bias** (here, 5% of samples are the goal itself) pulls it towards where it needs to go.
+
+**RRT-Connect** (James Kuffner and Steven LaValle, 2000) grows two trees, one from the start and one from the goal. Each iteration extends one tree a single step towards a random sample, then lets the other tree **connect**: step greedily towards the new node until it either reaches it or hits an obstacle. Then the trees swap roles. In open spaces the greedy connection crosses large distances in one iteration.
+
+The program runs both on the same query 20 times with different seeds and reports medians. It then **shortcuts** each path: pick two waypoints at random, and if the straight segment between them is free, delete everything in between. Repeat 200 times.
+
+```python run
+import math
+import numpy as np
+
+RECTS = np.array([[2.0, 0.0, 3.0, 6.0], [5.0, 4.0, 6.0, 10.0],
+                  [7.0, 1.0, 9.0, 2.5], [3.8, 7.5, 4.6, 8.3]])   # same world as before
+LO, HI = RECTS[:, :2], RECTS[:, 2:]
+CHECKS = [0]                                                      # counts edge checks
+
+def seg_free(p, q):
+    """True if the segment p -> q misses every rectangle (slab test, one segment)."""
+    CHECKS[0] += 1
+    d = q - p
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t1, t2 = (LO - p) / d, (HI - p) / d
+    tmin, tmax = np.minimum(t1, t2), np.maximum(t1, t2)
+    inside = (p >= LO) & (p <= HI)
+    tmin = np.where(d == 0, np.where(inside, -np.inf, np.inf), tmin)
+    tmax = np.where(d == 0, np.where(inside, np.inf, -np.inf), tmax)
+    return not np.any(np.maximum(tmin.max(axis=1), 0) <= np.minimum(tmax.min(axis=1), 1))
+
+def steer(a, b, step):
+    d = np.linalg.norm(b - a)
+    return b.copy() if d <= step else a + (b - a) * step / d
+
+def path_from(tree, parent, i):
+    out = []
+    while i is not None:
+        out.append(tree[i]); i = parent[i]
+    return out[::-1]
+
+def rrt(start, goal, rng, step=0.5, goal_bias=0.05, max_iter=20000):
+    tree, parent = [start], [None]
+    for it in range(1, max_iter + 1):
+        q = goal if rng.random() < goal_bias else rng.uniform(0, 10, 2)
+        i = int(np.argmin(np.sum((np.array(tree) - q) ** 2, axis=1)))
+        new = steer(tree[i], q, step)
+        if seg_free(tree[i], new):
+            tree.append(new); parent.append(i)
+            if np.linalg.norm(new - goal) <= step and seg_free(new, goal):
+                tree.append(goal); parent.append(len(tree) - 2)
+                return path_from(tree, parent, len(tree) - 1), it, len(tree)
+    return None, max_iter, len(tree)
+
+def rrt_connect(start, goal, rng, step=0.5, max_iter=20000):
+    A, pa, B, pb = [start], [None], [goal], [None]
+    for it in range(1, max_iter + 1):
+        q = rng.uniform(0, 10, 2)
+        i = int(np.argmin(np.sum((np.array(A) - q) ** 2, axis=1)))       # EXTEND tree A
+        new = steer(A[i], q, step)
+        if seg_free(A[i], new):
+            A.append(new); pa.append(i)
+            j = int(np.argmin(np.sum((np.array(B) - new) ** 2, axis=1)))   # CONNECT tree B
+            while True:
+                nxt = steer(B[j], new, step)
+                if not seg_free(B[j], nxt):
+                    break
+                B.append(nxt); pb.append(j); j = len(B) - 1
+                if np.array_equal(nxt, new):                              # the trees have met
+                    pA, pB = path_from(A, pa, len(A) - 1), path_from(B, pb, j)
+                    path = pA + pB[::-1][1:]
+                    if not np.array_equal(path[0], start):
+                        path = path[::-1]
+                    return path, it, len(A) + len(B)
+        A, pa, B, pb = B, pb, A, pa                                       # swap roles
+    return None, max_iter, len(A) + len(B)
+
+def length(path):
+    return sum(np.linalg.norm(b - a) for a, b in zip(path, path[1:]))
+
+def shortcut(path, rng, tries=200):
+    """Random shortcutting: replace the stretch between two waypoints by a straight edge if free."""
+    path = list(path)
+    for _ in range(tries):
+        if len(path) < 3:
+            break
+        i, j = sorted(rng.choice(len(path), 2, replace=False))
+        if j - i > 1 and seg_free(path[i], path[j]):
+            path = path[:i + 1] + path[j:]
+    return path
+
+start, goal = np.array([1.0, 1.0]), np.array([9.0, 9.0])
+print(f"{'planner':12}{'iterations':>11}{'nodes':>7}{'edge checks':>13}{'length (m)':>12}{'shortcut (m)':>14}")
+for name, planner in [("RRT", rrt), ("RRT-Connect", rrt_connect)]:
+    rows = []
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        CHECKS[0] = 0
+        path, iters, nodes = planner(start, goal, rng)
+        checks = CHECKS[0]
+        rows.append((iters, nodes, checks, length(path), length(shortcut(path, rng))))
+    med = np.median(np.array(rows), axis=0)
+    print(f"{name:12}{med[0]:11.0f}{med[1]:7.0f}{med[2]:13.0f}{med[3]:12.2f}{med[4]:14.2f}")
+print("(medians over 20 seeds)")
+```
+
+RRT-Connect needs about half the iterations and nodes of RRT, and fewer collision checks, to find a path. Both raw paths are about 22.6 m long, 43% longer than the optimum of 15.758 m, because random steps wander. Shortcutting brings them to about 18.2–18.3 m with 200 cheap tries. In practice nearly every sampling-based path is post-processed like this (and then smoothed and time-parameterised, the subject of the <LessonLink slug="trajectory-optimisation">trajectory optimisation lesson</LessonLink>), which is why RRT-Connect, fast but unconcerned with quality, has long been MoveIt's default planner for arms.
+
+<Narrator who="gideon">
+
+Every "free" verdict here is exact, because the robot is a point and the obstacles are boxes. For a real arm the segment test usually checks configurations at a fixed resolution along the motion, and a thin obstacle can slip between two checked configurations. Planners therefore choose the resolution from the arm's geometry (how far any point of the robot can move between checks), or use continuous collision checking, and treat the resolution as a safety parameter, not a speed knob.
+
+</Narrator>
+
+</Section>
+
+<Section id="rrt-star" kind="computation" title="RRT* and asymptotic optimality">
+
+The RRT's path does not improve with more samples. Once a node joins the tree its parent never changes, so the route to it is fixed forever; new samples only add branches. Sertac Karaman and Emilio Frazzoli proved in 2011 that, for this reason, the RRT converges to a suboptimal path with probability 1. Their fix, **RRT\***, changes two things in each iteration:
+
+1. **Choose the best parent.** Among all tree nodes within a radius $r$ of $q_{\text{new}}$ that can reach it by a free segment, connect $q_{\text{new}}$ to the one giving the lowest cost from the start, not just to the nearest.
+2. **Rewire.** For each of those neighbours, if going through $q_{\text{new}}$ would be cheaper than its current route, make $q_{\text{new}}$ its parent (and lower the costs of its whole subtree).
+
+<Theorem name="Asymptotic optimality of RRT* (Karaman and Frazzoli, 2011)">
+
+In a $d$-dimensional configuration space, let the connection radius after $n$ samples be $r_n = \min\{\gamma (\log n / n)^{1/d}, \eta\}$. If $\gamma$ exceeds a threshold $\gamma^*$ that depends on $d$ and on the volume of the free space, then the cost of the best path found by RRT\* converges to the optimal cost with probability 1. The RRT, and a PRM that connects each node to a fixed number $k$ of neighbours, are not asymptotically optimal.
+
+</Theorem>
+
+The radius shrinks just slowly enough that each new node still has about $\log n$ neighbours. Fewer would leave the graph too sparse to contain near-optimal paths; more would waste collision checks. The proof is beyond this lesson, but the program below lets you watch the theorem at work. It computes the exact optimum by building a **visibility graph** (shortest paths among polygons bend only at their corners, so a graph of mutually visible corners contains the optimum), then runs RRT and RRT\* for 4000 iterations with 5 seeds each, recording the best path length found after $N$ samples.
+
+```python run
+import heapq, math
+import numpy as np
+
+RECTS = np.array([[2.0, 0.0, 3.0, 6.0], [5.0, 4.0, 6.0, 10.0],
+                  [7.0, 1.0, 9.0, 2.5], [3.8, 7.5, 4.6, 8.3]])   # same world again
+LO, HI = RECTS[:, :2], RECTS[:, 2:]
+
+def free(P, Q):
+    """Vectorised slab test: for segments P[i] -> Q[i], True where all rectangles are missed."""
+    P, Q = np.atleast_2d(P)[:, None, :], np.atleast_2d(Q)[:, None, :]
+    D = Q - P
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t1, t2 = (LO - P) / D, (HI - P) / D
+    tmin, tmax = np.minimum(t1, t2), np.maximum(t1, t2)
+    inside = (P >= LO) & (P <= HI)
+    tmin = np.where(D == 0, np.where(inside, -np.inf, np.inf), tmin)
+    tmax = np.where(D == 0, np.where(inside, np.inf, -np.inf), tmax)
+    return ~np.any(np.maximum(tmin.max(axis=2), 0) <= np.minimum(tmax.min(axis=2), 1), axis=1)
+
+start, goal = np.array([1.0, 1.0]), np.array([9.0, 9.0])
+
+# The true optimum, from the visibility graph: shortest paths around polygons bend only at corners.
+eps = 1e-6
+corners = [np.array([x, y]) for x0, y0, x1, y1 in RECTS
+           for x, y in ((x0 - eps, y0 - eps), (x1 + eps, y0 - eps), (x0 - eps, y1 + eps), (x1 + eps, y1 + eps))
+           if 0 <= x <= 10 and 0 <= y <= 10]
+V = [start, goal] + corners
+dist, heap = {0: 0.0}, [(0.0, 0)]
+while heap:
+    d, u = heapq.heappop(heap)
+    if d > dist[u]:
+        continue
+    for v in range(len(V)):
+        if v != u and free(V[u], V[v])[0]:
+            nd = d + float(np.linalg.norm(V[v] - V[u]))
+            if nd < dist.get(v, math.inf):
+                dist[v] = nd
+                heapq.heappush(heap, (nd, v))
+optimum = dist[1]
+
+def plan(rng, n_iter, star, step=1.0, gamma=13.0, goal_tol=0.5, report=(500, 1000, 2000, 4000)):
+    nodes = np.zeros((n_iter + 1, 2)); nodes[0] = start
+    cost = np.zeros(n_iter + 1); parent = np.full(n_iter + 1, -1)
+    children = [[] for _ in range(n_iter + 1)]
+    n, best, out = 1, math.inf, {}
+    for it in range(1, n_iter + 1):
+        q = rng.uniform(0, 10, 2)
+        d2 = np.sum((nodes[:n] - q) ** 2, axis=1)
+        near_i = int(np.argmin(d2))
+        dq = math.sqrt(d2[near_i])
+        new = q if dq <= step else nodes[near_i] + (q - nodes[near_i]) * step / dq
+        if free(nodes[near_i], new)[0]:
+            p, c = near_i, cost[near_i] + float(np.linalg.norm(new - nodes[near_i]))
+            if star:                                    # choose the best parent among neighbours
+                r = min(gamma * math.sqrt(math.log(n + 1) / (n + 1)), step)
+                dn = np.linalg.norm(nodes[:n] - new, axis=1)
+                nb = np.nonzero(dn <= r)[0]
+                ok = free(nodes[nb], np.repeat(new[None], len(nb), axis=0)) if len(nb) else nb
+                nb, dn_nb = nb[ok], dn[nb[ok]]
+                if len(nb):
+                    k = int(np.argmin(cost[nb] + dn_nb))
+                    if cost[nb[k]] + dn_nb[k] < c:
+                        p, c = int(nb[k]), float(cost[nb[k]] + dn_nb[k])
+            nodes[n], cost[n], parent[n] = new, c, p
+            children[p].append(n)
+            if star:                                    # rewire neighbours through the new node
+                for j, dj in zip(nb, dn_nb):
+                    if c + dj < cost[j] - 1e-12:
+                        children[parent[j]].remove(j)
+                        parent[j] = n; children[n].append(int(j))
+                        delta = c + dj - cost[j]
+                        stack = [int(j)]
+                        while stack:                    # lower the cost of j's whole subtree
+                            s = stack.pop(); cost[s] += delta; stack.extend(children[s])
+            n += 1
+        if it in report:
+            near_goal = np.nonzero(np.linalg.norm(nodes[:n] - goal, axis=1) <= goal_tol)[0]
+            if len(near_goal):
+                ok = free(nodes[near_goal], np.repeat(goal[None], len(near_goal), axis=0))
+                cands = cost[near_goal[ok]] + np.linalg.norm(nodes[near_goal[ok]] - goal, axis=1)
+                best = min(best, float(cands.min())) if len(cands) else best
+            out[it] = best
+    return out
+
+print(f"optimal path length (visibility graph): {optimum:.3f} m")
+seeds = range(5)
+for name, star in [("RRT", False), ("RRT*", True)]:
+    runs = [plan(np.random.default_rng(s), 4000, star) for s in seeds]
+    row = "  ".join(f"{n:>4}: {np.mean([r[n] for r in runs]):6.3f}" for n in runs[0])
+    print(f"{name:5} mean best length after N samples ->  {row}")
+```
+
+RRT finds its path and stops improving: 23.62 m on average after 500 samples and still 23.62 m after 4000. RRT\*'s best path shrinks steadily, from 18.70 m to 16.04 m, while the optimum is 15.758 m: the excess falls from 19% to 6.6%, 3.3% and 1.8% as $N$ doubles. Each RRT\* iteration costs more (it checks segments to all neighbours within $r$), and the program takes noticeably longer than the RRT runs.
+
+<Narrator who="gideon">
+
+The threshold matters. For this world, the 2011 paper's formula $\gamma^* = 2(1 + 1/d)^{1/d}\big(\mu(\mathcal{C}_{\text{free}})/\zeta_d\big)^{1/d}$, with free area $\mu = 84.36$ m², $d = 2$ and unit-disc area $\zeta_2 = \pi$, gives $\gamma^* \approx 12.7$, so the code uses $\gamma = 13$. A 2020 re-examination by Kiril Solovey and colleagues found a gap in the original proof and re-established the result with a larger constant; in practice libraries scale the theoretical radius by a tunable factor.
+
+</Narrator>
+
+Later planners keep the guarantee while converging much faster. **Informed RRT\*** (Jonathan Gammell and colleagues, 2014) samples only inside the ellipse of points that could improve the current best path. **BIT\*** (2015) and its successors process batches of samples in order of a heuristic, like A* on an implicit random graph, and **FMT\*** (Lucas Janson, Marco Pavone and colleagues, 2015) runs a single dynamic-programming sweep over a batch of samples.
+
+</Section>
+
+<Section id="narrow-passages" kind="human" title="Narrow passages">
+
+Uniform sampling has one great weakness. Suppose the only way between two rooms is a doorway 0.1 m wide in a wall 0.4 m thick, in our 100 m² world. A uniform sample lands inside the doorway with probability $0.04 / 100 = 0.0004$, so we expect to draw 2500 samples before the first one does. In $d$ dimensions it is worse: a passage that is narrow in $k$ directions has a volume that shrinks like $w^k$ in its width $w$. Narrow passages are where sampling-based planners spend most of their time in practice: an arm reaching into a tight shelf, a peg entering a hole, a mobile manipulator passing through a door with its arm tucked.
+
+The cure is to sample more cleverly near the obstacles that form the passage. **Gaussian sampling** (Valérie Boor, Mark Overmars and Frank van der Stappen, 1999) draws pairs of nearby points and keeps the free one when exactly one of the pair collides, concentrating samples near obstacle boundaries. The **bridge test** (David Hsu and colleagues, 2003), pictured in the figure above, draws pairs where *both* points collide and keeps their midpoint if it is free: a short "bridge" whose two ends are inside obstacles and whose middle is not is very likely to cross a narrow gap.
+
+The next program builds a PRM of 200 uniform samples in two rooms joined by a doorway of decreasing width, 20 times per width, and asks how often the start (in the left room) connects to the goal (in the right room). It then adds the few midpoints that 20,000 bridge-test attempts find, and asks again.
+
+```python run
+import numpy as np
+
+def world(w):
+    """Two rooms split by a wall 0.4 m thick at x = 5, with a doorway of width w centred at y = 5."""
+    return np.array([[4.8, 0.0, 5.2, 5 - w / 2], [4.8, 5 + w / 2, 5.2, 10.0]])
+
+def in_collision(P, R):
+    P = np.atleast_2d(P)[:, None, :]
+    return np.any(np.all((P >= R[None, :, :2]) & (P <= R[None, :, 2:]), axis=2), axis=1)
+
+def free(P, Q, R):
+    P, Q = P[:, None, :], Q[:, None, :]
+    D = Q - P
+    LO, HI = R[None, :, :2], R[None, :, 2:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t1, t2 = (LO - P) / D, (HI - P) / D
+    tmin, tmax = np.minimum(t1, t2), np.maximum(t1, t2)
+    inside = (P >= LO) & (P <= HI)
+    tmin = np.where(D == 0, np.where(inside, -np.inf, np.inf), tmin)
+    tmax = np.where(D == 0, np.where(inside, np.inf, -np.inf), tmax)
+    return ~np.any(np.maximum(tmin.max(axis=2), 0) <= np.minimum(tmax.min(axis=2), 1), axis=1)
+
+def uniform_samples(n, R, rng):
+    P = rng.uniform(0, 10, (4 * n, 2))
+    return P[~in_collision(P, R)][:n]
+
+def bridge_samples(attempts, R, rng, sigma=0.5):
+    """The bridge test: two colliding ends a short random distance apart, with a free midpoint."""
+    A = rng.uniform(0, 10, (attempts, 2))
+    B = A + rng.normal(0, sigma, A.shape)
+    M = (A + B) / 2
+    return M[in_collision(A, R) & in_collision(B, R) & ~in_collision(M, R)]
+
+def connected(pts, R, k=10):
+    """Build a k-nearest PRM over pts plus start and goal; is the goal reachable?"""
+    pts = np.vstack([[2.0, 5.0], [8.0, 5.0], pts])
+    n = len(pts)
+    D = np.linalg.norm(pts[:, None] - pts[None], axis=2)
+    nbrs = np.argsort(D, axis=1)[:, 1:k + 1]
+    I, J = np.repeat(np.arange(n), k), nbrs.ravel()
+    ok = free(pts[I], pts[J], R)
+    parent = list(range(n))                                 # union-find over the free edges
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for i, j in zip(I[ok], J[ok]):
+        parent[find(i)] = find(j)
+    return find(0) == find(1)
+
+print("PRM, 200 uniform samples: runs (of 20) in which start and goal are connected")
+print(f"{'doorway':>8}{'uniform':>9}{'+ bridge samples':>18}{'bridge samples added':>22}")
+for w in (2.0, 1.0, 0.5, 0.25, 0.1):
+    R = world(w)
+    wins, added = [0, 0], 0
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        U = uniform_samples(200, R, rng)
+        Bs = bridge_samples(20000, R, rng)
+        wins[0] += connected(U, R)
+        wins[1] += connected(np.vstack([U, Bs]), R)
+        added += len(Bs)
+    print(f"{w:7.2f} m{wins[0]:6d}{wins[1]:15d}{added / 20:21.1f}")
+```
+
+With uniform samples alone, success falls from 20 runs out of 20 at a 2 m doorway to 7 at 0.25 m and 2 at 0.1 m. Adding on average only 2 or 3 bridge samples brings these to 18 and 15 out of 20. The bridge samples are cheap to find, because point checks cost much less than the segment checks that building a roadmap needs, and they are placed exactly where uniform samples almost never land. At wide doorways the bridge test finds nothing, correctly: there is no narrow gap to bridge. Real planners mix several samplers for this reason, along with alternatives such as sampling near the medial axis of the free space, or learning where to sample from past problems.
+
+<Narrator who="chloe">
+
+Behind every probabilistic-completeness proof is a quantity like the one in this experiment: how large a fraction of the free space can "see" through each passage. Jean-Claude Latombe and colleagues (Lydia Kavraki, David Hsu, Rajeev Motwani and others) formalised this as **$\varepsilon$-goodness** and **expansiveness**, and their bounds on the number of samples needed grow as that fraction shrinks. Narrow passages are, precisely, places where it is tiny.
+
+</Narrator>
+
+</Section>
+
+<Section id="practice" kind="human" title="Sampling-based planning in practice">
+
+**OMPL and MoveIt.** The [Open Motion Planning Library](https://ompl.kavrakilab.org/) from Lydia Kavraki's lab at Rice University implements dozens of planners (PRM, RRT, RRT-Connect, RRT\*, Informed RRT\*, BIT\*, KPIECE, EST and more) behind a common interface, deliberately without any collision checker of its own: the user supplies a state space and a validity checker. [MoveIt](https://moveit.ai/), the manipulation framework for ROS 2, wraps OMPL with robot models, collision checking against the robot's meshes and a scene built from sensors, and planners of other kinds: the Pilz industrial motion planner (deterministic straight-line and circular moves, as industrial controllers offer) and the optimisation-based CHOMP and STOMP. A typical call looks like this (shown for orientation, not run here; it needs a robot and a running MoveIt):
+
+```python
+# MoveIt 2 Python API (moveit_py), not run here: plan an arm to a named pose.
+# Check the calls against the documentation for your MoveIt release.
+from moveit.planning import MoveItPy
+robot = MoveItPy(node_name="planning_demo")
+arm = robot.get_planning_component("panda_arm")
+arm.set_start_state_to_current_state()
+arm.set_goal_state(configuration_name="ready")
+result = arm.plan()                        # default pipeline: OMPL, RRTConnect
+if result:
+    robot.execute(result.trajectory, controllers=[])
+```
+
+**Speed in 2026.** Collision checking dominates planning time, so recent work makes it massively parallel. NVIDIA's [cuRobo](https://curobo.org/) (2023) approximates robots by spheres and checks thousands of configurations at once on a GPU, which lets it run inverse kinematics and trajectory optimisation from many starting guesses in parallel. The Kavraki lab's [VAMP](https://github.com/KavrakiLab/vamp) (2024) vectorises collision checks with the SIMD instructions of an ordinary CPU and reports RRT-Connect plans for a seven-joint arm in well under a millisecond on standard benchmark problems. These speeds change how planners are used: rather than planning once, a robot can replan continually as a perception system updates the scene.
+
+**Learning to sample.** Neural networks trained on many solved problems can propose samples where solutions usually pass (such as Motion Planning Networks, by Ahmed Qureshi, Michael Yip and colleagues, 2019) or give a heuristic for search, while a classical planner keeps the guarantees. By 2026, many learned robot policies (the <LessonLink slug="vision-language-action-models">vision-language-action models</LessonLink> of the Frontier level) produce motions directly, without a planner; sampling-based planners remain the standard where collisions must be ruled out with certainty in a known scene, such as industrial cells and around people.
+
+**Dynamics.** Everything here connected configurations by straight segments, which suits arms moving slowly. Cars, drones and fast arms must obey dynamics. **Kinodynamic** RRTs grow the tree by simulating a control input for a short time instead of drawing a straight line; such problems were what the RRT was first designed for.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The RRT finds a shortest path, given enough time."** It does not: its path is fixed when first found, and Karaman and Frazzoli proved it converges to something suboptimal. Use RRT\* or a successor if quality matters, or (as most systems do) a fast planner followed by shortcutting and optimisation.
+
+</Misconception>
+
+<Misconception>
+
+**"If the planner found nothing, no path exists."** A probabilistically complete planner can only fail to find a path; it cannot prove there is none. A timeout near a narrow passage is common even when a path exists. Proving infeasibility needs other tools (an exact cell decomposition, or certified methods that are an active research topic).
+
+</Misconception>
+
+<Misconception>
+
+**"Random means unreproducible."** Fix the seed and a sampling planner is deterministic, which matters for debugging and for certification. Some planners use deterministic low-discrepancy sequences (such as Halton points) instead of random numbers, with the same guarantees.
+
+</Misconception>
+
+<Misconception>
+
+**"More samples fix narrow passages."** They help only slowly: the expected number of samples to hit a passage grows as its volume shrinks, which is exponential in the number of narrow directions. Better samplers, or a change of approach (moving obstacles aside, compliant motion), usually work better than brute force.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises use NumPy and run in your browser.
+
+<Exercises/>
+
+</Section>

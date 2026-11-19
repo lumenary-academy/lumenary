@@ -1,0 +1,458 @@
+---
+title: Depth sensing and point clouds
+subtitle: Getting the third dimension back. Stereo, structured light, time of flight and lidar; point clouds and how to align them with ICP; and occupancy maps built one beam at a time.
+minutes: 75
+objectives:
+  - Compute depth from stereo disparity and explain why its error grows with the square of the distance
+  - Compare structured light, time-of-flight cameras and lidar, and their failure modes
+  - Describe point clouds, their neighbourhoods and normals, and downsample them with a voxel grid
+  - Derive and implement the SVD solution for aligning paired points, and use it inside ICP
+  - Show ICP converging from a good start and failing from a bad one, and name the methods used in practice
+  - Build an occupancy grid from lidar scans with log-odds updates, and explain clamping and dynamic objects
+narrators: [chloe, margaret, gideon]
+prerequisites: [frames-and-transforms, uncertainty-and-bayes-filters, cameras-and-vision]
+related: [math.algebra.linear-algebra, math.applied.optimisation, math.geom.projective-geometry, math.prob.probability-rules, math.algebra.advanced-linear-algebra]
+references:
+  - title: "Least-squares fitting of two 3-D point sets"
+    author: K. S. Arun, T. S. Huang and S. D. Blostein
+    year: 1987
+    url: https://doi.org/10.1109/TPAMI.1987.4767965
+    note: The SVD solution for the best rotation and translation between paired points.
+  - title: "A method for registration of 3-D shapes"
+    author: Paul J. Besl and Neil D. McKay
+    year: 1992
+    url: https://doi.org/10.1109/34.121791
+    note: The iterative closest point algorithm.
+  - title: "KISS-ICP: In Defense of Point-to-Point ICP"
+    author: Ignacio Vizzo et al.
+    year: 2023
+    url: https://arxiv.org/abs/2209.15397
+    note: A simple, robust lidar odometry built on point-to-point ICP, with open-source code.
+  - title: "TEASER: Fast and Certifiable Point Cloud Registration"
+    author: Heng Yang, Jingnan Shi and Luca Carlone
+    year: 2020
+    url: https://arxiv.org/abs/2001.07715
+    note: Global registration that tolerates very many outlier correspondences.
+  - title: "High resolution maps from wide angle sonar"
+    author: Hans Moravec and Alberto Elfes
+    year: 1985
+    url: https://doi.org/10.1109/ROBOT.1985.1087316
+    note: The paper that introduced occupancy grids.
+  - title: "OctoMap: an efficient probabilistic 3D mapping framework based on octrees"
+    author: Armin Hornung et al.
+    year: 2013
+    url: https://doi.org/10.1007/s10514-012-9321-0
+  - title: Open3D, ICP registration tutorial
+    url: https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html
+  - title: Point Cloud Library (PCL)
+    url: https://pointclouds.org/
+  - title: "Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data"
+    author: Lihe Yang et al.
+    year: 2024
+    url: https://arxiv.org/abs/2401.10891
+    note: A widely used monocular depth network.
+  - title: Middlebury Stereo Vision
+    url: https://vision.middlebury.edu/stereo/
+    note: The classic benchmark and datasets for stereo matching.
+---
+
+<Section id="motivation" kind="motivation" title="Why depth">
+
+A mango-picking arm in Andhra Pradesh needs to know not only *which* pixels are a mango but how far away the fruit is, to within a centimetre or two, before it closes the gripper. A delivery robot on a pavement in Tallinn must tell a kerb from a painted line, which look the same in a photograph. A warehouse robot must know whether the space under a shelf is empty floor or a dropped box. All three need **depth**: the distance to the surfaces around them.
+
+<LessonLink slug="cameras-and-vision">The previous lesson</LessonLink> showed that one camera loses depth. This lesson gets it back, first with two cameras, then with sensors that send out their own light, and then turns the measurements into the robot's working representations: **point clouds**, which are aligned to each other to track motion, and **occupancy maps**, which say where the robot may drive.
+
+</Section>
+
+<Section id="stereo" kind="definitions" title="Stereo: depth from two views">
+
+Two cameras side by side, a known **baseline** $B$ apart, with parallel optical axes and the same focal length $f$ (in pixels), see a point at depth $Z$ at slightly different columns. The difference of columns is the **disparity** $d = u_L - u_R$. Similar triangles give the central formula of stereo:
+
+$$
+Z = \frac{f B}{d}.
+$$
+
+Real stereo heads are calibrated and then **rectified**: both images are warped so that each scene point appears in the same row of both, which turns the search for a match into a search along one row.
+
+<Figure caption="Stereo seen from above. The same point P projects to column x_L in the left image and x_R in the right one. Their difference, the disparity, is fB/Z: large for near points, small for far ones.">
+<svg viewBox="0 0 320 230" role="img" aria-label="Two camera centres, left and right, a baseline B apart along the bottom. A short image line sits a focal length f in front of each. A point P is above, at depth Z. Rays from P to each camera centre cross the image lines at x L and x R, offset differently from each image's centre.">
+  <line x1="40" y1="170" x2="160" y2="170" stroke="var(--sky)" strokeWidth="3" />
+  <line x1="170" y1="170" x2="290" y2="170" stroke="var(--sky)" strokeWidth="3" />
+  <line x1="100" y1="200" x2="230" y2="200" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+  <line x1="100" y1="200" x2="130" y2="40" stroke="currentColor" strokeWidth="1.2" />
+  <line x1="230" y1="200" x2="130" y2="40" stroke="currentColor" strokeWidth="1.2" />
+  <line x1="100" y1="200" x2="100" y2="160" stroke="currentColor" strokeWidth="0.8" strokeDasharray="2 2" />
+  <line x1="230" y1="200" x2="230" y2="160" stroke="currentColor" strokeWidth="0.8" strokeDasharray="2 2" />
+  <line x1="300" y1="40" x2="300" y2="200" stroke="currentColor" strokeWidth="0.8" />
+  <circle cx="100" cy="200" r="4" fill="currentColor" />
+  <circle cx="230" cy="200" r="4" fill="currentColor" />
+  <circle cx="130" cy="40" r="5" fill="var(--gold)" stroke="currentColor" />
+  <circle cx="105.6" cy="170" r="3" fill="var(--gold)" stroke="currentColor" />
+  <circle cx="211.3" cy="170" r="3" fill="var(--gold)" stroke="currentColor" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="138" y="38">P</text>
+    <text x="80" y="218">left</text>
+    <text x="216" y="218">right</text>
+    <text x="158" y="216">B</text>
+    <text x="104" y="160">x_L</text>
+    <text x="190" y="160">x_R</text>
+    <text x="304" y="124">Z</text>
+    <text x="18" y="190">f</text>
+  </g>
+  <line x1="30" y1="170" x2="30" y2="200" stroke="currentColor" strokeWidth="0.8" />
+</svg>
+</Figure>
+
+Differentiate $Z = fB/d$: an error $\delta d$ in disparity gives a depth error
+
+$$
+\delta Z \approx \frac{Z^2}{fB}\,\delta d.
+$$
+
+Depth error grows with the **square** of distance. Doubling the baseline or the focal length halves it, which is why long-range stereo rigs on cars have wide baselines and why a phone's two lenses, a centimetre apart, give good depth only up close.
+
+The program tabulates this for a small stereo camera ($f = 700$ px, $B = 12$ cm) and then runs the simplest matcher, **block matching**, along one rectified scan line showing a box 3 m away in front of a wall 8.4 m away. For each left pixel it compares a 9-pixel window with windows in the right image at every disparity from 0 to 40 and keeps the disparity with the smallest sum of absolute differences.
+
+```python run
+import numpy as np
+
+f, B = 700.0, 0.12                     # focal length (px) and baseline (m) of a small stereo camera
+print("depth Z    disparity d = fB/Z    depth error for a 0.25 px disparity error")
+for Z in (0.5, 1.0, 2.0, 4.0, 8.0):
+    d = f * B / Z
+    dZ = Z**2 / (f * B) * 0.25         # from Z = fB/d:  |dZ/dd| = fB/d^2 = Z^2/(fB)
+    print(f"{Z:5.1f} m       {d:7.1f} px                {100 * dZ:6.1f} cm")
+
+# Block matching along one rectified scanline: a box 3 m away in front of a wall 8.4 m away.
+rng = np.random.default_rng(3)
+W = 160
+true_d = np.full(W, f * B / 8.4)                   # 10 px for the wall
+true_d[60:100] = f * B / 3.0                       # 28 px for the box
+left = rng.uniform(0, 1, W)                        # textured surfaces, as the left camera sees them
+right = rng.uniform(0, 1, W)                       # (pixels the right camera sees but the left does not stay random)
+for x in np.argsort(true_d, kind="stable"):        # far surfaces first, so near ones overwrite them
+    xr = x - int(true_d[x])                        # a left pixel x appears at x - d in the right image
+    if xr >= 0:
+        right[xr] = left[x]
+left += rng.normal(0, 0.02, W)                     # a little sensor noise in both images
+right += rng.normal(0, 0.02, W)
+
+half, d_max = 4, 40                                # 9-pixel window, search disparities 0..40
+est = np.full(W, np.nan)
+for x in range(half + d_max, W - half):
+    patch = left[x - half: x + half + 1]
+    costs = [np.abs(patch - right[x - d - half: x - d + half + 1]).sum() for d in range(d_max + 1)]
+    est[x] = np.argmin(costs)                      # winner takes all: the disparity with the lowest SAD
+
+print("\npixels     what is there                    true depth   estimates within 5%   range of estimates")
+for a, b, what in [(44, 60, "wall, hidden from right camera"), (60, 96, "box"), (96, 100, "box edge"), (100, 156, "wall")]:
+    z_true = f * B / true_d[a:b]
+    z_est = f * B / np.maximum(est[a:b], 0.5)      # a disparity of 0 would mean infinitely far
+    ok = np.mean(np.abs(z_est - z_true) < 0.05 * z_true)
+    print(f"{a:3d}-{b - 1:3d}    {what:31s}  {z_true[0]:5.1f} m       {ok:6.0%}          {z_est.min():5.1f} to {z_est.max():5.1f} m")
+```
+
+At 1 m a quarter-pixel matching error costs 3 mm of depth; at 8 m it costs 19 cm. The block matcher gets every pixel of the box and the open wall right. It fails in two places, both instructive. At the box's right-hand edge, windows that straddle two depths give mixed answers. And just left of the box, the wall is **occluded** in the right camera's view (the box hides it), so there is no correct match to find, and the matcher returns depths from 2.7 to 84 m. Practical matchers detect such pixels with a **left–right consistency check** (match right-to-left as well, and discard pixels where the two disagree) and mark them invalid rather than guess.
+
+<Narrator who="gideon">
+
+Stereo needs texture. On a white wall, a glass door or a glossy floor every window looks like every other, the cost curve is flat, and the minimum is noise. This is not a bug to be fixed with a better matcher but a limit of passive sensing, and it is why many depth cameras add their own light.
+
+</Narrator>
+
+Modern stereo uses better costs and global reasoning: semi-global matching (Hirschmüller, 2005 and 2008) adds smoothness along many directions and runs in real time on embedded hardware; deep stereo networks, trained on synthetic and real data, now top benchmarks such as Middlebury and handle textureless regions far better, at a higher computational cost.
+
+</Section>
+
+<Section id="active" kind="human" title="Active depth: structured light, time of flight and lidar">
+
+Active sensors send out their own light, so they work on blank walls and in the dark.
+
+**Structured light** projects a known infrared pattern, often thousands of pseudo-random dots, and a camera beside the projector sees how the pattern shifts on the surfaces: it is stereo with one "camera" replaced by a projector. The PrimeSense sensor in Microsoft's first Kinect (2010) brought it to millions of homes, and robotics labs adopted it overnight; phone face-unlock modules use the same idea at close range. **Active stereo** cameras, such as Intel's RealSense D400 series, project a texture and match between two infrared cameras, so they also work outdoors, where sunlight drowns the projected pattern but provides texture of its own.
+
+**Time-of-flight (ToF)** cameras time the light's round trip at every pixel. *Indirect* ToF modulates the light at a frequency $f_{\text{mod}}$ and measures the phase shift $\varphi$ of the returning wave, giving $Z = c\,\varphi/(4\pi f_{\text{mod}})$. Phases repeat every $2\pi$, so depths are ambiguous beyond $c/(2 f_{\text{mod}})$; cameras combine several frequencies to unwrap the phase. ToF cameras suffer from **multipath** (light bouncing off two surfaces before returning, which rounds the inside corners of rooms) and from very dark or shiny materials.
+
+<Narrator who="margaret">
+
+At a modulation frequency of 20 MHz the ambiguity range is $c/(2f) = 3\times10^8 / (4\times10^7) = 7.5$ m: a wall at 8 m reads as 0.5 m. Light travels 30 cm in a nanosecond, so a direct time-of-flight sensor needs timing to about 70 picoseconds for 1 cm of range, which is why such sensors use single-photon avalanche diodes and dedicated timing circuits.
+
+</Narrator>
+
+**Lidar** (light detection and ranging) times short laser pulses, one direction at a time, and sweeps the beam. A 2-D lidar spins one beam in a plane; it is the workhorse of indoor mobile robots and, as a certified safety scanner, guards the area around industrial machines. 3-D lidars use 16 to 128 beams stacked vertically on a spinning head, or sweep with mirrors and micro-mirrors, and produce from hundreds of thousands to a few million points per second at ranges of 100 m or more, with errors of a few centimetres that hardly grow with distance (unlike stereo). **FMCW** lidars chirp the laser's frequency and also measure each point's radial velocity from the Doppler shift. As of 2026, makers include Ouster (which merged with Velodyne in 2023) in the United States, Hesai, RoboSense and Livox in China, SICK in Germany, Innoviz in Israel and Valeo in France, and prices have fallen from tens of thousands of dollars to a few hundred for some models.
+
+Lidars and depth cameras use infrared lasers designed and certified as **Class 1** under the IEC 60825-1 standard: safe in normal use. That certification covers the sealed product only; never open, modify or defeat the optics of a laser device, and never point a laser that is not certified Class 1 at anyone's eyes.
+
+Finally, **learned monocular depth**: networks such as MiDaS and Depth Anything (2024) estimate a depth map from a single image, using what they learned about how scenes are usually shaped. They produce dense, detailed maps where stereo has holes, and some estimate metric scale. But, as the previous lesson stressed, a single image cannot fix scale geometrically, so these estimates can be wrong without warning on unusual scenes; robots use them to fill gaps and densify, and lean on geometry where safety depends on it.
+
+</Section>
+
+<Section id="clouds" kind="definitions" title="Point clouds">
+
+<Definition term="Point cloud">
+
+A **point cloud** is a set of 3-D points $\{\mathbf{p}_i\}$ in a stated frame, often with extra fields per point: intensity, colour, a timestamp, a ring (beam) number. An **organised** cloud keeps the sensor's grid structure (one point per pixel of a depth camera, or per beam and angle of a lidar), so neighbours are found by index; an **unorganised** cloud is just a list.
+
+</Definition>
+
+A depth image becomes a point cloud by inverting the projection of the previous lesson: pixel $(u, v)$ with depth $Z$ is the point $\big((u - c_x)Z/f_x,\ (v - c_y)Z/f_y,\ Z\big)$ in the camera's optical frame, and ${}^{B}T_{C}$ carries it to the robot's body frame.
+
+Most processing needs **neighbourhoods**. A **k-d tree** (a binary tree splitting space along one axis at a time) finds the nearest neighbours of a point in about $O(\log n)$ time instead of $O(n)$. From the neighbours of a point, the **surface normal** is the eigenvector of their covariance matrix with the *smallest* eigenvalue: the direction in which the neighbourhood is thinnest. Normals tell a robot which surfaces are floor, which are walls and which way a grasp should approach.
+
+Raw clouds are large and uneven: a lidar returns many more points from nearby surfaces than distant ones. A **voxel grid filter** divides space into cubes (voxels) of side, say, 5 cm and replaces the points in each occupied voxel by their centroid, giving a cloud of roughly uniform density and a predictable size. The Point Cloud Library (PCL, C++) and Open3D (C++ and Python) provide all of this; ROS 2 carries clouds in `sensor_msgs/PointCloud2` messages.
+
+</Section>
+
+<Section id="icp" kind="computation" title="Registration: aligning two clouds with ICP">
+
+A robot that takes two scans from different poses sees the same walls in different coordinates. Finding the rigid transform that lines them up, **registration**, gives the motion between the scans (lidar odometry) or the robot's pose in a prior map (localisation), and it is the basic step of 3-D mapping.
+
+If we knew which point in one scan corresponds to which in the other, the best transform would have a closed form.
+
+<Theorem name="Best rigid alignment of paired points (Arun, Huang and Blostein; Kabsch; Horn; Umeyama)">
+
+Given pairs $(\mathbf{p}_i, \mathbf{q}_i)$, $i = 1, \dots, n$, let $\bar{\mathbf{p}}, \bar{\mathbf{q}}$ be the centroids and $M = \sum_i (\mathbf{p}_i - \bar{\mathbf{p}})(\mathbf{q}_i - \bar{\mathbf{q}})^{\mathsf T} = U\Sigma V^{\mathsf T}$ (an SVD). The rotation and translation minimising $\sum_i \|R\mathbf{p}_i + \mathbf{t} - \mathbf{q}_i\|^2$ are
+
+$$
+R = V\,\operatorname{diag}\!\big(1, 1, \det(VU^{\mathsf T})\big)\,U^{\mathsf T}, \qquad \mathbf{t} = \bar{\mathbf{q}} - R\,\bar{\mathbf{p}}.
+$$
+
+</Theorem>
+
+<Proof>
+
+For any $R$, the best $\mathbf{t}$ makes the centroids coincide (set the derivative with respect to $\mathbf{t}$ to zero), so work with centred points $\mathbf{p}'_i, \mathbf{q}'_i$. Expanding $\sum_i \|R\mathbf{p}'_i - \mathbf{q}'_i\|^2$, the squared lengths do not depend on $R$, so we must maximise $\sum_i \mathbf{q}'^{\mathsf T}_i R\,\mathbf{p}'_i = \operatorname{tr}(R M) = \operatorname{tr}(\Sigma\,V^{\mathsf T}RU)$. The matrix $Z = V^{\mathsf T}RU$ is orthogonal, so its diagonal entries are at most 1, and the trace $\sum_k \sigma_k Z_{kk}$ is largest when $Z = I$, giving $R = VU^{\mathsf T}$. If that has determinant $-1$ it is a reflection, not a rotation; the best rotation then flips the sign of the term with the smallest singular value, which is the $\operatorname{diag}(1, 1, -1)$ correction.
+
+</Proof>
+
+We do not know the pairs, so **iterative closest point** (ICP) guesses them: pair each source point with its nearest target point, solve for the best transform, apply it, and repeat. Each step cannot increase the sum of squared closest-point distances, so ICP always converges, but only to a *local* minimum. The program aligns two noisy scans of a room corner (a floor, two walls and a box, 600 points) taken from poses 25° and about half a metre apart, once from the identity and once from a guess that is 115° wrong.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+def rot_z(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
+
+# A scanned room corner: a floor patch, two walls and a box, about 600 points (metres).
+floor = np.column_stack([rng.uniform(0, 3, 250), rng.uniform(0, 2, 250), np.zeros(250)])
+wall1 = np.column_stack([rng.uniform(0, 3, 150), np.zeros(150), rng.uniform(0, 1.5, 150)])
+wall2 = np.column_stack([np.zeros(120), rng.uniform(0, 2, 120), rng.uniform(0, 1.5, 120)])
+box = np.column_stack([rng.uniform(1.8, 2.2, 80), rng.uniform(1.0, 1.4, 80), np.full(80, 0.4)])
+target = np.vstack([floor, wall1, wall2, box])
+
+# The second scan sees the same scene from a robot that has turned 25 deg and moved, with 1 cm noise.
+R_true, t_true = rot_z(np.radians(25)), np.array([0.4, -0.3, 0.05])
+source = (target - t_true) @ R_true + rng.normal(0, 0.01, target.shape)   # = R_true^T (target - t_true)
+
+def best_rigid(P, Q):
+    """R, t minimising sum ||R p_i + t - q_i||^2 for paired points (the SVD solution)."""
+    mp, mq = P.mean(axis=0), Q.mean(axis=0)
+    U, _, Vt = np.linalg.svd((P - mp).T @ (Q - mq))
+    D = np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))])       # guard against a reflection
+    R = Vt.T @ D @ U.T
+    return R, mq - R @ mp
+
+def icp(source, target, R, t, iters=30, label=""):
+    for k in range(iters):
+        moved = source @ R.T + t
+        d2 = ((moved[:, None, :] - target[None, :, :]) ** 2).sum(axis=2)   # all pairwise distances
+        nn = d2.argmin(axis=1)                                            # closest target point
+        if k in (0, 1, 2, 5, 10, 29):
+            ang = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
+            print(f"{label} iter {k:2d}: RMS closest-point distance {np.sqrt(d2.min(axis=1).mean()):.4f} m,"
+                  f" rotation {ang:6.1f} deg, translation {np.round(t, 3)}")
+        R, t = best_rigid(source, target[nn])
+    return R, t
+
+print("true motion: rotation 25.0 deg, translation", t_true)
+R, t = icp(source, target, np.eye(3), np.zeros(3), label="good start")
+R, t = icp(source, target, rot_z(np.radians(-90)), np.zeros(3), label="bad start ")
+```
+
+From the identity, ICP recovers the 25° turn and the translation to within a millimetre or two, and the final RMS closest-point distance, 1.7 cm, is the sensor noise ($\sqrt{3} \times 1$ cm for noise of 1 cm on each axis). It is slow, though: 30 iterations, because point-to-point ICP slides along flat surfaces only gradually. From the bad start it converges just as confidently to a wrong answer: rotated by $-156°$ instead of $+25°$ and shifted by more than two metres, with the floor and walls paired with the wrong surfaces. The only warning is the residual, 0.39 m, more than twenty times the noise. Real systems always check the residual, the fraction of points with a close partner, and agreement with odometry before accepting an alignment.
+
+<Narrator who="chloe">
+
+ICP is alternating minimisation, the same idea as the $k$-means algorithm: fix the correspondences and solve for the transform exactly; fix the transform and solve for the correspondences exactly. Each half-step lowers the same cost, so the cost must settle. Nothing in the argument says *where*, which is why the starting guess matters so much.
+
+</Narrator>
+
+In practice:
+
+- **Point-to-plane ICP** (Chen and Medioni, 1992) minimises distances to the target's tangent planes instead of its points, which lets surfaces slide freely along themselves and typically converges in a handful of iterations. **Generalised ICP** (2009) models both clouds' local surfaces as Gaussians; **NDT** (normal distributions transform) replaces the target by a grid of Gaussians.
+- **Robust kernels** down-weight pairs with large residuals, so moving people and parts of the scene seen in only one scan do less damage.
+- **A good initial guess** comes from wheel odometry, an IMU or a constant-velocity prediction; **KISS-ICP** (2023) builds a robust lidar odometry on point-to-point ICP with little more than that and adaptive thresholds.
+- **Global registration**, when there is no initial guess, matches local shape descriptors (FPFH, or learned 3-D features) with RANSAC, or uses certifiably robust solvers such as TEASER++, and then refines with ICP.
+- **Degenerate scenes** defeat every method: in a long featureless corridor or tunnel, the walls constrain sideways motion but not motion along the corridor. Good systems detect this from the Hessian of the cost and lean on other sensors.
+
+In Open3D, point-to-plane ICP is a single call (shown for reading, not run here):
+
+```python
+# Open3D registration sketch: not run here (needs Open3D and two point-cloud files).
+import numpy as np
+import open3d as o3d
+
+source = o3d.io.read_point_cloud("scan_1.pcd").voxel_down_sample(voxel_size=0.05)
+target = o3d.io.read_point_cloud("scan_0.pcd").voxel_down_sample(voxel_size=0.05)
+target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=30))
+result = o3d.pipelines.registration.registration_icp(
+    source, target, 0.2, np.eye(4),              # max correspondence distance (m), initial guess
+    o3d.pipelines.registration.TransformationEstimationPointToPlane())
+print(result.fitness, result.inlier_rmse)        # share of points with a partner, and their RMS distance
+print(result.transformation)                     # 4x4 target_T_source
+```
+
+</Section>
+
+<Section id="occupancy" kind="computation" title="Occupancy grids and log-odds">
+
+A robot that must plan a path needs to know which places are free, which are blocked, and which it has never seen. An **occupancy grid** (Moravec and Elfes, 1985) divides the world into cells and keeps, for each, the probability that it is occupied. Each cell is a tiny Bayes filter, as in <LessonLink slug="uncertainty-and-bayes-filters">Uncertainty and Bayes filters</LessonLink>, with a binary state that does not move.
+
+<Theorem name="The log-odds update">
+
+For a static binary state $m$ (occupied or free), with readings independent given $m$, define the log-odds $\ell = \log\frac{p(m)}{1 - p(m)}$. Then each reading $z_t$ updates it by addition:
+
+$$
+\ell_t = \ell_{t-1} + \log\frac{p(m \mid z_t)}{1 - p(m \mid z_t)} - \ell_0,
+$$
+
+where $p(m \mid z_t)$ is the **inverse sensor model** (how likely the cell is occupied given this one reading alone) and $\ell_0$ is the prior log-odds, 0 for a prior of one half.
+
+</Theorem>
+
+<Proof>
+
+Write Bayes' rule for $m$ and for "not $m$" and divide: the normalisers cancel, leaving posterior odds = prior odds × likelihood ratio $p(z_t \mid m)/p(z_t \mid \neg m)$. Use Bayes' rule again to express that ratio as $\frac{p(m \mid z_t)}{p(\neg m \mid z_t)} \cdot \frac{p(\neg m)}{p(m)}$. Taking logarithms turns the products into sums.
+
+</Proof>
+
+Addition is cheap, symmetric and numerically stable, which is why every occupancy map stores log-odds. For a lidar beam, the inverse sensor model is simple: cells the beam passed through are probably free ($p = 0.4$, so add $\log(0.4/0.6) \approx -0.41$), the cell where it ended is probably occupied ($p = 0.7$, add $+0.85$), and cells beyond the end are unknown and untouched.
+
+<Figure caption="The inverse sensor model for one lidar beam. Cells the beam crossed get evidence for 'free', the cell where it hit gets evidence for 'occupied', and cells behind the hit get nothing, because the beam says nothing about them.">
+<svg viewBox="0 0 320 110" role="img" aria-label="A row of ten square cells. A robot at the left sends a beam to the right that ends in the eighth cell. Cells two to seven are shaded light and marked free, the eighth is shaded gold and marked occupied, and cells nine and ten are blank and marked unknown.">
+  <defs>
+    <marker id="dp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="10" y="40" width="30" height="30" fill="none" />
+    <rect x="40" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="70" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="100" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="130" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="160" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="190" y="40" width="30" height="30" fill="var(--sky-soft)" />
+    <rect x="220" y="40" width="30" height="30" fill="var(--gold)" />
+    <rect x="250" y="40" width="30" height="30" fill="none" />
+    <rect x="280" y="40" width="30" height="30" fill="none" />
+  </g>
+  <circle cx="25" cy="55" r="8" fill="var(--sky)" stroke="currentColor" />
+  <line x1="33" y1="55" x2="232" y2="55" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#dp-arrow)" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="130" y="30">free: add −0.41</text>
+    <text x="235" y="92">occupied: +0.85</text>
+    <text x="280" y="30">unknown</text>
+    <text x="25" y="92">robot</text>
+  </g>
+</svg>
+</Figure>
+
+The program maps a 10 m by 5 m room with a partition wall, a round pillar and, for the first three scans only, a person standing in the left half. It integrates eight 120-beam scans taken along a path, clamping the log-odds to $[-2, 3.5]$. In the maps, `#` is occupied ($p > 0.7$), `.` is free ($p < 0.3$) and a blank is unknown.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(1)
+RES, W, H = 0.25, 40, 20                       # 10 m x 5 m room in 25 cm cells
+
+def solid(x, y, person):
+    """Ground truth: outer walls, a partition, a pillar, and (sometimes) a person."""
+    if x < 0.2 or x > 9.8 or y < 0.2 or y > 4.8:
+        return True
+    if 4.9 < x < 5.1 and y < 3.0:              # a partition wall with a doorway above it
+        return True
+    if (x - 7.5) ** 2 + (y - 3.5) ** 2 < 0.3 ** 2:   # a round pillar
+        return True
+    return person and (x - 2.5) ** 2 + (y - 3.5) ** 2 < 0.25 ** 2
+
+def scan(pose, person, beams=120, max_range=6.0):
+    """Simulated 2-D lidar: march along each beam until it hits something."""
+    out = []
+    for a in np.linspace(-np.pi, np.pi, beams, endpoint=False):
+        for r in np.arange(0.05, max_range, 0.02):
+            if solid(pose[0] + r * np.cos(a), pose[1] + r * np.sin(a), person):
+                out.append((a, r + rng.normal(0, 0.02)))
+                break
+    return out
+
+L_OCC, L_FREE, L_MIN, L_MAX = 0.85, -0.4, -2.0, 3.5   # log-odds of p = 0.7 and p = 0.4, and clamps
+logodds = np.zeros((W, H))                     # 0 = p 0.5 = unknown
+
+def integrate(pose, readings):
+    for a, r in readings:
+        cells = set()
+        for s in np.arange(0.0, r - RES / 2, RES / 4):          # cells the beam passed through: free
+            cells.add((int((pose[0] + s * np.cos(a)) / RES), int((pose[1] + s * np.sin(a)) / RES)))
+        hit = (int((pose[0] + r * np.cos(a)) / RES), int((pose[1] + r * np.sin(a)) / RES))
+        cells.discard(hit)
+        for i, j in cells:
+            logodds[i, j] = max(L_MIN, logodds[i, j] + L_FREE)
+        logodds[hit] = min(L_MAX, logodds[hit] + L_OCC)         # the cell where it ended: occupied
+
+def show(title):
+    p = 1 - 1 / (1 + np.exp(logodds))
+    print(title)
+    for j in reversed(range(H)):
+        print("".join("#" if p[i, j] > 0.7 else "." if p[i, j] < 0.3 else " " for i in range(W)))
+    print(f"occupied {np.sum(p > 0.7)}, free {np.sum(p < 0.3)}, unknown {np.sum((p >= 0.3) & (p <= 0.7))} cells\n")
+
+path = [(1.5, 1.5), (2.5, 2.0), (3.5, 1.5), (4.5, 3.8), (6.0, 3.8), (7.0, 2.0), (8.5, 1.5), (3.0, 3.0)]
+for k, (x, y) in enumerate(path):
+    integrate((x, y), scan((x, y), person=(k < 3)))   # a person stands at (2.5, 3.5) for the first three scans
+    if k == 2:
+        show("after 3 scans from the left room (a person is standing in it):")
+show("after all 8 scans (the person has walked away):")
+```
+
+After three scans from the left room the right room is still almost entirely unknown, and the person shows as an occupied blob with an unknown shadow behind it. After all eight scans the walls, the partition (two cells thick where it straddles a cell boundary), and the pillar's outline (its inside is unknown, since no beam can reach it) are clear, and the person has vanished: later beams that passed through the cells where they stood added free evidence. The **clamps** made this possible. Without an upper limit, a cell that collected a hundred "occupied" readings would need a hundred "free" ones to clear, and a map in a busy corridor would fill up with ghosts of people who had long gone.
+
+**In 3-D**, a dense voxel grid wastes memory on empty space, so **OctoMap** (2013) stores occupancy in an octree that merges uniform regions. Mapping for manipulation and for drones often stores a **truncated signed distance field** (TSDF) instead: in each voxel near a surface, the signed distance to it, averaged over many depth images. KinectFusion (2011) made this real-time on a GPU; Voxblox (2017) and NVIDIA's nvblox build TSDFs and then **Euclidean distance fields**, which tell a planner how far every point is from the nearest obstacle (the input to <LessonLink slug="trajectory-optimisation">trajectory optimisation</LessonLink>). Nav2's **costmaps** layer an occupancy grid, inflated by the robot's radius, under its planners, as <LessonLink slug="graph-search-planning">Graph search planning</LessonLink> will use.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A stereo camera has a fixed accuracy, say 1 cm."** Its error grows with the square of the distance. A datasheet figure is meaningful only with the distance it applies to, and a camera excellent at 1 m may be useless at 10 m.
+
+</Misconception>
+
+<Misconception>
+
+**"ICP finds the best alignment."** It finds the nearest local minimum of its cost from where it started. The lesson's bad start converged smoothly to an alignment more than 150° wrong. Always check the residual and the overlap, and give ICP a good initial guess.
+
+</Misconception>
+
+<Misconception>
+
+**"Unknown means free."** A cell no beam has crossed is unknown, and a planner that treats it as free will drive into the space behind a shelf or off a loading dock. Planners either treat unknown as blocked or plan cautiously through it.
+
+</Misconception>
+
+<Misconception>
+
+**"The best rotation is just $VU^{\mathsf T}$."** Without the determinant check, noisy or nearly flat data can produce a reflection, a matrix with determinant $-1$ that no rigid motion can perform, and the robot's map is suddenly mirrored.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
