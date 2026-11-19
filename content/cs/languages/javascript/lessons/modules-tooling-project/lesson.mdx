@@ -1,0 +1,479 @@
+---
+title: Modules, tooling and a project
+subtitle: Splitting code into ES modules, npm and package.json, the tools professionals run every day, and a complete program that uses everything in the course.
+minutes: 70
+objectives:
+  - Export and import with ES modules, and explain live bindings, single evaluation, dynamic import and JSON modules
+  - Read and write a package.json, explain semantic-version ranges and lockfiles, and install packages safely
+  - Describe what bundlers, linters, formatters and type checkers do, and set up the common ones
+  - Build a complete asynchronous program with a concurrency limit, retries, timeouts and a report
+  - Plan your next steps with JavaScript, from TypeScript to frameworks and servers
+prerequisites: [dom-and-events]
+references:
+  - title: "MDN: JavaScript modules"
+    author: Mozilla and contributors
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules
+  - title: "Node.js: Modules: ECMAScript modules"
+    author: OpenJS Foundation
+    url: https://nodejs.org/docs/latest/api/esm.html
+  - title: "Node.js: Modules: Packages"
+    author: OpenJS Foundation
+    url: https://nodejs.org/docs/latest/api/packages.html
+    note: How Node decides between ES modules and CommonJS, and the exports field.
+  - title: "npm Docs: package.json"
+    author: npm
+    url: https://docs.npmjs.com/cli/configuring-npm/package-json
+  - title: Semantic Versioning
+    url: https://semver.org/
+  - title: ESLint
+    url: https://eslint.org/
+  - title: Vite
+    url: https://vite.dev/
+  - title: Eloquent JavaScript
+    author: Marijn Haverbeke
+    url: https://eloquentjavascript.net/
+    note: A well-loved book on the language, free to read online.
+---
+
+<Section id="motivation" kind="motivation" title="From a file to a project">
+
+Every program in this course has fit in one file. Real projects don't. A modest web application has hundreds of files of its own and depends on hundreds of packages written by other people, and a team needs everyone's code to look the same, catch mistakes before they ship, and run the same way on every laptop and server.
+
+Three things make that possible. **Modules** let each file keep its own scope and say exactly what it shares. **npm** and its `package.json` describe a project, its scripts and its dependencies. And a small set of **tools**, a formatter, a linter, a type checker, a test runner and a bundler, run on every change. This final lesson covers all three, then puts the whole course to work in a complete program.
+
+</Section>
+
+<Section id="modules" kind="definitions" title="ES modules">
+
+<Definition term="ES module">
+
+An **ES module** is a file with its own top-level scope. Nothing in it is visible to other files unless it is **exported**, and it uses other modules' exports by **importing** them. Imports are resolved before the module runs, each module is evaluated **once** however many times it is imported, and modules always run in strict mode.
+
+</Definition>
+
+A small project might look like this:
+
+```text
+forecast/
+├── package.json
+├── src/
+│   ├── main.js
+│   ├── retry.js
+│   └── report.js
+└── test/
+    └── retry.test.js
+```
+
+```javascript
+// src/retry.js: named exports
+export const isRetryable = (err) => err.status >= 500;
+export async function retry(task, options = {}) { /* ... */ }
+
+// src/report.js: one default export
+export default function formatReport(results) { /* ... */ }
+
+// src/main.js: importing
+import { retry, isRetryable as shouldRetry } from "./retry.js";   // named, one renamed
+import formatReport from "./report.js";                           // default: any name you like
+import * as path from "node:path";                               // the whole namespace
+import { readFile } from "node:fs/promises";                     // a built-in module
+import { z } from "zod";                                         // a package from node_modules
+```
+
+The forms to know: **named exports** (`export const`, `export function`, or `export { a, b }` at the end) are imported by name in braces; a module may have one **default export**, imported without braces under any name; `import * as ns` gives an object holding all of a module's exports. Paths starting with `./` or `../` are relative to the importing file and, in Node and browsers, must include the extension. Bare names like `"zod"` refer to installed packages, and `"node:..."` names are Node's built-in modules.
+
+Many teams prefer named exports everywhere: a name that must match is easier to search for and to rename with an editor than a default export each importer names differently.
+
+Imports must sit at the top level and use fixed strings, which lets tools know a program's whole module graph without running it. For the rare case where you need to load a module later, or choose it at run time, `import(specifier)` returns a promise of the module. This program uses it to show the module semantics within a single file, by giving the extra modules as `data:` URLs:
+
+```javascript check
+// Modules in one runnable file: the extra "files" are given as data: URLs,
+// which import() accepts just like paths. In a project they would be counter.mjs etc.
+import { basename } from "node:path";             // a built-in module
+import { fileURLToPath } from "node:url";
+
+const counterSource = `
+  export let count = 0;                            // a named export
+  export function increment() { count += 1; }
+  export default function describe() { return "count is " + count; }
+`;
+const counter = await import(`data:text/javascript,${encodeURIComponent(counterSource)}`);
+
+console.log(Object.keys(counter));                 // the module namespace object
+counter.increment();
+counter.increment();
+console.log(counter.count, counter.default());     // live bindings: the importer sees updates
+
+try {
+  counter.count = 100;                             // importers cannot assign to exports
+} catch (err) {
+  console.log(err.name);
+}
+
+// The same module URL is evaluated once; every importer shares one instance.
+const again = await import(`data:text/javascript,${encodeURIComponent(counterSource)}`);
+console.log(again === counter, again.count);
+
+// ES2025 import attributes: JSON modules.
+const settings = await import('data:application/json,{"theme":"dark","fontSize":16}', {
+  with: { type: "json" },
+});
+console.log(settings.default);
+
+// import.meta describes the current module.
+console.log(basename(fileURLToPath(import.meta.url)));
+```
+
+```text
+[ 'count', 'default', 'increment' ]
+2 count is 2
+TypeError
+true 2
+{ theme: 'dark', fontSize: 16 }
+main.mjs
+```
+
+Three properties stand out. Imports are **live bindings**, not copies: after two calls to `increment`, the importer sees `count` as 2. They are **read-only** to the importer: only the exporting module can change its variables. And a module is **evaluated once**, so its top-level variables are shared by every importer, which makes a module a natural home for shared configuration or a cache (and a place to be careful with mutable state). The JSON import uses **import attributes**, new in ECMAScript 2025; in a file you would write `import settings from "./settings.json" with { type: "json" };`. The attribute makes the type explicit, so a server cannot trick the page into running code it expected to be data.
+
+### CommonJS, the older system
+
+Before ES modules, Node had its own system, **CommonJS**: `const x = require("./x")` and `module.exports = ...`. It loads synchronously, and you will see it throughout older code and packages. Node decides which system a file uses by its extension (`.mjs` is ES, `.cjs` is CommonJS) or, for `.js`, by the `"type"` field of the nearest `package.json` (`"module"` for ES). ES modules can import CommonJS packages, and since Node 22.12 CommonJS can `require` most ES modules too, so the two coexist. Write new code as ES modules.
+
+</Section>
+
+<Section id="npm" kind="computation" title="npm and package.json">
+
+**npm** is Node's package manager and the name of the public registry it installs from, the largest collection of open-source packages for any language. It is installed with Node. `npm init -y` creates a `package.json`, the file that describes a project:
+
+```json
+{
+  "name": "forecast",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.20.0",
+    "prettier": "^3.5.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
+```
+
+- `"type": "module"` makes every `.js` file in the project an ES module.
+- `"private": true` prevents publishing it to the registry by accident.
+- **`scripts`** are named commands: `npm test` and `npm start` run those two, and `npm run lint` runs any other. Binaries of installed packages (`eslint`, `prettier`) are on the path inside scripts. Scripts are a project's shared vocabulary; a new team member types `npm test` without needing to know which runner you chose.
+- **`dependencies`** are needed when the program runs; **`devDependencies`** only while developing (linters, test frameworks, bundlers). `npm install zod` adds to the first, `npm install --save-dev eslint` to the second.
+
+### Version ranges
+
+The `^3.24.1` is a **range**. npm packages follow **semantic versioning**: `MAJOR.MINOR.PATCH`, where a new major version may break existing code, a minor one adds features compatibly, and a patch only fixes bugs. A caret accepts any later version with the same leftmost non-zero part; a tilde accepts only later patches. This model of the rules shows what each range allows:
+
+```javascript check
+// What the version ranges in package.json mean: a small model of npm's caret and tilde.
+const parse = (v) => {
+  const [major, minor, patch] = v.split(".").map(Number);
+  return { major, minor, patch };
+};
+const compare = (a, b) => a.major - b.major || a.minor - b.minor || a.patch - b.patch;
+
+function satisfies(version, range) {
+  const v = parse(version);
+  const base = parse(range.slice(1));
+  if (compare(v, base) < 0) return false;            // never older than the base
+  switch (range[0]) {
+    case "^":                                         // same leftmost non-zero part
+      if (base.major > 0) return v.major === base.major;
+      if (base.minor > 0) return v.major === 0 && v.minor === base.minor;
+      return v.major === 0 && v.minor === 0 && v.patch === base.patch;
+    case "~":                                         // same major and minor
+      return v.major === base.major && v.minor === base.minor;
+    default:
+      throw new Error(`unsupported range: ${range}`);
+  }
+}
+
+const versions = ["1.4.2", "1.4.9", "1.5.0", "1.9.3", "2.0.0", "0.4.7", "0.5.0"];
+const ranges = ["^1.4.2", "~1.4.2", "^0.4.2"];
+
+console.log(("version  " + ranges.map((r) => r.padEnd(8)).join("")).trimEnd());
+for (const version of versions) {
+  const marks = ranges.map((r) => (satisfies(version, r) ? "yes" : "-").padEnd(8));
+  console.log((version.padEnd(9) + marks.join("")).trimEnd());
+}
+```
+
+```text
+version  ^1.4.2  ~1.4.2  ^0.4.2
+1.4.2    yes     yes     -
+1.4.9    yes     yes     -
+1.5.0    yes     -       -
+1.9.3    yes     -       -
+2.0.0    -       -       -
+0.4.7    -       -       yes
+0.5.0    -       -       -
+```
+
+(The real rules, implemented by npm's `semver` package, also handle pre-release tags like `2.0.0-beta.1` and many more range forms; the model covers the two you will see most.) For versions below 1.0, the caret is stricter, because in `0.x` releases the minor number is the one that signals breaking changes.
+
+### Lockfiles and installing safely
+
+A range describes what you are *willing* to accept; the **lockfile**, `package-lock.json`, records exactly what was installed, every package and sub-package down the tree, with checksums. Commit it. Then `npm ci` (for "clean install") deletes `node_modules` and installs exactly what the lockfile says, which is what build servers and new team members should run; `npm install` is for adding or updating packages. `node_modules`, which can hold thousands of packages, is never committed.
+
+Every dependency is code you run with your own permissions, written by people you don't know, along with *their* dependencies. Attacks that publish a malicious version of a popular package do happen, and several widely used packages were compromised that way in 2025. Professionals keep dependencies few and well known, read what an install will add, run `npm audit` and keep the lockfile under review, and update deliberately rather than automatically. The other package managers you will meet, **pnpm**, **Yarn** and **Bun**, use the same `package.json` and registry with different trade-offs in speed and disk use.
+
+</Section>
+
+<Section id="tools" kind="human" title="The tools on every professional's machine">
+
+A typical JavaScript project runs four or five tools, usually on every save in the editor and again on every push in continuous integration (CI).
+
+**A formatter** rewrites code into one consistent layout, ending all arguments about spaces, quotes and line breaks. **Prettier** is the long-standing standard; **Biome**, written in Rust, formats and lints much faster. Configure it once, run it on save, and never think about layout again.
+
+**A linter** finds likely bugs and risky patterns by reading the code without running it: unused variables, `==`, a forgotten `await`, a `switch` case that falls through. **ESLint** is the standard, configured in `eslint.config.js` (the "flat config" format, the default since ESLint 9):
+
+```javascript
+// eslint.config.js
+import js from "@eslint/js";
+import globals from "globals";
+
+export default [
+  js.configs.recommended,
+  {
+    languageOptions: { globals: globals.node },
+    rules: {
+      eqeqeq: "error",
+      "no-unused-vars": "warn",
+    },
+  },
+];
+```
+
+**A type checker** catches mismatched types before the program runs: passing a string where a number is expected, misspelling a property, forgetting that a value might be `undefined`. Most professional JavaScript today is written in **TypeScript**, which adds type annotations to the language and is checked by the TypeScript compiler; it has its own course in this series, and this course is its starting point. You can also get much of the benefit in plain JavaScript with JSDoc comments and `// @ts-check` at the top of a file, which editors such as Visual Studio Code understand.
+
+**A test runner**, from lesson seven: `node --test`, or Vitest or Jest.
+
+**A bundler** prepares code for browsers. Browsers can load ES modules directly, but an application split into hundreds of modules, plus its packages from `node_modules`, loads faster as a few optimised files. A bundler follows the imports from an entry file, combines the modules, drops code that is never used ("tree shaking"), minifies the result, and also transforms TypeScript, JSX and CSS. **Vite** is the most common choice for new projects: in development it serves your modules almost untouched for instant reloads, and for production it bundles them (using Rollup, and moving to the faster Rolldown). **esbuild** and **webpack** are others you will meet; Node programs usually need no bundler at all.
+
+A few Node features replace tools that used to be separate packages: `node --watch main.js` restarts on changes, `node --env-file=.env` loads environment variables, and `node --test` runs tests. Recent Node releases can even run TypeScript files directly by stripping the types.
+
+</Section>
+
+<Section id="project" kind="examples" title="Project: a resilient forecast fetcher">
+
+Here is a complete program in the style of real production code. It asks a weather service for forecasts for six cities. The service is flaky: some requests fail with a temporary server error (HTTP 503) and succeed when retried, one city is unknown (HTTP 404, not worth retrying), and one request is so slow it must be abandoned. The program must never send more than two requests at once, must retry only what is worth retrying, must give each attempt a time limit, and must report every city's outcome. So that it runs anywhere without a network, the service is simulated with timers; replacing `getForecast` with a real `fetch` would change nothing else.
+
+```javascript check
+// forecast.mjs: fetch forecasts for many cities from a flaky service,
+// at most two requests at a time, with retries, timeouts and a summary report.
+import assert from "node:assert/strict";
+import { setTimeout as sleep } from "node:timers/promises";
+
+// ---------- a fake service (in real life: fetch to an HTTP API) ----------
+class HttpError extends Error {
+  constructor(status, city) {
+    super(`HTTP ${status} for ${city}`);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+// For each city: how long the service takes, and what it does on each attempt.
+const SCRIPT = {
+  Accra:    { ms: 30, outcomes: [{ high: 31, rain: 40 }] },
+  Bogotá:   { ms: 20, outcomes: [503, { high: 19, rain: 70 }] },
+  Chennai:  { ms: 25, outcomes: [{ high: 33, rain: 85 }] },
+  Dakar:    { ms: 15, outcomes: [503, 503, 503] },
+  Edmonton: { ms: 200, outcomes: [{ high: -8, rain: 10 }] },
+  Florence: { ms: 10, outcomes: [404] },
+};
+
+function createService() {
+  const attempts = new Map();
+  let active = 0;
+  let maxActive = 0;
+  async function getForecast(city, { signal } = {}) {
+    const n = attempts.get(city) ?? 0;
+    attempts.set(city, n + 1);
+    active++;
+    maxActive = Math.max(maxActive, active);
+    try {
+      const { ms, outcomes } = SCRIPT[city];
+      await sleep(ms, undefined, { signal });
+      const outcome = outcomes[Math.min(n, outcomes.length - 1)];
+      if (typeof outcome === "number") throw new HttpError(outcome, city);
+      return { city, ...outcome };
+    } finally {
+      active--;
+    }
+  }
+  return { getForecast, attempts, stats: () => ({ maxActive }) };
+}
+
+// ---------- generic helpers (each would be its own small module) ----------
+const isRetryable = (err) => err instanceof HttpError && err.status >= 500;
+
+async function retry(task, { attempts = 3, baseDelayMs = 5 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await task(attempt);
+    } catch (err) {
+      if (attempt >= attempts || !isRetryable(err)) throw err;
+      await sleep(baseDelayMs * 2 ** (attempt - 1));   // exponential backoff
+    }
+  }
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next++;                // safe: no other code runs between read and write
+      results[index] = await fn(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+async function settle(promise) {
+  try {
+    return { ok: true, value: await promise };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+// ---------- the application ----------
+const describe = (err) => (err.name === "AbortError" ? "timed out" : err.message);
+
+function formatReport(results, cities) {
+  const lines = results.map((r, i) =>
+    r.ok
+      ? `${cities[i].padEnd(9)} ${String(r.value.high).padStart(3)} °C  rain ${String(r.value.rain).padStart(2)}%`
+      : `${cities[i].padEnd(9)} failed: ${describe(r.error)}`,
+  );
+  const ok = results.filter((r) => r.ok);
+  const wettest = ok.toSorted((a, b) => b.value.rain - a.value.rain)[0]?.value.city ?? "none";
+  return [...lines, `${ok.length}/${results.length} cities, wettest: ${wettest}`].join("\n");
+}
+
+async function main() {
+  const service = createService();
+  const cities = Object.keys(SCRIPT);
+  const results = await mapWithConcurrency(cities, 2, (city) =>
+    settle(retry(() => service.getForecast(city, { signal: AbortSignal.timeout(100) }))),
+  );
+  console.log(formatReport(results, cities));
+  console.log("attempts:", [...service.attempts].map(([city, n]) => `${city} ${n}`).join(", "));
+  console.log("most requests at once:", service.stats().maxActive);
+
+  // A few checks that the helpers behave (in a real project: a test file).
+  assert.deepEqual(await mapWithConcurrency([3, 1, 2], 2, async (x) => x * 10), [30, 10, 20]);
+  await assert.rejects(retry(async () => { throw new HttpError(404, "x"); }), { status: 404 });
+  console.log("self-checks passed");
+}
+
+await main();
+```
+
+```text
+Accra      31 °C  rain 40%
+Bogotá     19 °C  rain 70%
+Chennai    33 °C  rain 85%
+Dakar     failed: HTTP 503 for Dakar
+Edmonton  failed: timed out
+Florence  failed: HTTP 404 for Florence
+3/6 cities, wettest: Chennai
+attempts: Accra 1, Bogotá 2, Chennai 1, Dakar 3, Edmonton 1, Florence 1
+most requests at once: 2
+self-checks passed
+```
+
+### How it works, and which lesson each part comes from
+
+- **`createService`** is a closure (lesson four): `attempts`, `active` and `maxActive` are private state shared by the returned function. The `finally` (lesson seven) guarantees the active count goes down whether the request succeeds, fails or is aborted. `sleep` from `node:timers/promises` accepts a `signal`, like `fetch` does.
+- **`retry`** calls the task, and on failure decides with `isRetryable`: only server errors (5xx) are retried, so the 404 for Florence fails at once, and Dakar gives up after three attempts. The wait doubles each time, **exponential backoff**: hammering a struggling server with instant retries makes its trouble worse. Production code also adds random "jitter" to the waits, so that many clients don't retry in lockstep; it is left out here to keep the output reproducible.
+- **`mapWithConcurrency`** starts `limit` workers that each take the next index until none remain (lesson eight). `next++` is safe without a lock because, on one thread, nothing can run between reading `next` and incrementing it. Results are stored by index, so the report keeps the input order whatever order the requests finish in, and `most requests at once: 2` confirms the limit held.
+- **`settle`** turns each outcome into a result object, the "return, don't throw" style from lesson seven, so one failed city can't abort the whole run; it is `Promise.allSettled` for a single promise.
+- **Timeouts**: each attempt gets a fresh `AbortSignal.timeout(100)`. Edmonton's 200 ms request is aborted after 100 ms; the abort error is not retryable, so it is reported as timed out.
+- **The report** uses `map`, `filter`, `toSorted`, optional chaining and `??` (lessons two, five and six), and `padEnd`/`padStart` for columns.
+- **The self-checks** use `node:assert` and `assert.rejects` for async code, a habit worth keeping even in small scripts.
+
+### Making it a real project
+
+To turn the program into a maintained project, split it along its sections into modules (`service.js`, `retry.js`, `pool.js`, `report.js`, `main.js`) with named exports, move the checks into `test/*.test.js` files run by `npm test`, add ESLint and Prettier as dev dependencies with the scripts shown earlier, and replace the fake service with:
+
+```javascript
+export async function getForecast(city, { signal } = {}) {
+  const url = new URL("https://api.example.org/forecast");
+  url.searchParams.set("city", city);
+  const response = await fetch(url, { signal });
+  if (!response.ok) throw new HttpError(response.status, city);
+  return response.json();
+}
+```
+
+Nothing else changes, which is the payoff of keeping the parts small and their interfaces clear. Good extensions to try: honour a `Retry-After` header, add jitter to the backoff, accept the city list from a file or the command line (`process.argv`), cache results for ten minutes in a `Map`, and rewrite `mapWithConcurrency` as an async generator that yields results as they arrive.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the language that professionals write, how it runs, and the tools around it. Where you go from here depends on what you want to build:
+
+- **Types.** Learn TypeScript next: it is the default for professional JavaScript, and its course in this series starts where this one ends.
+- **The web front end.** Build a few pages with plain DOM code first, then learn one framework well; React, Vue and Svelte all have excellent official tutorials. Learn HTML and CSS properly alongside, and accessibility from the start.
+- **Servers.** Node's own `node:http` module, then a framework such as Express, Fastify or Hono; learn about databases and authentication along the way, and read the Node.js documentation's guides.
+- **Depth.** Read MDN's guide and reference end to end, the free book [Eloquent JavaScript](https://eloquentjavascript.net/), and, when you want the exact rules, the [specification](https://tc39.es/ecma262/). Follow [TC39's proposals](https://github.com/tc39/proposals) to see what is coming.
+
+Above all, build things you care about and read other people's code. The ideas of this course, values and coercion, closures, prototypes, the event loop, promises, will keep explaining what you see.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`import` copies the exported value."** It creates a live, read-only binding to the exporting module's variable. If the exporter changes it, importers see the change.
+
+</Misconception>
+
+<Misconception>
+
+**"A caret range means I always get the latest version."** It allows newer minor and patch versions, but what you actually get is pinned by the lockfile until you deliberately update. Without a committed lockfile, two machines can install different code.
+
+</Misconception>
+
+<Misconception>
+
+**"More packages means less work."** Every dependency is code to trust, update and audit. A ten-line function you write and test yourself is often cheaper over the life of a project than a package for it.
+
+</Misconception>
+
+<Misconception>
+
+**"Linters and formatters are for beginners."** Professional teams rely on them most: they let reviewers spend their attention on design and correctness instead of style and typos, and they catch whole classes of bugs, like a missing `await`, automatically.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The last two are about the project: run it, change it, and check your predictions.
+
+<Exercises/>
+
+</Section>

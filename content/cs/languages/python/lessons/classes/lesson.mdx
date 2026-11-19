@@ -1,0 +1,517 @@
+---
+title: Classes, dataclasses and protocols
+subtitle: How Python's classes really work, how modern code avoids boilerplate with dataclasses, and two ways to describe an interface.
+minutes: 60
+objectives:
+  - Explain instances, class and instance attributes, bound methods, and how self works
+  - Use properties, classmethods and staticmethods for validation, alternative constructors and helpers
+  - Use inheritance and super() correctly, read a method resolution order, and prefer composition when it fits
+  - Write dataclasses (frozen, ordered, keyword-only, with slots) and enums
+  - Choose between abstract base classes and protocols to describe an interface
+prerequisites: [functions]
+references:
+  - title: "The Python Tutorial: Classes"
+    url: https://docs.python.org/3/tutorial/classes.html
+  - title: "The Python Standard Library: dataclasses"
+    url: https://docs.python.org/3/library/dataclasses.html
+  - title: "The Python Standard Library: enum"
+    url: https://docs.python.org/3/library/enum.html
+  - title: "The Python Standard Library: abc, abstract base classes"
+    url: https://docs.python.org/3/library/abc.html
+  - title: "PEP 544: Protocols, structural subtyping (static duck typing)"
+    url: https://peps.python.org/pep-0544/
+  - title: "The Python 2.3 Method Resolution Order"
+    author: Michele Simionato
+    url: https://docs.python.org/3/howto/mro.html
+    note: The classic explanation of the C3 algorithm behind the MRO.
+  - title: "Descriptor Guide"
+    url: https://docs.python.org/3/howto/descriptor.html
+    note: How properties, methods, classmethods and staticmethods work underneath.
+---
+
+<Section id="motivation" kind="motivation" title="Classes in a language of objects">
+
+Every value in Python is already an object, and every object has a class, so in one sense you have been using classes since your first `print`. What this lesson adds is writing your own well: knowing what `self` really is, when to use a property or a classmethod, how inheritance and `super()` behave once there is more than one parent, and above all how *little* class machinery modern Python code actually needs.
+
+That last point surprises people who come from Java or C#. Python programmers write fewer, smaller classes. Plain functions and modules do much of the organising work that classes do elsewhere; `dataclasses` write the boring methods for you; and interfaces are often described by **protocols**, which check what an object can *do* rather than what it inherits from. The goal is not to avoid classes, but to reach for exactly as much structure as the problem needs.
+
+</Section>
+
+<Section id="anatomy" kind="definitions" title="The anatomy of a class">
+
+A `class` statement runs its body like a little module and collects the names defined there (methods, class attributes) into a new class object. Calling the class creates an instance and passes it to `__init__` as `self`.
+
+```python check
+class Thermostat:
+    unit = "°C"                        # class attribute: one value, shared by all instances
+    count = 0
+
+    def __init__(self, room, target=20.0):
+        self.room = room               # instance attributes live in the instance's __dict__
+        self.target = target           # this assignment goes through the property below
+        Thermostat.count += 1
+
+    @property
+    def target(self):                  # read as kitchen.target, no parentheses
+        return self._target
+
+    @target.setter
+    def target(self, value):           # runs on kitchen.target = ...
+        if not 5 <= value <= 30:
+            raise ValueError(f"target {value} is outside 5-30")
+        self._target = float(value)
+
+    @classmethod
+    def from_setting(cls, text):       # an alternative constructor: receives the class
+        room, _, target = text.partition("=")
+        return cls(room.strip(), float(target))
+
+    @staticmethod
+    def to_fahrenheit(celsius):        # a plain function that lives in the class namespace
+        return celsius * 9 / 5 + 32
+
+    def describe(self):
+        return f"{self.room}: {self.target}{self.unit}"
+
+    def __repr__(self):
+        return f"{type(self).__name__}({self.room!r}, {self.target})"
+
+
+kitchen = Thermostat("kitchen")
+study = Thermostat.from_setting("study = 22.5")
+print(kitchen, study, Thermostat.count)
+print(kitchen.__dict__)
+print(kitchen.describe() == Thermostat.describe(kitchen))   # what a method call means
+study.target = 19
+print(study.describe(), Thermostat.to_fahrenheit(study.target))
+try:
+    kitchen.target = 45
+except ValueError as err:
+    print("ValueError:", err)
+```
+
+```text
+Thermostat('kitchen', 20.0) Thermostat('study', 22.5) 2
+{'room': 'kitchen', '_target': 20.0}
+True
+study: 19.0°C 66.2
+ValueError: target 45 is outside 5-30
+```
+
+What to take from it:
+
+- **`self` is just the first parameter.** `kitchen.describe()` looks up `describe` on the class, finds a function, and calls it with `kitchen` as the first argument; `Thermostat.describe(kitchen)` does the same thing explicitly. The name `self` is a convention, never a keyword, but always follow it.
+- **Attribute lookup goes instance first, then class.** `kitchen.unit` is not in `kitchen.__dict__`, so Python finds it on the class. Assigning `kitchen.unit = "K"` would create an instance attribute that *shadows* the class one for that instance only.
+- **Properties keep the attribute syntax and add logic.** Start with plain attributes; if you later need validation or a computed value, turn the attribute into a property and no caller has to change. That is why Python code does not need `get_target()` and `set_target()` methods.
+- **`classmethod` receives the class**, which is what alternative constructors need: `cls(...)` builds an instance of whatever class it was called on, subclasses included. `dict.fromkeys` and `datetime.fromisoformat` are classmethods. **`staticmethod`** receives nothing special; use it for a helper that belongs with the class conceptually, or just write a module-level function.
+
+Python has no `private` keyword. A single leading underscore, as in `_target`, means "internal; use at your own risk", and everyone respects it. Two leading underscores (`__target`) trigger *name mangling* to `_Thermostat__target`, which avoids accidental clashes in subclasses but is not a security feature. The community saying is "we are all consenting adults here".
+
+</Section>
+
+<Section id="inheritance" kind="examples" title="Inheritance, super() and the MRO">
+
+A subclass inherits everything from its base classes and can override or extend it. `super()` gives access to the next class in line, which matters as soon as there is more than one base class.
+
+```python check
+import json
+
+
+class Shape:
+    def __init__(self, name):
+        self.name = name
+
+    def area(self):
+        raise NotImplementedError
+
+    def describe(self):
+        return f"{self.name} with area {self.area():.2f}"
+
+
+class Rectangle(Shape):
+    def __init__(self, width, height):
+        super().__init__("rectangle")
+        self.width, self.height = width, height
+
+    def area(self):
+        return self.width * self.height
+
+
+class Square(Rectangle):
+    def __init__(self, side):
+        super().__init__(side, side)
+        self.name = "square"
+
+
+class JsonMixin:
+    """A mixin adds one capability to any class; it is not meant to stand alone."""
+    def to_json(self):
+        return json.dumps(vars(self), sort_keys=True)
+
+
+class Tile(JsonMixin, Square):
+    pass
+
+
+tile = Tile(3)
+print(tile.describe(), tile.to_json())
+print([cls.__name__ for cls in Tile.__mro__])
+print(isinstance(tile, Rectangle), issubclass(Tile, Shape))
+
+
+class Base:
+    def hello(self):
+        return ["Base"]
+
+
+class Left(Base):
+    def hello(self):
+        return ["Left"] + super().hello()
+
+
+class Right(Base):
+    def hello(self):
+        return ["Right"] + super().hello()
+
+
+class Child(Left, Right):
+    def hello(self):
+        return ["Child"] + super().hello()
+
+
+print(Child().hello())
+```
+
+```text
+square with area 9.00 {"height": 3, "name": "square", "width": 3}
+['Tile', 'JsonMixin', 'Square', 'Rectangle', 'Shape', 'object']
+True True
+['Child', 'Left', 'Right', 'Base']
+```
+
+<Definition term="Method resolution order (MRO)">
+
+The order in which Python searches a class and its ancestors for an attribute, stored in `Class.__mro__`. It is computed by the C3 linearisation algorithm, which keeps every class before its bases and keeps the left-to-right order of the bases in each `class` statement.
+
+</Definition>
+
+The last line is the surprising one. `Left`'s `super().hello()` did not call `Base`; it called `Right`, the next class in `Child`'s MRO. `super()` means "the next class after mine *in this object's MRO*", not "my parent". That is what makes **cooperative multiple inheritance** work: each class calls `super()` once, and every class in the diamond runs exactly once.
+
+In practice, deep hierarchies are rare in good Python. Use inheritance for a genuine "is a" relationship, for mixins that add one small capability, and when a framework asks you to subclass its base class. Otherwise prefer **composition**: give your object another object as an attribute and delegate to it. A `Report` that *has* an `Exporter` can switch exporters at run time; a `Report` that *is* a `CsvExporter` cannot.
+
+</Section>
+
+<Section id="dataclasses" kind="computation" title="Dataclasses and enums">
+
+Many classes exist mainly to hold data. Writing `__init__`, `__repr__` and `__eq__` for them by hand is tedious and error-prone, so Python 3.7 added `dataclasses` (PEP 557). The decorator reads the class's annotated fields and generates the methods for you; its options generate more.
+
+```python check
+from dataclasses import FrozenInstanceError, asdict, dataclass, field, replace
+from enum import StrEnum, auto
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class Coordinate:
+    lat: float
+    lon: float
+
+
+class Status(StrEnum):            # Python 3.11+: members are also strings
+    OPEN = auto()                 # auto() gives the lower-cased name, "open"
+    CLOSED = auto()
+
+
+@dataclass(kw_only=True)
+class Station:
+    name: str
+    where: Coordinate
+    lines: list[str] = field(default_factory=list)   # never a bare [] default
+    status: Status = Status.OPEN
+    visits: int = field(default=0, compare=False)    # ignored by ==
+
+    def __post_init__(self):                         # validation after the generated __init__
+        if not self.name:
+            raise ValueError("a station needs a name")
+
+
+central = Station(name="Nairobi Central", where=Coordinate(-1.29, 36.83), lines=["Madaraka Express"])
+busy = replace(central, visits=99)                   # a modified copy
+print(central)
+print(central == busy, central is busy)
+print(sorted([Coordinate(10, 2), Coordinate(-5, 7), Coordinate(10, 1)]))
+print(asdict(central))
+print(Status.CLOSED, Status("open") is Status.OPEN, [s.value for s in Status])
+try:
+    central.where.lat = 0.0
+except FrozenInstanceError as err:
+    print("FrozenInstanceError:", err)
+print(len({Coordinate(1, 2), Coordinate(1, 2)}))
+```
+
+```text
+Station(name='Nairobi Central', where=Coordinate(lat=-1.29, lon=36.83), lines=['Madaraka Express'], status=<Status.OPEN: 'open'>, visits=0)
+True False
+[Coordinate(lat=-5, lon=7), Coordinate(lat=10, lon=1), Coordinate(lat=10, lon=2)]
+{'name': 'Nairobi Central', 'where': {'lat': -1.29, 'lon': 36.83}, 'lines': ['Madaraka Express'], 'status': <Status.OPEN: 'open'>, 'visits': 0}
+closed True ['open', 'closed']
+FrozenInstanceError: cannot assign to field 'lat'
+1
+```
+
+The options you will use most:
+
+| Option | Effect |
+| --- | --- |
+| `frozen=True` | assignment to fields raises; with `eq=True` (the default) you also get a `__hash__` |
+| `order=True` | `<`, `<=`, `>`, `>=` compare fields in order, as tuples |
+| `slots=True` (3.10) | uses `__slots__`: less memory per instance, no stray attributes |
+| `kw_only=True` (3.10) | every field must be passed by keyword |
+| `field(default_factory=list)` | a fresh mutable default per instance |
+| `field(compare=False, repr=False)` | leave a field out of `==` or the repr |
+
+`Coordinate` is the class you wrote by hand as `Money` in lesson 2, in four lines: frozen, ordered, hashable, with a repr. Note that `asdict` converted the nested `Coordinate` and that `StrEnum` members printed as plain strings, both convenient for JSON. Enums in general (`Enum`, `IntEnum`, `StrEnum`, `Flag`) replace magic strings and numbers with named constants that a checker and an IDE can follow.
+
+Two relatives are worth knowing. `typing.NamedTuple` gives an immutable tuple with named fields, useful when a tuple is expected (for example from a database driver). Third-party libraries extend the idea: **attrs** (which inspired dataclasses) adds validators and converters, and **Pydantic** validates and converts untrusted input such as JSON from a web request against the annotated types.
+
+</Section>
+
+<Section id="interfaces" kind="intuition" title="Nominal or structural: ABCs and protocols">
+
+How do you say "any object that can do X"? Python offers two answers.
+
+An **abstract base class** (ABC) is *nominal*: a class satisfies the interface by inheriting from it (or by being registered). Abstract methods must be overridden before the class can be instantiated, and the ABC can supply concrete methods built on the abstract ones. `collections.abc` uses this style.
+
+A **protocol** (PEP 544, Python 3.8) is *structural*: any class with the right methods satisfies it, with no inheritance at all. This is duck typing ("if it walks like a duck...") made visible to type checkers. A protocol is checked by tools such as mypy before the program runs; marked `@runtime_checkable`, it also works with `isinstance`, though that check only looks at method names, not signatures.
+
+```python check
+import io
+from abc import ABC, abstractmethod
+from typing import Protocol, runtime_checkable
+
+
+class Exporter(ABC):
+    @abstractmethod
+    def export(self, rows: list[dict]) -> str: ...
+
+    def export_all(self, tables):            # concrete, built on the abstract method
+        return [self.export(rows) for rows in tables]
+
+
+class CsvExporter(Exporter):
+    def export(self, rows):
+        header = ",".join(rows[0])
+        body = [",".join(str(v) for v in row.values()) for row in rows]
+        return "\n".join([header, *body])
+
+
+try:
+    Exporter()
+except TypeError as err:
+    print("TypeError:", err)
+for text in CsvExporter().export_all([[{"city": "Lima", "rank": 1}, {"city": "Pune", "rank": 2}]]):
+    print(text)
+
+
+@runtime_checkable
+class SupportsClose(Protocol):
+    def close(self) -> None: ...
+
+
+class Connection:                            # does not mention SupportsClose at all
+    def close(self) -> None:
+        print("  connection closed")
+
+
+def shut_down(resources: list[SupportsClose]) -> None:
+    for resource in resources:
+        resource.close()
+
+
+shut_down([Connection(), io.StringIO()])     # a standard-library class fits too
+print(isinstance(Connection(), SupportsClose), isinstance(42, SupportsClose))
+```
+
+```text
+TypeError: Can't instantiate abstract class Exporter without an implementation for abstract method 'export'
+city,rank
+Lima,1
+Pune,2
+  connection closed
+True False
+```
+
+Which to choose? Use a **protocol** when you describe what *callers* need, especially across library boundaries, because existing classes (like `io.StringIO` above) satisfy it without being changed. Use an **ABC** when you are the author of a family of classes and want to share implementation and force subclasses to fill in specific methods. Most new typed code leans towards protocols; lesson 6 shows them working with a type checker.
+
+</Section>
+
+<Section id="descriptors" kind="computation" title="Under the hood: descriptors and class hooks">
+
+How does `kitchen.describe` turn into a method bound to `kitchen`? How does `@property` intercept `kitchen.target = 45`? Both use the **descriptor protocol**: if a class attribute is an object whose type defines `__get__` (and optionally `__set__`), then reading the attribute through an instance calls `__get__` instead of returning the object itself. Functions define `__get__`, which returns a bound method; `property`, `classmethod` and `staticmethod` are descriptor classes too.
+
+You can write your own when the same attribute logic repeats across many classes. A descriptor's `__set_name__` hook (Python 3.6) tells it the name it was assigned to. A related hook, `__init_subclass__`, runs whenever a class is subclassed, which is a light way to build plugin registries without metaclasses:
+
+```python check
+class Positive:
+    """A reusable validated attribute: a descriptor."""
+    def __set_name__(self, owner, name):
+        self.private = "_" + name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:                      # accessed on the class itself
+            return self
+        return getattr(obj, self.private)
+
+    def __set__(self, obj, value):
+        if value <= 0:
+            raise ValueError(f"{self.private[1:]} must be positive, got {value}")
+        setattr(obj, self.private, value)
+
+
+class Parcel:
+    weight_kg = Positive()
+    length_cm = Positive()
+
+    def __init__(self, weight_kg, length_cm):
+        self.weight_kg = weight_kg           # calls Positive.__set__
+        self.length_cm = length_cm
+
+
+box = Parcel(2.5, 40)
+print(box.weight_kg, box.length_cm, vars(box))
+try:
+    box.length_cm = -3
+except ValueError as err:
+    print("ValueError:", err)
+
+
+class Command:
+    registry = {}
+
+    def __init_subclass__(cls, name, **kwargs):   # runs for every subclass
+        super().__init_subclass__(**kwargs)
+        Command.registry[name] = cls
+
+
+class Add(Command, name="add"):
+    pass
+
+
+class Remove(Command, name="rm"):
+    pass
+
+
+print({name: cls.__name__ for name, cls in Command.registry.items()})
+```
+
+```text
+2.5 40 {'_weight_kg': 2.5, '_length_cm': 40}
+ValueError: length_cm must be positive, got -3
+{'add': 'Add', 'rm': 'Remove'}
+```
+
+Descriptors are how ORMs such as Django and SQLAlchemy make `user.email` read from a database row, and how dataclasses' `field` metadata is gathered. You will write one rarely, but recognising the protocol turns a lot of "magic" in libraries into ordinary Python. The [Descriptor Guide](https://docs.python.org/3/howto/descriptor.html) in the official HOWTOs walks through the details, including a pure-Python version of `property`.
+
+</Section>
+
+<Section id="slots" kind="human" title="Memory, slots and other practicalities">
+
+By default every instance has a `__dict__`, a dictionary holding its attributes, which is what makes it possible to add attributes at any time. Declaring `__slots__` replaces the dictionary with fixed storage for the named attributes. Try it:
+
+```python run
+class PointDict:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+
+class PointSlots:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+
+p, q = PointDict(1, 2), PointSlots(1, 2)
+p.z = 3                                   # fine: p has a __dict__
+try:
+    q.z = 3                               # no slot called z
+except AttributeError:
+    print("PointSlots refused the new attribute z")
+print(hasattr(p, "__dict__"), hasattr(q, "__dict__"))
+```
+
+```text
+PointSlots refused the new attribute z
+True False
+```
+
+Slots save memory (noticeably when you have millions of small objects), make attribute access slightly faster, and catch typos such as `self.totl = 0`. The cost is flexibility: no ad-hoc attributes, and some care with multiple inheritance. `@dataclass(slots=True)` is the easiest way to get them.
+
+A few more conventions experienced Python programmers follow:
+
+- **Put a useful `__repr__` on every class** (dataclasses do it for you).
+- **Do the minimum in `__init__`**: assign attributes and validate. Expensive work such as I/O belongs in a classmethod constructor (`Config.from_file(path)`), so objects are cheap to build in tests.
+- **Do not write a class with one method and an `__init__`**. That is a function wearing a costume; write the function, or use a closure or `functools.partial`.
+- **Keep class attributes immutable.** A mutable class attribute is shared by every instance, which is the mutable-default trap in another form.
+
+</Section>
+
+<Section id="history" kind="history" title="How Python's classes grew up">
+
+Python's class system was rebuilt more than once, and traces of each stage are still visible.
+
+- **Python 2.2 (2001)** unified built-in types and user classes (PEPs 252 and 253). Before that you could not subclass `list` or `dict`, and "new-style" classes, which inherit from `object`, had to be requested explicitly. In Python 3 every class is new-style, which is why `object` appears at the end of every MRO.
+- **Python 2.3** adopted the **C3** method resolution order, an algorithm first published for the Dylan language, after the earlier order was shown to behave badly with diamonds.
+- **Python 3.0** added abstract base classes (PEP 3119) and class decorators (PEP 3129), the hook that `@dataclass` relies on.
+- **Python 3.7** added `dataclasses` (PEP 557), whose design openly credits the third-party **attrs** library; **3.8** added protocols (PEP 544); **3.10** added `slots=True` and `kw_only=True` to dataclasses.
+
+The direction of travel is clear: less boilerplate written by hand, more declared intent that tools can check. Each step was proposed, argued and recorded in a PEP, so when a design choice puzzles you, the PEP usually explains it.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`super()` calls the parent class."** It calls the *next class in the instance's MRO*. With single inheritance that is the parent; with multiple inheritance it may be a sibling, as `Child().hello()` showed.
+
+</Misconception>
+
+<Misconception>
+
+**"Double underscores make an attribute private."** They trigger name mangling, which only prevents accidental clashes between a class and its subclasses. Anyone can still reach `obj._Class__attr`. Python relies on convention (`_internal`) rather than enforcement.
+
+</Misconception>
+
+<Misconception>
+
+**"Good object-oriented code needs getters and setters."** In Python, expose plain attributes; switch to a property only when you need logic, and callers will not notice the change.
+
+</Misconception>
+
+<Misconception>
+
+**"Robust code checks `isinstance` before using an object."** Python code usually just uses the object and lets a missing method raise an error, which is duck typing. Explicit `isinstance` checks against concrete classes reject perfectly good objects (a `StringIO` where you expected a file, a `tuple` where you expected a `list`). When you need to state an expectation, annotate the parameter with a protocol or an ABC from `collections.abc` and let the type checker verify callers.
+
+</Misconception>
+
+<Misconception>
+
+**"Everything belongs in a class."** A module is already a namespace and a natural singleton: a `utils` class full of staticmethods is better as a module of functions, and a class created only to hold configuration is often better as a frozen dataclass instance or a few module-level constants.
+
+</Misconception>
+
+<Misconception>
+
+**"A `frozen` dataclass is deeply immutable."** Freezing stops you rebinding the fields, but a field that holds a list can still be mutated (`station.lines.append(...)`). For true immutability, use immutable field types such as tuples, `frozenset` and, from Python 3.15, the built-in `frozendict`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The last exercise asks you to design a small dataclass with validation.
+
+<Exercises/>
+
+</Section>

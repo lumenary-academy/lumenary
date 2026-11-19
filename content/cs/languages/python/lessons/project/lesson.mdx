@@ -1,0 +1,509 @@
+---
+title: "Project: a log report, built, tested and profiled"
+subtitle: A complete command-line tool from the standard library, written in idiomatic style, tested with pytest and measured with a profiler, then where to go next.
+minutes: 70
+objectives:
+  - Find your way around the standard library and know which module to reach for
+  - Build a complete command-line tool from small, typed, testable pieces
+  - Test it with pytest, including logging, files, output and exit statuses
+  - Profile a program, find its hot spots, and judge which optimisations are worth making
+  - Plan your next steps as a professional Python programmer
+prerequisites: [concurrency]
+references:
+  - title: "The Python Standard Library (index)"
+    url: https://docs.python.org/3/library/index.html
+  - title: "Logging HOWTO"
+    url: https://docs.python.org/3/howto/logging.html
+  - title: "The Python Standard Library: argparse"
+    url: https://docs.python.org/3/library/argparse.html
+  - title: "The Python Profilers"
+    url: https://docs.python.org/3/library/profile.html
+  - title: "The Python Standard Library: timeit"
+    url: https://docs.python.org/3/library/timeit.html
+  - title: "The Python Standard Library: tracemalloc"
+    url: https://docs.python.org/3/library/tracemalloc.html
+  - title: py-spy
+    url: https://github.com/benfred/py-spy
+    note: A sampling profiler that attaches to a running Python process.
+  - title: Fluent Python
+    author: Luciano Ramalho
+    url: https://www.fluentpython.com/
+    note: A deep, book-length treatment of the language's data model and idioms.
+  - title: Architecture Patterns with Python
+    author: Harry Percival and Bob Gregory
+    url: https://www.cosmicpython.com/
+    note: Structuring larger applications; free to read online.
+---
+
+<Section id="motivation" kind="motivation" title="Putting it all together">
+
+This last lesson builds one complete program, the way you would at work. The tool is **logstat**, which reads a web server's access log and prints a summary: how many requests succeeded or failed, which paths are busiest, and how slow the slowest requests are. It is small enough to read in one sitting, and it uses nearly everything from this course: dataclasses and type hints, a generator pipeline, the data model (`Counter` and friends), exceptions and logging, a context manager, argument parsing, and a `main` function that returns an exit status. Then we test it with pytest and measure it with a profiler.
+
+Every module it imports comes from the **standard library**, Python's famous "batteries included". That is deliberate. Knowing what is already in the box is one of the clearest signs of an experienced Python programmer, so we start with a map.
+
+</Section>
+
+<Section id="stdlib" kind="reading" title="A map of the standard library">
+
+The standard library has over two hundred modules. You do not need to know them all, but you should know which drawer to open. These are the ones professionals reach for most:
+
+| Area | Modules | Typical use |
+| --- | --- | --- |
+| Text | `re`, `string`, `textwrap`, `difflib`, `unicodedata` | patterns, templates, wrapping, diffs, Unicode properties |
+| Data structures | `collections`, `heapq`, `bisect`, `array`, `enum`, `dataclasses` | counters, deques, default dicts, priority queues, sorted inserts |
+| Numbers | `math`, `decimal`, `fractions`, `statistics`, `random` | exact decimals for money, means and quantiles, seeded randomness |
+| Time | `datetime`, `zoneinfo`, `time` | dates with real time zones, timers |
+| Files and paths | `pathlib`, `shutil`, `tempfile`, `glob` | paths as objects, copying, temporary directories |
+| Formats | `json`, `csv`, `tomllib`, `sqlite3`, `zipfile`, `gzip`, `compression.zstd` (3.14) | reading and writing data, an embedded SQL database |
+| Operating system | `os`, `sys`, `subprocess`, `signal`, `shlex` | environment, running other programs |
+| Concurrency | `threading`, `concurrent.futures`, `asyncio`, `multiprocessing`, `queue` | lesson 9 |
+| Networking | `urllib.request`, `http.client`, `http.server`, `socket`, `ssl` | simple HTTP clients and servers |
+| Functional tools | `itertools`, `functools`, `operator` | lessons 3 and 4 |
+| Development | `logging`, `argparse`, `unittest`, `doctest`, `pdb`, `cProfile`, `timeit`, `tracemalloc`, `warnings`, `typing` | the tools of this lesson |
+
+Two judgements come with experience. First, for some jobs the community has standardised on a third-party package even though the standard library can do it: HTTP clients (requests, httpx), data frames (pandas, Polars), arrays (NumPy), command-line interfaces (Click, Typer) and data validation (Pydantic). Second, the standard library is conservative by design, so its modules change slowly and stay compatible for years. That makes it the right default for small tools like ours, where avoiding dependencies means the tool runs anywhere Python does.
+
+</Section>
+
+<Section id="project" kind="examples" title="The program">
+
+Each line of the log records one request:
+
+```text
+2026-11-02T10:15:03 GET /api/orders 200 123ms
+```
+
+The design follows the habits from earlier lessons. **Parsing** is separated from **summarising**, which is separated from **rendering** and from the **command line**, so each part can be tested alone. Parsing is a generator, so the tool streams a log of any size. A malformed line is logged and skipped rather than crashing the run, because one corrupt line should not hide a million good ones. `main` takes its arguments as a list and *returns* an exit status instead of calling `sys.exit` itself, which makes it easy to call from tests. Read it from the top:
+
+```python check
+"""logstat: summarise a web server's access log.
+
+Each line looks like:  2026-11-02T10:15:03 GET /api/orders 200 123ms
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import statistics
+import sys
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+log = logging.getLogger("logstat")
+
+LINE = re.compile(r"(?P<when>\S+) (?P<method>[A-Z]+) (?P<path>\S+) (?P<status>\d{3}) (?P<ms>\d+)ms")
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    when: datetime
+    method: str
+    path: str
+    status: int
+    ms: int
+
+
+class Malformed(ValueError):
+    """A line that does not follow the log format."""
+
+
+def parse_line(line: str) -> Request:
+    match = LINE.fullmatch(line.strip())
+    if match is None:
+        raise Malformed(f"cannot parse {line.strip()!r}")
+    return Request(
+        when=datetime.fromisoformat(match["when"]),
+        method=match["method"],
+        path=match["path"],
+        status=int(match["status"]),
+        ms=int(match["ms"]),
+    )
+
+
+def parse(lines: Iterable[str]) -> Iterator[Request]:
+    """Yield requests, skipping (and logging) malformed lines."""
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            yield parse_line(line)
+        except (Malformed, ValueError) as err:
+            log.warning("line %d skipped: %s", number, err)
+
+
+def summarise(requests: Iterable[Request], top: int = 3) -> dict:
+    statuses: Counter[str] = Counter()
+    paths: Counter[str] = Counter()
+    latencies: defaultdict[str, list[int]] = defaultdict(list)
+    for r in requests:
+        statuses[f"{r.status // 100}xx"] += 1
+        paths[r.path] += 1
+        latencies[r.path].append(r.ms)
+    every = sorted(ms for values in latencies.values() for ms in values)
+    if not every:
+        return {"requests": 0}
+    cuts = statistics.quantiles(every, n=100, method="inclusive") if len(every) > 1 else [every[0]] * 99
+    return {
+        "requests": len(every),
+        "status_classes": dict(sorted(statuses.items())),
+        "busiest": [{"path": p, "requests": n, "median_ms": statistics.median(latencies[p])}
+                    for p, n in paths.most_common(top)],
+        "latency_ms": {"p50": cuts[49], "p95": cuts[94], "p99": cuts[98]},
+    }
+
+
+def render_text(summary: dict) -> str:
+    if summary["requests"] == 0:
+        return "no requests"
+    lines = [f"{summary['requests']:,} requests"]
+    lines += [f"  {cls}: {n:,}" for cls, n in summary["status_classes"].items()]
+    lines.append("busiest paths:")
+    lines += [f"  {b['path']:<16}{b['requests']:>6,}  median {b['median_ms']:g} ms" for b in summary["busiest"]]
+    lat = summary["latency_ms"]
+    lines.append(f"latency: p50 {lat['p50']:g} ms, p95 {lat['p95']:g} ms, p99 {lat['p99']:g} ms")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="logstat", description="Summarise an access log.")
+    parser.add_argument("logfile", type=Path)
+    parser.add_argument("--top", type=int, default=3, help="how many busy paths to show")
+    parser.add_argument("--format", choices=["text", "json"], default="text")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(levelname)s %(message)s", stream=sys.stdout, force=True)
+    try:
+        with args.logfile.open(encoding="utf-8") as f:
+            summary = summarise(parse(f), top=args.top)
+    except OSError as err:
+        log.error("cannot read %s: %s", args.logfile.name, err.strerror)
+        return 2
+    print(json.dumps(summary, indent=2) if args.format == "json" else render_text(summary))
+    return 0
+
+
+def demo() -> None:
+    """Write a sample log with a fixed random seed, then run the tool on it three ways."""
+    import random
+    import tempfile
+
+    rng = random.Random(2026)
+    paths = ["/", "/api/orders", "/api/stock", "/login", "/img/logo.png"]
+    with tempfile.TemporaryDirectory() as tmp:
+        log_file = Path(tmp, "access.log")
+        with log_file.open("w", encoding="utf-8") as f:
+            for i in range(5000):
+                path = rng.choices(paths, weights=[5, 9, 4, 2, 6])[0]
+                status = rng.choices([200, 304, 404, 500], weights=[90, 6, 3, 1])[0]
+                ms = int(rng.lognormvariate(3.5, 0.6)) + (400 if path == "/api/stock" else 0)
+                f.write(f"2026-11-02T{10 + i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d} GET {path} {status} {ms}ms\n")
+            f.write("this line is garbage\n")
+        print("exit status", main([str(log_file)]))
+        print("exit status", main([str(log_file), "--top", "1", "--format", "json"]))
+        print("exit status", main([str(Path(tmp, "missing.log"))]))
+
+
+if __name__ == "__main__":
+    demo()                  # in the real logstat.py:  sys.exit(main())
+```
+
+```text
+WARNING line 5001 skipped: cannot parse 'this line is garbage'
+5,000 requests
+  2xx: 4,514
+  3xx: 289
+  4xx: 150
+  5xx: 47
+busiest paths:
+  /api/orders      1,790  median 32 ms
+  /img/logo.png    1,118  median 33 ms
+  /                  925  median 31 ms
+latency: p50 37 ms, p95 441 ms, p99 475.01 ms
+exit status 0
+WARNING line 5001 skipped: cannot parse 'this line is garbage'
+{
+  "requests": 5000,
+  "status_classes": {
+    "2xx": 4514,
+    "3xx": 289,
+    "4xx": 150,
+    "5xx": 47
+  },
+  "busiest": [
+    {
+      "path": "/api/orders",
+      "requests": 1790,
+      "median_ms": 32.0
+    }
+  ],
+  "latency_ms": {
+    "p50": 37.0,
+    "p95": 441.0,
+    "p99": 475.01
+  }
+}
+exit status 0
+ERROR cannot read missing.log: No such file or directory
+exit status 2
+```
+
+Points worth noticing:
+
+- **`Request` is a frozen, slotted dataclass**: immutable, hashable, compact, and printed readably in a debugger.
+- **The regular expression uses named groups** (`(?P<status>\d{3})`), and `fullmatch` rejects lines with anything extra. Converting the timestamp with `datetime.fromisoformat` validates it too: a month of 13 raises `ValueError`, which `parse` catches along with our own `Malformed`.
+- **`log = logging.getLogger("logstat")`** at module level, then `log.warning(...)` with `%s` placeholders. The logging module formats the message only if it will actually be emitted, and the *application* (here `main`) decides where messages go and at what level with `basicConfig`. A library should never configure logging itself; it should only create loggers. (We send log records to standard output in this demonstration so that they appear in the captured output; a real tool would leave them on standard error, the default.)
+- **`statistics.quantiles`** computes the percentiles. The 95th and 99th percentiles, not the average, are what operations teams watch, because the average hides the slow tail that users actually feel; here the slow `/api/stock` endpoint dominates the tail.
+- **Exit statuses** follow the Unix convention: 0 for success, non-zero for failure (argparse itself exits with 2 for bad arguments, so we reuse 2 for an unreadable file). Lesson 8's `[project.scripts]` would turn `main` into a `logstat` command.
+
+To make the program runnable here without a log file, the check version ends with a `demo()` that writes a sample log, using a seeded random generator so the output is reproducible, and calls `main` three times. The real file ends with `if __name__ == "__main__": sys.exit(main())`.
+
+</Section>
+
+<Section id="tests" kind="computation" title="Testing the tool">
+
+The tests live in `test_logstat.py`, next to `logstat.py` (in a packaged project they would go in `tests/` and import the installed package). Notice how each part of the design is tested at its own level: `parse_line` with single strings, `parse` with a list of lines (and pytest's `caplog` fixture to check the warning), `summarise` with a hundred synthetic requests whose percentiles we can work out by hand, and `main` end to end with a temporary file (`tmp_path`) and captured output (`capsys`):
+
+```python
+import json
+from datetime import datetime
+
+import pytest
+
+from logstat import main, parse, parse_line, summarise
+
+
+def test_parse_line():
+    r = parse_line("2026-11-02T10:15:03 GET /api/orders 200 123ms\n")
+    assert r.when == datetime(2026, 11, 2, 10, 15, 3)
+    assert (r.method, r.path, r.status, r.ms) == ("GET", "/api/orders", 200, 123)
+
+
+@pytest.mark.parametrize("bad", [
+    "GET / 200 5ms",                         # no timestamp
+    "2026-11-02T10:15:03 GET / 2000 5ms",    # status has four digits
+    "2026-13-02T10:15:03 GET / 200 5ms",     # month 13
+])
+def test_parse_line_rejects(bad):
+    with pytest.raises(ValueError):
+        parse_line(bad)
+
+
+def test_parse_skips_and_logs_bad_lines(caplog):
+    lines = ["2026-11-02T10:00:00 GET / 200 10ms", "nonsense", "", "2026-11-02T10:00:01 GET / 404 20ms"]
+    assert [r.status for r in parse(lines)] == [200, 404]
+    assert "line 2 skipped" in caplog.text
+
+
+def test_summary_counts_and_percentiles():
+    lines = [f"2026-11-02T10:{s // 60:02d}:{s % 60:02d} GET /a 200 {s + 1}ms" for s in range(100)]
+    summary = summarise(parse(lines), top=1)
+    assert summary["requests"] == 100
+    assert summary["status_classes"] == {"2xx": 100}
+    assert summary["busiest"] == [{"path": "/a", "requests": 100, "median_ms": 50.5}]
+    assert summary["latency_ms"]["p50"] == pytest.approx(50.5)
+
+
+def test_empty_log():
+    assert summarise([]) == {"requests": 0}
+
+
+def test_main_json(tmp_path, capsys):
+    log_file = tmp_path / "access.log"
+    log_file.write_text("2026-11-02T10:00:00 GET /x 500 7ms\n", encoding="utf-8")
+    assert main([str(log_file), "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status_classes"] == {"5xx": 1}
+
+
+def test_main_missing_file(tmp_path):
+    assert main([str(tmp_path / "nope.log")]) == 2
+```
+
+Running `pytest -q` in that directory (pytest 8.4):
+
+```text
+.........                                                                [100%]
+9 passed in 0.02s
+```
+
+The summary test is the important one. With latencies 1 to 100 ms, the median is 50.5 ms, a number we can check by reasoning rather than by copying whatever the code printed. Tests that merely record current output, without anyone checking it is right, are much weaker.
+
+</Section>
+
+<Section id="performance" kind="computation" title="Measure before you optimise">
+
+Is logstat fast enough? The only honest way to answer is to **measure**. The standard library's deterministic profiler, `cProfile`, records every function call. Profiling the summary of 200,000 generated lines:
+
+```python
+import cProfile, io, pstats, random
+from logstat import parse, summarise
+
+rng = random.Random(1)
+paths = ["/", "/api/orders", "/api/stock", "/login"]
+lines = [f"2026-11-02T10:{i // 60 % 60:02d}:{i % 60:02d} GET {rng.choice(paths)} 200 {rng.randrange(5, 900)}ms"
+         for i in range(200_000)]
+prof = cProfile.Profile()
+prof.enable()
+summarise(parse(lines))
+prof.disable()
+out = io.StringIO()
+pstats.Stats(prof, stream=out).strip_dirs().sort_stats("tottime").print_stats(8)
+print(out.getvalue())
+```
+
+One run with CPython 3.13 printed:
+
+```text
+         1800523 function calls (1800518 primitive calls) in 2.251 seconds
+
+   Ordered by: internal time
+   List reduced from 127 to 8 due to restriction <8>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+   200000    0.711    0.000    1.383    0.000 logstat.py:37(parse_line)
+        1    0.378    0.378    2.251    2.251 logstat.py:61(summarise)
+   200000    0.340    0.000    0.340    0.000 <string>:2(__init__)
+   200000    0.217    0.000    0.217    0.000 {method 'fullmatch' of 're.Pattern' objects}
+   200001    0.215    0.000    1.650    0.000 logstat.py:50(parse)
+        6    0.131    0.022    0.160    0.027 {built-in method builtins.sorted}
+   400000    0.102    0.000    0.102    0.000 {method 'strip' of 'str' objects}
+   200000    0.065    0.000    0.065    0.000 {built-in method fromisoformat}
+```
+
+`tottime` is time spent in the function itself; `cumtime` includes the functions it calls. The picture is a flat one: about 11 microseconds per line under the profiler (which itself adds overhead), spread across the regular expression, the dataclass's generated `__init__` (shown as `<string>:2(__init__)`), string stripping and the summary. There is no single culprit. Micro-optimisations, such as unpacking `match.groups()` once instead of five named lookups, or using a `NamedTuple` instead of a frozen dataclass, each shave roughly ten to thirty percent off the parsing time when measured with `timeit`. For a tool that summarises a day's log in about a second, that is not worth less readable code. **Knowing when to stop is part of performance work.**
+
+Profiles are not always flat. When one function dominates, the fix is usually an algorithmic one, and the gain is not tens of percent but orders of magnitude. Here is the classic case, a membership test against a list:
+
+```python check
+"""Profile, find the hot spot, fix it, and measure again."""
+import cProfile
+import io
+import pstats
+import random
+import re
+import timeit
+from collections import Counter
+
+rng = random.Random(7)
+VOCABULARY = [f"word{i}" for i in range(3000)]
+STOP_LIST = [f"word{i}" for i in range(0, 3000, 10)]      # 300 common words to ignore
+STOP_SET = frozenset(STOP_LIST)
+TEXT = " ".join(rng.choice(VOCABULARY) for _ in range(100_000))
+
+
+def tokens(text):
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def interesting_slow(word):
+    return word not in STOP_LIST            # scans up to 300 strings every time
+
+
+def interesting_fast(word):
+    return word not in STOP_SET             # one hash lookup
+
+
+def top_words(text, interesting, n=3):
+    return Counter(w for w in tokens(text) if interesting(w)).most_common(n)
+
+
+profiler = cProfile.Profile()
+profiler.enable()
+slow = top_words(TEXT, interesting_slow)
+profiler.disable()
+report = io.StringIO()
+pstats.Stats(profiler, stream=report).strip_dirs().sort_stats("tottime").print_stats(3)
+print(report.getvalue().strip())
+
+fast = top_words(TEXT, interesting_fast)
+print("same answer:", slow == fast, fast)
+for name, func in [("list", interesting_slow), ("frozenset", interesting_fast)]:
+    seconds = min(timeit.repeat(lambda: func("word2999"), number=10_000, repeat=5)) / 10_000
+    print(f"membership in a {name:<9}: {seconds * 1e9:8.0f} ns per lookup")
+```
+
+```text
+190542 function calls (190521 primitive calls) in 0.547 seconds
+
+   Ordered by: internal time
+   List reduced from 168 to 3 due to restriction <3>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+   100000    0.421    0.000    0.421    0.000 main.py:21(interesting_slow)
+    90070    0.054    0.000    0.475    0.000 main.py:30(<genexpr>)
+        1    0.040    0.040    0.515    0.515 {built-in method _collections._count_elements}
+same answer: True [('word2835', 54), ('word2693', 53), ('word2195', 53)]
+membership in a list     :     4008 ns per lookup
+membership in a frozenset:       90 ns per lookup
+```
+
+The profile points straight at `interesting_slow`, which accounts for most of the run. Each call scans a list of 300 stop words; a `frozenset` answers the same question with one hash lookup. `timeit`, which repeats a statement many times and takes the best of several runs to reduce noise, shows the difference per lookup. (Timings vary between machines and runs; the ratio is what matters.)
+
+What experienced Python engineers do when something is too slow, roughly in order:
+
+1. **Measure** with a profiler: `python -m cProfile -s tottime script.py` for a quick look; the sampling profilers **py-spy** and **Scalene**, or Python 3.15's new built-in `profiling.sampling` (Tachyon), to look inside a long-running or production process with almost no overhead; `tracemalloc` when the problem is memory.
+2. **Fix the algorithm and the data structures**: sets and dicts for lookups, avoiding repeated work, streaming instead of loading everything, a database index instead of a scan.
+3. **Use the built-ins and the standard library**, which are implemented in C: `sum`, `sorted`, `Counter`, `str.join`, `itertools`.
+4. **Move numeric loops into vectorised libraries** such as NumPy, pandas or Polars, which run them in compiled code.
+5. **Use concurrency** where the program waits (lesson 9).
+6. **Compile the hot spot**: Cython, mypyc (which compiles type-annotated Python), or an extension written in Rust with PyO3. Or run the whole program on PyPy, whose JIT compiler often speeds up pure-Python loops several times.
+
+And keep an eye on CPython itself: the 3.11 release notes report an average speedup of about 1.25 times over 3.10 on the standard benchmark suite, and 3.13 introduced an experimental JIT compiler that 3.15 upgraded significantly. Upgrading Python is often the cheapest optimisation there is.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the language as professionals use it. Where you go from here depends on what you want to build, but these resources stay useful in every direction:
+
+- **The official documentation**: the [Library Reference](https://docs.python.org/3/library/index.html), the [Language Reference](https://docs.python.org/3/reference/) and the HOWTOs (logging, descriptors, sorting, regular expressions). Read the *What's New* page of every release; it is the fastest way to keep up.
+- **The PEPs**, at [peps.python.org](https://peps.python.org/), for the reasoning behind every feature, and [discuss.python.org](https://discuss.python.org/), where new proposals are debated in the open.
+- **Packaging and typing**: the [Python Packaging User Guide](https://packaging.python.org/) and the [typing documentation](https://typing.python.org/).
+- **Books** with official sites: *Fluent Python* by Luciano Ramalho ([fluentpython.com](https://www.fluentpython.com/)) goes deeper into almost every topic of this course; *Effective Python* by Brett Slatkin ([effectivepython.com](https://effectivepython.com/)) is a collection of focused best practices; *Architecture Patterns with Python* by Harry Percival and Bob Gregory ([cosmicpython.com](https://www.cosmicpython.com/)) is about structuring large applications.
+- **Talks**: recordings from PyCon US ([us.pycon.org](https://us.pycon.org/)) and regional PyCons around the world are indexed at [pyvideo.org](https://pyvideo.org/).
+- **Contributing**: the [Python Developer's Guide](https://devguide.python.org/) explains how to contribute to CPython itself, and almost every library you use welcomes documentation fixes, bug reports and tests. Reading and contributing to real projects is how good programmers become excellent ones.
+
+Then pick a domain and go deep: web services (Django, FastAPI, Flask), data (pandas, Polars, DuckDB), science and machine learning (NumPy, SciPy, PyTorch, JAX), automation and infrastructure, or education. The Python you learned here is the same in all of them.
+
+<Reflection title="Code as a gift to the next reader">
+
+The Zen of Python says readability counts, and much of this course has been about writing code that someone else, often your future self, can understand and trust: clear names, small functions, honest error messages, tests that say what they check. There is something quietly generous in that discipline. Most of what we write is read far more often than it is written, by people we will never meet. Writing it with care, so that it serves them well, is a small daily way of treating others as we would want to be treated.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"I can tell where the program is slow by reading it."** Experienced engineers are regularly wrong about this, which is why they profile first. In logstat, the regular expression looks like the obvious cost, yet `fullmatch` takes well under a fifth of the time.
+
+</Misconception>
+
+<Misconception>
+
+**"Print statements are fine for diagnostics in a real tool."** `print` cannot be turned off, filtered by severity, timestamped or redirected per module. `logging` can, and a library that logs instead of printing lets each application decide what it wants to see.
+
+</Misconception>
+
+<Misconception>
+
+**"A tool should call `sys.exit()` wherever it fails."** Exiting from deep inside a program makes it impossible to test or reuse. Raise exceptions in the core, turn them into messages and an exit status in `main`, and call `sys.exit(main())` exactly once, at the bottom.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Some exercises extend logstat; the last asks you to write a small piece of it yourself.
+
+<Exercises/>
+
+</Section>

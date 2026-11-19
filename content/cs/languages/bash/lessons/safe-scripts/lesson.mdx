@@ -1,0 +1,358 @@
+---
+title: Scripts that fail safely
+subtitle: Strict mode and its caveats, cleaning up with trap, checking scripts with ShellCheck, debugging with xtrace, and the defensive habits that keep shell scripts from doing damage.
+minutes: 55
+objectives:
+  - Explain what set -e, set -u and set -o pipefail do, and the cases where set -e does not stop a script
+  - Use mktemp and trap to clean up reliably, whatever way a script ends
+  - Run ShellCheck, read its warnings, and fix the bugs it finds
+  - Debug a script with bash -n, set -x and PS4
+  - Apply the defensive habits that prevent destructive mistakes
+prerequisites: [text-processing]
+references:
+  - title: ShellCheck
+    url: https://www.shellcheck.net/
+    note: Paste a script to check it online, or install the shellcheck command; each warning has a wiki page explaining it.
+  - title: ShellCheck on GitHub
+    url: https://github.com/koalaman/shellcheck
+  - title: "Bash Reference Manual: The Set Builtin"
+    url: https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html
+  - title: "BashFAQ 105: Why doesn't set -e do what I expected?"
+    url: https://mywiki.wooledge.org/BashFAQ/105
+  - title: "BashPitfalls"
+    url: https://mywiki.wooledge.org/BashPitfalls
+    note: A long list of common mistakes, each with an explanation and a fix.
+---
+
+<Section id="motivation" kind="motivation" title="Small scripts, large consequences">
+
+Shell scripts often run with real power: as an administrator, in a deployment pipeline, on every user's machine as part of an installer. They delete files, move data and restart services. And by default, Bash is extraordinarily forgiving: an unset variable expands to nothing, a failed command is followed by the next one as if nothing happened, and a file name with a space quietly becomes two.
+
+Put those together and you get the classic disaster. A widely reported bug in 2015 in the Linux launcher script of the Steam game client contained a line like `rm -rf "$STEAMROOT/"*`; in some circumstances `STEAMROOT` was empty, the line became `rm -rf /*`, and users lost every file they could write to. Nothing about the line looks dangerous at a glance. That is the point of this lesson: safety in shell scripting comes from habits and tools, not from being careful on the day.
+
+</Section>
+
+<Section id="strict-mode" kind="definitions" title="Strict mode, and what it does not do">
+
+Many professional scripts start with the same line, often called "unofficial strict mode":
+
+```bash
+set -euo pipefail
+```
+
+<Definition term="set -e (errexit)">
+
+Exit immediately when a command fails (returns a non-zero status), instead of carrying on.
+
+</Definition>
+
+<Definition term="set -u (nounset)">
+
+Treat the expansion of an unset variable as an error. A typo such as `$nmae` stops the script instead of silently becoming an empty string.
+
+</Definition>
+
+<Definition term="set -o pipefail">
+
+A pipeline fails if any of its commands fails, not only the last one (lesson 3).
+
+</Definition>
+
+With `-u`, the Steam line would have stopped with "STEAMROOT: unbound variable" if the variable had been unset, and `${STEAMROOT:?}` would have caught the empty case too. Strict mode is valuable, but `set -e` in particular has rules that surprise everyone. This script shows the main ones; each case runs in a child `bash` so that the main script survives to show the next:
+
+```bash check
+#!/usr/bin/env bash
+# Each demonstration runs in a child bash, so its failure does not stop this script.
+demo() {
+    printf '$ %s\n' "$1"
+    bash -c "$1" 2>&1
+    echo "  (exit status $?)"
+}
+
+demo 'false; echo "without -e, the script carries on"'
+demo 'set -e; false; echo "never printed"'
+demo 'set -e; if false; then :; fi; false || true; echo "failures inside conditions are allowed"'
+# shellcheck disable=SC2016  # the single quotes are deliberate: the child shell expands $nmae
+demo 'set -u; echo "Hello, $nmae"'
+demo 'set -e; false | true; echo "without pipefail, the failing first stage is ignored"'
+demo 'set -eo pipefail; false | true; echo "never printed"'
+demo 'set -e; count=0; (( count++ )); echo "never printed: (( 0 )) counts as a failure"'
+demo 'set -e; f() { false; echo "still running inside f"; }; f || echo "f failed"'
+```
+
+```text
+$ false; echo "without -e, the script carries on"
+without -e, the script carries on
+  (exit status 0)
+$ set -e; false; echo "never printed"
+  (exit status 1)
+$ set -e; if false; then :; fi; false || true; echo "failures inside conditions are allowed"
+failures inside conditions are allowed
+  (exit status 0)
+$ set -u; echo "Hello, $nmae"
+bash: line 1: nmae: unbound variable
+  (exit status 127)
+$ set -e; false | true; echo "without pipefail, the failing first stage is ignored"
+without pipefail, the failing first stage is ignored
+  (exit status 0)
+$ set -eo pipefail; false | true; echo "never printed"
+  (exit status 1)
+$ set -e; count=0; (( count++ )); echo "never printed: (( 0 )) counts as a failure"
+  (exit status 1)
+$ set -e; f() { false; echo "still running inside f"; }; f || echo "f failed"
+still running inside f
+  (exit status 0)
+```
+
+What to take from it:
+
+- **Failures that are tested are allowed.** A command in an `if` condition, or on the left of `&&` or `||`, may fail without stopping the script, because the script is visibly handling it. That is what makes `grep -q x file || echo missing` possible under `set -e`.
+- **`(( count++ ))` fails when `count` is 0**, because the expression's value is 0. Write `(( ++count ))` or `count=$(( count + 1 ))` in strict scripts.
+- **The worst surprise: `set -e` is switched off for the whole body of a function called in a tested context.** `f || echo "f failed"` ran `f` with `-e` disabled, so `false` inside it did not stop anything, and because `f`'s last command succeeded, "f failed" was never printed. Do not rely on `set -e` inside functions you call from conditions; check important commands explicitly (`cmd || return 1`).
+- Also remember lesson 5's trap: `local out=$(cmd)` hides `cmd`'s failure from `set -e`.
+
+The professional consensus is that strict mode is worth using, as a safety net, but it is not a substitute for checking the commands that matter.
+
+</Section>
+
+<Section id="cleanup" kind="examples" title="Temporary files and cleanup with trap">
+
+Scripts often need scratch space. Two rules: create it with **`mktemp`**, which makes a new file or directory with an unpredictable name (fixed names like `/tmp/data.txt` collide with other runs and can be abused by other users), and remove it with a **`trap`** on `EXIT`, which runs however the script ends: normally, through `exit`, or because `set -e` stopped it.
+
+```bash check
+#!/usr/bin/env bash
+export TMPDIR=$PWD            # keep this demonstration's temporary files in its own directory
+
+cat > job.sh <<'JOB'
+#!/usr/bin/env bash
+set -euo pipefail
+work=$(mktemp -d)                         # a new, private, uniquely named directory
+echo "$work" > workdir.txt
+trap 'rm -rf -- "$work"; echo "cleanup ran"' EXIT   # runs however the script ends
+echo "processing..."
+touch "$work/partial.dat"
+false                                     # something fails half-way through
+echo "never reached"
+JOB
+
+bash job.sh || echo "job.sh failed with status $?"
+if [[ -d $(< workdir.txt) ]]; then echo "temporary directory left behind"; else echo "temporary directory removed"; fi
+```
+
+```text
+processing...
+cleanup ran
+job.sh failed with status 1
+temporary directory removed
+```
+
+The child script failed half-way, yet its cleanup ran and the temporary directory is gone. (The demonstration points `TMPDIR` at its own working directory; normally `mktemp` uses `/tmp`.) `trap` can also catch signals such as `INT` (Ctrl-C) and `TERM`, which lesson 8 covers. Two details matter in the trap itself: single quotes, so that `$work` is expanded when the trap *runs*, and `rm -rf --` with the variable quoted, so that a strange name cannot become an option.
+
+</Section>
+
+<Section id="shellcheck" kind="computation" title="ShellCheck: a linter that knows the traps">
+
+**ShellCheck**, written by Vidar Holen and first released in 2012, reads shell scripts and reports bugs and risky constructs, each with a code (SC2086, SC2164, …) and a wiki page explaining it. It knows nearly every pitfall in this course. Most professional teams run it in their editor and in CI, and treat its warnings like compiler errors. Here is a short script with several of the bugs you have learned about:
+
+```bash
+#!/usr/bin/env bash
+# rotate.sh: keep only the newest N backups in a directory
+dir=$1
+keep=${2:-5}
+cd $dir
+for f in $(ls -t *.tar.gz | tail -n +$((keep+1))); do
+    rm $f
+done
+echo "Kept $keep backups in $dir"
+```
+
+Running `shellcheck rotate.sh` (version 0.8.0) prints:
+
+```text
+
+In rotate.sh line 5:
+cd $dir
+^-----^ SC2164 (warning): Use 'cd ... || exit' or 'cd ... || return' in case cd fails.
+   ^--^ SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+cd "$dir" || exit
+
+
+In rotate.sh line 6:
+for f in $(ls -t *.tar.gz | tail -n +$((keep+1))); do
+           ^------------^ SC2012 (info): Use find instead of ls to better handle non-alphanumeric filenames.
+                 ^-- SC2035 (info): Use ./*glob* or -- *glob* so names with dashes won't become options.
+
+
+In rotate.sh line 7:
+    rm $f
+       ^-- SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+    rm "$f"
+
+For more information:
+  https://www.shellcheck.net/wiki/SC2164 -- Use 'cd ... || exit' or 'cd ... |...
+  https://www.shellcheck.net/wiki/SC2012 -- Use find instead of ls to better ...
+  https://www.shellcheck.net/wiki/SC2035 -- Use ./*glob* or -- *glob* so name...
+```
+
+Every warning points at a real failure: if `cd` fails (a typo in the directory name), the loop runs in the *wrong directory* and deletes the wrong files; unquoted `$dir` and `$f` break on spaces; parsing `ls` breaks on unusual names; a file named `-rf.tar.gz` would be read as options. Here is a rewrite that passes ShellCheck cleanly. It relies on the backups having dated names, so that sorting by name is sorting by age, and it uses an array instead of parsing `ls`:
+
+```bash check
+#!/usr/bin/env bash
+# rotate: keep only the newest N backups in a directory (fixed version).
+set -euo pipefail
+
+rotate() {
+    local dir=${1:?usage: rotate DIR [KEEP]} keep=${2:-5}
+    [[ -d $dir ]] || { echo "rotate: not a directory: $dir" >&2; return 1; }
+    [[ $keep =~ ^[0-9]+$ ]] || { echo "rotate: KEEP must be a number: $keep" >&2; return 1; }
+    local backups=("$dir"/backup-*.tar.gz)        # dated names sort oldest first
+    [[ -e ${backups[0]} ]] || { echo "rotate: no backups in $dir"; return 0; }
+    local count=${#backups[@]}
+    if (( count > keep )); then
+        rm -- "${backups[@]:0:count-keep}"         # delete all but the last KEEP
+    fi
+    echo "kept $(( count < keep ? count : keep )) of $count backups in $dir"
+}
+
+mkdir -p "my backups"
+for day in 01 02 03 04 05 06 07; do touch "my backups/backup-2026-11-$day.tar.gz"; done
+rotate "my backups" 3
+ls "my backups"
+rotate "no such dir" 3 2>&1 || true
+rotate "my backups" lots 2>&1 || true
+```
+
+```text
+kept 3 of 7 backups in my backups
+backup-2026-11-05.tar.gz
+backup-2026-11-06.tar.gz
+backup-2026-11-07.tar.gz
+rotate: not a directory: no such dir
+rotate: KEEP must be a number: lots
+```
+
+Notice the defensive touches: `${1:?usage...}` stops with a message if the directory argument is missing; the directory and the number are validated before anything is deleted; the glob that matches nothing is detected; `rm --` ends option parsing; and the arithmetic in the slice, `${backups[@]:0:count-keep}`, selects exactly the files to remove. The directory name containing a space is no problem at all.
+
+When a warning is a false alarm, disable it for one line with a directive comment that explains why, such as `# shellcheck disable=SC2016  # the child shell expands this`, as the strict-mode demonstration above does. Do not disable warnings globally.
+
+</Section>
+
+<Section id="debugging" kind="human" title="Debugging a script">
+
+Three tools cover most debugging:
+
+- **`bash -n script.sh`** parses the script without running it and reports syntax errors.
+- **`set -x`** (xtrace) prints every command *after expansion*, just before running it, so you can see exactly what the quoting and expansions produced. `set +x` turns it off again, and `bash -x script.sh` traces a whole script.
+- **`PS4`** sets the prefix of each trace line; putting `${LINENO}` (and `${FUNCNAME[0]}` for the function name) in it tells you where each line came from.
+
+```bash check
+#!/usr/bin/env bash
+BASH_XTRACEFD=1                          # send the trace to stdout (normally it goes to stderr)
+PS4='+ line ${LINENO}: '                 # what each trace line starts with
+files=("annual report.pdf" notes.txt)
+set -x                                   # trace: print each command after expansion
+cp -- "${files[@]}" /dev/null 2>/dev/null || status=$?
+name="Kofi"
+greeting="Hello, ${name}"
+set +x
+echo "$greeting"
+echo "cp status: ${status:-0}"
+bash -n -c 'if true; then echo ok' 2>&1 || echo "bash -n found a syntax error without running anything"
+```
+
+```text
++ line 6: cp -- 'annual report.pdf' notes.txt /dev/null
++ line 6: status=1
++ line 7: name=Kofi
++ line 8: greeting='Hello, Kofi'
++ line 9: set +x
+Hello, Kofi
+cp status: 1
+bash: -c: line 2: syntax error: unexpected end of file
+bash -n found a syntax error without running anything
+```
+
+The trace shows `cp` receiving `'annual report.pdf'` as one argument, quoted in the trace exactly as Bash would need it, which is often all you need to see to find a quoting bug. (The trace normally goes to stderr; this script sent it to stdout with `BASH_XTRACEFD=1` so that it appears in the output.) For larger scripts, add a `--verbose` option that turns on logging, and keep `set -x` for the hard cases.
+
+</Section>
+
+<Section id="habits" kind="human" title="A checklist of defensive habits">
+
+Strict mode and ShellCheck catch a great deal, but the habits below are what experienced engineers apply every time they write a script that changes anything:
+
+1. **Quote every expansion**, and use arrays for lists (lessons 2 and 5).
+2. **Never let an empty variable reach a destructive command.** Write `rm -rf -- "${dir:?}/"*`; the `:?` stops the script if `dir` is empty or unset.
+3. **Check `cd`**: `cd -- "$dir" || exit 1`, or run the work in a subshell, `( cd -- "$dir" && do_work )`.
+4. **Use `--`** before arguments that might start with a dash, and `./*` rather than `*` in globs passed to commands.
+5. **Validate inputs** (numbers, directories, required arguments) before doing anything irreversible, and fail with a clear message on stderr and a non-zero status.
+6. **Make dangerous scripts rehearsable.** A `--dry-run` option that prints what would be done is cheap to add and saves careers.
+7. **Make them idempotent** where possible: running the script twice should be as safe as running it once (`mkdir -p`, `ln -sfn`, checking before creating).
+8. **Check that required tools exist** at the start: `command -v jq >/dev/null || die "jq is required"`.
+9. **Never use `eval` on data**, and be wary of `curl ... | bash`: read scripts from the internet before running them.
+10. **Run ShellCheck**, in your editor and in CI.
+
+</Section>
+
+<Section id="portability-security" kind="human" title="Portability and security">
+
+Two more concerns separate scripts that work on your laptop from scripts that are safe to give to others.
+
+**Portability.** Decide which shell you are writing for and say so in the shebang. Bash features (`[[ ]]`, arrays, `${var,,}`, `mapfile`) are fine with `#!/usr/bin/env bash`; a `#!/bin/sh` script must stick to POSIX, and tools such as `checkbashisms` (from Debian) or ShellCheck with `--shell=sh` will tell you when it does not. The external tools differ too: GNU and BSD versions of `sed -i`, `date`, `stat`, `readlink -f` and `grep -P` behave differently or are missing, so a script developed on Linux may fail on macOS. Test on every platform you claim to support, or require GNU tools explicitly. If you need a minimum Bash version, check it at the start: `(( BASH_VERSINFO[0] >= 4 )) || die "needs Bash 4 or newer"`.
+
+**Security.** Data must never become code. That means no `eval` on anything derived from input, no `bash -c "$user_text"`, and quoting, because an unquoted variable containing `*` or `-rf` is interpreted by the shell or by the command. Scripts that run with more privileges than their caller (from `sudo` rules, cron jobs as root, or CI with deployment secrets) deserve extra care: set a known `PATH` at the top, avoid writing to directories other users can write to, and never print secrets in logs (remember that `set -x` prints every expanded command, including passwords in arguments).
+
+Bash itself has had serious vulnerabilities. The best known is **Shellshock**, disclosed in September 2014: a parsing bug in the way Bash imported functions from environment variables let an attacker who could set an environment variable (for example, through a web server's CGI interface) run arbitrary commands. It had been present for about twenty-five years. Patches were released within days, but vulnerable systems were attacked for years afterwards. The lessons are general ones: keep the shell updated like any other software, and do not use shell scripts to process untrusted input from the network.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"With `set -e`, my script stops on every error."** Not inside conditions, not on the left of `&&` and `||`, not for non-final commands of a pipeline without `pipefail`, not in functions called from a condition, and not for failures hidden by `local x=$(...)`. Treat it as a safety net with holes.
+
+</Misconception>
+
+<Misconception>
+
+**"`set -u` protects against empty variables."** It catches *unset* ones. A variable set to the empty string passes. Use `${var:?message}` where emptiness would be dangerous.
+
+</Misconception>
+
+<Misconception>
+
+**"ShellCheck's warnings are style nitpicks."** Almost all of them describe inputs on which the script misbehaves. Read the wiki page for any warning you do not understand; it usually includes the failing case.
+
+</Misconception>
+
+<Misconception>
+
+**"Adding `|| true` is the way to make strict mode quiet."** It is the right tool for a command whose failure is genuinely expected and harmless, with a comment saying so. Sprinkled everywhere, it silently switches off the safety net you turned on.
+
+</Misconception>
+
+<Misconception>
+
+**"An `EXIT` trap always runs."** It runs on normal exit, `exit`, errors and most signals Bash can catch, but nothing can catch `kill -9` (SIGKILL) or a power failure. Scripts that must survive those need to be safe to re-run, which is one more reason to make them idempotent.
+
+</Misconception>
+
+<Misconception>
+
+**"Temporary files can go in `/tmp/myscript.tmp`."** A fixed name collides with a second run of the same script and lets another user on the machine pre-create the file or a link with that name. Use `mktemp`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Several questions ask whether a strict-mode script stops; check them with `bash -c '...'; echo $?`.
+
+<Exercises/>
+
+</Section>

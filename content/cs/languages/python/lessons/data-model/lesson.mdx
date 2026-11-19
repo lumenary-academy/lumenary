@@ -1,0 +1,481 @@
+---
+title: The data model
+subtitle: How len, +, ==, in, for and print find their way into your own classes, through special methods.
+minutes: 55
+objectives:
+  - Explain how the interpreter turns syntax and built-ins into calls to special methods on the type
+  - Give a class a useful repr and str, and support format specifications
+  - Implement equality, ordering and hashing that obey the hashing contract
+  - Implement arithmetic with NotImplemented and reflected operators so that sum() and mixed operands work
+  - Make a class behave like a container, and know which fallbacks Python uses when a method is missing
+prerequisites: [the-python-way]
+references:
+  - title: "The Python Language Reference: Data model"
+    url: https://docs.python.org/3/reference/datamodel.html
+    note: The authoritative list of special methods and exactly when the interpreter calls them.
+  - title: "The Python Standard Library: functools.total_ordering"
+    url: https://docs.python.org/3/library/functools.html#functools.total_ordering
+  - title: "The Python Standard Library: operator, standard operators as functions"
+    url: https://docs.python.org/3/library/operator.html
+  - title: "The Python Standard Library: collections.abc"
+    url: https://docs.python.org/3/library/collections.abc.html
+    note: The abstract base classes that name each protocol, and which methods each one provides for free.
+---
+
+<Section id="motivation" kind="motivation" title="One spelling, many types">
+
+You already use one idea all the time without seeing it. `len("hello")`, `len([1, 2, 3])` and `len({"a": 1})` all work, although a string, a list and a dictionary are completely different objects inside. `+` adds numbers, joins strings and concatenates lists. `for` walks over lists, files, dictionaries and ranges. `print` shows anything.
+
+Python does not achieve this with a giant `if` inside `len` that knows every type. It does it with a contract called the **data model**: when you write `len(x)`, the interpreter calls a method named `__len__` on `x`'s type. Lists define `__len__`, strings define it, and if your class defines it, `len` works on your objects too. The same goes for almost every piece of syntax: `a + b`, `a == b`, `x in c`, `c[i]`, `for item in c`, `with`, calling `f(...)`, even `print(x)`.
+
+These methods, with names that start and end in two underscores, are called **special methods**, or *dunder methods* ("double underscore"). They are the reason Python code built from third-party libraries feels like the language itself: a NumPy array supports `+` and `[ ]`, a pandas DataFrame supports `len`, a SQLAlchemy column supports `==` (to build a query!), all through this one mechanism. Once you understand it, you can design classes that feel just as native, and you can read any library's source code and see what is going on.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="The interpreter calls you">
+
+The key shift is to think of special methods as **hooks the interpreter calls**, not methods you call yourself. You write `len(shelf)`; Python runs, roughly, `type(shelf).__len__(shelf)`. You write `a + b`; Python runs `type(a).__add__(a, b)`, and if that says it cannot handle `b`, it tries `type(b).__radd__(b, a)`.
+
+Two details in that sentence matter.
+
+First, special methods are looked up on the **type**, not on the instance. Putting a `__len__` attribute on one object does nothing; `len` asks the class:
+
+```python check
+class Quiet:
+    def __len__(self):
+        return 3
+
+
+q = Quiet()
+q.__len__ = lambda: 99       # an attribute on this one instance...
+print(len(q), q.__len__())   # ...len() ignores it and asks the class
+```
+
+```text
+3 99
+```
+
+This rule makes special-method lookup fast and predictable, and it is why you define these methods in the class body.
+
+Second, the interpreter often has a **fallback plan**. If a class has no `__bool__`, `if obj:` uses `__len__` (zero means false); if it has neither, every instance is true. If a class has no `__contains__`, `x in obj` iterates over `obj` looking for `x`. If it has no `__iter__` but has `__getitem__`, `for` calls `__getitem__(0)`, `__getitem__(1)` and so on until an `IndexError`. If `__str__` is missing, `str()` uses `__repr__`. Knowing the fallbacks tells you the *minimum* you must write; knowing the full protocol tells you what to write when efficiency matters.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="A map of the special methods">
+
+The [data model chapter](https://docs.python.org/3/reference/datamodel.html) of the Language Reference lists them all. These are the ones you will write most often:
+
+| You write | Python calls | Notes |
+| --- | --- | --- |
+| `repr(x)`, the REPL, inside containers | `__repr__` | Unambiguous, for programmers; ideally looks like code that rebuilds `x` |
+| `str(x)`, `print(x)` | `__str__` | Readable, for users; falls back to `__repr__` |
+| `f"{x:spec}"`, `format(x, spec)` | `__format__` | Receives the text after the colon |
+| `x == y`, `x != y` | `__eq__`, `__ne__` | `__ne__` defaults to the inverse of `__eq__` |
+| `x < y` and friends | `__lt__`, `__le__`, `__gt__`, `__ge__` | `functools.total_ordering` fills in the rest from `__eq__` and one of them |
+| `hash(x)`, dict keys, set members | `__hash__` | Must agree with `__eq__` (see below) |
+| `bool(x)`, `if x:` | `__bool__` | Falls back to `__len__` |
+| `len(x)` | `__len__` | Must return an `int` ≥ 0 |
+| `x[k]`, `x[k] = v`, `del x[k]` | `__getitem__`, `__setitem__`, `__delitem__` | `k` may be a `slice` object |
+| `item in x` | `__contains__` | Falls back to iteration |
+| `for item in x`, `iter(x)` | `__iter__` | Lesson 3 |
+| `x + y`, `x * y`, … | `__add__`, `__mul__`, … | Return `NotImplemented` for operands you do not support |
+| `y + x` when `y` cannot | `__radd__`, `__rmul__`, … | The *reflected* operation |
+| `x += y` | `__iadd__` | Optional; falls back to `x = x + y` |
+| `-x`, `abs(x)` | `__neg__`, `__abs__` | |
+| `x(...)` | `__call__` | Makes instances callable |
+| `with x:` | `__enter__`, `__exit__` | Lesson 7 |
+
+<Definition term="NotImplemented">
+
+A special singleton value (not an exception) that a binary operator method returns to say "I do not know how to combine myself with this operand". The interpreter then tries the reflected method on the other operand, and raises `TypeError` only if both sides decline.
+
+</Definition>
+
+</Section>
+
+<Section id="money" kind="examples" title="Worked example: a money type">
+
+Money is a classic place where the built-in types are not quite right: `float` cannot represent most decimal fractions exactly, and nothing stops you adding euros to rupees. Here is a small `Money` class that stores an exact integer number of minor units (cents, paise, centimes) and plugs into Python's operators. Read it slowly; every method is a hook for some piece of syntax.
+
+```python check
+"""money.py: a value type that takes part in Python's operators."""
+from functools import total_ordering
+
+
+@total_ordering
+class Money:
+    """An exact amount: an integer number of minor units (cents) in one currency."""
+
+    def __init__(self, cents: int, currency: str = "EUR"):
+        self.cents = cents
+        self.currency = currency
+
+    def __repr__(self):
+        return f"Money({self.cents!r}, {self.currency!r})"
+
+    def __str__(self):
+        sign = "-" if self.cents < 0 else ""
+        whole, part = divmod(abs(self.cents), 100)
+        return f"{sign}{whole:,}.{part:02d} {self.currency}"
+
+    def _same_currency(self, other):
+        """True if other is Money in our currency; False if it is not Money at all."""
+        if not isinstance(other, Money):
+            return False
+        if other.currency != self.currency:
+            raise ValueError(f"cannot combine {self.currency} with {other.currency}")
+        return True
+
+    def __eq__(self, other):
+        if not isinstance(other, Money):
+            return NotImplemented
+        return (self.cents, self.currency) == (other.cents, other.currency)
+
+    def __hash__(self):
+        return hash((self.cents, self.currency))
+
+    def __lt__(self, other):
+        if not self._same_currency(other):
+            return NotImplemented
+        return self.cents < other.cents
+
+    def __add__(self, other):
+        if not self._same_currency(other):
+            return NotImplemented
+        return Money(self.cents + other.cents, self.currency)
+
+    def __radd__(self, other):
+        if other == 0:            # sum() starts from 0, so 0 + Money must work
+            return self
+        return NotImplemented
+
+    def __mul__(self, factor):
+        if not isinstance(factor, int):
+            return NotImplemented
+        return Money(self.cents * factor, self.currency)
+
+    __rmul__ = __mul__            # 3 * price is the same as price * 3
+
+    def __neg__(self):
+        return Money(-self.cents, self.currency)
+
+    def __bool__(self):
+        return self.cents != 0
+
+
+price, tax = Money(1250), Money(250)
+print(repr(price), "|", price)
+print(price + tax, "|", price * 3, "|", 3 * price, "|", -price)
+print(sum([price, tax, Money(5)]))
+print(price > tax, price >= Money(1250), price == Money(1250), price != tax)
+print(sorted([price, tax, Money(999)]))
+print(len({Money(100), Money(100), Money(200)}), bool(Money(0)))
+
+for bad in (5, Money(100, "GBP")):
+    try:
+        price + bad
+    except (TypeError, ValueError) as err:
+        print(type(err).__name__ + ":", err)
+```
+
+```text
+Money(1250, 'EUR') | 12.50 EUR
+15.00 EUR | 37.50 EUR | 37.50 EUR | -12.50 EUR
+15.05 EUR
+True True True True
+[Money(250, 'EUR'), Money(999, 'EUR'), Money(1250, 'EUR')]
+2 False
+TypeError: unsupported operand type(s) for +: 'Money' and 'int'
+ValueError: cannot combine EUR with GBP
+```
+
+Walk through what happened:
+
+- `print(price)` used `__str__`; `repr(price)` and the list printed by `sorted` used `__repr__`. A good `__repr__` is a gift to whoever debugs your code: when it looks like the constructor call, you can paste it back into the REPL.
+- `price > tax` and `price >= Money(1250)` work although the class only defines `__lt__` and `__eq__`: `@total_ordering` derived the other three comparisons. `!=` came for free from `__eq__`.
+- `3 * price` first tried `int.__mul__(3, price)`, which returned `NotImplemented` (an `int` knows nothing about `Money`), so Python tried `Money.__rmul__(price, 3)`.
+- `sum([...])` computes `0 + price + tax + ...`. The first step is `0 + price`; `int` declines, so `Money.__radd__(price, 0)` runs, and we treat 0 as the identity. Without `__radd__` you would have to write `sum(items, Money(0))`.
+- `price + 5` returned `NotImplemented` from `__add__`; `int` has no `__radd__` that accepts `Money`; so Python raised the `TypeError` itself, with a clear message. Mixing currencies is a different kind of error, a *value* the type understands but refuses, so we raise `ValueError` ourselves.
+- The set `{Money(100), Money(100), Money(200)}` has two members, because equal objects have equal hashes.
+
+</Section>
+
+<Section id="hashing" kind="human" title="Equality and hashing: the contract">
+
+Dictionaries and sets find keys by hash first, then confirm with `==`. That only works if one rule holds:
+
+<Theorem name="The hashing contract">
+
+If `a == b`, then `hash(a) == hash(b)`. And the hash of an object must not change while it is in a set or used as a dict key.
+
+</Theorem>
+
+Python protects you from the most common way to break the first rule: if a class defines `__eq__` but not `__hash__`, Python sets `__hash__` to `None`, and its instances become **unhashable** (putting one in a set raises `TypeError`). That is the right default, because a class that compares by value but hashes by identity would put two "equal" objects in different buckets.
+
+The easiest correct `__hash__` hashes a tuple of exactly the fields `__eq__` compares, as `Money` does. The second rule is about mutability, and breaking it makes data quietly disappear. Run this:
+
+```python run
+class Key:
+    def __init__(self, value):
+        self.value = value
+
+    def __eq__(self, other):
+        return isinstance(other, Key) and self.value == other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+
+k = Key(1)
+table = {k: "found"}
+k.value = 2                     # mutate a key that is already in the dict
+print(k in table, Key(1) in table, Key(2) in table, len(table))
+```
+
+```text
+False False False 1
+```
+
+The dict still holds one entry, but no key can reach it: looking up `k` now searches the bucket for hash 2, where nothing was stored, and looking up `Key(1)` finds the right bucket but the stored key no longer compares equal. No error is raised; the entry is simply lost.
+
+The same would happen to a `Money` if code changed its `cents` after putting it in a set. Our `Money` relies on a convention, "never mutate a `Money`; make a new one", which is how all of Python's own value types behave. In lesson 5 you will see `@dataclass(frozen=True)`, which writes `__eq__` and `__hash__` for you *and* enforces immutability, and which is what most professionals would use for a type like this.
+
+Equality has one more subtlety: return `NotImplemented` (not `False`) when you do not recognise the other object. Then Python gives the other operand a chance, and if both decline, `==` falls back to identity, so `Money(1) == "1"` is simply `False`.
+
+</Section>
+
+<Section id="containers" kind="computation" title="Containers, and the fallbacks in action">
+
+Container protocols let your class work with `len`, indexing, slicing, `in`, `for`, `reversed`, `sorted`, `list()` and every function that accepts an iterable. Here is a shelf that keeps book titles in alphabetical order:
+
+```python check
+"""A sorted sequence of titles that behaves like a built-in sequence."""
+from bisect import bisect_left, insort
+
+
+class Shelf:
+    def __init__(self, titles=()):
+        self._titles = sorted(titles)
+
+    def add(self, title):
+        insort(self._titles, title)      # insert, keeping the list sorted
+
+    def __len__(self):
+        return len(self._titles)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):     # shelf[1:3] gives a smaller Shelf
+            return Shelf(self._titles[index])
+        return self._titles[index]       # ints, including negative ones
+
+    def __contains__(self, title):       # binary search instead of a scan
+        i = bisect_left(self._titles, title)
+        return i < len(self._titles) and self._titles[i] == title
+
+    def __iter__(self):
+        return iter(self._titles)
+
+    def __repr__(self):
+        return f"Shelf({self._titles!r})"
+
+
+shelf = Shelf(["Things Fall Apart", "Don Quixote", "The Tale of Genji"])
+shelf.add("One Hundred Years of Solitude")
+print(len(shelf), shelf[0], shelf[-1])
+print(shelf[1:3])
+print("Don Quixote" in shelf, "Dune" in shelf)
+print([title.split()[0] for title in shelf])
+print(list(reversed(shelf)))
+print(bool(Shelf()), bool(shelf))
+```
+
+```text
+4 Don Quixote Things Fall Apart
+Shelf(['One Hundred Years of Solitude', 'The Tale of Genji'])
+True False
+['Don', 'One', 'The', 'Things']
+['Things Fall Apart', 'The Tale of Genji', 'One Hundred Years of Solitude', 'Don Quixote']
+False True
+```
+
+We never wrote `__reversed__` or `__bool__`: `reversed` used `__len__` and `__getitem__`, and truthiness used `__len__`. We *did* write `__contains__`, though the fallback would have worked, because a binary search on a sorted list is $O(\log n)$ where scanning is $O(n)$. That is the general pattern: fallbacks give you correctness, and specific methods give you speed.
+
+The fallbacks are easy to see with a class that announces every call:
+
+```python check
+class Squares:
+    """Only __getitem__: the old sequence protocol."""
+    def __getitem__(self, i):
+        print(f"  __getitem__({i})")
+        if i >= 3:
+            raise IndexError(i)
+        return i * i
+
+
+print(list(Squares()))
+print(4 in Squares())
+
+
+class Scaler:
+    """__call__ makes instances callable, like functions that carry settings."""
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __call__(self, x):
+        return x * self.factor
+
+
+double = Scaler(2)
+print(double(21), callable(double), list(map(double, [1, 2, 3])))
+```
+
+```text
+  __getitem__(0)
+  __getitem__(1)
+  __getitem__(2)
+  __getitem__(3)
+[0, 1, 4]
+  __getitem__(0)
+  __getitem__(1)
+  __getitem__(2)
+True
+42 True [2, 4, 6]
+```
+
+For real container classes, consider inheriting from the abstract base classes in `collections.abc`. If you subclass `collections.abc.Sequence` and write only `__getitem__` and `__len__`, you get correct `__contains__`, `__iter__`, `__reversed__`, `index` and `count` for free, and `isinstance(shelf, Sequence)` becomes true. Lesson 5 returns to abstract base classes.
+
+</Section>
+
+<Section id="format" kind="examples" title="Your own format specifications">
+
+`f"{x:spec}"` calls `type(x).__format__(x, "spec")`, and the meaning of `spec` is entirely up to the type: `datetime` understands `%Y-%m-%d`, numbers understand `.2f`. Experiment with this one in the browser:
+
+```python run
+class Temperature:
+    def __init__(self, celsius):
+        self.celsius = celsius
+
+    def __repr__(self):
+        return f"Temperature({self.celsius!r})"
+
+    def __str__(self):
+        return f"{self.celsius} °C"
+
+    def __format__(self, spec):
+        # A trailing "F" means Fahrenheit; the rest is an ordinary float spec.
+        if spec.endswith("F"):
+            return f"{self.celsius * 9 / 5 + 32:{spec[:-1]}f} °F"
+        return f"{self.celsius:{spec}} °C"
+
+
+t = Temperature(21.5)
+print(t)                 # __str__
+print([t])               # a list shows the repr of its items
+print(f"{t}")            # __format__ with an empty spec
+print(f"{t:.0f} | {t:.1F} | {t!r}")
+```
+
+```text
+21.5 °C
+[Temperature(21.5)]
+21.5 °C
+22 °C | 70.7 °F | Temperature(21.5)
+```
+
+Notice that `f"{t:.0f}"` printed `22` for 21.5: Python rounds halves to the nearest even digit, the rounding rule used in statistics and finance to avoid drift.
+
+</Section>
+
+<Section id="in-the-wild" kind="human" title="In the wild: paths, proxies and query builders">
+
+Once you know the data model, you start to see it in every library you use, and you can judge when an author used it well.
+
+**`pathlib` and the `/` operator.** `Path` objects define `__truediv__` (and `__rtruediv__`), so `Path("data") / "2026" / "sales.csv"` builds a path. It is a good overload: `/` already *looks* like a path separator, the result is the obvious one, and it is far less error-prone than gluing strings with `os.path.join`.
+
+**Comparisons that do not return booleans.** Nothing says `__gt__` must return `True` or `False`. In pandas, `table["age"] > 30` returns a whole column of booleans, one per row, which you can then use to filter: `table[table["age"] > 30]`. SQLAlchemy's `User.name == "Ana"` returns an object representing a SQL condition. The price is that `if table["age"] > 30:` cannot mean anything sensible, so pandas makes `__bool__` raise an error ("the truth value of a Series is ambiguous") rather than guess. That error message is the data model talking.
+
+**Attribute hooks.** `obj.name` has hooks of its own. `__getattr__(self, name)` runs only when normal lookup *fails*, which makes it ideal for wrappers and proxies. (Its sibling `__getattribute__` runs for *every* attribute access and is rarely worth the trouble; `__setattr__` intercepts assignment.) Beneath methods, `property`, `classmethod` and `staticmethod` lies one more protocol, **descriptors** (`__get__`, `__set__`), which lesson 5 shows from the user's side.
+
+Here are the first and third ideas together. Watch the last line carefully: it is the "looked up on the type" rule again.
+
+```python check
+from pathlib import PurePosixPath
+
+reports = PurePosixPath("/srv") / "reports" / "2026"
+print(reports, "|", reports.name, "|", reports.parent)
+print("archive" / PurePosixPath("old.csv"))     # str / Path uses Path.__rtruediv__
+
+
+class Recorder:
+    """Wraps any object and logs the attributes that reach it through __getattr__."""
+    def __init__(self, target):
+        self._target = target
+        self.log = []
+
+    def __getattr__(self, name):        # only called when normal lookup fails
+        self.log.append(name)
+        return getattr(self._target, name)
+
+
+fruit = Recorder(["kiwi", "fig"])
+fruit.append("date")
+fruit.sort()
+print(fruit._target, fruit.log)
+try:
+    len(fruit)                          # special methods skip __getattr__
+except TypeError as err:
+    print("TypeError:", err)
+```
+
+```text
+/srv/reports/2026 | 2026 | /srv/reports
+archive/old.csv
+['date', 'fig', 'kiwi'] ['append', 'sort']
+TypeError: object of type 'Recorder' has no len()
+```
+
+`fruit.append` and `fruit.sort` were forwarded, but `len(fruit)` was not: the interpreter looked for `__len__` on the `Recorder` class, found nothing, and never consulted `__getattr__`. A proxy that must support `len`, `in` or `[ ]` has to define those special methods explicitly. Real proxy libraries do exactly that, which is why their source code contains long lists of one-line dunder methods.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"I should call `x.__len__()` directly."** Call `len(x)`. The built-in does more than forward the call: it checks the result is a non-negative integer, uses the type's slot efficiently, and applies the fallbacks. Special methods are for the interpreter to call; you implement them.
+
+</Misconception>
+
+<Misconception>
+
+**"An operator method should raise `NotImplementedError` for unsupported operands."** Return `NotImplemented`, the value. `NotImplementedError` is an exception for abstract methods that a subclass has not written yet. Raising it from `__add__` stops Python from trying the reflected method on the other operand.
+
+</Misconception>
+
+<Misconception>
+
+**"`__init__` creates the object."** By the time `__init__` runs, the object exists; `__init__` only initialises it. The constructor is `__new__`, which you rarely need (mainly when subclassing immutable types such as `int` or `tuple`).
+
+</Misconception>
+
+<Misconception>
+
+**"`__del__` is a destructor I can rely on for cleanup."** It runs when the object is reclaimed, which in CPython is usually as soon as the last reference disappears, but not in other implementations, not for objects in some reference cycles until the garbage collector runs, and not reliably at interpreter exit. For files, locks and connections use a context manager (lesson 7).
+
+</Misconception>
+
+<Misconception>
+
+**"More dunders make a better class."** Implement the protocols that match what the object *is*. A `Money` supports `+` because adding money is meaningful; it does not support `*` between two `Money` values because "euros squared" means nothing. Operator overloading that surprises readers is worse than a well-named method.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Predict before you run. The last exercise asks you to write a value type with comparisons and hashing.
+
+<Exercises/>
+
+</Section>

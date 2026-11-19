@@ -1,0 +1,362 @@
+---
+title: Memory and concurrency
+subtitle: Who keeps an object alive (ARC, weak and unowned), and who may touch it (async/await, actors, Sendable and Swift 6 data-race safety).
+minutes: 70
+objectives:
+  - Explain automatic reference counting and predict when deinit runs
+  - Find and break reference cycles with weak, unowned and capture lists such as [weak self]
+  - Write async functions and call them with await, async let and task groups
+  - Protect shared mutable state with actors, and explain what the main actor is for
+  - Explain Sendable and how the Swift 6 language mode rules out data races at compile time
+prerequisites: [errors-and-testing]
+references:
+  - title: "The Swift Programming Language: Automatic Reference Counting, Concurrency"
+    url: https://docs.swift.org/swift-book/documentation/the-swift-programming-language/
+  - title: Swift 6 migration guide
+    url: https://www.swift.org/migration/documentation/migrationguide/
+    note: The official guide to data-race safety, Sendable, isolation and moving a codebase to the Swift 6 language mode.
+  - title: Announcing Swift 6
+    url: https://www.swift.org/blog/announcing-swift-6/
+  - title: Swift concurrency documentation
+    url: https://www.swift.org/documentation/concurrency/
+  - title: "SE-0306: Actors"
+    url: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0306-actors.md
+---
+
+<Section id="motivation" kind="motivation" title="Two questions about every object">
+
+In the lesson on structs and classes you met reference types: one object, many names. Sharing is useful, but it raises two questions that every Swift programmer learns to ask about every class.
+
+**Who keeps this object alive?** An object must stay in memory as long as anyone still needs it and be freed as soon as no one does. Swift answers this with **automatic reference counting** (ARC): no garbage collector pausing your program, and no manual `free` to forget. ARC is simple and predictable, but it has one blind spot, reference cycles, which you must learn to see.
+
+**Who may touch it, and when?** Modern devices have many processor cores, and apps must download, decode and compute without freezing the screen. The moment two pieces of code run at the same time and one of them writes to shared memory, you risk a **data race**: corrupted values, crashes that appear once in a thousand runs, bugs that vanish under the debugger. Swift's concurrency model (`async`/`await`, tasks and actors) and, since Swift 6, a compiler that *proves* the absence of data races, answer this second question.
+
+The two halves of this lesson are linked: value types avoid both problems, because a value has exactly one owner and is copied rather than shared. Most of what follows is about the places where you do share.
+
+</Section>
+
+<Section id="arc" kind="examples" title="Automatic reference counting">
+
+<Definition term="automatic reference counting">
+
+Every class instance carries a count of the **strong references** to it: variables, constants, properties and closure captures that refer to it. The compiler inserts code to increase the count when a reference is created and decrease it when one goes away. When the count reaches zero, the instance's `deinit` runs and its memory is freed, immediately.
+
+</Definition>
+
+```swift check
+final class Student {
+    let name: String
+    var club: Club?
+    init(name: String) { self.name = name; print("\(name) arrives") }
+    deinit { print("\(name) leaves") }
+}
+
+final class Club {
+    let title: String
+    var president: Student?          // a strong reference
+    init(title: String) { self.title = title; print("\(title) club opens") }
+    deinit { print("\(title) club closes") }
+}
+
+print("-- one owner, then none")
+var a: Student? = Student(name: "Aiko")
+var b = a                       // two strong references now
+a = nil
+print("Aiko still here:", b?.name ?? "gone")
+b = nil                         // the last reference goes: deinit runs
+
+print("-- a reference cycle")
+var s: Student? = Student(name: "Bongani")
+var c: Club? = Club(title: "Chess")
+s?.club = c
+c?.president = s
+s = nil
+c = nil
+print("(neither deinit ran: each object keeps the other alive)")
+```
+
+```text
+-- one owner, then none
+Aiko arrives
+Aiko still here: Aiko
+Aiko leaves
+-- a reference cycle
+Bongani arrives
+Chess club opens
+(neither deinit ran: each object keeps the other alive)
+```
+
+Making the variables optional lets us drop a reference by assigning `nil`. Aiko's object survives `a = nil` because `b` still refers to it, and its `deinit` runs at the exact moment the last reference disappears. That determinism is ARC's great strength: you can rely on `deinit` to close a file or release a resource at a known time, which a garbage-collected language cannot promise.
+
+The second half shows ARC's blind spot. The student refers to the club and the club refers back to the student. When the program drops its own references, each object still has a count of one, from the other, so neither is ever freed. This is a **reference cycle**, and it is a memory leak: the objects are unreachable but still allocated. A garbage collector would find and free them; ARC never will.
+
+### weak and unowned
+
+The fix is to make one direction of the relationship not count. Swift has two kinds of non-owning reference:
+
+- A **`weak`** reference does not keep the object alive, and becomes `nil` automatically when the object is freed. It must therefore be an optional `var`. Use it when the other object may legitimately go away first.
+- An **`unowned`** reference also does not keep the object alive, but is not optional; accessing it after the object is gone traps. Use it only when the other object is guaranteed to live at least as long, such as a credit card's reference to the customer who owns it.
+
+Closures are the other common source of cycles: an object stores a closure, and the closure captures `self` strongly. A **capture list** fixes it.
+
+```swift check
+final class Student {
+    let name: String
+    var club: Club?
+    init(name: String) { self.name = name }
+    deinit { print("\(name) leaves") }
+}
+
+final class Club {
+    let title: String
+    weak var president: Student?     // weak: does not keep the student alive
+    init(title: String) { self.title = title }
+    deinit { print("\(title) club closes") }
+}
+
+var s: Student? = Student(name: "Bongani")
+var c: Club? = Club(title: "Chess")
+s?.club = c
+c?.president = s
+s = nil
+print("president is now:", c?.president?.name ?? "nobody")
+c = nil
+
+// Closures capture strongly too. [weak self] breaks the cycle.
+final class Timer {
+    let label: String
+    var onTick: (() -> Void)?
+    init(label: String) { self.label = label }
+    func start() {
+        onTick = { [weak self] in
+            guard let self else { return }
+            print("tick from \(self.label)")
+        }
+    }
+    deinit { print("timer \(label) released") }
+}
+
+var t: Timer? = Timer(label: "kitchen")
+t?.start()
+t?.onTick?()
+t = nil
+```
+
+```text
+Bongani leaves
+president is now: nobody
+Chess club closes
+tick from kitchen
+timer kitchen released
+```
+
+With `weak var president`, dropping the program's reference to Bongani frees him at once, and the club's `president` quietly becomes `nil`. In `Timer`, the closure stored in `onTick` would keep the timer alive forever if it captured `self` strongly; `[weak self]` captures a weak reference instead, and `guard let self else { return }` turns it back into a strong one just for the duration of the call. This three-line pattern appears in almost every Swift app, in callbacks, notification handlers and animations.
+
+How do professionals find leaks? Xcode's memory graph debugger draws the objects in a running app and highlights cycles, and Instruments has a Leaks tool. A good habit is a quick review rule: whenever a class stores a closure, or two classes refer to each other, decide which reference is the owner and make the other one `weak` or `unowned`.
+
+</Section>
+
+<Section id="async" kind="examples" title="async and await">
+
+Before Swift 5.5, asynchronous Swift was written with completion handlers: "start this download, and here is a closure to call when it finishes". The code ran out of order, errors were easy to drop, and nested callbacks drifted to the right of the screen. **`async`/`await`** lets you write the same work as straight-line code.
+
+<Definition term="async function, suspension point">
+
+An **`async`** function can **suspend**: pause while waiting for something (a timer, the network, another task) and let its thread do other work, then resume later. Every call to an `async` function is marked with **`await`**, which marks a possible **suspension point**, just as `try` marks a possible error.
+
+</Definition>
+
+```swift check
+// A pretend network call: it suspends for a while, then returns.
+func fetchTemperature(of city: String) async throws -> Int {
+    try await Task.sleep(for: .milliseconds(100))
+    let readings = ["Cusco": 14, "Dakar": 29, "Tromsø": -3]
+    return readings[city] ?? 20
+}
+
+let clock = ContinuousClock()
+
+// One after another: each await waits for the previous call to finish.
+let sequential = try await clock.measure {
+    let a = try await fetchTemperature(of: "Cusco")
+    let b = try await fetchTemperature(of: "Dakar")
+    print("sequential:", a, b)
+}
+
+// async let starts both at once; await collects the results.
+let parallel = try await clock.measure {
+    async let a = fetchTemperature(of: "Cusco")
+    async let b = fetchTemperature(of: "Dakar")
+    print("async let:", try await a, try await b)
+}
+print("parallel was faster:", parallel < sequential)
+
+// A task group runs any number of child tasks and gathers their results.
+let cities = ["Cusco", "Dakar", "Tromsø"]
+let report = try await withThrowingTaskGroup(of: (String, Int).self) { group in
+    for city in cities {
+        group.addTask { (city, try await fetchTemperature(of: city)) }
+    }
+    var results: [String: Int] = [:]
+    for try await (city, temperature) in group {
+        results[city] = temperature
+    }
+    return results
+}
+for city in cities {
+    print(city, report[city] ?? 0)
+}
+```
+
+```text
+sequential: 14 29
+async let: 14 29
+parallel was faster: true
+Cusco 14
+Dakar 29
+Tromsø -3
+```
+
+`Task.sleep` stands in for a network call: it suspends for 100 milliseconds without blocking a thread. (It is `throws` because a sleeping task can be cancelled.) A `main.swift` file may use `await` at the top level; in other code, you start asynchronous work by creating a `Task { ... }` or by being called from another `async` function.
+
+The program measures three ways of making the calls:
+
+- **Sequential `await`s** run one after the other: the second fetch starts only when the first has finished, so this takes about 200 milliseconds.
+- **`async let`** starts a child task immediately and lets you `await` its result later. Both fetches run at the same time, so this takes about 100 milliseconds, which is why `parallel < sequential` printed `true`.
+- **`withThrowingTaskGroup`** creates any number of child tasks, here one per city, and the `for try await` loop receives their results *in the order they finish*, which is unpredictable. The program stores them in a dictionary and prints in a fixed order, so the output is the same on every run.
+
+All three are **structured concurrency**: child tasks belong to the scope that created them and are always finished (or cancelled) before it exits, so work cannot leak away and errors always come back to someone. If an error escapes the group, as it would here through `for try await`, the remaining child tasks are cancelled. Cancellation in Swift is *cooperative*: a task is told it has been cancelled, and long-running code should check `Task.isCancelled` or call `try Task.checkCancellation()`; sleeps and most system APIs do so automatically.
+
+</Section>
+
+<Section id="actors" kind="examples" title="Actors, Sendable and data-race safety">
+
+Here is a classic data race. A thousand child tasks each add one to a shared counter:
+
+```swift
+final class Tally {
+    var count = 0
+}
+
+func countConcurrently() async -> Int {
+    let tally = Tally()
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 1...1000 {
+            group.addTask { tally.count += 1 }
+        }
+    }
+    return tally.count
+}
+```
+
+`count += 1` is really three steps (read, add, write), and two tasks on two cores can interleave them so that one increment is lost. In most languages this compiles, and the answer is usually 1,000 and occasionally less. In the **Swift 6 language mode**, it does not compile:
+
+```text
+error: passing closure as a 'sending' parameter risks causing data races between code in the current isolation context and concurrent execution of the closure
+```
+
+The compiler noticed that a mutable object is reachable from closures that run concurrently. (In the older Swift 5 mode, compiled as `swiftc` does by default, this example compiled without a single warning, which is exactly why the new mode exists.) To share mutable state safely, put it in an **actor**.
+
+<Definition term="actor">
+
+An **actor** is a reference type, like a class, that protects its mutable state by **isolation**: only one task at a time may run code inside it. Code outside the actor must use `await` to call its methods or read its properties, because it may have to wait its turn.
+
+</Definition>
+
+```swift check
+// An actor protects its state: only one task at a time runs inside it.
+actor TicketOffice {
+    private var remaining: Int
+    private(set) var sold: [String] = []
+
+    init(tickets: Int) { remaining = tickets }
+
+    func buy(for name: String) -> Bool {
+        guard remaining > 0 else { return false }
+        remaining -= 1
+        sold.append(name)
+        return true
+    }
+}
+
+// A struct of Sendable values is itself Sendable: safe to pass between tasks.
+struct Purchase: Sendable {
+    let name: String
+    let succeeded: Bool
+}
+
+let office = TicketOffice(tickets: 3)
+let fans = ["Ana", "Bilal", "Chen", "Dara", "Emeka", "Fatima"]
+
+let purchases = await withTaskGroup(of: Purchase.self) { group in
+    for fan in fans {
+        group.addTask {
+            let ok = await office.buy(for: fan)    // await: we may have to wait our turn
+            return Purchase(name: fan, succeeded: ok)
+        }
+    }
+    var all: [Purchase] = []
+    for await p in group {
+        all.append(p)
+    }
+    return all
+}
+
+let winners = purchases.filter(\.succeeded).count
+let soldTo = await office.sold
+print("sold \(soldTo.count) tickets, \(winners) fans succeeded, \(purchases.count - winners) were turned away")
+print("no ticket was sold twice:", Set(soldTo).count == soldTo.count)
+```
+
+```text
+sold 3 tickets, 3 fans succeeded, 3 were turned away
+no ticket was sold twice: true
+```
+
+Six fans try to buy three tickets at the same moment. Inside `buy`, the check `remaining > 0` and the decrement happen with no other task inside the actor, so exactly three purchases succeed and no ticket is sold twice, on every run. Which three fans win depends on timing; the program prints only what is guaranteed.
+
+The other piece is **`Sendable`**: a protocol, checked by the compiler, for types whose values can safely cross from one concurrent context to another. Value types made of `Sendable` parts are `Sendable` (the compiler infers it for non-public structs and enums; `Purchase` declares it explicitly, as public types must). Actors are `Sendable`, because they protect themselves. Immutable `final` classes can be. A class with `var` properties, like `Tally`, is not, and the compiler will not let it be shared between tasks. Between `Sendable` checks and actor isolation, the Swift 6 language mode guarantees that safe code has no data races. When a type really is thread-safe for reasons the compiler cannot see, such as an internal lock, `@unchecked Sendable` lets you take responsibility, and code review should treat every use with suspicion.
+
+### The main actor
+
+User interfaces on every platform must be updated from one thread, the main thread. Swift models it as a global actor, **`@MainActor`**. Mark a class, function or property `@MainActor` and the compiler ensures it is used only on the main thread, inserting `await` where other code must hop over to it. In an app, view models and UI code are `@MainActor`, and slow work (decoding, image processing, computation) runs elsewhere and sends `Sendable` results back. Top-level code in `main.swift` runs on the main actor, which is why the earlier lessons kept mutable state out of plain global functions.
+
+### Approachable concurrency (Swift 6.2)
+
+Early experience with Swift 6 showed that many programs, especially apps, do most of their work on the main thread and were burdened with annotations they did not need. Swift 6.2 introduced options that the toolchain calls *approachable concurrency*. A module can make `@MainActor` its **default isolation** (`-default-isolation MainActor`, or a setting in `Package.swift`), so that single-threaded code needs no annotations at all; `nonisolated async` functions can run on their caller's actor rather than hopping to a background thread; and a new attribute, `@concurrent`, explicitly sends a function to run concurrently. New packages created by `swift package init` in Swift 6.4 already enable the approachable-concurrency upcoming feature in their manifest. The guarantees are the same; the defaults are friendlier. Expect codebases to differ in which options they use, and read a module's settings before reasoning about its isolation.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"ARC is a garbage collector."** Both free memory automatically, but ARC frees each object the instant its count reaches zero, with no background scanning, and it cannot detect cycles. A garbage collector can collect cycles but frees memory at times you do not control.
+
+</Misconception>
+
+<Misconception>
+
+**"Use `[weak self]` in every closure, just in case."** Only escaping closures that are stored by something `self` owns can form a cycle. Closures passed to `map` or other non-escaping parameters cannot, and in a `Task` that will finish soon, capturing `self` strongly is usually fine and simpler. Think about ownership instead of sprinkling `weak`.
+
+</Misconception>
+
+<Misconception>
+
+**"`async` means it runs on a background thread."** `async` means the function *can suspend*. Where it runs is decided by isolation: an `async` method of a `@MainActor` class runs on the main actor. To get work off the main actor, run it in a non-isolated context, such as a `@concurrent` function, a detached task, or another actor.
+
+</Misconception>
+
+<Misconception>
+
+**"Actors make everything inside them atomic."** Only the code between two `await`s runs without interruption. If an actor method awaits something halfway through, other tasks may enter the actor during the suspension and change its state (*reentrancy*). Check your assumptions again after every `await`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

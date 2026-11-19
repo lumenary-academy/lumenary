@@ -1,0 +1,408 @@
+---
+title: Type hints and static checking
+subtitle: Annotating a dynamic language, letting a checker find bugs before the program runs, and adopting types in a real codebase.
+minutes: 55
+objectives:
+  - Write type hints for variables, functions, collections, optional values, unions, literals and typed dictionaries
+  - Run mypy, read its errors, and use narrowing and reveal_type
+  - Write generic functions and classes, type aliases and typed decorators with the Python 3.12 syntax
+  - Explain what hints do and do not do at run time, and how annotations are evaluated in 3.14
+  - Adopt type checking gradually in an existing project
+prerequisites: [classes]
+references:
+  - title: "The Python Standard Library: typing"
+    url: https://docs.python.org/3/library/typing.html
+  - title: "Static Typing with Python (the typing documentation and specification)"
+    url: https://typing.python.org/
+    note: The typing specification that all type checkers follow, guides, and a reference of every typing PEP.
+  - title: mypy documentation
+    url: https://mypy.readthedocs.io/
+  - title: Pyright
+    url: https://github.com/microsoft/pyright
+  - title: "PEP 484: Type Hints"
+    url: https://peps.python.org/pep-0484/
+  - title: "PEP 695: Type Parameter Syntax"
+    url: https://peps.python.org/pep-0695/
+  - title: "PEP 649: Deferred Evaluation Of Annotations Using Descriptors"
+    url: https://peps.python.org/pep-0649/
+  - title: typeshed
+    url: https://github.com/python/typeshed
+    note: Type stubs for the standard library and many third-party packages, used by every checker.
+---
+
+<Section id="motivation" kind="motivation" title="Why annotate a dynamic language?">
+
+Python checks types while the program runs: `"3" + 4` fails at the moment that line executes, not before. For a fifty-line script that is fine. For a codebase of half a million lines, maintained by dozens of people, it means a mistake in a rarely used branch can sit unnoticed for months and then fail in production at three in the morning. It also means that when you rename a field or change what a function returns, nothing tells you which of the four hundred callers you just broke.
+
+**Type hints** are Python's answer. You annotate names with the types you intend, and a separate program, a **static type checker** such as mypy or Pyright, reads the code *without running it* and reports places where the types cannot fit. Python itself still ignores the hints at run time; they cost nothing and change nothing about how the program executes.
+
+Hints pay for themselves in three ways. A checker finds real bugs, especially around `None`. Editors use the hints for completion, navigation and safe renaming. And a signature like `def send(to: list[Address], *, retries: int = 3) -> Receipt` documents itself better than any comment. That is why typed Python became the norm in professional codebases over the last decade: mypy itself grew up at Dropbox, where its author Jukka Lehtosalo worked, and today most widely used libraries ship type information.
+
+</Section>
+
+<Section id="syntax" kind="definitions" title="The vocabulary of hints">
+
+Annotations go after a colon for parameters and variables, and after `->` for return values:
+
+```python
+retries: int = 3
+names: list[str] = []
+
+def greet(name: str, times: int = 1) -> str:
+    return " ".join([f"hi {name}"] * times)
+```
+
+The forms you will write most often:
+
+| Hint | Meaning | Since |
+| --- | --- | --- |
+| `int`, `str`, `bytes`, `float`, `bool` | that type (an `int` is accepted where `float` is expected) | |
+| `list[str]`, `dict[str, int]`, `set[int]` | built-in collections with item types | 3.9 |
+| `tuple[int, str]`, `tuple[int, ...]` | fixed-length, or any length of one type | 3.9 |
+| `X \| Y`, `X \| None` | either type; "or `None`" is the most common union | 3.10 |
+| `Sequence[T]`, `Mapping[K, V]`, `Iterable[T]` (from `collections.abc`) | read-only interfaces: accept these, return concrete types | |
+| `Callable[[int, str], bool]` | a function taking an `int` and a `str` and returning `bool` | |
+| `Literal["r", "w"]` | exactly one of these values | 3.8 |
+| `TypedDict` subclass | a dict with known string keys and per-key types | 3.8 |
+| `Final`, `ClassVar` | must not be reassigned; belongs to the class | 3.8 |
+| `Self` | the type of the current class, for methods that return `self` | 3.11 |
+| `Any` | opt out: anything goes, unchecked | |
+| `object` | anything, but you may only do what every object supports | |
+
+Two of these deserve emphasis. `Any` and `object` both accept every value, but they are opposites: `Any` switches checking *off* (you can call any method on it), while `object` keeps it *on* (you can call almost nothing without first checking the type). And a good rule for parameters is to accept the most general interface you actually use, such as `Iterable[str]` if you only loop over it, and to return the most specific type, such as `list[str]`, so callers know what they get.
+
+</Section>
+
+<Section id="runtime" kind="intuition" title="What hints do when the program runs">
+
+Almost nothing. The interpreter stores annotations so tools can read them, and otherwise ignores them:
+
+```python run
+from typing import get_type_hints
+
+
+def greet(name: str, times: int = 1) -> str:
+    return " ".join([f"hi {name}"] * times)
+
+
+print(greet("Ana", 2))
+print(greet(42))                     # no error: hints are not enforced when the program runs
+print(get_type_hints(greet))         # but they are there for tools to read
+print(isinstance(3, int | str))      # some hint syntax also works as ordinary values (3.10+)
+```
+
+```text
+hi Ana hi Ana
+hi 42
+{'name': <class 'str'>, 'times': <class 'int'>, 'return': <class 'str'>}
+True
+```
+
+`greet(42)` ran happily, because `f"hi {name}"` works for any object. A checker would have flagged the call. This split is deliberate and important: hints are a *development-time* safety net, not a run-time guard. Code that receives untrusted data (JSON from a web request, a configuration file, user input) still has to validate it. Libraries such as **Pydantic** and the standard library's `dataclasses` read annotations at run time to build validators or generated methods, which is the main reason runtime access to annotations exists.
+
+How annotations are *evaluated* has changed over the years. Originally they were evaluated when the `def` ran, which made forward references (a class mentioning itself) awkward and imports for typing slow. `from __future__ import annotations` (PEP 563) turned them into strings. Python 3.14 settled the question with **deferred evaluation** (PEPs 649 and 749): annotations are computed only when something asks for them, and the new `annotationlib` module gives tools control over how. For everyday code, the upshot is that forward references simply work on 3.14 and later.
+
+</Section>
+
+<Section id="mypy" kind="examples" title="A checker at work">
+
+Here is a small module with four bugs, the kind that slip through review. It uses a `TypedDict` to describe the dictionaries that represent orders, a `Literal` for the allowed statuses, and the `type` statement (3.12) to name that literal:
+
+```python
+from typing import Literal, TypedDict
+
+type Status = Literal["new", "paid", "shipped"]
+
+
+class Order(TypedDict):
+    id: int
+    status: Status
+    total_cents: int
+
+
+def find(orders: list[Order], order_id: int) -> Order | None:
+    for order in orders:
+        if order["id"] == order_id:
+            return order
+    return None
+
+
+def mark_paid(order: Order) -> None:
+    order["status"] = "payed"
+
+
+def total(orders: list[Order]) -> int:
+    return sum(order["total_cents"] for order in orders)
+
+
+orders: list[Order] = [{"id": 1, "status": "new", "total_cents": 1500}]
+latest = find(orders, 7)
+print(latest["status"])         # latest may be None
+if latest is not None:
+    print(latest["status"])     # fine: the check narrows Order | None to Order
+print(total([{"id": 2, "status": "new", "total": 500}]))
+```
+
+Running the program would crash on the first `print` (there is no order 7, so `latest` is `None`), and the misspelt status and the wrong key would only cause trouble later, somewhere else. Running `mypy orders.py` finds all of them without executing anything:
+
+```text
+orders.py:20: error: Value of "status" has incompatible type "Literal['payed']"; expected "Literal['new', 'paid', 'shipped']"  [typeddict-item]
+orders.py:29: error: Value of type "Order | None" is not indexable  [index]
+orders.py:32: error: Missing key "total_cents" for TypedDict "Order"  [typeddict-item]
+orders.py:32: error: Extra key "total" for TypedDict "Order"  [typeddict-unknown-key]
+Found 4 errors in 1 file (checked 1 source file)
+```
+
+Line 29 shows the single most valuable thing a checker does: it forces you to handle `None`. Line 31 shows how you satisfy it. After `if latest is not None:`, the checker **narrows** the type from `Order | None` to `Order` inside the block. Narrowing also follows `isinstance` checks, `return` and `raise` in an earlier branch, and comparisons with literals. When you are not sure what the checker thinks a type is, write `reveal_type(expr)`; the checker prints its inference as a note.
+
+Here is the module with all four problems fixed. The walrus operator from lesson 1 lets the last `if` both bind and narrow `order`. mypy now reports `Success: no issues found in 1 source file`, and the program runs:
+
+```python check
+"""orders.py, fixed: mypy reports no issues, and the program runs."""
+from typing import Literal, TypedDict
+
+type Status = Literal["new", "paid", "shipped"]
+
+
+class Order(TypedDict):
+    id: int
+    status: Status
+    total_cents: int
+
+
+def find(orders: list[Order], order_id: int) -> Order | None:
+    for order in orders:
+        if order["id"] == order_id:
+            return order
+    return None
+
+
+def mark_paid(order: Order) -> None:
+    order["status"] = "paid"
+
+
+def total(orders: list[Order]) -> int:
+    return sum(order["total_cents"] for order in orders)
+
+
+orders: list[Order] = [
+    {"id": 1, "status": "new", "total_cents": 1500},
+    {"id": 2, "status": "new", "total_cents": 500},
+]
+latest = find(orders, 7)
+print("order 7:", latest["status"] if latest is not None else "not found")
+if (order := find(orders, 1)) is not None:
+    mark_paid(order)
+print(orders[0]["status"], total(orders))
+```
+
+```text
+order 7: not found
+paid 2000
+```
+
+### Gradual typing
+
+You do not have to annotate everything at once. By default mypy does not check the *bodies* of functions that have no annotations at all, so you can add types one module at a time. Consider:
+
+```python
+def parse_port(text):
+    return int(text)
+
+
+def describe(port: int) -> str:
+    return "port " + port
+```
+
+Plain `mypy strict.py` reports only the bug in the annotated function; `mypy --strict strict.py` also insists that every function be annotated and that nothing typed `Any` leaks into a typed return value:
+
+```text
+strict.py:1: error: Function is missing a type annotation  [no-untyped-def]
+strict.py:6: error: Returning Any from function declared to return "str"  [no-any-return]
+strict.py:6: error: Unsupported operand types for + ("str" and "int")  [operator]
+Found 3 errors in 1 file (checked 1 source file)
+```
+
+The error codes in square brackets matter: when you must silence a false alarm, write `# type: ignore[operator]` with the specific code, never a bare `# type: ignore`, so the suppression cannot hide a different error later. (Both outputs above are from mypy 2.4.)
+
+</Section>
+
+<Section id="generics" kind="computation" title="Generics, aliases and typed decorators">
+
+A **generic** function or class works for many types while keeping track of which one. Without generics, `first(items)` could only promise to return `object` or `Any`; with a type parameter `T`, it promises to return the same type the sequence holds. Python 3.12 introduced a compact syntax for this (PEP 695): the parameters go in square brackets after the name.
+
+```python check
+"""Generics with the Python 3.12 syntax, and a typed decorator."""
+import functools
+from collections.abc import Callable, Sequence
+from typing import reveal_type
+
+type Matrix = list[list[float]]              # a type alias (3.12 type statement)
+
+
+def first[T](items: Sequence[T]) -> T:       # T is a type parameter
+    return items[0]
+
+
+class Stack[T]:                              # a generic class
+    def __init__(self) -> None:
+        self._items: list[T] = []
+
+    def push(self, item: T) -> None:
+        self._items.append(item)
+
+    def pop(self) -> T:
+        return self._items.pop()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def logged[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """A decorator that keeps the wrapped function's exact signature for the checker."""
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        print(f"calling {func.__name__}{args}")
+        return func(*args, **kwargs)
+    return wrapper
+
+
+@logged
+def scale(m: Matrix, factor: float) -> Matrix:
+    return [[x * factor for x in row] for row in m]
+
+
+numbers = first([3, 1, 2])
+letter = first("xyz")
+reveal_type(numbers)                          # the checker says int; at run time this prints to stderr
+reveal_type(letter)
+stack: Stack[str] = Stack()
+stack.push("ndizi")
+stack.push("embe")
+print(numbers, letter, stack.pop(), len(stack))
+print(scale([[1.0, 2.0]], 3))
+print(first.__type_params__, Stack.__type_params__, Matrix.__value__)
+```
+
+Run with Python 3.13, it prints (the first two lines come from `reveal_type` on standard error):
+
+```text
+Runtime type is 'int'
+Runtime type is 'str'
+3 x embe 1
+calling scale([[1.0, 2.0]], 3)
+[[3.0, 6.0]]
+(T,) (T,) list[list[float]]
+```
+
+and mypy, reading the same file, reports:
+
+```text
+generics.py:43: note: Revealed type is "int"
+generics.py:44: note: Revealed type is "str"
+Success: no issues found in 1 source file
+```
+
+The checker inferred `int` for `first([3, 1, 2])` and `str` for `first("xyz")`; `stack.push(42)` would be an error because `stack` is a `Stack[str]`. The decorator uses `**P`, a **parameter specification** (PEP 612), to say "the wrapper accepts exactly the parameters `func` accepts", so `scale` keeps its full signature after decoration, and a call such as `scale([[1.0]], "3")` is still caught. Before 3.12 you would declare `T = TypeVar("T")` and `P = ParamSpec("P")` at module level instead; you will meet both styles in real code, and they mean the same thing.
+
+Generics combine naturally with the **protocols** from lesson 5. Here `T: Ordered` gives the type parameter an upper **bound**: `largest` accepts any iterable of things that support `<`, such as numbers, strings, dates and your own ordered classes, and the checker knows the result has the same type as the items.
+
+```python check
+"""A generic function bounded by a protocol."""
+from collections.abc import Iterable
+from datetime import date
+from typing import Protocol, Self
+
+
+class Ordered(Protocol):
+    def __lt__(self, other: Self, /) -> bool: ...
+
+
+def largest[T: Ordered](items: Iterable[T]) -> T:
+    iterator = iter(items)
+    try:
+        best = next(iterator)
+    except StopIteration:
+        raise ValueError("largest() of an empty iterable") from None
+    for item in iterator:
+        if best < item:
+            best = item
+    return best
+
+
+print(largest([3, 9, 2]))
+print(largest(["mango", "fig", "papaya"]))
+print(largest([date(2026, 3, 1), date(2025, 12, 31)]))
+```
+
+```text
+9
+papaya
+2026-03-01
+```
+
+Add the line `print(largest([1j, 2j]))` and mypy objects before anything runs, because complex numbers cannot be ordered:
+
+```text
+bad.py:26: error: Value of type variable "T" of "largest" cannot be "complex"  [type-var]
+Found 1 error in 1 file (checked 1 source file)
+```
+
+</Section>
+
+<Section id="practice" kind="human" title="Typing in a real project">
+
+What experienced teams actually do:
+
+- **Pick a checker and run it in CI.** **mypy** is the original and the reference for the typing specification's behaviour. **Pyright** (which powers Microsoft's Pylance in VS Code) is fast and strict. In 2025 two newer checkers written in Rust appeared, Astral's **ty** and Meta's **Pyrefly**, aimed at very large codebases. They differ in defaults and inference details, so a project standardises on one, configures it in `pyproject.toml`, and makes CI fail on new errors.
+- **Tighten gradually.** Start with default settings, fix what is found, then turn on stricter options per module (`disallow_untyped_defs`, then `strict`) as each module is cleaned up. New code is written fully typed from day one.
+- **Annotate boundaries first.** Public functions, data structures and anything crossing a module boundary give the most value per annotation. Local variables rarely need hints: the checker infers them.
+- **Know where types come from.** The standard library's types live in **typeshed**, a shared repository of *stub files* (`.pyi`, signatures without bodies). Libraries that ship their own hints include a `py.typed` marker file; others have stub packages named like `types-requests`.
+- **Escape hatches, sparingly.** `Any`, `cast(T, value)` and `# type: ignore[code]` exist for code the checker cannot understand. Each one is a small hole in the net; review them like you would review a `try: ... except: pass`.
+- **Do not fight the language.** Some dynamic patterns (heavily dynamic attribute access, monkey-patching) are hard to type. Often that is a hint the design could be simpler; sometimes it is fine to leave that corner as `Any`.
+
+</Section>
+
+<Section id="history" kind="history" title="From annotations to a type system">
+
+Python 3.0 (2008) added **function annotations** (PEP 3107) with deliberately *no* meaning: any expression could go after the colon, and it was left to libraries to decide what to do with it. Meanwhile Jukka Lehtosalo was building mypy as a PhD project at Cambridge. In 2014 Guido van Rossum, Lehtosalo and Łukasz Langa wrote **PEP 484**, which gave annotations a standard meaning as type hints and added the `typing` module in Python 3.5. Variable annotations followed in 3.6 (PEP 526), protocols, `TypedDict` and `Literal` in 3.8, built-in generics like `list[int]` in 3.9, `X | Y` in 3.10, `Self` in 3.11, the new generic syntax and `@override` in 3.12, `TypeIs` and type-parameter defaults in 3.13, and deferred evaluation in 3.14. Python 3.15 (2026) added more, such as `TypedDict` classes that declare the type of extra keys (PEP 728). Since 2023 a **typing council** (PEP 729) has maintained a single **typing specification**, so that all checkers can agree on behaviour.
+
+Through all of it, one principle from PEP 484 has held: type hints are optional, and Python will remain a dynamically typed language.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Type hints make Python check types at run time" or "make it faster."** CPython ignores them when executing. They are read by checkers, editors and some libraries. (Tools such as mypyc can compile typed code to C extensions, but that is a separate step.)
+
+</Misconception>
+
+<Misconception>
+
+**"If the checker passes, the types are right at run time."** Only as far as the hints and the data are honest. JSON from outside, `Any`, `cast` and `type: ignore` can all let a wrong type through. Validate external data at the boundary.
+
+</Misconception>
+
+<Misconception>
+
+**"`Optional[X]` means the parameter is optional."** It means "`X` or `None`". Whether a parameter can be omitted depends on whether it has a default. The modern spelling, `X | None`, avoids the confusion.
+
+</Misconception>
+
+<Misconception>
+
+**"Annotating a parameter as `list[float]` is the safe choice."** It rejects tuples, generators and other sequences that would work fine, and it also says the function might mutate the list. If you only read it, accept `Sequence[float]` or `Iterable[float]`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+These exercises ask what a checker would say and what Python does at run time; keep the two apart. The last one asks you to write a small generic function (its hints are for readers and checkers; the tests check behaviour).
+
+<Exercises/>
+
+</Section>

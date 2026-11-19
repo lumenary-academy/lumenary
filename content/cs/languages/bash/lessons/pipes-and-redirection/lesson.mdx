@@ -1,0 +1,324 @@
+---
+title: Pipes and redirection
+subtitle: Standard input, output and error, sending them to files and to each other, and building pipelines out of small programs.
+minutes: 50
+objectives:
+  - Explain the three standard streams and file descriptors 0, 1 and 2
+  - Redirect output, errors and input with >, >>, 2>, 2>&1 and <, and get the order right
+  - Build pipelines, read their exit statuses with PIPESTATUS, and know what pipefail changes
+  - Use here-documents, here-strings, process substitution, tee and xargs
+  - Read a file line by line safely, and avoid the subshell trap of piping into a loop
+prerequisites: [quoting-and-expansions]
+references:
+  - title: "Bash Reference Manual: Redirections"
+    url: https://www.gnu.org/software/bash/manual/html_node/Redirections.html
+  - title: "Bash Reference Manual: Pipelines"
+    url: https://www.gnu.org/software/bash/manual/html_node/Pipelines.html
+  - title: "BashFAQ 001: How can I read a file line by line?"
+    url: https://mywiki.wooledge.org/BashFAQ/001
+  - title: GNU Coreutils manual
+    url: https://www.gnu.org/software/coreutils/manual/
+    note: The documentation for sort, uniq, tr, tee, wc, head and the other standard tools.
+---
+
+<Section id="motivation" kind="motivation" title="Small programs, joined together">
+
+In 1973, Unix gained a feature that changed how people use computers: the **pipe**. Doug McIlroy at Bell Labs had long argued that programs should be connectable like segments of garden hose; Ken Thompson implemented pipes, and within months the shell had the `|` notation still used today. Almost overnight, programs that each did one small job (sort lines, count them, find a pattern) could be combined into tools nobody had written. The style of working that grew from this is often summed up as: write programs that do one thing well, make them work together, and use plain text as the common format between them.
+
+Fifty years later, that style is still how experienced engineers answer questions on the command line. "Which ten IP addresses made the most requests yesterday?" is one line of shell, built from programs that know nothing about IP addresses. This lesson covers the plumbing that makes it possible: where a program's input comes from and where its output goes, and how to connect them.
+
+</Section>
+
+<Section id="streams" kind="definitions" title="Three streams">
+
+Every process starts with three open **streams**, identified by small numbers called **file descriptors**:
+
+| Number | Name | Default | Used for |
+| --- | --- | --- | --- |
+| 0 | standard input (stdin) | the keyboard | data the program reads |
+| 1 | standard output (stdout) | the terminal | the program's results |
+| 2 | standard error (stderr) | the terminal | error messages and diagnostics |
+
+Keeping errors on a separate stream from results is what lets you send results to a file or another program while still seeing the errors on screen. A well-behaved program, including your own scripts, writes its output to stdout and its complaints to stderr (`echo "something went wrong" >&2`).
+
+**Redirections** change where the streams point, for one command. Bash processes them from left to right, *before* the command runs:
+
+| Syntax | Meaning |
+| --- | --- |
+| `cmd > file` | stdout to `file`, created or **truncated** first |
+| `cmd >> file` | stdout appended to `file` |
+| `cmd 2> file` | stderr to `file` |
+| `cmd > file 2>&1` | stdout to `file`, then stderr to wherever stdout now points |
+| `cmd &> file` | Bash shorthand for the line above |
+| `cmd < file` | stdin read from `file` |
+| `cmd > /dev/null` | discard output (`/dev/null` swallows everything written to it) |
+
+`2>&1` reads as "make descriptor 2 a copy of descriptor 1 *as it is right now*". That "right now" is why the order of redirections matters, as the next example shows.
+
+</Section>
+
+<Section id="redirection" kind="examples" title="Redirection in action">
+
+The script runs in a temporary directory, creates a file, and asks `ls` about it and about a file that does not exist, so that `ls` produces both output and an error:
+
+```bash check
+#!/usr/bin/env bash
+printf 'line one\nline two\n' > notes.txt     # > creates or overwrites
+printf 'line three\n' >> notes.txt            # >> appends
+wc -l < notes.txt                             # < feeds a file to standard input
+
+ls notes.txt missing.txt > found.txt 2> problems.txt
+echo "stdout went to found.txt:    $(cat found.txt)"
+echo "stderr went to problems.txt: $(cat problems.txt)"
+
+ls notes.txt missing.txt > both.txt 2>&1      # both streams into one file
+wc -l < both.txt
+
+ls notes.txt missing.txt 2>&1 > only-out.txt  # order matters: stderr still goes to the screen
+ls missing.txt > /dev/null 2>&1               # discard everything
+echo "exit status was still $?"
+```
+
+```text
+3
+stdout went to found.txt:    notes.txt
+stderr went to problems.txt: ls: cannot access 'missing.txt': No such file or directory
+2
+ls: cannot access 'missing.txt': No such file or directory
+exit status was still 2
+```
+
+Read the last three commands carefully:
+
+- `> both.txt 2>&1`: first stdout goes to the file, then stderr is pointed at the same place. Both lines end up in `both.txt`.
+- `2>&1 > only-out.txt`: first stderr is pointed at where stdout points *at that moment* (the screen), and only then is stdout moved to the file. So the error still appeared on screen, as you can see in the output.
+- `> /dev/null 2>&1` discards both streams, but the exit status still reports the failure. Silencing a command's messages does not make it succeed.
+
+Because `>` silently truncates, an interactive typo such as `> important.txt` instead of `>> important.txt` can destroy data. `set -o noclobber` makes `>` refuse to overwrite an existing file (use `>|` when you really mean it); some people turn it on in their `~/.bashrc` for exactly this reason.
+
+</Section>
+
+<Section id="pipelines" kind="computation" title="Pipelines">
+
+A **pipeline**, `cmd1 | cmd2 | cmd3`, connects each command's stdout to the next one's stdin. All the commands start at the same time, each in its own process, and data flows through as it is produced, so a pipeline can process far more data than fits in memory, and `head` can stop the whole thing early once it has what it needs.
+
+```bash check
+#!/usr/bin/env bash
+export LC_ALL=C
+printf '%s\n' banana apple cherry apple banana apple > fruit.txt
+
+sort fruit.txt | uniq -c | sort -rn | head -n 2   # the classic "top N" pipeline
+tr 'a-z' 'A-Z' < fruit.txt | head -n 1
+
+false | true
+echo "status of the pipeline: $?; of each part: ${PIPESTATUS[*]}"
+set -o pipefail
+false | true
+echo "with pipefail: $?"
+```
+
+```text
+      3 apple
+      2 banana
+BANANA
+status of the pipeline: 0; of each part: 1 0
+with pipefail: 1
+```
+
+`sort | uniq -c | sort -rn | head -n 2` is worth memorising: sort so that equal lines are adjacent, count each run of equal lines, sort the counts numerically in reverse, and keep the top. You will use variations of it for the rest of your career. Lesson 6 covers these tools properly.
+
+The **exit status of a pipeline** is, by default, the status of its *last* command. `false | true` succeeds, even though `false` failed. The array `PIPESTATUS` holds the status of every part (`1 0`), and `set -o pipefail` changes the rule so that the pipeline fails if *any* part fails. Lesson 7 explains why safe scripts turn it on. Note also `tr 'a-z' 'A-Z' < fruit.txt` rather than `cat fruit.txt | tr ...`: when a command can read a file through `<`, there is no need for an extra `cat` process.
+
+</Section>
+
+<Section id="more-plumbing" kind="examples" title="Here-documents, process substitution, tee and xargs">
+
+A few more pieces of plumbing turn up constantly in real scripts:
+
+```bash check
+#!/usr/bin/env bash
+export LC_ALL=C
+name="Fatima"
+cat <<EOT
+Dear $name,
+your order of $((3 * 4)) items has shipped.
+EOT
+cat <<'EOT'
+In a quoted here-document, $name and $((3 * 4)) stay as they are.
+EOT
+
+read -r first rest <<< "alpha beta gamma"     # here-string: a string as standard input
+echo "first=$first rest=$rest"
+
+diff <(printf '%s\n' a b c) <(printf '%s\n' a c d)   # process substitution: output as a file
+echo "diff exit status: $?"
+
+printf '%s\n' one two three | tee copy.txt | wc -l   # tee: save a copy and pass it on
+tr '\n' ' ' < copy.txt; echo
+
+printf '%s\0' "summer photo.jpg" "notes.md" | xargs -0 touch   # NUL-separated: any name is safe
+printf '%s\n' *.jpg *.md
+```
+
+```text
+Dear Fatima,
+your order of 12 items has shipped.
+In a quoted here-document, $name and $((3 * 4)) stay as they are.
+first=alpha rest=beta gamma
+2d1
+< b
+3a3
+> d
+diff exit status: 1
+3
+one two three 
+summer photo.jpg
+notes.md
+```
+
+- A **here-document**, `<<WORD ... WORD`, feeds the lines in between to a command's stdin. Variables and `$(( ))` expand inside it, which makes it a simple templating tool for generating configuration files or emails. Quoting the delimiter (`<<'WORD'`) turns expansion off. With `<<-WORD`, leading *tab* characters are stripped, so the body can be indented inside a function.
+- A **here-string**, `<<< "text"`, feeds a single string to stdin.
+- **Process substitution**, `<(command)`, runs a command and gives its output a temporary file name, for programs that insist on file names rather than stdin. `diff <(...) <(...)` compares the output of two commands without temporary files; `diff` exits with 1 because the inputs differ, which is information, not an error.
+- **`tee file`** copies its input to a file *and* to stdout, so you can save an intermediate stage of a pipeline and keep going.
+- **`xargs`** turns lines (or, with `-0`, NUL-separated items) from stdin into *arguments* of a command. The NUL byte is the only character that cannot appear in a file name, which is why `find ... -print0 | xargs -0 ...` is the robust way to pass file names between programs.
+
+</Section>
+
+<Section id="scripts-streams" kind="computation" title="Streams in your own scripts">
+
+Your scripts and functions have the same three streams, and using them well is a mark of a professional script. **Results go to stdout; messages for humans go to stderr.** Then a caller can capture or pipe your results without your progress messages getting mixed in. Redirections also apply to whole groups of commands, and `exec` with only redirections changes the streams of the *current* shell, for the rest of the script:
+
+```bash check
+#!/usr/bin/env bash
+log() { printf 'log: %s\n' "$*" >&2; }        # diagnostics go to stderr
+
+report() {
+    log "building the report"
+    printf 'total: %d\n' 42                    # results go to stdout
+}
+
+report > report.txt                            # only the result is captured...
+echo "report.txt holds: $(cat report.txt)"     # ...the log line went to stderr
+
+{
+    echo "header"
+    printf '%s\n' row1 row2
+} > table.txt                                  # one redirection for a whole group
+wc -l < table.txt
+
+exec 3> audit.txt                              # open descriptor 3 for the rest of the script
+echo "step 1 done" >&3
+echo "step 2 done" >&3
+exec 3>&-                                      # close it
+cat audit.txt
+```
+
+The standard output was:
+
+```text
+report.txt holds: total: 42
+3
+step 1 done
+step 2 done
+```
+
+On a terminal you would also see `log: building the report`, printed by `log` on stderr: the redirection `> report.txt` captured the function's result but not its diagnostic. Three techniques are on show:
+
+- **A `log` function that writes to `>&2`**, used for every message meant for a person. It is the single most useful helper in scripting.
+- **`{ ...; } > file`** redirects a group of commands once, instead of appending line by line with `>>`. (Use `( ... )` instead of braces to run the group in a subshell, so that `cd` and variable changes inside it do not leak out.)
+- **`exec 3> file`** opens an extra file descriptor that any later command can write to with `>&3`, and `exec 3>&-` closes it. A common variant at the top of long-running scripts is `exec > >(tee -a run.log) 2>&1`, which sends everything the script prints both to the screen and to a log file.
+
+</Section>
+
+<Section id="reading-lines" kind="human" title="Reading input line by line">
+
+Processing a file one line at a time is one of the most common jobs in a script, and the correct idiom has three parts that are each there for a reason:
+
+```bash check
+#!/usr/bin/env bash
+printf 'name,age,city\nAna,34,Lima\nBo,28,Oslo\nChidi,41,Enugu\n' > people.csv
+
+{
+    read -r header                              # consume the header line
+    while IFS=, read -r name age city; do       # split each line at commas
+        printf '%-6s %3d  %s\n' "$name" "$age" "$city"
+    done
+} < people.csv
+
+count=0
+printf 'a\nb\nc\n' | while read -r line; do
+    count=$((count + 1))                        # runs in a subshell: lost afterwards
+done
+echo "after the pipe: count=$count"
+
+while read -r line; do
+    count=$((count + 1))
+done < <(printf 'a\nb\nc\n')                    # process substitution keeps the loop in this shell
+echo "after process substitution: count=$count"
+```
+
+```text
+Ana     34  Lima
+Bo      28  Oslo
+Chidi   41  Enugu
+after the pipe: count=0
+after process substitution: count=3
+```
+
+- **`while IFS=, read -r a b c`**: `read` reads one line and splits it into the named variables at the characters in `IFS`, here a comma, for this one command only. The last variable receives the rest of the line. To read whole lines unchanged, use `IFS= read -r line`, which also keeps leading and trailing spaces.
+- **`-r`** stops `read` from treating backslashes as escape characters. Without it, a line containing `C:\new` would come out mangled. Always use it.
+- **`done < file`** redirects the whole loop's input. Grouping commands in `{ ...; }` lets them share one input, which is how the header line was consumed before the loop started.
+
+The second half of the script shows a trap that catches everyone once. Each part of a pipeline runs in a separate process (a **subshell**), so a `while` loop on the right of a `|` changes `count` in its own copy, which disappears when the loop ends. Feed the loop with a redirection or with process substitution, `done < <(command)`, and it runs in the current shell. (Bash's `lastpipe` option is another fix, but only in scripts, where job control is off.)
+
+Finally, a word of caution: a `while read` loop runs Bash code once per line, which is slow for large files. For real data, let a specialised tool such as `awk`, `grep` or `sort` do the per-line work, as lesson 6 shows; use the loop when each line needs to drive a *command*, such as one `curl` call per URL.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`sort data.txt > data.txt` sorts the file in place."** The shell truncates `data.txt` when it sets up the redirection, *before* `sort` starts, so `sort` reads an empty file and the data is gone. Write to a new file and rename it (`sort data.txt > data.tmp && mv data.tmp data.txt`), or use `sort -o data.txt data.txt`, which `sort` supports specially.
+
+</Misconception>
+
+<Misconception>
+
+**"`2>&1 > file` and `> file 2>&1` are the same."** Redirections are applied left to right, and `2>&1` copies wherever stdout points *at that moment*. Only `> file 2>&1` sends both streams to the file.
+
+</Misconception>
+
+<Misconception>
+
+**"A pipeline fails if any command in it fails."** By default only the last command's status counts. `curl ... | tar x` reports success even when the download failed, unless you check `PIPESTATUS` or use `set -o pipefail`.
+
+</Misconception>
+
+<Misconception>
+
+**"In `a | b`, `a` runs to completion and then `b` starts."** Both start at once and run side by side, connected by a small buffer. That is why `yes | head -n 3` finishes instantly although `yes` prints forever: when `head` exits, `yes` is stopped the next time it writes to the closed pipe (by a signal called `SIGPIPE`).
+
+</Misconception>
+
+<Misconception>
+
+**"`xargs` is fine for file names."** Plain `xargs` splits its input at spaces and newlines and treats quotes specially, so `my file.txt` becomes two arguments. Use NUL separators (`find -print0 | xargs -0`) or `find -exec ... {} +` when names come from the file system.
+
+</Misconception>
+
+<Misconception>
+
+**"Error messages are part of the output."** They are on a different stream. That is why `cmd | grep error` often finds nothing: the errors went straight to the terminal. Use `cmd 2>&1 | grep error` to search both.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+For each question, decide where every stream ends up before you run anything.
+
+<Exercises/>
+
+</Section>
