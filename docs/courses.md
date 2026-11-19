@@ -7,6 +7,7 @@ Lumenary Math has its own knowledge graph, Lean library and experiments (see the
 | Lumenary CS | `content/cs/` | English | `/en/cs/`, `/en/cs/<slug>/` |
 | Spanish, taught in English | `content/lingua/spanish/` | English | `/en/lingua/spanish/`, `/en/lingua/spanish/<slug>/` |
 | Inglés, enseñado en español | `content/lingua/ingles/` | Spanish | `/es/lingua/ingles/`, `/es/lingua/ingles/<slug>/` |
+| Programming languages (Assembly … Zig) | `content/cs/languages/<id>/` | English | `/en/cs/languages/`, `/en/cs/languages/<id>/`, `/en/cs/languages/<id>/<slug>/` |
 
 A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`). `/[locale]/lingua/` lists the Lingua courses in every locale.
 
@@ -83,6 +84,26 @@ Plain Markdown is encouraged: headings (`###`, `####`; `##` is the section title
 
 Fenced code blocks are highlighted (python, bash, sql, javascript, typescript, c, cpp, go, rust, java, json, yaml, html, css, diff; anything else is shown plain, e.g. `text`). A Python block whose fence reads ```` ```python run ```` gets **Run** and **Edit** buttons and runs in the learner's browser (Pyodide: CPython 3.13 with numpy, in a sandboxed worker).
 
+In the programming-language courses, a block whose fence reads ```` ```rust check ```` (any language below) is a **complete program** that `npm run verify:courses` compiles and runs with that language's own toolchain; it must exit with status 0. Use `check` for every complete program you show, and plain fences for fragments. Fence names and how each is run (`compute/verify_courses.py`, `RUNNERS`):
+
+| Fence | Saved as | Run with |
+| --- | --- | --- |
+| `asm` | main.s | GNU as (x86-64, Intel or AT&T syntax as the lesson says) + ld, no libc |
+| `c`, `fortran` | main.c, main.f90 | gcc -std=c17, gfortran -std=f2018 |
+| `cpp` | main.cpp | g++ 14 -std=c++23 |
+| `rust`, `zig`, `go` | main.rs, main.zig, main.go | rustc (edition 2024), zig run, go run |
+| `java` | Main.java | java 25, single-file launch |
+| `kotlin`, `scala` | main.kt, main.scala | kotlinc + JDK 21, scala-cli |
+| `csharp`, `fsharp`, `vb` | main.cs, main.fsx, Program.vb | .NET 10: dotnet run main.cs, dotnet fsi, a VB console project |
+| `swift`, `dart` | main.swift, main.dart | swiftc, dart run |
+| `javascript`, `typescript` | main.mjs, main.ts | Node 22; tsc --strict then node |
+| `python`, `bash`, `perl`, `lua`, `ruby`, `php` | main.* | CPython 3.13, bash, perl 5, Lua 5.5, Ruby, PHP |
+| `haskell`, `ocaml`, `elixir`, `erlang`, `clojure`, `scheme` | main.hs, main.ml, main.exs, main.erl (escript), main.clj, main.scm | runghc, ocaml, elixir, escript, clojure -M, chibi-scheme (R7RS) |
+| `sql`, `r`, `julia`, `matlab` | main.sql, main.R, main.jl, main.m | sqlite3, Rscript, julia, GNU Octave |
+| `prolog`, `cobol`, `ada`, `pascal` | main.pl, main.cob, main.adb, main.pas | SWI-Prolog, GnuCOBOL (free format), GNAT, Free Pascal |
+
+`compute/toolchains/setup.sh` installs these (tarballs under `~/.cache/lumenary-toolchains`, the rest as Docker images, run without network). A check whose toolchain is missing is reported as skipped and never counts as tested. To run one program by hand: `python3 compute/verify_courses.py --snippet rust path/to/main.rs`.
+
 Every `python run` block is executed by `npm run verify:courses` in a fresh interpreter and must finish without an exception in under a minute. So a runnable block must be self-contained and must not use `input()`, threads, processes, sockets, the network, files outside a temporary directory, or randomness without a fixed seed when it prints results. Top-level `await` is allowed (the browser supports it). Write Python that also runs on CPython 3.10 (no `match` on 3.10-incompatible syntax, no PEP 695 generics). Use plain ```` ```python ```` (not runnable) for code that cannot meet these rules.
 
 ### MDX pitfalls
@@ -121,6 +142,10 @@ Feedback never shames: "Not yet — …" rather than "Wrong".
 ### Lumenary CS
 
 Each lesson goes from the idea to working code to the professional view: motivation, intuition, precise definitions, worked examples with runnable code, complexity and correctness where they apply, misconceptions, how it is done in industry or research (with links), and exercises that include at least one or two Python exercises where code makes sense. Higher levels are written for strong university students and working engineers; the frontier level should read like a briefing from someone who works at an AI lab, linking the primary papers and the labs' own documentation.
+
+### Programming-language courses
+
+One course per language under `content/cs/languages/<id>/` (`id` is the directory name), each with its own `course.json` (`group`: the family it is listed under; `year`: when the language appeared) in three levels — Foundations, Practice, Professional — of eight to ten lessons in all. A course takes a learner who knows what a variable and a loop are (Lumenary CS's Start level) from a first program in the language to the idioms, tools and practices of professionals who use it every day: its history and design philosophy, installing the official toolchain, the core language, its type system and signature features, errors and testing, concurrency or memory as the language frames them, its ecosystem, and a complete small project. Show what the program prints only as it actually printed when run. Exercises use `choice`, `integer`, `set` and `text` (for example "what does this program print?", answered as text).
 
 ### Lumenary Lingua
 

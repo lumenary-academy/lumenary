@@ -24,6 +24,7 @@ const MIN_EXERCISES = { scientia: 4, lingua: 6 } as const;
 
 const courseDirs = [
   ...(exists("content/cs/course.json") ? ["cs"] : []),
+  ...(exists("content/cs/languages") ? dirs("content/cs/languages").filter((d) => exists(`content/cs/languages/${d}/course.json`)).map((d) => `cs/languages/${d}`) : []),
   ...(exists("content/lingua") ? dirs("content/lingua").filter((d) => exists(`content/lingua/${d}/course.json`)).map((d) => `lingua/${d}`) : []),
 ];
 const topics = new Set(GraphFile.parse(json("content/math/graph/graph.json")).topics.map((t) => t.id));
@@ -36,6 +37,11 @@ function prose(body: string): string {
 /** ```python run blocks, as the code report counts them. */
 function runnableBlocks(body: string): string[] {
   return [...body.matchAll(/^```python[ \t]+run[ \t]*\n([\s\S]*?)^```\s*$/gm)].map((m) => m[1]!);
+}
+
+/** ```<lang> check blocks (complete programs run with the language's toolchain), as the code report counts them. */
+function checkBlocks(body: string): string[] {
+  return [...body.matchAll(/^```([\w#+-]+)[ \t]+check[ \t]*\n([\s\S]*?)^```\s*$/gm)].map((m) => m[1]!);
 }
 
 it("there is Lumenary CS and at least the two first Lingua courses", () => {
@@ -57,7 +63,10 @@ describe.each(courseDirs)("course %s", (dir) => {
     expect(new Set(course.levels.map((l) => l.id)).size).toBe(course.levels.length);
     expect(dirs(`content/${dir}/lessons`).sort()).toEqual([...slugs].sort());
     if (course.division === "lingua") expect(dir).toBe(`lingua/${course.id}`);
-    else expect(dir).toBe(course.id);
+    else if (dir.startsWith("cs/languages/")) {
+      expect(dir).toBe(`cs/languages/${course.id}`);
+      expect(course.group, "a language course names its family").toBeTruthy();
+    } else expect(dir).toBe(course.id);
   });
 
   describe.each(slugs)("%s", (slug) => {
@@ -116,11 +125,16 @@ describe.each(courseDirs)("course %s", (dir) => {
 
     it("has all its runnable code in the code report, passing (compute/verify_courses.py)", () => {
       const snippets = runnableBlocks(body).length;
+      const checks = checkBlocks(body).length;
       const pythonExercises = exercises.filter((e) => e.type === "python").length;
-      if (snippets + pythonExercises === 0) return;
+      if (snippets + checks + pythonExercises === 0) return;
       const row = report?.lessons[`${dir}/${slug}`];
       expect(row, "run npm run verify:courses").toBeTruthy();
-      expect(row).toEqual({ snippets, snippetsPassed: snippets, exercises: pythonExercises, exercisesPassed: pythonExercises });
+      expect({ ...row!, checksPassed: undefined, checksSkipped: undefined }).toEqual({
+        snippets, snippetsPassed: snippets, exercises: pythonExercises, exercisesPassed: pythonExercises, checks, checksPassed: undefined, checksSkipped: undefined,
+      });
+      // A check may be skipped where its toolchain isn't installed (CI); it may never fail.
+      expect(row!.checksPassed + row!.checksSkipped, "every check passed or was skipped").toBe(checks);
     });
   });
 });

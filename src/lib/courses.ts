@@ -41,10 +41,14 @@ function cached<T>(key: string, load: () => T): T {
   return memo.get(key) as T;
 }
 
-/** content/ directories that hold a course.json. */
+/** content/ directories that hold a course.json: cs, cs/languages/<id>, lingua/<id>. */
 export function courseDirs(): string[] {
   const out: string[] = [];
   if (exists(path.join(CONTENT, "cs/course.json"))) out.push("cs");
+  const languages = path.join(CONTENT, "cs/languages");
+  if (exists(languages)) {
+    for (const d of fs.readdirSync(languages).sort()) if (exists(path.join(languages, d, "course.json"))) out.push(`cs/languages/${d}`);
+  }
   const lingua = path.join(CONTENT, "lingua");
   if (exists(lingua)) {
     for (const d of fs.readdirSync(lingua).sort()) if (exists(path.join(lingua, d, "course.json"))) out.push(`lingua/${d}`);
@@ -56,13 +60,22 @@ export function getCourses(): LoadedCourse[] {
   return cached("courses", () =>
     courseDirs().map((dir) => {
       const course = CourseFile.parse(JSON.parse(read(path.join(CONTENT, dir, "course.json"))));
-      return { course, dir, path: course.division === "lingua" ? `lingua/${course.id}` : course.id, slugs: course.levels.flatMap((l) => l.lessons) };
+      return { course, dir, path: course.division === "lingua" ? `lingua/${course.id}` : dir, slugs: course.levels.flatMap((l) => l.lessons) };
     }),
   );
 }
 
 export function getCourse(id: string, division?: CourseFile["division"]): LoadedCourse | undefined {
-  return getCourses().find((c) => c.course.id === id && (!division || c.course.division === division));
+  return getCourses().find((c) => c.course.id === id && (!division || c.course.division === division) && !c.dir.startsWith("cs/languages/"));
+}
+
+/** The programming-language courses (content/cs/languages/<id>), in alphabetical order. */
+export function getLanguageCourses(): LoadedCourse[] {
+  return getCourses().filter((c) => c.dir.startsWith("cs/languages/"));
+}
+
+export function getLanguageCourse(id: string): LoadedCourse | undefined {
+  return getLanguageCourses().find((c) => c.course.id === id);
 }
 
 export function getCourseLesson(c: LoadedCourse, slug: string): CourseLesson {
@@ -95,7 +108,7 @@ export function getCourseCodeReport() {
 export function lessonCodeStatus(c: LoadedCourse, slug: string): { tested: boolean; count: number } | null {
   const row = getCourseCodeReport()?.lessons[`${c.dir}/${slug}`];
   if (!row) return null;
-  const count = row.snippets + row.exercises;
+  const count = row.snippets + row.exercises + row.checks;
   if (count === 0) return null;
-  return { tested: row.snippetsPassed === row.snippets && row.exercisesPassed === row.exercises, count };
+  return { tested: row.snippetsPassed === row.snippets && row.exercisesPassed === row.exercises && row.checksPassed === row.checks, count };
 }

@@ -272,6 +272,9 @@ export const CourseFile = z.object({
   locale: z.enum(["en", "es", "ar", "hi", "zh-Hans", "sw"]),
   /** Lingua: the language being learned (BCP 47). */
   learn: z.string().optional(),
+  /** Programming-language courses: the family they are listed under on /cs/languages/, and the year the language appeared. */
+  group: z.string().optional(),
+  year: z.number().int().optional(),
   /** Interface words the course pages need beyond the site catalogue, in the course's language. */
   ui: z.object({
     levels: z.string(),
@@ -313,6 +316,8 @@ export type CourseLessonFrontmatter = z.infer<typeof CourseLessonFrontmatter>;
 export const CourseCodeReport = z.object({
   generatedAt: z.string(),
   python: z.string(),
+  /** Toolchain versions behind the checks, by language. */
+  toolchains: z.record(z.string(), z.string()).default({}),
   lessons: z.record(
     z.string(),
     z.object({
@@ -320,6 +325,11 @@ export const CourseCodeReport = z.object({
       snippetsPassed: z.number().int(),
       exercises: z.number().int(),
       exercisesPassed: z.number().int(),
+      /** ```<lang> check blocks: complete programs compiled and run with the language's own toolchain. */
+      checks: z.number().int().default(0),
+      checksPassed: z.number().int().default(0),
+      /** Checks whose toolchain was not installed where the report was made (never counted as tested). */
+      checksSkipped: z.number().int().default(0),
     }),
   ),
 });

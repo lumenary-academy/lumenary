@@ -18,8 +18,14 @@ import { Say } from "./Say";
 
 const lessonHref = (locale: string, c: LoadedCourse, slug: string) => href(locale, `${c.path}/${slug}`);
 
+/** Where a course sits: Lumenary CS's programming-language courses link back to their index. */
+function parentOf(c: LoadedCourse, locale: string): { href: string; label: string } | null {
+  return c.dir.startsWith("cs/languages/") ? { href: href(locale, "cs/languages"), label: "Programming languages" } : null;
+}
+
 /** A course's front page: its description and every level with its lessons. */
 export async function CourseOverview({ c, locale }: { c: LoadedCourse; locale: Locale }) {
+  const parent = parentOf(c, locale);
   const { course } = c;
   let n = 0;
   return (
@@ -27,7 +33,17 @@ export async function CourseOverview({ c, locale }: { c: LoadedCourse; locale: L
       <header className="relative overflow-hidden border-b border-line">
         <div className="bg-grid pointer-events-none absolute inset-0 opacity-40 [mask-image:radial-gradient(ellipse_at_top_right,black,transparent_65%)]" aria-hidden="true" />
         <div className="container-page relative py-12 sm:py-16">
-          <p className="eyebrow">{course.division === "lingua" ? "Lumenary Lingua" : "Lumenary Scientia"}</p>
+          <p className="eyebrow">
+            {parent ? (
+              <Link href={parent.href} className="hover:underline">
+                Lumenary CS · {parent.label}
+              </Link>
+            ) : course.division === "lingua" ? (
+              "Lumenary Lingua"
+            ) : (
+              "Lumenary Scientia"
+            )}
+          </p>
           <h1 className="mt-4 text-4xl font-semibold leading-[1.08] text-ink sm:text-[3.4rem]">{course.title}</h1>
           <p className="mt-4 max-w-3xl font-serif text-xl leading-relaxed text-ink-2" dangerouslySetInnerHTML={{ __html: mdInline(course.subtitle) }} />
           <div className="prose-lumen mt-6 max-w-3xl text-ink-2">
@@ -146,6 +162,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
   const code = lessonCodeStatus(c, slug);
   const related = fm.related.map((id) => getTopic(id)).filter((x) => x !== undefined);
   const ui = course.ui;
+  const parent = parentOf(c, locale);
 
   return (
     <Messages locale={locale} ns={["exercise", "python", "lesson", "lingua", ...widgetMessageNamespaces(lesson.body)]}>
@@ -154,6 +171,14 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
           <div className="bg-grid pointer-events-none absolute inset-0 opacity-40 [mask-image:radial-gradient(ellipse_at_top_right,black,transparent_65%)]" aria-hidden="true" />
           <div className="container-page relative py-10 sm:py-14">
             <nav className="flex flex-wrap items-center gap-2 text-sm text-muted" aria-label="Breadcrumb">
+              {parent && (
+                <>
+                  <Link href={parent.href} className="hover:text-ink">
+                    {parent.label}
+                  </Link>
+                  <span aria-hidden="true">/</span>
+                </>
+              )}
               <Link href={href(locale, c.path)} className="hover:text-ink">
                 {course.title}
               </Link>

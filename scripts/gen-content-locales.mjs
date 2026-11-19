@@ -25,9 +25,11 @@ function courseLocales() {
   const add = (file) => {
     if (!fs.existsSync(file)) return;
     const c = JSON.parse(fs.readFileSync(file, "utf8"));
-    out[c.division === "lingua" ? `lingua/${c.id}` : c.id] = c.locale;
+    out[c.division === "lingua" ? `lingua/${c.id}` : path.relative(CONTENT, path.dirname(file))] = c.locale;
   };
   add(path.join(CONTENT, "cs/course.json"));
+  const languages = path.join(CONTENT, "cs/languages");
+  if (fs.existsSync(languages)) for (const d of fs.readdirSync(languages).sort()) add(path.join(languages, d, "course.json"));
   const lingua = path.join(CONTENT, "lingua");
   if (fs.existsSync(lingua)) for (const d of fs.readdirSync(lingua).sort()) add(path.join(lingua, d, "course.json"));
   return out;
