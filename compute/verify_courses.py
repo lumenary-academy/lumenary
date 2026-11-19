@@ -150,8 +150,13 @@ def toolchain_version(lang, r):
     return VERSIONS[lang]
 
 
+PYTHON_ONLY = False
+
+
 def run_check(lang, code, timeout):
     """("passed" | "failed" | "skipped", message) for one ```<lang> check block."""
+    if PYTHON_ONLY:
+        return "skipped", "--python-only"
     r, why = runner_for(lang)
     if r is None:
         return "skipped", why
@@ -267,8 +272,12 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("--no-write", action="store_true", help="check only; leave the report as it is")
+    parser.add_argument("--python-only", action="store_true", help="run the Python blocks and exercises; count every ```<lang> check as skipped (CI, whose toolchain versions differ from the reference ones)")
     parser.add_argument("--snippet", nargs=2, metavar=("LANG", "FILE"), help="compile and run one program with a check runner, print its output, and exit")
     args = parser.parse_args()
+
+    global PYTHON_ONLY
+    PYTHON_ONLY = args.python_only
 
     if args.snippet:
         lang, file = args.snippet
