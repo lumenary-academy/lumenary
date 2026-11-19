@@ -23,6 +23,9 @@ const SOURCES = [
   ...files("content/cs", /\.(mdx|json)$/),
   ...files("content/ee", /\.(mdx|json)$/),
   ...files("content/robotics", /\.(mdx|json)$/),
+  ...files("content/chemistry", /\.(mdx|json)$/),
+  ...files("content/me", /\.(mdx|json)$/),
+  ...files("content/materials", /\.(mdx|json)$/),
   ...files("compute/experiments", /\.py$/),
   ...files("src/i18n/messages", /\.json$/),
   "content/math/graph/graph.json",
@@ -38,6 +41,8 @@ describe("safety of examples", () => {
     expect(safetyProblems("An apple falls from a tree.")).toEqual([]);
     expect(safetyProblems("Touch the live wire to see what happens.")).not.toEqual([]);
     expect(safetyProblems("Never touch a live wire or open a mains plug.")).toEqual([]);
+    expect(safetyProblems("Mix bleach and ammonia in a bucket.")).not.toEqual([]);
+    expect(safetyProblems("Never mix bleach with ammonia or vinegar.")).toEqual([]);
   });
   for (const file of SOURCES)
     it(file, () => {

@@ -1,4 +1,4 @@
-# Courses: Lumenary CS, EE, Robotics and Lingua
+# Courses: Lumenary CS, EE, Robotics, Chemistry, ME, Materials and Lingua
 
 Lumenary Math has its own knowledge graph, Lean library and experiments (see the [authoring guide](authoring-guide.md)). The other subjects are **courses**: a syllabus and a directory per lesson, rendered by the same lesson components. This guide is the contract for writing one.
 
@@ -11,8 +11,11 @@ Lumenary Math has its own knowledge graph, Lean library and experiments (see the
 | Lumenary CS electives (Blockchains & Verifiable Computation …) | `content/cs/electives/<id>/` | English | `/en/cs/electives/`, `/en/cs/electives/<id>/`, `/en/cs/electives/<id>/<slug>/` |
 | Lumenary EE (electrical engineering) | `content/ee/` | English | `/en/ee/`, `/en/ee/<slug>/` |
 | Lumenary Robotics | `content/robotics/` | English | `/en/robotics/`, `/en/robotics/<slug>/` |
+| Lumenary Chemistry | `content/chemistry/` | English | `/en/chemistry/`, `/en/chemistry/<slug>/` |
+| Lumenary ME (mechanical engineering) | `content/me/` | English | `/en/me/`, `/en/me/<slug>/` |
+| Lumenary Materials (materials science) | `content/materials/` | English | `/en/materials/`, `/en/materials/<slug>/` |
 
-A Scientia subject is a directory under `content/` with a `course.json` (`cs`, `ee`, `robotics`); the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`). `/[locale]/lingua/` lists the Lingua courses in every locale.
+A Scientia subject is a directory under `content/` with a `course.json` (`cs`, `ee`, `robotics`, `chemistry`, `me`, `materials`); it is listed on the front page by `src/lib/subjects.ts`, and its routes are `src/app/[locale]/<id>/`; the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`). `/[locale]/lingua/` lists the Lingua courses in every locale.
 
 ## Files
 
@@ -184,6 +187,16 @@ An elective is a course nested in Lumenary CS (`content/cs/electives/<id>/`, lis
 ### Lumenary EE and Lumenary Robotics
 
 The two engineering subjects follow Lumenary CS's pattern: from no experience at all (the Start level, from about age 11) to the frontier of 2026, each lesson going from the idea to a calculation or simulation to professional practice. Calculations, simulations and exercises are in Python with NumPy (```` ```python run ```` blocks and Python exercises, which run in the browser); Lumenary EE also shows hardware in Verilog and circuits as SPICE netlists, run by `verilog` and `spice` checks. Code that needs hardware, ROS 2, a vendor toolchain or a GPU (embedded C for a real microcontroller, a ROS 2 node, Solidity) is shown in plain fences and labelled as not run. Figures (inline SVG) are especially valuable here: circuit diagrams, block diagrams, waveforms, robot frames. Safety is part of the teaching: never suggest experiments with mains electricity, large batteries, high power or heavy machines; say what is safe (small batteries, current-limited supplies, small slow robots) and why industrial equipment is guarded and certified. Link datasheets, standards bodies, manufacturers' application notes, labs' papers and open-source projects; never copy them.
+
+### Lumenary Chemistry, ME and Materials
+
+They follow the same pattern as Lumenary EE and Robotics: a Start level for about age 11, then university material up to a frontier level for 2026, with calculations and simulations in Python (NumPy; SymPy where symbolic work helps) and SVG figures (molecules, apparatus, free-body diagrams, phase diagrams, crystal cells). Safety rules are stricter here:
+
+- **Chemistry.** Suggest only kitchen-safe activities, done with an adult (an indicator from red cabbage, dissolving, crystallising salt or sugar); everything else belongs in a properly equipped laboratory with trained supervision. Never give instructions for making or concentrating hazardous substances — explosives, toxic gases, controlled drugs, chemical-warfare agents — even as history or as "what not to do"; discuss such topics only at the level of ideas, policy and history (the Chemical Weapons Convention, the Haber–Bosch story), and frame AI-for-chemistry's dual-use risks soberly. Teach hazard symbols (GHS) and safety data sheets. Never suggest tasting or smelling chemicals, or mixing household cleaners.
+- **Mechanical engineering.** Suggest only safe making (cardboard, wood, plastic models, hand tools with supervision, 3D printers as intended); explain guards, protective equipment and pressure-vessel and lifting rules rather than encouraging anything risky.
+- **Materials science.** Heat treatment, casting, furnaces and chemical etching are described, not suggested as home activities.
+
+tests/safety.test.ts scans these courses too.
 
 ### Lumenary Lingua
 
