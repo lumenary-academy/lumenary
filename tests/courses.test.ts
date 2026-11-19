@@ -31,6 +31,8 @@ const courseDirs = [
   ...[...COLLECTIONS, "lingua"].flatMap((family) => (exists(`content/${family}`) ? dirs(`content/${family}`).filter((d) => exists(`content/${family}/${d}/course.json`)).sort().map((d) => `${family}/${d}`) : [])),
 ];
 const topics = new Set(GraphFile.parse(json("content/math/graph/graph.json")).topics.map((t) => t.id));
+/** The Scientia subjects with courses ("cs", "ee", …): Markdown links into them are checked. */
+const subjects = new Set(courseDirs.filter((d) => !d.includes("/")));
 /** Every course page and lesson page, for checking Markdown links between courses ("/en/cs/…/", "/en/ee/…/"). */
 const coursePages = new Set<string>(["/en/cs/languages/", "/en/cs/electives/"]);
 for (const dir of courseDirs) {
@@ -138,7 +140,8 @@ describe.each(courseDirs)("course %s", (dir) => {
       for (const m of text.matchAll(/<LessonLink\s+slug="([^"]+)"/g)) expect(slugs, `LessonLink ${m[1]}`).toContain(m[1]);
       for (const m of text.matchAll(/<TopicLink\s+id="([^"]+)"/g)) expect(topics.has(m[1]!), `TopicLink ${m[1]}`).toBe(true);
       // Markdown links to other courses' pages must point to pages that exist (anchors allowed).
-      for (const m of text.matchAll(/\]\((\/en\/(?:cs|ee|robotics)(?:\/[^)#\s]*)?)(?:#[^)\s]*)?\)/g)) {
+      for (const m of text.matchAll(/\]\((\/en\/([a-z][a-z-]*)(?:\/[^)#\s]*)?)(?:#[^)\s]*)?\)/g)) {
+        if (!subjects.has(m[2]!)) continue;
         const target = m[1]!.endsWith("/") ? m[1]! : `${m[1]}/`;
         expect(coursePages.has(target), `link to ${m[1]}`).toBe(true);
       }
