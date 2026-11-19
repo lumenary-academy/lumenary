@@ -10,6 +10,7 @@ objectives:
   - Implement ring all-reduce and count the data it moves
   - Explain FlashAttention as an IO-aware algorithm, and implement its online-softmax core
   - Describe how large runs survive hardware failures, and choose a checkpoint interval
+narrators: [chloe, margaret, gideon]
 prerequisites: [memory-hierarchy, distributed-systems, attention-and-transformers, language-models]
 related: [math.algebra.linear-algebra, math.comp.numerical-analysis]
 references:
@@ -207,6 +208,12 @@ print(f"\nafter 10,000 updates of 1e-4: float32 weight = {float(w32):.4f}, bf16 
 
 The last line is the key to **mixed-precision training** ([Micikevicius et al., 2017](https://arxiv.org/abs/1710.03740)). A weight stored in BF16 cannot absorb an update smaller than about half its spacing: $1 + 10^{-4}$ rounds straight back to 1, ten thousand times in a row. So training keeps an FP32 **master copy** of the weights and the optimiser states, casts weights to BF16 for the forward and backward passes, and accumulates the sums inside matrix multiplies in FP32.
 
+<Narrator who="gideon">
+
+`to_bf16` is right for ordinary numbers but not for every bit pattern. A NaN whose payload sits only in the low 16 bits, such as `0x7F808000`, has those bits rounded away and comes out as infinity, and the NaN `0x7FFFFFFF` carries into the sign bit and comes out as $-0.0$. Production converters check for NaN first and return a canonical NaN — the kind of case a test suite should include on purpose.
+
+</Narrator>
+
 **FP8** goes further, with per-tensor or per-block scaling factors so that values fit its tiny range ([FP8 formats](https://arxiv.org/abs/2209.05433)). DeepSeek-V3 (late 2024) was the first widely documented frontier-scale run to do most matrix multiplies in FP8; since then FP8 training has spread, and 4-bit formats (such as the Open Compute Project's microscaling MXFP4 and NVIDIA's NVFP4) are supported in hardware and actively researched for training as well as inference. Lower precision is one of the fastest-moving areas of the field; what is experimental in one year is routine two years later.
 
 </Section>
@@ -351,6 +358,12 @@ Standard attention computes the $n \times n$ score matrix $S = QK^{\top}$, write
 
 [FlashAttention](https://arxiv.org/abs/2205.14135) (Dao and colleagues, 2022) computes *exactly* the same result without ever storing $S$ or $P$ in HBM. It loads blocks of $Q$, $K$ and $V$ into on-chip SRAM, computes the scores for that block, and folds them into the output immediately. The difficulty is the softmax, whose denominator needs every score in the row. The fix is the **online softmax**: keep, for each query, the running maximum $m$, the running sum of exponentials $\ell$ and the running weighted sum of values $o$. When a new block arrives with a larger maximum $m'$, rescale the old $\ell$ and $o$ by $e^{m - m'}$ and add the new block's contributions. At the end, $o / \ell$ is the exact attention output.
 
+<Narrator who="chloe">
+
+The key fact is that the running triple $(m, \ell, o)$ can be *merged*. Two partial results over different blocks of keys combine as $m = \max(m_1, m_2)$, $\ell = \ell_1 e^{m_1 - m} + \ell_2 e^{m_2 - m}$, and $o$ likewise, and this merge is associative. So the blocks need not be visited in order or by one worker: FlashAttention-2 splits them across threads and ring attention across devices, and the pieces combine in any grouping — the same algebra that lets a sum be reduced in parallel.
+
+</Narrator>
+
 ```python run
 import numpy as np
 
@@ -410,6 +423,12 @@ $$
 - **Loss spikes.** Training occasionally diverges for reasons that are not hardware at all: a bad batch, an optimiser instability. Google's PaLM team handled spikes by rolling back to a checkpoint about a hundred steps earlier and skipping a few hundred batches of data around the spike. Stability tricks — careful initialisation, normalising queries and keys, gradient clipping, lower learning rates for some parameters — are part of every large recipe.
 
 This is <LessonLink slug="reliability-engineering">reliability engineering</LessonLink> at its most expensive: at typical cloud rental prices, an idle hour of a 16,000-GPU cluster costs on the order of tens of thousands of US dollars.
+
+<Narrator who="margaret">
+
+Put Meta's figures into Young's formula. More than 400 interruptions in 54 days is one every 194 minutes or so. If saving pauses training for $\delta = 2$ minutes, $\tau \approx \sqrt{2 \cdot 2 \cdot 194} \approx 28$ minutes, and the time lost to saving plus redone work, about $\delta/\tau + \tau/(2M)$, comes to 14%. Cut the pause to 10 seconds with asynchronous saving and $\tau \approx 8$ minutes, with about 4% lost — which is why that brief pause is engineered so hard.
+
+</Narrator>
 
 </Section>
 
