@@ -72,7 +72,8 @@ if [ -z "$WANT" ] || want python; then
   uv python install 3.13 >/dev/null 2>&1; ln -sf "$(uv python find 3.13)" "$T/bin/python3.13"; echo "python $("$T/bin/python3.13" --version)"
 fi
 if [ -z "$WANT" ] || want images; then
-  for img in gcc:14 swift:latest php:cli ruby:latest haskell:latest ocaml/opam:debian-ocaml-5.4 elixir:latest clojure:temurin-21-tools-deps swipl:latest gnuoctave/octave:latest freepascal/fpc:latest alire/gnat:latest; do
+  for img in gcc:14 swift:latest php:cli ruby:latest haskell:latest ocaml/opam:debian-ocaml-5.4 elixir:latest clojure:temurin-21-tools-deps swipl:latest gnuoctave/octave:latest; do
     docker pull -q "$img" >/dev/null 2>&1 && echo "image $img" || echo "image $img FAILED"
   done
+  docker build -q -t lumenary/debian-toolchains -f "$(dirname "$0")/Dockerfile.debian" "$(dirname "$0")" >/dev/null && echo "image lumenary/debian-toolchains (fpc, gnat)"
 fi

@@ -99,8 +99,8 @@ RUNNERS = {
     "clojure": {"file": "main.clj", "cmd": "clojure -M main.clj", "image": "clojure:temurin-21-tools-deps", "version": "clojure --version"},
     "prolog": {"file": "main.pl", "cmd": "swipl main.pl", "image": "swipl:latest", "version": "swipl --version"},
     "matlab": {"file": "main.m", "cmd": "octave --no-gui --no-window-system --quiet main.m", "image": "gnuoctave/octave:latest", "version": "octave --version | head -1"},
-    "pascal": {"file": "main.pas", "cmd": "fpc -v0 main.pas >/dev/null && ./main", "image": "freepascal/fpc:latest", "version": "fpc -iV"},
-    "ada": {"file": "main.adb", "cmd": "gnatmake -q main.adb && ./main", "image": "alire/gnat:latest", "version": "gnatmake --version | head -1"},
+    "pascal": {"file": "main.pas", "cmd": "fpc -v0 main.pas >/dev/null && ./main", "image": "lumenary/debian-toolchains", "version": "fpc -iV"},
+    "ada": {"file": "main.adb", "cmd": "gnatmake -q main.adb && ./main", "image": "lumenary/debian-toolchains", "version": "gnatmake --version | head -1"},
 }
 ALIASES = {"c++": "cpp", "cs": "csharp", "c#": "csharp", "f#": "fsharp", "visual-basic": "vb", "js": "javascript", "ts": "typescript", "sh": "bash", "octave": "matlab", "object-pascal": "pascal", "py": "python", "fortran-free-form": "fortran"}
 
