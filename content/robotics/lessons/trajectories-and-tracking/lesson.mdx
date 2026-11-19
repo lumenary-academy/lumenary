@@ -1,0 +1,495 @@
+---
+title: Trajectories and tracking
+subtitle: Plan how a joint should move through time, within its speed and torque limits — then make the arm follow, using its model as well as its errors.
+minutes: 75
+objectives:
+  - Distinguish a path from a trajectory, and design point-to-point motions with cubic and quintic polynomials and trapezoidal velocity profiles
+  - Fit a smooth spline through waypoints and explain why it can overshoot them
+  - Choose a motion's duration to respect velocity, acceleration and torque limits by time scaling
+  - Explain why feedback alone lags a moving reference, and how feedforward removes the lag
+  - Derive computed-torque control, simulate it on a two-link arm, and compare it with independent-joint PD, including with a wrong model
+prerequisites: [forward-kinematics, robot-dynamics, feedback-and-pid, state-space-and-lqr]
+related: [math.analysis.single-variable-calculus, math.algebra.linear-algebra, math.comp.numerical-methods, math.applied.classical-mechanics]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 9 covers trajectory generation and time scaling, chapter 11 robot control including computed torque; free preprint and videos.
+  - title: "Time-optimal control of robotic manipulators along specified paths"
+    author: James E. Bobrow, Steven Dubowsky and John S. Gibson
+    year: 1985
+    note: With the work of Kang Shin and Neil McKay the same year, the origin of time-optimal path parameterisation. International Journal of Robotics Research 4(3).
+  - title: "TOPP-RA: time-optimal path parameterisation by reachability analysis"
+    author: Hung Pham and Quang-Cuong Pham
+    url: https://github.com/hungpham2511/toppra
+    note: Open-source implementation of a fast, robust method for the fastest timing of a path under velocity, acceleration and torque limits.
+  - title: "Ruckig"
+    author: Lars Berscheid and Torsten Kröger
+    url: https://github.com/pantor/ruckig
+    note: Open-source online trajectory generation with velocity, acceleration and jerk limits, computed in microseconds.
+  - title: "The coordination of arm movements: an experimentally confirmed mathematical model"
+    author: Tamar Flash and Neville Hogan
+    year: 1985
+    note: Human reaching motions are close to minimum-jerk trajectories, which are quintic polynomials. Journal of Neuroscience 5(7).
+  - title: "Pinocchio"
+    url: https://github.com/stack-of-tasks/pinocchio
+    note: Fast inverse dynamics (the recursive Newton–Euler algorithm) and its derivatives, used for computed-torque and whole-body control.
+  - title: "ros2_control"
+    url: https://control.ros.org/
+    note: Its joint-trajectory controller interpolates a planned trajectory with splines and tracks it with PID plus feedforward.
+  - title: "MoveIt"
+    url: https://moveit.ai/
+    note: The ROS motion-planning framework; after planning a path it time-parameterises it within the robot's limits.
+---
+
+<Section id="motivation" kind="motivation" title="From 'go there' to 'go there like this'">
+
+In <LessonLink slug="feedback-and-pid">feedback and PID</LessonLink> we asked a joint to jump from one angle to another by changing its reference in a single step. The controller responded with everything it had: the voltage saturated, the integrator wound up, the derivative kicked. For a small hobby joint that is a nuisance. For a 20 kg arm in a car factory in Puebla, or a surgical arm in Seoul, it is unacceptable: steps excite vibrations in the links, shake the payload, wear the gearboxes and make the motion unpredictable to anyone nearby.
+
+Real robots never receive steps. A **trajectory generator** turns "go from here to there" into a smooth reference that says where each joint should be at every instant, how fast it should be moving, and how fast that speed should change, all within the limits of the motors. Then a **tracking controller** makes the robot follow that moving reference. This lesson does both: first the classic ways to plan a motion in time, then the key idea of tracking, which is to use the robot's model to *predict* the torque each instant needs, and to leave feedback only the small errors that prediction misses.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Paths, trajectories and timing">
+
+A **path** is a geometric curve: the set of configurations the robot passes through, with no clock. A **trajectory** is a path with timing: a configuration for every instant. The same path can be traversed slowly and gently or quickly and violently, and separating the two questions, *where* and *when*, is one of the most useful ideas in motion planning. We write a trajectory as $q(t) = \text{path}(s(t))$, where the path is parameterised by $s \in [0, 1]$ and the **time scaling** $s(t)$ says how far along the path the robot is at time $t$.
+
+Why not just feed a moving reference to the PID loop and let it follow? Because feedback acts on errors, so it must first *have* an error. A joint asked to move at a steady 1 rad/s under P control will lag behind its reference by exactly the error needed to produce the voltage for 1 rad/s. The lag grows with speed and with load. The fix is the one every skilled person uses without thinking.
+
+<Analogy>
+
+When you lift a suitcase you expect to be heavy, your muscles tense *before* it leaves the ground; if it turns out to be empty, it flies up. Your brain predicted the force the motion would need and sent it in advance: that is **feedforward**. Feedback, from your eyes and the stretch sensors in your muscles, then corrects whatever the prediction got wrong.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="point-to-point trajectory">
+
+A **point-to-point** trajectory moves from $q_0$ to $q_f$ in a duration $T$, usually **rest-to-rest**: zero velocity (and often zero acceleration) at both ends. A **via-point** trajectory passes through intermediate waypoints without stopping.
+
+</Definition>
+
+<Definition term="smoothness">
+
+A trajectory is $C^k$ if it and its first $k$ derivatives are continuous. A trajectory that is $C^1$ but not $C^2$ has jumps in acceleration, so the motor torque jumps; a jump in acceleration is an infinite **jerk** (the derivative of acceleration), which excites vibration.
+
+</Definition>
+
+<Definition term="feedforward">
+
+A **feedforward** term computes, from the desired trajectory and a model, the input the plant needs to follow it, before any error occurs. A tracking controller combines feedforward with feedback on the tracking error $e = q_d - q$.
+
+</Definition>
+
+</Section>
+
+<Section id="point-to-point" kind="examples" title="Point to point: polynomials and trapezoids">
+
+Write the move as $q(t) = q_0 + \Delta\, s(t)$, with $\Delta = q_f - q_0$ and $s$ going from 0 to 1. Everything is about choosing $s(t)$ on $[0, T]$; let $\tau = t/T$.
+
+**Cubic.** Four conditions, $s(0) = 0$, $s(T) = 1$, $\dot s(0) = \dot s(T) = 0$, fix a cubic: $s = 3\tau^2 - 2\tau^3$. Its peak velocity is $1.5\,\Delta/T$ at mid-move, and its acceleration $\Delta(6 - 12\tau)/T^2$ is largest at the ends, $6\Delta/T^2$. That is the problem: the robot is at rest before $t = 0$ with zero acceleration, and at $t = 0$ the acceleration jumps to its maximum.
+
+**Quintic.** Add $\ddot s(0) = \ddot s(T) = 0$, six conditions in all, and the unique quintic is
+
+$$
+s(\tau) = 10\tau^3 - 15\tau^4 + 6\tau^5 .
+$$
+
+It starts and stops gently, with continuous acceleration. The price is a higher peak velocity, $1.875\,\Delta/T$, and peak acceleration $\tfrac{10}{\sqrt 3}\Delta/T^2 \approx 5.77\,\Delta/T^2$ at $\tau = \tfrac12 \mp \tfrac{1}{2\sqrt 3}$.
+
+**Trapezoidal velocity.** Accelerate at the limit $a_{\max}$, cruise at $v_{\max}$, decelerate at $a_{\max}$. The ramps take $t_a = v_{\max}/a_{\max}$ and the whole move $T = \Delta/v_{\max} + v_{\max}/a_{\max}$. If $\Delta < v_{\max}^2/a_{\max}$, the joint never reaches $v_{\max}$ and the profile becomes a triangle with peak velocity $\sqrt{\Delta\,a_{\max}}$. Industrial controllers have used this profile for decades because it is the fastest possible motion under velocity and acceleration limits.
+
+<Figure caption="Velocity against time for a 1.2 rad move in 1 s, three ways. The cubic (solid) and the trapezoid (dashed) start with a jump in acceleration; the quintic (gold) starts and ends with zero acceleration but needs the highest peak velocity, 2.25 rad/s. The area under each curve is the same 1.2 rad.">
+<svg viewBox="0 0 420 240" role="img" aria-label="A graph of joint velocity against time over one second. A parabola-shaped cubic curve peaks at 1.8 radians per second at half a second. A bell-shaped quintic curve, flat at both ends, peaks higher at 2.25 radians per second. A trapezoid ramps up linearly to 1.5 radians per second at 0.2 seconds, stays flat until 0.8 seconds, and ramps down to zero at one second." xmlns="http://www.w3.org/2000/svg">
+  <g stroke="currentColor" strokeWidth="1" fill="none">
+    <line x1="50" y1="25" x2="50" y2="200" />
+    <line x1="50" y1="200" x2="400" y2="200" />
+    <line x1="46" y1="129.2" x2="50" y2="129.2" />
+    <line x1="46" y1="58.3" x2="50" y2="58.3" />
+  </g>
+  <polyline fill="none" stroke="currentColor" strokeWidth="2" points="50,200.0 67,175.8 84,154.1 101,135.0 118,118.4 135,104.4 152,92.9 169,84.0 186,77.6 203,73.8 220,72.5 237,73.8 254,77.6 271,84.0 288,92.9 305,104.4 322,118.4 339,135.0 356,154.1 373,175.8 390,200.0" />
+  <polyline fill="none" stroke="var(--gold)" strokeWidth="2.5" points="50,200.0 67,194.2 84,179.3 101,158.5 118,134.7 135,110.4 152,87.5 169,68.0 186,53.1 203,43.8 220,40.6 237,43.8 254,53.1 271,68.0 288,87.5 305,110.4 322,134.7 339,158.5 356,179.3 373,194.2 390,200.0" />
+  <polyline fill="none" stroke="currentColor" strokeWidth="2" strokeDasharray="6 4" points="50,200.0 118,93.8 322,93.8 390,200.0" />
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor">
+    <text x="42" y="204" textAnchor="end">0</text>
+    <text x="42" y="133" textAnchor="end">1</text>
+    <text x="42" y="62" textAnchor="end">2</text>
+    <text x="50" y="216" textAnchor="middle">0</text>
+    <text x="220" y="216" textAnchor="middle">0.5</text>
+    <text x="390" y="216" textAnchor="middle">1.0 s</text>
+    <text x="8" y="18">velocity (rad/s)</text>
+    <text x="232" y="34" fill="var(--gold)">quintic</text>
+    <text x="232" y="68">cubic</text>
+    <text x="300" y="88">trapezoid</text>
+  </g>
+</svg>
+</Figure>
+
+Now turn the question round, as a robot controller must: given limits of 2 rad/s and 8 rad/s² on a joint, what is the *shortest* duration for a 1.2 rad move with each profile? For the polynomials, the peaks scale as $\Delta/T$ and $\Delta/T^2$, so $T$ must satisfy both limits.
+
+```python run
+import numpy as np
+
+def cubic(d, T, t):
+    s = t / T
+    return d * (3 * s**2 - 2 * s**3), d * (6 * s - 6 * s**2) / T, d * (6 - 12 * s) / T**2
+
+def quintic(d, T, t):
+    s = t / T
+    return (d * (10 * s**3 - 15 * s**4 + 6 * s**5), d * (30 * s**2 - 60 * s**3 + 30 * s**4) / T,
+            d * (60 * s - 180 * s**2 + 120 * s**3) / T**2)
+
+def trapezoid(d, v, a, t):
+    """Accelerate at a, cruise at v, decelerate at a. Falls back to a triangle if d < v^2/a."""
+    if d < v * v / a:
+        v = np.sqrt(d * a)                          # never reaches v: triangular profile
+    ta, T = v / a, d / v + v / a
+    if t < ta:
+        return 0.5 * a * t * t, a * t, a
+    if t < T - ta:
+        return v * (t - ta / 2), v, 0.0
+    r = T - t
+    return d - 0.5 * a * r * r, a * r, -a
+
+d, v_max, a_max = 1.2, 2.0, 8.0                     # a 1.2 rad move; joint limits 2 rad/s, 8 rad/s^2
+T_cubic = max(1.5 * d / v_max, np.sqrt(6 * d / a_max))
+T_quintic = max(1.875 * d / v_max, np.sqrt(10 / np.sqrt(3) * d / a_max))
+T_trap = d / v_max + v_max / a_max
+
+print(f"{'profile':10} {'shortest T':>10} {'peak vel':>9} {'peak acc':>9} {'acc at start':>12}")
+for name, T, prof in [("cubic", T_cubic, lambda t, T=T_cubic: cubic(d, T, t)),
+                      ("quintic", T_quintic, lambda t, T=T_quintic: quintic(d, T, t)),
+                      ("trapezoid", T_trap, lambda t: trapezoid(d, v_max, a_max, t))]:
+    ts = np.linspace(0, T, 2001)
+    q, v, a = np.array([prof(t) for t in ts]).T
+    assert abs(q[-1] - d) < 1e-9 and abs(v[-1]) < 1e-9          # it arrives, at rest
+    print(f"{name:10} {T:9.3f}s {np.abs(v).max():8.3f} {np.abs(a).max():9.3f} {a[0]:12.3f}")
+```
+
+The trapezoid is fastest (0.85 s) because it runs at a limit the whole time. The quintic is slowest (1.125 s), limited by its high peak velocity, but it is the only one whose acceleration starts at zero. The cubic and the trapezoid both demand 8 rad/s² instantly at $t = 0$.
+
+<Narrator who="chloe">
+
+The quintic is not an arbitrary choice: among all motions from rest to rest in time $T$, it is the one that minimises the integrated squared jerk, $\int_0^T \dddot q^{\,2}\,dt$. (The Euler–Lagrange equation of that cost is $q^{(6)} = 0$, whose solutions are exactly the quintics.) Tamar Flash and Neville Hogan found in 1985 that human reaching movements follow this minimum-jerk profile closely, which is one reason quintic motions look natural to people watching a robot.
+
+</Narrator>
+
+Industrial controllers usually go one step further and limit jerk too: the **S-curve** profile replaces each corner of the trapezoid with a short ramp of constant jerk, giving seven phases (jerk up, constant acceleration, jerk down, cruise, and the mirror image). It is nearly as fast as the trapezoid and nearly as gentle as the quintic.
+
+</Section>
+
+<Section id="splines" kind="human" title="Through waypoints: splines">
+
+A task often specifies several waypoints: lift the part, move above the bin, lower it. Stopping at each is slow and jerky. Instead, pass through them with a **cubic spline**: a separate cubic on each interval, joined so that position, velocity *and acceleration* are continuous at every waypoint. Given the waypoint times, the unknowns are the velocities $v_i$ at the waypoints, and requiring equal accelerations on both sides of each interior waypoint gives one linear equation per waypoint, a tridiagonal system that is cheap to solve.
+
+```python run
+import numpy as np
+
+def knot_velocities(ts, qs, v_start=0.0, v_end=0.0):
+    """Velocities at the waypoints that make piecewise-cubic motion continuous in acceleration."""
+    n, h = len(ts), np.diff(ts)
+    A, b = np.zeros((n, n)), np.zeros(n)
+    A[0, 0], b[0], A[-1, -1], b[-1] = 1.0, v_start, 1.0, v_end
+    for i in range(1, n - 1):                     # acceleration continuity at waypoint i
+        A[i, i - 1], A[i, i], A[i, i + 1] = 1 / h[i - 1], 2 / h[i - 1] + 2 / h[i], 1 / h[i]
+        b[i] = 3 * ((qs[i] - qs[i - 1]) / h[i - 1]**2 + (qs[i + 1] - qs[i]) / h[i]**2)
+    return np.linalg.solve(A, b)
+
+def hermite(ts, qs, vs, t):
+    """Evaluate the piecewise cubic with positions qs and velocities vs at the knots ts."""
+    i = min(np.searchsorted(ts, t, side="right") - 1, len(ts) - 2)
+    h, s = ts[i + 1] - ts[i], (t - ts[i]) / (ts[i + 1] - ts[i])
+    p0, p1, m0, m1 = qs[i], qs[i + 1], vs[i] * h, vs[i + 1] * h
+    q = (2*s**3 - 3*s**2 + 1) * p0 + (s**3 - 2*s**2 + s) * m0 + (-2*s**3 + 3*s**2) * p1 + (s**3 - s**2) * m1
+    dq = ((6*s**2 - 6*s) * p0 + (3*s**2 - 4*s + 1) * m0 + (-6*s**2 + 6*s) * p1 + (3*s**2 - 2*s) * m1) / h
+    ddq = ((12*s - 6) * p0 + (6*s - 4) * m0 + (-12*s + 6) * p1 + (6*s - 2) * m1) / h**2
+    return q, dq, ddq
+
+ts = np.array([0.0, 1.0, 2.0, 3.0, 4.0])          # when to pass each waypoint (s)
+qs = np.array([0.0, 0.8, 0.5, 1.2, 1.0])          # one joint's waypoints (rad)
+vs = knot_velocities(ts, qs)
+print("velocities at the waypoints:", np.round(vs, 3))
+
+grid = np.linspace(0, 4, 4001)
+for name, v_knots in [("spline (C2)", vs), ("stop at each", np.zeros_like(qs))]:
+    q, dq, ddq = np.array([hermite(ts, qs, v_knots, t) for t in grid]).T
+    jumps = [abs(hermite(ts, qs, v_knots, tk - 1e-9)[2] - hermite(ts, qs, v_knots, tk + 1e-9)[2])
+             for tk in ts[1:-1]]
+    print(f"{name:13} peak |v| {np.abs(dq).max():.3f} rad/s   peak |a| {np.abs(ddq).max():.3f} rad/s^2"
+          f"   largest jump in a at a waypoint {max(jumps):.3f}")
+
+# Too fast for a 0.8 rad/s limit? Stretch time by c: velocities scale by 1/c, accelerations by 1/c^2.
+c = np.abs(np.array([hermite(ts, qs, vs, t)[1] for t in grid])).max() / 0.8
+print(f"to respect 0.8 rad/s, stretch every interval by {c:.3f}: total {4 * c:.2f} s instead of 4 s")
+q = np.array([hermite(ts, qs, vs, t)[0] for t in grid])
+print(f"highest point of the spline: {q.max():.3f} rad at t = {grid[q.argmax()]:.2f} s (highest waypoint {qs.max()})")
+```
+
+Passing through the waypoints with the spline's velocities lowers both peaks and makes acceleration continuous everywhere; stopping at each waypoint makes acceleration jump, by up to 3 rad/s², at the stops. The last lines show the time-scaling trick: if the spline is too fast for the joint, stretch every interval by the same factor $c$. Velocities fall by $c$ and accelerations by $c^2$, and the path is unchanged.
+
+<Narrator who="gideon">
+
+A spline passes *through* its waypoints but does not stay *between* them: here it climbs to 1.225 rad, past the highest waypoint of 1.2 rad, because it arrives at that waypoint still moving upwards. If 1.2 rad were a joint limit, or a shelf edge in task space, the smooth trajectory would hit it. Check the whole trajectory against limits and obstacles, not only the waypoints, or use a method that respects bounds by construction.
+
+</Narrator>
+
+For a robot with several joints, every joint uses the same waypoint times so that they arrive together, and the time scaling is set by whichever joint is most constrained. Splines in task space (the tool's position and orientation) work the same way, with each sample then converted to joint angles by <LessonLink slug="inverse-kinematics">inverse kinematics</LessonLink>.
+
+</Section>
+
+<Section id="time-scaling" kind="computation" title="Time scaling against torque limits">
+
+Velocity and acceleration limits are simple stand-ins for the real constraint: what the motors can deliver. Along a trajectory, the torque each joint needs follows from <LessonLink slug="robot-dynamics">the dynamics</LessonLink>, the **inverse dynamics**
+
+$$
+\tau = M(q)\,\ddot q + c(q, \dot q) + g(q),
+$$
+
+where $M$ is the mass matrix, $c$ the Coriolis and centrifugal terms and $g$ gravity. For the rest of the lesson we use a planar two-link arm moving in a vertical plane, with links of 0.5 m and 0.4 m and, for simplicity, each link's mass (2 kg and 1 kg) concentrated at its far end. Its drives can deliver 40 N·m at the shoulder and 15 N·m at the elbow. The task: swing from $q = (-0.5, 0.8)$ rad to $(1.0, -0.4)$ rad, lifting the hand from about $(0.82, -0.12)$ m to $(0.60, 0.65)$ m, along a quintic.
+
+```python run
+import numpy as np
+
+L1, L2, G = 0.5, 0.4, 9.81
+TAU_MAX = np.array([40.0, 15.0])
+
+def dynamics(q, dq, m1=2.0, m2=1.0):
+    c1, c2, s2, c12 = np.cos(q[0]), np.cos(q[1]), np.sin(q[1]), np.cos(q[0] + q[1])
+    M = np.array([[m1 * L1**2 + m2 * (L1**2 + L2**2 + 2 * L1 * L2 * c2), m2 * (L2**2 + L1 * L2 * c2)],
+                  [m2 * (L2**2 + L1 * L2 * c2), m2 * L2**2]])
+    h = m2 * L1 * L2 * s2
+    c = np.array([-h * (2 * dq[0] * dq[1] + dq[1]**2), h * dq[0]**2])
+    g = np.array([(m1 + m2) * G * L1 * c1 + m2 * G * L2 * c12, m2 * G * L2 * c12])
+    return M, c, g
+
+def quintic(q0, qf, T, t):
+    s, d = np.clip(t / T, 0, 1), qf - q0
+    return (q0 + d * (10 * s**3 - 15 * s**4 + 6 * s**5), d * (30 * s**2 - 60 * s**3 + 30 * s**4) / T,
+            d * (60 * s - 180 * s**2 + 120 * s**3) / T**2)
+
+def peak_torques(q0, qf, T, samples=400):
+    """Inverse dynamics along the trajectory: tau = M(q) ddq + c(q, dq) + g(q)."""
+    peak = np.zeros(2)
+    for t in np.linspace(0, T, samples):
+        q, dq, ddq = quintic(q0, qf, T, t)
+        M, c, g = dynamics(q, dq)
+        peak = np.maximum(peak, np.abs(M @ ddq + c + g))
+    return peak
+
+q0, qf = np.array([-0.5, 0.8]), np.array([1.0, -0.4])     # a 1.5 rad swing of the shoulder
+print(f"{'T (s)':>6} {'peak tau1':>10} {'peak tau2':>10}   limits {TAU_MAX[0]:.0f}, {TAU_MAX[1]:.0f} N m")
+for T in [1.5, 1.0, 0.8, 0.6, 0.5, 0.4]:
+    p = peak_torques(q0, qf, T)
+    print(f"{T:6.2f} {p[0]:10.1f} {p[1]:10.1f}   {'ok' if np.all(p <= TAU_MAX) else 'TOO FAST'}")
+
+lo, hi = 0.3, 1.5                                          # bisection on the duration
+for _ in range(40):
+    mid = 0.5 * (lo + hi)
+    lo, hi = (lo, mid) if np.all(peak_torques(q0, qf, mid) <= TAU_MAX) else (mid, hi)
+print(f"shortest duration within the torque limits: {hi:.3f} s")
+print("gravity alone at the start needs", np.round(dynamics(q0, np.zeros(2))[2], 1), "N m, at any speed")
+```
+
+Note how the torques scale. Stretching time by $c$ divides $\dot q$ by $c$ and $\ddot q$ by $c^2$, so the inertial and Coriolis terms fall by $c^2$, but gravity does not change at all. Halving the duration from 1.0 s to 0.5 s roughly doubles the shoulder's peak torque, from 26.0 to 51.6 N·m, not quadruples it, because about 17 N·m of it is gravity. And if gravity alone ever exceeded a joint's limit, no amount of slowing down would help: the arm simply cannot hold that pose.
+
+Uniform scaling is conservative, since it slows the whole move because of its worst instant. **Time-optimal path parameterisation** (TOPP), developed by Bobrow, Dubowsky and Gibson and by Shin and McKay in 1985, chooses the speed $\dot s$ separately at every point of the path, running each instant at the limit of some joint. Modern implementations such as [TOPP-RA](https://github.com/hungpham2511/toppra) do this in milliseconds, and motion-planning frameworks such as [MoveIt](https://moveit.ai/) run such a step after planning every path.
+
+</Section>
+
+<Section id="tracking" kind="human" title="Tracking: feedforward plus feedback">
+
+Now make the arm follow the trajectory. Three controllers, in order of how much they know about the arm:
+
+1. **Independent-joint PD.** Each joint has its own PD loop on its own error, with gains scaled by the inertia that joint feels at the start. It knows nothing about gravity or about how the joints push on each other.
+2. **PD plus gravity compensation.** The same, plus the gravity torque $g(q)$ computed from the model, so the PD loops no longer have to hold the arm up.
+3. **Computed-torque control.** Use the whole model.
+
+<Definition term="computed-torque control">
+
+Given the desired trajectory $(q_d, \dot q_d, \ddot q_d)$ and gains $K_p, K_d$, **computed-torque control** (also called inverse-dynamics control) applies
+
+$$
+\tau = M(q)\big(\ddot q_d + K_d\,\dot e + K_p\,e\big) + c(q, \dot q) + g(q), \qquad e = q_d - q .
+$$
+
+</Definition>
+
+<Theorem name="Exact linearisation by computed torque">
+
+If the model is exact and $M(q)$ is invertible, computed-torque control makes the tracking error obey $\ddot e + K_d\,\dot e + K_p\,e = 0$ for every joint, independently of the configuration. With diagonal positive-definite $K_p$ and $K_d$, the error decays exponentially to zero from any initial error.
+
+</Theorem>
+
+<Proof>
+
+Substitute the control into the arm's dynamics $M\ddot q + c + g = \tau$: the $c$ and $g$ terms cancel, leaving $M\ddot q = M(\ddot q_d + K_d\dot e + K_p e)$. Since $M$ is invertible, $\ddot q = \ddot q_d + K_d\dot e + K_p e$, which is $\ddot e + K_d \dot e + K_p e = 0$. With diagonal gains this is one linear second-order equation per joint, whose characteristic roots $\lambda^2 + k_d\lambda + k_p = 0$ have negative real parts whenever $k_p, k_d > 0$.
+
+</Proof>
+
+The controller has two parts. The **feedforward** $M(q)\ddot q_d + c + g$ supplies the torque the motion needs; the **feedback** $M(q)(K_d\dot e + K_p e)$ corrects errors, scaled by the inertia so that the same gains give the same response in every configuration. With $K_p = 400$ s⁻² and $K_d = 40$ s⁻¹, every joint's error behaves like a critically damped oscillator with natural frequency 20 rad/s.
+
+<Figure caption="Computed-torque control. The trajectory generator supplies desired position, velocity and acceleration; an outer PD loop turns the tracking error into a corrected acceleration; the inverse-dynamics block, using the arm's model and its measured state, converts that acceleration into joint torques.">
+<svg viewBox="0 0 540 200" role="img" aria-label="A trajectory generator block outputs desired position, velocity and acceleration into a block labelled outer PD, which also receives the measured position and velocity. The PD block outputs a commanded acceleration v into an inverse dynamics block computing M of q times v plus c plus g. Its output torque tau drives the arm block. The arm's measured position and velocity feed back to both the PD block and the inverse dynamics block." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="tt-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="50" width="95" height="50" rx="4" />
+    <rect x="150" y="50" width="95" height="50" rx="4" />
+    <rect x="290" y="50" width="120" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="450" y="50" width="80" height="50" rx="4" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#tt-arrow)">
+    <line x1="105" y1="75" x2="148" y2="75" />
+    <line x1="245" y1="75" x2="288" y2="75" />
+    <line x1="410" y1="75" x2="448" y2="75" />
+    <polyline points="490,100 490,165 197,165 197,102" />
+    <polyline points="350,165 350,102" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor" textAnchor="middle">
+    <text x="57" y="72">trajectory</text>
+    <text x="57" y="87">generator</text>
+    <text x="197" y="72">outer PD</text>
+    <text x="197" y="87" fontSize="11">q̈d + Kd ė + Kp e</text>
+    <text x="350" y="72">inverse dynamics</text>
+    <text x="350" y="87" fontSize="11">M(q) v + c + g</text>
+    <text x="490" y="80">arm</text>
+    <text x="126" y="66" fontSize="11">qd, q̇d, q̈d</text>
+    <text x="266" y="66">v</text>
+    <text x="429" y="66">τ</text>
+    <text x="420" y="182">measured q, q̇</text>
+  </g>
+</svg>
+</Figure>
+
+The simulation runs each controller at 1 kHz on the true arm, following the 0.8 s quintic from the last section. The fourth row gives computed torque a wrong model: it believes the forearm is 20 % lighter than it is, a realistic error once a gripper or payload is attached.
+
+```python run
+import numpy as np
+
+# Planar 2-link arm in a vertical plane, each link's mass at its far end.
+L1, L2, G = 0.5, 0.4, 9.81
+TAU_MAX = np.array([40.0, 15.0])           # N m, what the joint drives can deliver
+
+def dynamics(q, dq, m1=2.0, m2=1.0):
+    """M(q), the Coriolis/centrifugal vector c(q, dq) and gravity g(q):  M ddq + c + g = tau."""
+    c1, c2, s2 = np.cos(q[0]), np.cos(q[1]), np.sin(q[1])
+    c12 = np.cos(q[0] + q[1])
+    M = np.array([[m1 * L1**2 + m2 * (L1**2 + L2**2 + 2 * L1 * L2 * c2), m2 * (L2**2 + L1 * L2 * c2)],
+                  [m2 * (L2**2 + L1 * L2 * c2), m2 * L2**2]])
+    h = m2 * L1 * L2 * s2
+    c = np.array([-h * (2 * dq[0] * dq[1] + dq[1]**2), h * dq[0]**2])
+    g = np.array([(m1 + m2) * G * L1 * c1 + m2 * G * L2 * c12, m2 * G * L2 * c12])
+    return M, c, g
+
+def accel(x, tau):
+    q, dq = x[:2], x[2:]
+    M, c, g = dynamics(q, dq)                       # the TRUE arm
+    return np.concatenate([dq, np.linalg.solve(M, tau - c - g)])
+
+def rk4(x, tau, h):
+    k1 = accel(x, tau); k2 = accel(x + h / 2 * k1, tau)
+    k3 = accel(x + h / 2 * k2, tau); k4 = accel(x + h * k3, tau)
+    return x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+def quintic(q0, qf, T, t):
+    """Rest-to-rest quintic: position, velocity, acceleration at time t."""
+    s = np.clip(t / T, 0, 1)
+    d = qf - q0
+    return (q0 + d * (10 * s**3 - 15 * s**4 + 6 * s**5),
+            d * (30 * s**2 - 60 * s**3 + 30 * s**4) / T,
+            d * (60 * s - 180 * s**2 + 120 * s**3) / T**2)
+
+q0, qf, T_move = np.array([-0.5, 0.8]), np.array([1.0, -0.4]), 0.8
+DT = 0.001                                           # 1 kHz control
+KP, KD = np.array([400.0, 400.0]), np.array([40.0, 40.0])   # "stiffness" in rad/s^2 per rad
+M_nom = np.diag(dynamics(q0, np.zeros(2))[0])        # a constant inertia guess per joint
+
+def track(controller, seconds=1.2):
+    x = np.concatenate([q0, np.zeros(2)])
+    errs, taus = [], []
+    for k in range(int(seconds / DT)):
+        qd, dqd, ddqd = quintic(q0, qf, T_move, k * DT)
+        e, de = qd - x[:2], dqd - x[2:]
+        tau = np.clip(controller(x[:2], x[2:], qd, dqd, ddqd, e, de), -TAU_MAX, TAU_MAX)
+        errs.append(e); taus.append(tau)
+        x = rk4(x, tau, DT)
+    return np.abs(np.array(errs)).max(axis=0), np.abs(np.array(errs[-1])), np.abs(np.array(taus)).max(axis=0)
+
+def pd(q, dq, qd, dqd, ddqd, e, de):
+    return M_nom * (KP * e + KD * de)
+def pd_gravity(q, dq, qd, dqd, ddqd, e, de):
+    return M_nom * (KP * e + KD * de) + dynamics(q, dq)[2]
+def computed_torque(q, dq, qd, dqd, ddqd, e, de, m2=1.0):
+    M, c, g = dynamics(q, dq, m2=m2)
+    return M @ (ddqd + KD * de + KP * e) + c + g
+def computed_torque_wrong(*args):
+    return computed_torque(*args, m2=0.8)            # model thinks the forearm is 20 % lighter
+
+print(f"{'controller':26} {'max error (mrad)':>17} {'final error':>12} {'peak torque (N m)':>18}")
+for name, ctl in [("independent PD", pd), ("PD + gravity", pd_gravity),
+                  ("computed torque", computed_torque), ("computed torque, m2 -20%", computed_torque_wrong)]:
+    emax, efin, tmax = track(ctl)
+    print(f"{name:26} {emax[0]*1e3:8.1f} {emax[1]*1e3:8.1f} {efin[0]*1e3:6.2f} {efin[1]*1e3:5.2f} {tmax[0]:9.1f} {tmax[1]:8.1f}")
+```
+
+<Narrator who="margaret">
+
+Read the table as a ladder. Independent PD with these gains lags by up to 109 mrad (6°) at the elbow and ends 54 mrad short, because the loops must hold the arm up with error alone. Gravity compensation halves the peak error and removes most of the final error. Computed torque with an exact model tracks to 0.1 mrad, a thousand times better than PD, with *less* peak torque than either. With the forearm's mass wrong by 20 %, it still tracks the shoulder sixteen times and the elbow twice as well as PD plus gravity, but it now ends 15 mrad off at the elbow, because the gravity it predicts is too small and nothing integrates the difference away.
+
+</Narrator>
+
+The last row is the practical lesson. A model is never exact: payloads change, friction drifts with temperature, cables pull. Practical tracking controllers therefore combine the model with something that removes its residual errors: an integral term, a **disturbance observer** that estimates the unmodelled torque the way <LessonLink slug="state-space-and-lqr">the observer lesson</LessonLink> estimated velocities, **adaptive control** that updates the masses online (the dynamics are linear in the inertial parameters, which makes this tractable), or a model **learned** from data. And the feedforward is only as good as the reference: a step has infinite $\ddot q_d$, which is one more reason to plan smooth trajectories first.
+
+</Section>
+
+<Section id="professional" kind="human" title="How it is done in practice">
+
+- **Industrial arms** generate jerk-limited S-curve or spline trajectories in their controller and track them with cascaded drive loops (<LessonLink slug="feedback-and-pid">feedback and PID</LessonLink> showed the cascade) plus model-based feedforward of velocity, acceleration and gravity torque, computed for every joint at the controller's interpolation rate, typically every millisecond or faster. Users rarely see it; they see the "motion profile" and "payload" settings, and the payload setting exists because the feedforward needs it.
+- **Online trajectory generation.** When the target can change at any moment (a conveyor, a person's hand, a visual-servoing loop), the trajectory must be replanned every control cycle. Libraries such as [Ruckig](https://github.com/pantor/ruckig) compute the time-optimal jerk-limited motion from *any* current state to a new target in microseconds, which is what makes this possible.
+- **Torque-controlled research and collaborative arms** accept joint torques directly over a 1 kHz real-time interface, so computed-torque and the impedance controllers of <LessonLink slug="force-and-impedance-control">the next lesson</LessonLink> run on the robot's own computer. Libraries such as [Pinocchio](https://github.com/stack-of-tasks/pinocchio) compute inverse dynamics for a seven-joint arm in a few microseconds with the recursive Newton–Euler algorithm, whose cost grows only linearly with the number of joints.
+- **ROS 2.** The joint-trajectory controller of [ros2_control](https://control.ros.org/) takes a list of timed waypoints, interpolates them with splines and tracks them with feedforward plus PID; MoveIt produces those waypoints with a time-parameterisation step after planning.
+- **Legged robots and humanoids** use the same idea, generalised: the "inverse dynamics" is a small optimisation that finds joint torques realising desired accelerations of the body and feet while respecting contact forces and friction (whole-body control), run at around 1 kHz under a slower planner.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Smoother is always slower."** A quintic is slower than a trapezoid under the same velocity limit, but a jerk-limited S-curve loses very little time, and on a real arm a smooth motion often finishes *sooner*, because it does not leave the tool vibrating for a settling time at the end.
+
+</Misconception>
+
+<Misconception>
+
+**"With a good enough feedback loop, feedforward is unnecessary."** Feedback needs an error to act, so a pure feedback controller following a moving reference always lags, and raising the gains to shrink the lag runs into noise, saturation and stability limits. Feedforward removes the predictable part of the error without raising any gain.
+
+</Misconception>
+
+<Misconception>
+
+**"Computed-torque control cancels the dynamics, so the robot becomes linear."** Only if the model is exact. In practice it removes most of the nonlinearity, and the feedback and any integral or adaptive terms handle the rest; the 20 % mass error in the table shows what is left over.
+
+</Misconception>
+
+<Misconception>
+
+**"If every waypoint is within the limits, the trajectory is too."** Interpolation can overshoot waypoints (the spline above did), and the peak velocity or torque usually occurs between waypoints. Check limits on a fine time grid, or use a time-parameterisation method that enforces them.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

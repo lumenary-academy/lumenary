@@ -1,0 +1,439 @@
+---
+title: Uncertainty and Bayes filters
+subtitle: A robot never knows exactly where it is. It can know how unsure it is, and update that every time it moves and every time it looks.
+minutes: 60
+objectives:
+  - Explain why a robot should carry a belief, a probability distribution over states, instead of a single best guess
+  - Use Bayes' rule, the law of total probability and conditional independence on sensor readings, including the base-rate trap
+  - Write a motion model and a measurement model for a simple robot, and state the Markov assumption behind them
+  - Derive the two steps of the Bayes filter, prediction and correction, and implement them as a histogram (grid) localiser in NumPy
+  - Recognise overconfident models and correlated readings, and explain how they make a filter fail
+narrators: [chloe, margaret, gideon]
+prerequisites: [sensing, wheeled-robots, state-space-and-lqr]
+related: [math.prob.probability-rules, math.prob.probability-theory, math.prob.markov-chains, math.prob.statistics, math.applied.information-theory]
+references:
+  - title: Probabilistic Robotics
+    author: Sebastian Thrun, Wolfram Burgard and Dieter Fox
+    year: 2005
+    note: The standard textbook on probabilistic state estimation for robots (MIT Press). Chapters 2 and 8 cover the Bayes filter and grid localisation.
+  - title: "Markov Localization for Mobile Robots in Dynamic Environments"
+    author: Dieter Fox, Wolfram Burgard and Sebastian Thrun
+    year: 1999
+    url: https://arxiv.org/abs/1106.0222
+    note: Grid-based Bayes filtering on real robots, including the museum tour guides, and how to cope with people walking past the sensors.
+  - title: "Experiences with an interactive museum tour-guide robot"
+    author: Wolfram Burgard et al.
+    year: 1999
+    url: https://doi.org/10.1016/S0004-3702(99)00070-3
+    note: RHINO, which guided visitors at the Deutsches Museum in Bonn in 1997 using Markov localisation.
+  - title: Bayesian Filtering and Smoothing (2nd edition, free pre-publication PDF)
+    author: Simo Särkkä and Lennart Svensson
+    year: 2023
+    url: https://users.aalto.fi/~ssarkka/pub/bfs_book_2023_online.pdf
+    note: A rigorous, readable treatment of Bayes filters, Kalman filters and particle filters.
+  - title: "A tutorial on hidden Markov models and selected applications in speech recognition"
+    author: Lawrence R. Rabiner
+    year: 1989
+    url: https://doi.org/10.1109/5.18626
+    note: The same recursion as this lesson's filter, under the name "forward algorithm", from speech recognition.
+---
+
+<Section id="motivation" kind="motivation" title="A robot that knows what it does not know">
+
+A small robot rides on a rail through a vertical-farm greenhouse in Nairobi, pausing at each rack of seedlings to photograph the leaves. The rail is a 20-metre loop. The robot counts wheel turns, so it has an idea how far it has gone, but its wheel slips a little on the damp rail, and after a few laps that idea is wrong by metres. To correct itself it has a downward-looking light sensor that sees strips of reflective tape stuck to the rail at a few places. The sensor is good but not perfect: a wet patch sometimes shines like tape, and dirty tape is sometimes missed.
+
+Where is the robot? The honest answer is never a single number. It is something like: "probably near rack 7; possibly near rack 15, which looks the same; certainly not near the door". In <LessonLink slug="wheeled-robots">Wheeled robots and odometry</LessonLink> you saw dead reckoning drift without bound. In <LessonLink slug="state-space-and-lqr">State-space models and LQR</LessonLink> you met observers, which correct a model's prediction with measurements, but they track a single estimate and say nothing about how far to trust it. This lesson gives the robot a richer state of mind: a **belief**, a probability for every place it might be, updated with one rule every time it moves and every time it senses.
+
+That rule is the **Bayes filter**. Every estimator in the rest of this level is a version of it: the <LessonLink slug="kalman-filters">Kalman filter</LessonLink> when beliefs are Gaussian, the <LessonLink slug="particle-filters-and-localisation">particle filter</LessonLink> when beliefs are clouds of samples, occupancy maps in <LessonLink slug="depth-and-point-clouds">Depth sensing and point clouds</LessonLink>, and the estimation half of <LessonLink slug="slam">SLAM</LessonLink>. Here we implement it in its plainest form, a histogram over a grid of places, and watch a robot become certain, lose its certainty and win it back.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Belief: a probability for every place">
+
+Chop the greenhouse loop into cells and give each cell a number between 0 and 1, the robot's probability that it is there; the numbers add up to 1. That list of numbers is the belief. Two things change it.
+
+- **Moving blurs it.** If the robot was surely in cell 3 and commands "advance one cell", it is now probably in cell 4, but perhaps in 3 (the wheel slipped) or 5 (it overshot). Motion shifts the belief along and spreads it out. Motion alone can only make the robot *less* certain.
+- **Sensing sharpens it.** If the sensor reports "tape", every taped cell becomes more plausible and every bare cell less. Each cell's probability is multiplied by how likely that reading would have been from there, and the whole list is rescaled to add up to 1.
+
+The figure shows four moments on a short loop of 20 cells with tape under cells 3, 8 and 14. At first the robot has no idea. One sighting of tape leaves three equally good hypotheses. Moving five cells carries all three along and blurs them. A second sighting of tape is consistent with only one of the three stories, because only one taped cell lies five cells after another, and that hypothesis now holds 69% of the belief.
+
+<Figure caption="A belief over 20 cells on a loop, with tape under the cells marked in gold. 1: uniform, no information. 2: after seeing tape, three peaks (25% each). 3: after moving five cells, the peaks have shifted and spread. 4: after seeing tape again, one hypothesis dominates (69% on cell 8), with some doubt left on cell 14. Bar heights are the filter's actual probabilities.">
+<svg viewBox="0 0 400 262" role="img" aria-label="Four rows of bar charts over 20 cells. Row 1 has all bars equal and low. Row 2 has three tall bars at the three taped cells. Row 3 has three peaks shifted five cells to the right, each with small shoulders. Row 4 has one tall bar at cell 8, a small bar at cell 14 and tiny bars elsewhere.">
+  <path d="M122 58v-3.5h9V58z M135 58v-3.5h9V58z M148 58v-3.5h9V58z M161 58v-3.5h9V58z M174 58v-3.5h9V58z M187 58v-3.5h9V58z M200 58v-3.5h9V58z M213 58v-3.5h9V58z M226 58v-3.5h9V58z M239 58v-3.5h9V58z M252 58v-3.5h9V58z M265 58v-3.5h9V58z M278 58v-3.5h9V58z M291 58v-3.5h9V58z M304 58v-3.5h9V58z M317 58v-3.5h9V58z M330 58v-3.5h9V58z M343 58v-3.5h9V58z M356 58v-3.5h9V58z M369 58v-3.5h9V58z" fill="var(--sky)" />
+  <line x1="116" y1="58" x2="384" y2="58" stroke="currentColor" strokeWidth="1" />
+  <text x="6" y="54" fill="currentColor" fontFamily="sans-serif" fontSize="11">1. no idea</text>
+  <path d="M122 120v-1.0h9V120z M135 120v-1.0h9V120z M148 120v-1.0h9V120z M161 120v-17.7h9V120z M174 120v-1.0h9V120z M187 120v-1.0h9V120z M200 120v-1.0h9V120z M213 120v-1.0h9V120z M226 120v-17.7h9V120z M239 120v-1.0h9V120z M252 120v-1.0h9V120z M265 120v-1.0h9V120z M278 120v-1.0h9V120z M291 120v-1.0h9V120z M304 120v-17.7h9V120z M317 120v-1.0h9V120z M330 120v-1.0h9V120z M343 120v-1.0h9V120z M356 120v-1.0h9V120z M369 120v-1.0h9V120z" fill="var(--sky)" />
+  <line x1="116" y1="120" x2="384" y2="120" stroke="currentColor" strokeWidth="1" />
+  <text x="6" y="116" fill="currentColor" fontFamily="sans-serif" fontSize="11">2. sees tape</text>
+  <path d="M122 182v-2.7h9V182z M135 182v-1.0h9V182z M148 182v-1.0h9V182z M161 182v-1.0h9V182z M174 182v-1.0h9V182z M187 182v-1.0h9V182z M200 182v-1.0h9V182z M213 182v-2.7h9V182z M226 182v-14.4h9V182z M239 182v-2.7h9V182z M252 182v-1.0h9V182z M265 182v-1.0h9V182z M278 182v-2.7h9V182z M291 182v-14.4h9V182z M304 182v-2.7h9V182z M317 182v-1.0h9V182z M330 182v-1.0h9V182z M343 182v-1.0h9V182z M356 182v-2.7h9V182z M369 182v-14.4h9V182z" fill="var(--sky)" />
+  <line x1="116" y1="182" x2="384" y2="182" stroke="currentColor" strokeWidth="1" />
+  <text x="6" y="178" fill="currentColor" fontFamily="sans-serif" fontSize="11">3. moves 5 cells</text>
+  <path d="M122 244v-0.6h9V244z M135 244v-0.6h9V244z M148 244v-0.6h9V244z M161 244v-3.3h9V244z M174 244v-0.6h9V244z M187 244v-0.6h9V244z M200 244v-0.6h9V244z M213 244v-0.6h9V244z M226 244v-48.1h9V244z M239 244v-0.6h9V244z M252 244v-0.6h9V244z M265 244v-0.6h9V244z M278 244v-0.6h9V244z M291 244v-2.7h9V244z M304 244v-8.9h9V244z M317 244v-0.6h9V244z M330 244v-0.6h9V244z M343 244v-0.6h9V244z M356 244v-0.6h9V244z M369 244v-2.7h9V244z" fill="var(--sky)" />
+  <line x1="116" y1="244" x2="384" y2="244" stroke="currentColor" strokeWidth="1" />
+  <text x="6" y="240" fill="currentColor" fontFamily="sans-serif" fontSize="11">4. sees tape again</text>
+  <text x="240" y="206" fill="currentColor" fontFamily="sans-serif" fontSize="10">0.69</text>
+  <path d="M160 60h11v4h-11z M225 60h11v4h-11z M303 60h11v4h-11z M160 122h11v4h-11z M225 122h11v4h-11z M303 122h11v4h-11z M160 184h11v4h-11z M225 184h11v4h-11z M303 184h11v4h-11z M160 246h11v4h-11z M225 246h11v4h-11z M303 246h11v4h-11z" fill="var(--gold)" />
+</svg>
+</Figure>
+
+<Narrator who="chloe">
+
+Notice what made the second sighting decisive: not the tape itself, but the *pattern* of tape relative to the motion. A single reading only tells you "I am at one of the taped places"; a sequence of readings, tied together by a motion model, picks out which one. Localisation is pattern matching through time.
+
+</Narrator>
+
+</Section>
+
+<Section id="probability" kind="definitions" title="The probability a robot needs">
+
+Lumenary Math's <TopicLink id="math.prob.probability-rules">Conditional probability and independence</TopicLink> and <TopicLink id="math.prob.probability-theory">Probability theory</TopicLink> develop these ideas carefully. Here is the toolkit a robot uses, in robot language.
+
+<Definition term="Random variable, distribution, belief">
+
+A **random variable** is a quantity whose value the robot is unsure of: its cell $X$, the next reading $Z$. Its **distribution** assigns a probability to every value, $p(x) = P(X = x)$, with $\sum_x p(x) = 1$ (for continuous quantities, a density that integrates to 1). The robot's **belief** at time $t$ is the distribution of its state given everything it has done and seen:
+
+$$
+\mathrm{bel}(x_t) = p(x_t \mid u_{1:t},\, z_{1:t}),
+$$
+
+where $u_{1:t}$ are the commands (controls) $u_1, \dots, u_t$ and $z_{1:t}$ the measurements $z_1, \dots, z_t$.
+
+</Definition>
+
+Three rules do almost all the work. **Conditional probability**: $p(a \mid b) = p(a, b)/p(b)$, the probability of $a$ once you know $b$. **Total probability** (marginalisation): $p(a) = \sum_b p(a \mid b)\,p(b)$; to get the chance of a reading, average over every place you might be. And their consequence:
+
+<Theorem name="Bayes' rule">
+
+For a state $x$ and a measurement $z$ with $p(z) > 0$,
+
+$$
+p(x \mid z) = \frac{p(z \mid x)\,p(x)}{p(z)} = \eta\; p(z \mid x)\,p(x), \qquad \eta = \frac{1}{\sum_{x'} p(z \mid x')\,p(x')}.
+$$
+
+</Theorem>
+
+Read it as: **posterior ∝ likelihood × prior.** The *prior* $p(x)$ is what the robot believed before the reading. The *likelihood* $p(z \mid x)$ is the sensor's datasheet in probabilistic form: how often this reading occurs from each state. It is the direction a robot can actually model, because it is about the physics of the sensor. Bayes' rule turns it round into what we want, $p(x \mid z)$. The constant $\eta$ just rescales so the posterior sums to 1, so in code we multiply and then normalise.
+
+<Definition term="Conditional independence">
+
+Readings $z_1$ and $z_2$ are **conditionally independent given** $x$ if $p(z_1, z_2 \mid x) = p(z_1 \mid x)\,p(z_2 \mid x)$: once you know the true state, one reading tells you nothing more about the other. Their errors are unrelated.
+
+</Definition>
+
+Conditional independence is what lets a robot multiply evidence. It also answers the question left open in <LessonLink slug="sensing">How robots sense the world</LessonLink>: why does averaging four times as many readings only halve the error? If $n$ readings have independent errors, each with variance $\sigma^2$, the variance of their mean is $\sigma^2/n$ (variances of independent quantities add, and dividing by $n$ divides the variance by $n^2$). The *standard deviation*, the typical error, is therefore $\sigma/\sqrt{n}$: four times the readings, half the error. If the errors are not independent, for instance a sensor with a fixed offset, averaging does not remove them at all.
+
+<Narrator who="gideon">
+
+Every multiplication of likelihoods in this lesson is a claim that the errors are independent given the state. A lidar beam hitting the same glass door twice, a camera that sees the same reflection in consecutive frames, two detectors fed the same image: these errors are correlated, and multiplying them makes the robot far more confident than it has any right to be.
+
+</Narrator>
+
+</Section>
+
+<Section id="bayes-by-hand" kind="examples" title="Bayes' rule with a real sensor">
+
+<Example title="One reading of the tape sensor">
+
+The greenhouse rail has 40 cells, 10 of them taped, and the robot has no idea where it is: its prior that it is on tape is $10/40 = 0.25$. The sensor reports "tape" ($T$) with probability $0.9$ when over tape and with probability $0.05$ over bare rail. It reports $T$. How likely is it that the robot is over tape?
+
+Total probability gives the chance of the reading: $p(T) = 0.9 \times 0.25 + 0.05 \times 0.75 = 0.2625$. Bayes' rule gives
+
+$$
+p(\text{tape} \mid T) = \frac{0.9 \times 0.25}{0.2625} \approx 0.857.
+$$
+
+Now suppose only 2 cells of 40 were taped. The same sensor, the same reading, but $p(\text{tape} \mid T) = 0.045 / 0.0925 \approx 0.486$: less than a coin toss. When the thing you are looking for is rare, false alarms from the many places where it is absent can outnumber true detections from the few places where it is present. This is the **base-rate effect**, and it is why a "90% accurate" sensor never makes a robot 90% sure.
+
+</Example>
+
+A convenient form for repeated evidence uses **odds**, $o = p/(1-p)$. Bayes' rule becomes "posterior odds = prior odds × likelihood ratio", where the likelihood ratio of a $T$ reading is $0.9 / 0.05 = 18$. Independent readings multiply their ratios. The program checks both numbers above and shows what repeated readings do.
+
+```python run
+# Bayes' rule for one reading of the tape sensor
+p_hit, p_false = 0.9, 0.05            # p(T | tape), p(T | bare rail)
+
+for name, prior in [("10 of 40 cells taped", 10 / 40), ("2 of 40 cells taped", 2 / 40)]:
+    p_T = p_hit * prior + p_false * (1 - prior)          # total probability of seeing "T"
+    post = p_hit * prior / p_T                           # Bayes' rule
+    print(f"{name}: p(T) = {p_T:.4f}, p(tape | T) = {post:.3f}")
+
+# The same reading, repeated k times while the robot stands still.
+prior = 10 / 40
+odds0 = prior / (1 - prior)
+ratio = p_hit / p_false                                  # likelihood ratio of one "T"
+print(f"\nlikelihood ratio of one 'T' reading: {ratio:.0f}")
+for k in range(1, 5):
+    odds = odds0 * ratio ** k                            # valid only if readings are independent given the cell
+    print(f"{k} reading(s) of 'T': p(tape) = {odds / (1 + odds):.5f}")
+```
+
+Two readings take the robot from 0.857 to 0.991 and four to 0.99997. That is correct *if* the readings are independent given the cell. If the robot is parked over a wet patch that shines like tape, all four readings make the same mistake, and the real probability that it is over tape has barely moved from 0.857. The filter has no way to know this; only the person who wrote the sensor model can.
+
+</Section>
+
+<Section id="bayes-filter" kind="definitions" title="Motion models, measurement models and the Bayes filter">
+
+A filter needs two models of the world, both written as conditional probabilities.
+
+<Definition term="Motion model and measurement model">
+
+The **motion model** (or transition model) $p(x_t \mid x_{t-1}, u_t)$ gives the probability of arriving in state $x_t$ when command $u_t$ is executed from state $x_{t-1}$. For the rail robot, "advance one cell" lands one cell on with probability $0.9$ and zero or two cells on with probability $0.05$ each.
+
+The **measurement model** (or sensor model) $p(z_t \mid x_t)$ gives the probability of reading $z_t$ from state $x_t$. For the tape sensor, $p(T \mid \text{taped cell}) = 0.9$ and $p(T \mid \text{bare cell}) = 0.05$.
+
+</Definition>
+
+In <LessonLink slug="state-space-and-lqr">State-space models and LQR</LessonLink> the same two ingredients appeared as $x_{t} = A x_{t-1} + B u_t$ and $y_t = C x_t$. The probabilistic versions add the noise explicitly: they say not "where the robot goes" but "where it might go, and how likely each possibility is".
+
+<Definition term="The Markov assumption">
+
+The state is **complete**: given $x_{t-1}$ and $u_t$, the new state $x_t$ does not depend on any earlier states, commands or readings; and given $x_t$, the reading $z_t$ does not depend on anything else. In symbols, $p(x_t \mid x_{0:t-1}, u_{1:t}, z_{1:t-1}) = p(x_t \mid x_{t-1}, u_t)$ and $p(z_t \mid x_{0:t}, u_{1:t}, z_{1:t-1}) = p(z_t \mid x_t)$.
+
+</Definition>
+
+<Figure caption="The structure the Bayes filter assumes, drawn as a dynamic Bayesian network. Each state depends only on the previous state and the command; each reading depends only on the current state. Everything the past can tell you about the future passes through the current state.">
+<svg viewBox="0 0 400 200" role="img" aria-label="A chain of three circles labelled x at t minus 1, x at t and x at t plus 1, joined by arrows from left to right. Above each arrow into a state is a box labelled u for the command, with an arrow down into the state. Below each state is a circle labelled z, the reading, with an arrow from the state down to it.">
+  <defs>
+    <marker id="ub-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="70" cy="100" r="24" />
+    <circle cx="200" cy="100" r="24" />
+    <circle cx="330" cy="100" r="24" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="70" cy="172" r="18" />
+    <circle cx="200" cy="172" r="18" />
+    <circle cx="330" cy="172" r="18" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="118" y="14" width="34" height="26" rx="4" />
+    <rect x="248" y="14" width="34" height="26" rx="4" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" markerEnd="url(#ub-arrow)">
+    <line x1="94" y1="100" x2="174" y2="100" />
+    <line x1="224" y1="100" x2="304" y2="100" />
+    <line x1="146" y1="40" x2="184" y2="80" />
+    <line x1="276" y1="40" x2="314" y2="80" />
+    <line x1="70" y1="124" x2="70" y2="152" />
+    <line x1="200" y1="124" x2="200" y2="152" />
+    <line x1="330" y1="124" x2="330" y2="152" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="13" textAnchor="middle">
+    <text x="70" y="105">x<tspan dy="4" fontSize="9">t−1</tspan></text>
+    <text x="200" y="105">x<tspan dy="4" fontSize="9">t</tspan></text>
+    <text x="330" y="105">x<tspan dy="4" fontSize="9">t+1</tspan></text>
+    <text x="135" y="32">u<tspan dy="4" fontSize="9">t</tspan></text>
+    <text x="265" y="32">u<tspan dy="4" fontSize="9">t+1</tspan></text>
+    <text x="70" y="177">z<tspan dy="4" fontSize="9">t−1</tspan></text>
+    <text x="200" y="177">z<tspan dy="4" fontSize="9">t</tspan></text>
+    <text x="330" y="177">z<tspan dy="4" fontSize="9">t+1</tspan></text>
+  </g>
+</svg>
+</Figure>
+
+<Theorem name="The Bayes filter">
+
+Under the Markov assumption, the belief can be updated recursively. Given $\mathrm{bel}(x_{t-1})$, a command $u_t$ and a reading $z_t$:
+
+$$
+\text{predict:}\quad \overline{\mathrm{bel}}(x_t) = \sum_{x_{t-1}} p(x_t \mid x_{t-1}, u_t)\,\mathrm{bel}(x_{t-1}),
+\qquad
+\text{correct:}\quad \mathrm{bel}(x_t) = \eta\; p(z_t \mid x_t)\,\overline{\mathrm{bel}}(x_t).
+$$
+
+For continuous states the sum is an integral.
+
+</Theorem>
+
+<Proof>
+
+Apply Bayes' rule to $x_t$ and $z_t$, keeping everything else as background knowledge: $\mathrm{bel}(x_t) = \eta\, p(z_t \mid x_t, u_{1:t}, z_{1:t-1})\; p(x_t \mid u_{1:t}, z_{1:t-1})$. By the Markov assumption the first factor is $p(z_t \mid x_t)$. For the second, use total probability over the previous state: $p(x_t \mid u_{1:t}, z_{1:t-1}) = \sum_{x_{t-1}} p(x_t \mid x_{t-1}, u_{1:t}, z_{1:t-1})\; p(x_{t-1} \mid u_{1:t}, z_{1:t-1})$. The Markov assumption reduces the first factor to $p(x_t \mid x_{t-1}, u_t)$. In the second, the command $u_t$ was issued after $x_{t-1}$ and carries no information about it (the robot chooses commands from its data, not from a secret view of the truth), so it is $p(x_{t-1} \mid u_{1:t-1}, z_{1:t-1}) = \mathrm{bel}(x_{t-1})$. Substituting gives the two lines.
+
+</Proof>
+
+The filter's memory is one distribution: everything the robot ever saw and did is summarised in $\mathrm{bel}(x_{t-1})$. That is what makes it usable in real time. The predict step is a **convolution** of the belief with the motion noise; the correct step is a pointwise multiplication by the likelihood, followed by normalisation. The same recursion appears, with different names, as the forward algorithm for hidden Markov models in speech recognition and genomics (Lumenary Math's <TopicLink id="math.prob.markov-chains">Markov chains</TopicLink> covers the chain of states underneath).
+
+</Section>
+
+<Section id="histogram" kind="computation" title="A histogram localiser">
+
+On a finite grid, the belief is a NumPy array and each step of the filter is a line or two. The robot below starts with a uniform belief, drives 42 cells round the 40-cell loop (one commanded cell per step, slipping now and then), and reads its tape sensor after every step, except between steps 15 and 28, when it passes through a misting zone that wets the sensor and the readings are discarded. Each printed line shows the belief as a strip of 40 characters, one per cell (blank for less than 0.005, then `.`, `:`, `+`, `#`, and `@` for 0.4 or more), its **entropy** $H = -\sum_x p(x)\log_2 p(x)$, a measure of uncertainty in bits ($\log_2 40 \approx 5.32$ for a uniform belief, 0 for certainty), the most probable cell, and the true cell.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(2)
+N = 40                                       # a loop of rail: 40 cells of 0.5 m each
+tape = np.zeros(N, dtype=bool)
+tape[[1, 2, 7, 15, 16, 17, 22, 30, 34, 35]] = True   # reflective tape under these cells
+
+P_HIT, P_FALSE = 0.9, 0.05                   # p(z = tape | tape), p(z = tape | bare rail)
+MOVE = {0: 0.05, 1: 0.9, 2: 0.05}            # "advance one cell": p(actual advance = k)
+
+def predict(bel):
+    """Motion update: bel(x) <- sum over k of p(advance k) * bel(x - k), on a loop."""
+    return sum(p * np.roll(bel, k) for k, p in MOVE.items())
+
+def update(bel, saw_tape):
+    """Measurement update: multiply by p(z | x) cell by cell, then normalise."""
+    if saw_tape:
+        like = np.where(tape, P_HIT, P_FALSE)
+    else:
+        like = np.where(tape, 1 - P_HIT, 1 - P_FALSE)
+    post = like * bel
+    return post / post.sum()
+
+def entropy_bits(bel):
+    p = bel[bel > 0]
+    return float(-(p * np.log2(p)).sum())
+
+def strip(bel):
+    """One character per cell: ' ' < 0.005 <= '.' < 0.02 <= ':' < 0.05 <= '+' < 0.15 <= '#' < 0.4 <= '@'."""
+    return "".join(" .:+#@"[int(np.searchsorted([0.005, 0.02, 0.05, 0.15, 0.4], b, side="right"))] for b in bel)
+
+true, bel = 5, np.full(N, 1.0 / N)           # the filter starts with no idea where it is
+print("          rail   [" + "".join("T" if m else "_" for m in tape) + "]")
+for t in range(1, 43):
+    true = (true + rng.choice(3, p=[0.05, 0.9, 0.05])) % N   # the real robot moves...
+    bel = predict(bel)                                       # ...and the filter predicts
+    blind = 15 <= t <= 28                                    # misting zone: no usable readings
+    if not blind:
+        z = rng.random() < (P_HIT if tape[true] else P_FALSE)
+        bel = update(bel, z)
+    if t in (1, 3, 6, 9, 12, 14, 17, 20, 23, 26, 28, 30, 33, 36, 39, 42):
+        best = int(np.argmax(bel))
+        seen = "--" if blind else ("T" if z else "_")
+        print(f"t={t:2d}  z={seen:2s} [{strip(bel)}] H={entropy_bits(bel):4.2f} bits"
+              f"  best={best:2d} (p={bel[best]:.2f})  true={true:2d}")
+```
+
+Read the run in three acts.
+
+1. **Becoming certain (steps 1 to 14).** The first "no tape" reading only rules out the taped cells, and the entropy barely moves from 5.32 to 5.07 bits. By step 3 the robot has several hypotheses moving in step with each other. At step 9 it sees tape, and by step 12, having seen the end of the three-cell strip go by, it is 82% sure it is in cell 18, which is correct. Entropy has fallen to 1.21 bits.
+2. **Becoming uncertain (steps 15 to 28).** In the misting zone the filter can only predict. Each step convolves the belief with the motion noise, so the peak sinks (0.69, 0.54, 0.44, 0.38, 0.33, 0.31) and spreads into a hump four or five cells wide, while the entropy climbs to 2.93 bits. Note that the peak still tracks the truth: the robot is not lost, it is honestly less sure.
+3. **Certain again (steps 29 to 42).** Two readings after leaving the mist, the belief snaps back to 80% on the correct cell, and after the tape at cells 1 and 2 and then 7 it reaches 94%.
+
+<Narrator who="margaret">
+
+Grids get expensive fast. This rail needs 40 numbers. A wheeled robot on a 50 m × 50 m warehouse floor has a 3-D state $(x, y, \theta)$; at 5 cm and 2° resolution that is $1000 \times 1000 \times 180 = 1.8 \times 10^8$ cells, 720 MB in single precision, and every predict step convolves all of them. A drone's 6-D pose on a grid is out of the question, which is why the next two lessons replace the grid by a Gaussian and by samples.
+
+</Narrator>
+
+</Section>
+
+<Section id="overconfidence" kind="computation" title="When the model is too sure of itself">
+
+A tempting shortcut is to tell the filter that its sensor and wheels never err: $p(T \mid \text{tape}) = 1$, $p(T \mid \text{bare}) = 0$, and "advance one cell" always advances exactly one. The arithmetic is simpler and the belief collapses to a single cell faster. The program runs that filter beside an honest one on the same robot.
+
+```python run
+import numpy as np
+
+N = 40
+tape = np.zeros(N, dtype=bool)
+tape[[1, 2, 7, 15, 16, 17, 22, 30, 34, 35]] = True
+
+def make_filter(p_hit, p_false, move):
+    def step(bel, z):
+        bel = sum(p * np.roll(bel, k) for k, p in move.items())          # predict
+        like = np.where(tape, p_hit, p_false) if z else np.where(tape, 1 - p_hit, 1 - p_false)
+        post = like * bel
+        total = post.sum()
+        return post / total if total > 0 else post                       # all zero: nothing left to normalise
+    return step
+
+honest = make_filter(0.9, 0.05, {0: 0.05, 1: 0.9, 2: 0.05})   # the noise the robot really has
+certain = make_filter(1.0, 0.0, {1: 1.0})                      # "my sensor and wheels never err"
+
+rng = np.random.default_rng(11)
+true = 5
+bel_h = bel_c = np.full(N, 1.0 / N)
+for t in range(1, 41):
+    advance = rng.choice(3, p=[0.05, 0.9, 0.05])
+    true = (true + advance) % N
+    z = rng.random() < (0.9 if tape[true] else 0.05)
+    bel_h, bel_c = honest(bel_h, z), certain(bel_c, z)
+    note = "" if advance == 1 else f"  <- wheel slip: advanced {advance}"
+    if t % 5 == 0 or advance != 1 or bel_c.sum() == 0:
+        c = "all zero!" if bel_c.sum() == 0 else f"best={int(np.argmax(bel_c)):2d} p={bel_c.max():.2f}"
+        print(f"t={t:2d} true={true:2d} | honest: best={int(np.argmax(bel_h)):2d} p={bel_h.max():.2f}"
+              f" | certain: {c}{note}")
+    if bel_c.sum() == 0:
+        print("The overconfident filter has ruled out every cell, including the true one.")
+        break
+```
+
+For ten steps the overconfident filter looks *better*: at step 10 it is 50% sure of the right cell while the honest one is 44% sure. At step 11 the wheel slips and the robot advances two cells. The overconfident filter, which believes slips are impossible, moves its belief one cell and is now 100% sure of cell 16 while the robot is in 17. At step 12 the next reading contradicts every hypothesis it has left, every cell's probability is zero, and there is nothing to normalise. In floating point the division would produce `nan`; in a robot it means a localiser that has crashed or, worse, one that keeps reporting the wrong place. The honest filter took the slip in its stride.
+
+The lesson generalises: **never assign probability zero to something that can happen.** A zero in a Bayes filter can never be undone, because multiplication by any likelihood keeps it zero. Real sensor models add a small floor for "something unexpected" (a random reading, a person walking past), and real motion models are a little wider than the measured noise.
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+Grid-based Bayes filtering on real robots is called **Markov localisation**, and it made its name in museums. In 1997 the robot RHINO, built at the University of Bonn, guided visitors around the Deutsches Museum in Bonn for six days, and in 1998 its successor MINERVA did the same at the Smithsonian's National Museum of American History in Washington. Both had to localise among crowds that blocked their sonar and laser beams; the papers by Burgard, Fox, Thrun and colleagues in the references describe how a grid belief over $(x, y, \theta)$ coped, including filtering out readings that were probably people rather than walls.
+
+Today the grid form survives where the state is small or naturally discrete: a robot on a rail or in a lift shaft, a topological map ("which room am I in?"), the heading of a compass-less robot, and above all **occupancy grids**, where the grid is over the *map* rather than the robot's pose. Each cell holds the belief that it is occupied, and each lidar beam is a measurement update; you will build one in <LessonLink slug="depth-and-point-clouds">Depth sensing and point clouds</LessonLink>.
+
+For pose estimation, practitioners choose a representation of the belief to make the Bayes filter affordable:
+
+| Belief representation | Filter | Good at | Weak at |
+| --- | --- | --- | --- |
+| Histogram over a grid | Grid (histogram) filter | Any shape, multiple hypotheses, easy to understand | Cost grows exponentially with state dimension |
+| Gaussian (mean and covariance) | Kalman filter, EKF, UKF | Fast, high-dimensional, smooth tracking | Only one hypothesis; needs near-linear models |
+| Weighted samples | Particle filter | Multiple hypotheses, any noise, global localisation | Needs many samples in high dimensions |
+| A whole trajectory, optimised | Factor graphs, smoothing | Large-scale mapping, revisiting the past | Heavier computation, not a simple recursion |
+
+The next two lessons are the second and third rows; the last row is <LessonLink slug="slam">SLAM</LessonLink>. In a typical ROS 2 navigation stack, a particle filter (AMCL) localises against the map, an extended Kalman filter fuses wheels and inertial sensors (the [robot_localization](https://github.com/cra-ros-pkg/robot_localization) package), and an occupancy grid stores the map: three Bayes filters with three belief representations, running side by side.
+
+The Bayes filter also connects robotics to machine learning. A recurrent neural network that reads sensor data and outputs a state estimate has the same shape: a hidden state carried forward and updated with each new input. Research on "differentiable filters" trains the motion and measurement models of a Bayes filter from data while keeping its structure; Lumenary CS's [learning from data](/en/cs/learning-from-data/) and [neural networks](/en/cs/neural-networks/) lessons cover the learning side.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Probability describes randomness in the world; the robot's position is not random."** The robot is somewhere definite. The belief describes the *robot's knowledge*, and two robots with different data hold different beliefs about the same fact. That is exactly what we want: the belief is an honest summary of evidence, used to decide how carefully to act.
+
+</Misconception>
+
+<Misconception>
+
+**"A sensor that is right 90% of the time makes the robot 90% sure."** The posterior depends on the prior. With tape under 2 of 40 cells, a single "tape" reading from a sensor with a 90% hit rate and a 5% false-alarm rate leaves the robot only 49% sure it is over tape.
+
+</Misconception>
+
+<Misconception>
+
+**"More readings always mean more certainty."** Only if their errors are independent given the state. Ten readings from a sensor parked over the same reflective puddle are worth little more than one. Good systems downsample correlated data (using every fifth lidar beam, say) or inflate the noise in the model to compensate.
+
+</Misconception>
+
+<Misconception>
+
+**"The motion step and the sensor step are both corrections."** Prediction can only add uncertainty (it spreads the belief); correction usually removes it. The misting zone in the simulation shows a filter that predicts without correcting: still right on average, steadily less sure.
+
+</Misconception>
+
+<Misconception>
+
+**"A sharper model is a better model."** A model that rules out what can happen (a zero likelihood, a motion with no slip) makes the filter overconfident and eventually catastrophically wrong, as the second simulation showed. Err on the side of a model that is slightly too uncertain.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Thomas Bayes's essay on inverse probability was published in 1763, after his death, and Pierre-Simon Laplace developed the rule into a general method of reasoning from evidence over the following decades. Recursive estimation came from engineering in the 1960s: Rudolf Kálmán's filter (1960) and the work of Ruslan Stratonovich on nonlinear filtering. Hidden Markov models and their forward algorithm, developed by Leonard Baum and colleagues in the late 1960s, became the backbone of speech recognition. Probabilistic robotics took shape in the 1990s, when grid-based Markov localisation ran on museum robots in Germany and the United States, and the textbook *Probabilistic Robotics* by Thrun, Burgard and Fox (2005) made "represent uncertainty explicitly" the field's working assumption.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,462 @@
+---
+title: Particle filters and localisation
+subtitle: Represent a belief by thousands of guesses, keep the ones the sensors agree with, and a robot can find itself in a building that looks the same in every direction.
+minutes: 70
+objectives:
+  - Explain how a weighted set of samples represents a belief, including beliefs with several peaks
+  - Derive the particle filter from importance sampling and implement Monte Carlo localisation in 2-D with landmarks
+  - Compute the effective sample size and implement low-variance resampling, and explain why it beats independent draws
+  - Recognise particle deprivation and the kidnapped-robot problem, and recover with random particle injection
+  - Explain how KLD-sampling adapts the number of particles
+  - Configure and reason about AMCL, the particle-filter localiser of ROS 2's navigation stack
+narrators: [chloe, margaret, gideon]
+prerequisites: [wheeled-robots, uncertainty-and-bayes-filters, kalman-filters]
+related: [math.prob.probability-theory, math.prob.statistics, math.prob.stochastic-processes, math.prob.markov-chains]
+references:
+  - title: "Novel approach to nonlinear/non-Gaussian Bayesian state estimation"
+    author: Neil J. Gordon, David J. Salmond and Adrian F. M. Smith
+    year: 1993
+    url: https://doi.org/10.1049/ip-f-2.1993.0015
+    note: The bootstrap filter, the first practical particle filter.
+  - title: "Monte Carlo localization for mobile robots"
+    author: Frank Dellaert, Dieter Fox, Wolfram Burgard and Sebastian Thrun
+    year: 1999
+    url: https://doi.org/10.1109/ROBOT.1999.772544
+    note: Particle filters applied to robot localisation.
+  - title: "Adapting the sample size in particle filters through KLD-sampling"
+    author: Dieter Fox
+    year: 2003
+    url: https://doi.org/10.1177/0278364903022012001
+    note: How many particles are enough, decided on the fly.
+  - title: "Robust Monte Carlo localization for mobile robots"
+    author: Sebastian Thrun, Dieter Fox, Wolfram Burgard and Frank Dellaert
+    year: 2001
+    url: https://doi.org/10.1016/S0004-3702(01)00069-8
+  - title: "Nav2 AMCL (source and README)"
+    url: https://github.com/ros-navigation/navigation2/tree/main/nav2_amcl
+    note: The particle-filter localiser of ROS 2's navigation stack. Its parameters are documented on the Nav2 site.
+  - title: Nav2 documentation
+    url: https://docs.nav2.org/
+  - title: "Differentiable Particle Filters: End-to-End Learning with Algorithmic Priors"
+    author: Rico Jonschkowski, Divyam Rastogi and Oliver Brock
+    year: 2018
+    url: https://arxiv.org/abs/1805.11122
+    note: Learning a particle filter's motion and measurement models from data.
+---
+
+<Section id="motivation" kind="motivation" title="When the answer has several peaks">
+
+A cleaning robot is switched on in a hotel in Kyoto in the middle of the night. Somebody carried it from the corridor where it last stopped and set it down in a different one. Every corridor on the floor has the same carpet, the same doors at the same spacing, the same fire extinguisher in a niche. What should the robot believe about where it is?
+
+Not "somewhere in the middle of the floor", which is what a Kalman filter's single Gaussian would say if it tried to cover every corridor at once, and which is the one place the robot certainly is not. The honest belief has a peak in *each* corridor that matches what it sees, and nothing in between. Only after it drives to the end and sees the lift lobby, or the window, can it decide which peak is real. The <LessonLink slug="uncertainty-and-bayes-filters">histogram filter</LessonLink> could represent such a belief, but a grid over a hotel floor at useful resolution has hundreds of millions of cells. The <LessonLink slug="kalman-filters">Kalman filter</LessonLink> is cheap but has one peak.
+
+The **particle filter** keeps the Bayes filter and represents the belief by a few thousand samples, called particles, each a complete guess at the robot's pose. Particles cluster where the robot is likely to be and avoid where it is not, so they spend memory only where it matters, and any number of peaks costs nothing extra. Applied to robots, it is called **Monte Carlo localisation** (MCL), and in the form of AMCL it is the default localiser of ROS 2's navigation stack, used on many research and commercial mobile robots.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="A belief made of guesses">
+
+Think of each particle as a small ghost robot with its own pose. The filter repeats three steps.
+
+1. **Move.** Every ghost executes the real robot's command, each with its own random slip drawn from the motion model. The cloud shifts and spreads, as a belief should when the robot moves.
+2. **Weigh.** When a reading arrives, each ghost asks: "if I were the real robot, how likely is this reading?" That likelihood is its weight. Ghosts in places that match the reading weigh a lot; the rest weigh almost nothing.
+3. **Resample.** Draw a new set of ghosts from the old one, each picked with probability proportional to its weight. Heavy ghosts are copied several times; light ones die out. The total number stays the same.
+
+After a few rounds, the ghosts crowd into the places consistent with everything the robot has seen, which is exactly what the belief should look like.
+
+<Figure caption="Monte Carlo localisation in a symmetric hall: five identical posts, four in a square and one by the east wall. A robot that sees two posts and nothing else is consistent with several poses, each a quarter-turn of the others about the hall's centre, and the particles gather around them. The fourth cluster, beside the east post, is nearly empty: a robot there would have seen that post.">
+<svg viewBox="0 0 280 260" role="img" aria-label="A square hall with five posts drawn as gold squares: four near the corners and one near the middle of the right wall. Four clusters of dots, each with an arrow showing a heading, sit at the top, left, bottom and right of the hall's centre; the right-hand cluster has only a few dots. The top cluster is marked as the true robot.">
+  <rect x="40" y="30" width="200" height="200" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <path d="M141 71h0.1 M133 73h0.1 M138 82h0.1 M153 79h0.1 M140 75h0.1 M148 80h0.1 M144 87h0.1 M137 83h0.1 M131 91h0.1 M129 82h0.1 M139 82h0.1 M140 89h0.1 M139 78h0.1 M145 86h0.1 M87 144h0.1 M86 145h0.1 M80 122h0.1 M75 124h0.1 M92 132h0.1 M93 126h0.1 M97 132h0.1 M86 134h0.1 M83 130h0.1 M84 123h0.1 M77 138h0.1 M83 145h0.1 M103 147h0.1 M88 134h0.1 M152 194h0.1 M148 185h0.1 M139 185h0.1 M144 188h0.1 M139 178h0.1 M153 197h0.1 M151 173h0.1 M137 178h0.1 M137 168h0.1 M141 182h0.1 M138 181h0.1 M139 186h0.1 M154 193h0.1 M115 181h0.1 M189 127h0.1 M189 131h0.1 M192 123h0.1" stroke="var(--sky)" strokeWidth="5" strokeLinecap="round" fill="none" />
+  <g stroke="currentColor" strokeWidth="1.5">
+    <line x1="140" y1="80" x2="122" y2="80" />
+    <line x1="90" y1="130" x2="90" y2="148" />
+    <line x1="140" y1="180" x2="158" y2="180" />
+    <line x1="190" y1="130" x2="190" y2="112" />
+  </g>
+  <g fill="var(--gold)" stroke="currentColor">
+    <rect x="75" y="185" width="10" height="10" />
+    <rect x="195" y="185" width="10" height="10" />
+    <rect x="75" y="65" width="10" height="10" />
+    <rect x="195" y="65" width="10" height="10" />
+    <rect x="215" y="125" width="10" height="10" />
+  </g>
+  <circle cx="140" cy="80" r="9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="3 2" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="112" y="58">true pose</text>
+    <text x="40" y="250">10 m × 10 m hall; arrows show each cluster's heading</text>
+  </g>
+</svg>
+</Figure>
+
+<Analogy>
+
+A search party looking for a lost hiker spreads out, everyone walking the route the hiker's phone says they took. Each time the hiker radios a landmark ("I can see a waterfall below me"), searchers who can see a waterfall below them call back, and the coordinator sends more searchers to those spots and recalls the others. No one needs a map of probabilities: the density of searchers *is* the map.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Importance sampling and the particle filter">
+
+<Definition term="Particle representation">
+
+A belief $\mathrm{bel}(x)$ is represented by $N$ samples $x^{[1]}, \dots, x^{[N]}$ with weights $w^{[1]}, \dots, w^{[N]}$ summing to 1. Any expectation is approximated by a weighted average: $\mathbb{E}[g(x)] \approx \sum_i w^{[i]} g(x^{[i]})$, with an error that shrinks like $1/\sqrt{N}$ whatever the dimension of $x$.
+
+</Definition>
+
+Why weight by the likelihood? Suppose we want samples from a **target** distribution $f$ but can only draw from a **proposal** $g$. Drawing from $g$ and giving each sample the weight $f(x)/g(x)$ corrects the mismatch exactly in expectation; this is **importance sampling**. In the particle filter, the target is the posterior $\eta\,p(z_t \mid x_t)\,\overline{\mathrm{bel}}(x_t)$ and the proposal is the prediction $\overline{\mathrm{bel}}(x_t)$, from which the move step has already sampled. Their ratio is $\eta\, p(z_t \mid x_t)$: the importance weight is just the measurement likelihood.
+
+<Definition term="Monte Carlo localisation (the bootstrap particle filter)">
+
+Given particles $\{x_{t-1}^{[i]}\}$, a command $u_t$ and a reading $z_t$:
+
+1. **Sample:** for each $i$, draw $x_t^{[i]} \sim p(x_t \mid x_{t-1}^{[i]}, u_t)$.
+2. **Weight:** $w^{[i]} \propto p(z_t \mid x_t^{[i]})$, normalised to sum to 1.
+3. **Resample:** draw $N$ new particles, each equal to $x_t^{[i]}$ with probability $w^{[i]}$, and reset all weights to $1/N$.
+
+</Definition>
+
+Resampling is what keeps the filter healthy. Without it, after a few dozen readings almost all the weight would sit on one or two particles and the others would be wasted computation. A standard measure of this **degeneracy** is the **effective sample size**,
+
+$$
+N_{\text{eff}} = \frac{1}{\sum_i \big(w^{[i]}\big)^2},
+$$
+
+which equals $N$ when all weights are equal and 1 when one particle has all the weight. Many implementations resample only when $N_{\text{eff}}$ falls below, say, $N/2$.
+
+<Definition term="Low-variance (systematic) resampling">
+
+Lay the normalised weights end to end along the interval $[0, 1)$. Draw *one* random number $r$ in $[0, 1/N)$ and place $N$ pointers at $r, r + 1/N, r + 2/N, \dots$. Each pointer selects the particle whose segment it falls in.
+
+</Definition>
+
+<Figure caption="Low-variance resampling of five particles with weights 0.05, 0.1, 0.05, 0.2 and 0.6, laid end to end. Five evenly spaced pointers, shifted by one random offset, pick the particles: the heaviest is picked three times, the 0.1 and 0.2 particles once each, the two lightest not at all. With independent draws instead, the heaviest could be picked anywhere from zero to five times.">
+<svg viewBox="0 0 380 120" role="img" aria-label="A horizontal bar divided into five segments whose widths are 0.05, 0.1, 0.05, 0.2 and 0.6 of the whole, labelled with their weights. Above it, five downward arrows at evenly spaced positions 0.1, 0.3, 0.5, 0.7 and 0.9 point into the segments: one into the 0.1 segment, one into the 0.2 segment and three into the 0.6 segment.">
+  <defs>
+    <marker id="pf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1.2">
+    <rect x="30" y="60" width="16" height="30" fill="var(--gold-soft)" />
+    <rect x="46" y="60" width="32" height="30" fill="var(--sky-soft)" />
+    <rect x="78" y="60" width="16" height="30" fill="var(--gold-soft)" />
+    <rect x="94" y="60" width="64" height="30" fill="var(--sky-soft)" />
+    <rect x="158" y="60" width="192" height="30" fill="var(--gold-soft)" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" markerEnd="url(#pf-arrow)">
+    <line x1="62" y1="20" x2="62" y2="56" />
+    <line x1="126" y1="20" x2="126" y2="56" />
+    <line x1="190" y1="20" x2="190" y2="56" />
+    <line x1="254" y1="20" x2="254" y2="56" />
+    <line x1="318" y1="20" x2="318" y2="56" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="36" y="108">0.05</text>
+    <text x="62" y="108">0.1</text>
+    <text x="88" y="108">0.05</text>
+    <text x="126" y="108">0.2</text>
+    <text x="254" y="108">0.6</text>
+    <text x="62" y="14">0.1</text>
+    <text x="126" y="14">0.3</text>
+    <text x="190" y="14">0.5</text>
+    <text x="254" y="14">0.7</text>
+    <text x="318" y="14">0.9</text>
+  </g>
+</svg>
+</Figure>
+
+A particle with weight $w$ gets either $\lfloor Nw \rfloor$ or $\lceil Nw \rceil$ copies, never wildly more or fewer, and the whole step costs $O(N)$ with a single random number.
+
+</Section>
+
+<Section id="mcl" kind="computation" title="Monte Carlo localisation in a symmetric hall">
+
+The program below localises a robot in a $10\,\text{m} \times 10\,\text{m}$ hall with five identical posts: four in a square, which makes the hall look the same after a quarter turn, and one by the east wall, which breaks the symmetry. The robot's sensor reports the range and bearing of every post within 4 m but cannot tell posts apart, so each reading's likelihood is an average over all the posts it might have come from, plus a small floor for outliers. Seeing a different *number* of posts from the number a particle expects also lowers its weight. The robot drives anticlockwise round a 2.5 m circle; 5,000 particles start spread uniformly over every position and heading. The table tracks how the weight is shared between the truth and the three quarter-turned look-alike poses; the maps show the particle cloud (after resampling, so density is belief) with `P` for posts and `R` for the robot's cell, drawn on top of any particles there.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(5)
+posts = np.array([[2, 2], [8, 2], [2, 8], [8, 8], [9, 5]], dtype=float)  # identical posts; (9, 5) breaks the symmetry
+SIZE, RANGE, N = 10.0, 4.0, 5000             # a 10 m x 10 m hall; the sensor sees posts within 4 m
+sig_r, sig_b = 0.2, np.radians(6)            # range and bearing noise
+wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+
+def move(p, v, w):
+    """Sample the motion model: unicycle step with noisy speed and turn, for an (n, 3) array of poses."""
+    n = len(p)
+    th = p[:, 2] + w + rng.normal(0, 0.02, n)
+    v = v + rng.normal(0, 0.03, n)
+    return np.stack([p[:, 0] + v * np.cos(th), p[:, 1] + v * np.sin(th), wrap(th)], axis=1)
+
+def observe(pose):
+    """(range, bearing) to every post within range. The posts look identical: no labels."""
+    d = posts - pose[:2]
+    r, b = np.hypot(d[:, 0], d[:, 1]), wrap(np.arctan2(d[:, 1], d[:, 0]) - pose[2])
+    s = r < RANGE
+    return np.stack([r[s] + rng.normal(0, sig_r, s.sum()), b[s] + rng.normal(0, sig_b, s.sum())], axis=1)
+
+def likelihood(p, z):
+    """p(z | pose) for every particle: each reading may come from any post, plus a small outlier floor."""
+    d = posts[None, :, :] - p[:, None, :2]
+    r, b = np.hypot(d[..., 0], d[..., 1]), np.arctan2(d[..., 1], d[..., 0]) - p[:, None, 2]
+    w = np.ones(len(p))
+    for zr, zb in z:
+        g = np.exp(-0.5 * (((zr - r) / sig_r) ** 2 + (wrap(zb - b) / sig_b) ** 2))
+        w *= g.mean(axis=1) + 1e-3
+    return w * np.where((r < RANGE).sum(axis=1) == len(z), 1.0, 0.1)   # seeing the wrong number of posts is evidence too
+
+def low_variance_resample(p, w):
+    positions = (rng.random() + np.arange(len(w))) / len(w)          # one random offset, evenly spaced pointers
+    return p[np.minimum(np.searchsorted(np.cumsum(w), positions), len(w) - 1)]
+
+def picture(p, truth):
+    """ASCII map of the hall, 2 characters per metre across and 1 per metre up. P = post, R = robot."""
+    H, _, _ = np.histogram2d(p[:, 0], p[:, 1], bins=[20, 10], range=[[0, SIZE], [0, SIZE]])
+    rows = [[" .:#@"[int(np.searchsorted([1, 20, 100, 400], H[i, j], side="right"))] for i in range(20)] for j in range(10)]
+    for x, y in posts:
+        rows[int(y)][int(2 * x)] = "P"
+    rows[int(truth[1])][int(2 * truth[0])] = "R"
+    return "\n".join("|" + "".join(r) + "|" for r in reversed(rows))
+
+def turned(pose, k):                          # the robot's position turned k quarter-turns about the hall's centre
+    c, s = np.cos(k * np.pi / 2), np.sin(k * np.pi / 2)
+    dx, dy = pose[0] - 5, pose[1] - 5
+    return np.array([5 + c * dx - s * dy, 5 + s * dx + c * dy])
+
+truth = np.array([5.0, 7.5, np.pi])           # the robot starts at the top of a 2.5 m circle, heading west
+p = np.column_stack([rng.uniform(0, SIZE, N), rng.uniform(0, SIZE, N), rng.uniform(-np.pi, np.pi, N)])
+print(" t   N_eff   share of particles within 1 m of: truth | truth turned 90, 180, 270 deg   error of mean")
+for t in range(0, 61):
+    if t > 0:
+        truth = move(truth[None], 0.3, 0.12)[0]          # the robot drives anticlockwise round the circle
+        p = move(p, 0.3, 0.12)                            # every particle samples the same motion
+    w = likelihood(p, observe(truth))
+    w /= w.sum()
+    share = [w[np.hypot(*(p[:, :2] - turned(truth, k)).T) < 1.0].sum() for k in range(4)]
+    if t in (0, 3, 6, 9, 12, 15, 18, 24, 40, 60):
+        err = np.hypot(*(w @ p[:, :2] - truth[:2]))
+        print(f"{t:2d}  {1 / np.sum(w**2):6.0f}        {share[0]:5.2f} | {share[1]:5.2f} {share[2]:5.2f} {share[3]:5.2f}"
+              f"                     {err:5.2f} m")
+    p = low_variance_resample(p, w)
+    if t in (3, 24):
+        print(picture(p, truth))              # after resampling, particle density shows the belief
+```
+
+At the first reading the effective sample size is 25: of 5,000 random guesses only a handful explain two posts at those ranges and bearings. After three steps the particles have gathered into clusters, and the weight is split between the truth (0.18), its 90° look-alike (0.28) and its 180° look-alike (0.42), with nothing on the 270° pose beside the east post. The map at step 3 shows these clusters, plus another just above the truth that fits the readings almost as well. At step 6 the filter is in real danger: 93% of the weight sits on the 90° look-alike and only 4% on the truth. Then the look-alike begins to approach the east post, which it should be able to see and cannot, and the truth's share climbs to 0.62, 0.84, 0.92 and finally 1.00 by step 18. From then on the weighted mean stays within 0.2 m of the truth, usually within a few centimetres.
+
+<Narrator who="chloe">
+
+The look-alikes are not a bug in the filter: they are the right answer to the question the robot has asked so far. A symmetric world plus a sensor that cannot tell landmarks apart makes several poses *genuinely* equally likely. What the filter needs is time and a reading that breaks the symmetry, and what it must not do is throw the losing hypotheses away before that reading arrives.
+
+</Narrator>
+
+</Section>
+
+<Section id="resampling" kind="computation" title="Why the way you resample matters">
+
+Two resampling schemes are common. **Multinomial** resampling makes $N$ independent draws. **Low-variance** resampling uses the comb of evenly spaced pointers. Both give each particle $Nw$ copies on average; they differ in the *variance* around that average, and in what happens when the weights carry no information at all.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+
+def multinomial(w):                    # N independent draws, each picking particle i with probability w[i]
+    return rng.choice(len(w), size=len(w), p=w)
+
+def low_variance(w):                   # one random number, N evenly spaced pointers into the cumulative weights
+    positions = (rng.random() + np.arange(len(w))) / len(w)
+    return np.minimum(np.searchsorted(np.cumsum(w), positions), len(w) - 1)
+
+N = 1000
+# 1. Weights carrying real information: how many copies does particle i get, compared with N * w[i]?
+w = rng.random(N) ** 4
+w /= w.sum()
+for name, f in [("multinomial", multinomial), ("low-variance", low_variance)]:
+    errs = [np.bincount(f(w), minlength=N) - N * w for _ in range(200)]
+    print(f"{name:12s}: RMS deviation of copy counts from N*w = {np.sqrt(np.mean(np.square(errs))):.3f}")
+
+# 2. Weights carrying no information (all equal), resampled 100 times in a row: how many distinct particles survive?
+for name, f in [("multinomial", multinomial), ("low-variance", low_variance)]:
+    ids = np.arange(N)
+    alive = []
+    for k in range(1, 101):
+        ids = ids[f(np.full(N, 1.0 / N))]
+        if k in (1, 10, 100):
+            alive.append(len(np.unique(ids)))
+    print(f"{name:12s}: distinct original particles after 1, 10, 100 resamplings: {alive}")
+```
+
+With informative weights, low-variance resampling keeps the number of copies about three times closer to $Nw$ (RMS deviation 0.35 against 1.00). With equal weights, which happens whenever readings are uninformative (a featureless corridor, a sensor that is off), it is far more striking. Multinomial resampling loses 38% of the distinct particles in one step and 98% after a hundred steps: the cloud collapses onto the descendants of a few lucky ancestors by pure chance, the same random drift that shrinks genetic diversity in small populations. Low-variance resampling with equal weights returns every particle exactly once, so it loses nothing. This is why practical filters use it, and why many also skip resampling when $N_{\text{eff}}$ is high.
+
+</Section>
+
+<Section id="deprivation" kind="human" title="Particle deprivation, kidnapping and adaptive particle counts">
+
+A particle filter can only find the robot where it has particles. If, by bad luck or a sudden change, no particle lies near the true pose, resampling only multiplies the wrong ones. This is **particle deprivation**, and it has two common causes: too few particles for the size of the space (in the first run, only a handful of 5,000 particles started anywhere near the truth), and the **kidnapped-robot problem**, where the robot is moved without its knowledge: carried by a person, pushed by a pallet jack, or simply mislocalised after a long stretch of bad readings. Kidnapping is the hardest localisation test, because a well-converged filter has, by design, no particles anywhere else.
+
+The standard remedy is to **inject random particles** when the data say the current cloud fits badly. **Augmented MCL** keeps two running averages of how well the particles explain the readings, a slow one ($w_{\text{slow}}$) and a fast one ($w_{\text{fast}}$), and replaces a fraction $\max(0,\ 1 - w_{\text{fast}}/w_{\text{slow}})$ of the particles with uniformly random poses. While the fit is steady, the two agree and nothing is injected; when the fit drops suddenly, the fast average falls first and injection begins. The program kidnaps a well-localised robot at step 30, carrying it about 4.5 m and turning it, and compares plain and augmented MCL.
+
+```python run
+import numpy as np
+
+posts = np.array([[2, 2], [8, 2], [2, 8], [8, 8], [9, 5]], dtype=float)
+SIZE, RANGE, N = 10.0, 4.0, 2000
+sig_r, sig_b = 0.2, np.radians(6)
+wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+
+def move(p, v, w, rng):
+    th = p[:, 2] + w + rng.normal(0, 0.02, len(p))
+    v = v + rng.normal(0, 0.03, len(p))
+    return np.stack([p[:, 0] + v * np.cos(th), p[:, 1] + v * np.sin(th), wrap(th)], axis=1)
+
+def observe(pose, rng):
+    d = posts - pose[:2]
+    r, b = np.hypot(d[:, 0], d[:, 1]), wrap(np.arctan2(d[:, 1], d[:, 0]) - pose[2])
+    s = r < RANGE
+    return np.stack([r[s] + rng.normal(0, sig_r, s.sum()), b[s] + rng.normal(0, sig_b, s.sum())], axis=1)
+
+def likelihood(p, z):
+    d = posts[None, :, :] - p[:, None, :2]
+    r, b = np.hypot(d[..., 0], d[..., 1]), np.arctan2(d[..., 1], d[..., 0]) - p[:, None, 2]
+    w = np.ones(len(p))
+    for zr, zb in z:
+        w *= np.exp(-0.5 * (((zr - r) / sig_r) ** 2 + (wrap(zb - b) / sig_b) ** 2)).mean(axis=1) + 1e-3
+    return w * np.where((r < RANGE).sum(axis=1) == len(z), 1.0, 0.1)
+
+def run(augmented, a_slow=0.01, a_fast=0.2, seed=8):
+    rng = np.random.default_rng(seed)
+    truth = np.array([5.0, 7.5, np.pi])
+    p = truth + rng.normal(0, [0.1, 0.1, 0.05], (N, 3))             # the robot starts well localised
+    w_slow = w_fast = None
+    errors, injected = {}, {}
+    for t in range(1, 91):
+        truth = move(truth[None], 0.3, 0.12, rng)[0]
+        if t == 30:
+            truth = np.array([2.5, 5.0, -1.57])     # kidnapped: carried 4.5 m away and turned
+        p = move(p, 0.3, 0.12, rng)
+        z = observe(truth, rng)
+        w = likelihood(p, z)
+        fit = w.mean() ** (1 / max(1, len(z)))                        # how well the particles explain each reading
+        w_slow = fit if w_slow is None else w_slow + a_slow * (fit - w_slow)   # long-run average fit
+        w_fast = fit if w_fast is None else w_fast + a_fast * (fit - w_fast)   # short-run average fit
+        w /= w.sum()
+        p = p[np.minimum(np.searchsorted(np.cumsum(w), (rng.random() + np.arange(N)) / N), N - 1)]
+        n_new = int(N * max(0.0, 1.0 - w_fast / w_slow)) if augmented else 0
+        if n_new:                                                     # fit suddenly worse: add random guesses
+            p[rng.choice(N, n_new, replace=False)] = np.column_stack(
+                [rng.uniform(0, SIZE, n_new), rng.uniform(0, SIZE, n_new), rng.uniform(-np.pi, np.pi, n_new)])
+        errors[t] = np.hypot(*(np.median(p[:, :2], axis=0) - truth[:2]))
+        injected[t] = n_new
+    return errors, injected
+
+steps = (10, 29, 30, 33, 35, 40, 45, 50, 55, 60, 90)
+(plain, _), (aug, inj) = run(False), run(True)
+print("step              " + " ".join(f"{t:5d}" for t in steps))
+print("plain MCL error   " + " ".join(f"{plain[t]:5.2f}" for t in steps) + "  m")
+print("augmented error   " + " ".join(f"{aug[t]:5.2f}" for t in steps) + "  m")
+print("random injected   " + " ".join(f"{inj[t]:5d}" for t in steps) + "  particles")
+```
+
+Plain MCL never recovers: its particles keep tracking a robot that is no longer there, at an error of 4 to 5 m for the remaining sixty steps. In augmented MCL nothing happens for five steps while the fast average sinks below the slow one; then the filter starts replacing up to about half of its particles with random guesses each step. For a while the guesses settle in the hall's look-alike places (the error swings around 3 m), but by step 55 the cloud has found the true pose and injection stops. The price is visible too: random particles cost accuracy when they are not needed, which is why $\alpha_{\text{slow}} \ll \alpha_{\text{fast}}$ and why injection is often switched off when the robot's start pose is known.
+
+**How many particles?** Global localisation in a large building needs tens of thousands; tracking a localised robot needs a few hundred. **KLD-sampling** (Fox, 2001 and 2003) chooses $N$ on the fly. It divides the state space into bins (say 0.5 m by 0.5 m by 10°), counts the number $k$ of bins the particles occupy, and draws particles until there are enough that, with probability $1 - \delta$, the particle approximation is within $\varepsilon$ of the true belief in Kullback–Leibler divergence:
+
+$$
+N \approx \frac{k - 1}{2\varepsilon}\left(1 - \frac{2}{9(k-1)} + \sqrt{\frac{2}{9(k-1)}}\, z_{1-\delta}\right)^{3},
+$$
+
+where $z_{1-\delta}$ is the standard normal quantile.
+
+<Narrator who="margaret">
+
+With $\varepsilon = 0.05$ and $\delta = 0.01$ ($z \approx 2.326$), a tight cloud occupying 10 bins needs 217 particles, one spread over 100 bins needs 1,347, and a globally uncertain one over 1,000 bins needs 11,060. The particle count grows roughly linearly with the volume of the belief, so a filter can run with a few hundred particles while tracking and grow only when it is lost.
+
+</Narrator>
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view: AMCL in ROS 2">
+
+In ROS 2, localisation against a known 2-D map is usually done by **AMCL** (adaptive Monte Carlo localisation), part of the [Nav2](https://docs.nav2.org/) navigation stack. Its lineage runs through this lesson: it implements MCL with KLD-sampling for the particle count and augmented-MCL injection for recovery, and it descends from the `amcl` driver of the Player project, ported to ROS and then to ROS 2.
+
+What it does each cycle:
+
+- **Motion model:** it reads the robot's odometry (the transform from `odom` to `base_link`) and samples each particle's motion from a model with noise parameters `alpha1` to `alpha5`, which say how much rotation and translation errors grow with the distance and angle driven. It updates only after the robot has moved more than `update_min_d` or turned more than `update_min_a`, saving computation when parked and avoiding repeated use of the same evidence.
+- **Measurement model:** the default **likelihood field** model precomputes, for every map cell, the distance to the nearest obstacle. A laser beam's likelihood is then a Gaussian in the distance from its endpoint to the nearest obstacle (width `sigma_hit`), mixed with a uniform term for random readings (`z_rand`). This is smooth, fast and forgiving of small map errors; the older beam model, which ray-casts every beam, is more exact and much slower. Only a subset of beams (`max_beams`) is used, partly to save time and partly because neighbouring beams' errors are correlated, as <LessonLink slug="uncertainty-and-bayes-filters">the first lesson of this level</LessonLink> warned.
+- **Output:** the estimated pose of `base_link` in `map`, published as the *correction* transform from `map` to `odom`, exactly the arrangement of <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>, together with a covariance computed from the particle cloud.
+
+An excerpt of a configuration file might look like this (shown for reading, not run; check the Nav2 documentation for your release's parameters and defaults):
+
+```yaml
+# Nav2 AMCL parameters (excerpt; values for illustration)
+amcl:
+  ros__parameters:
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    laser_model_type: "likelihood_field"
+    min_particles: 500          # KLD-sampling bounds
+    max_particles: 2000
+    pf_err: 0.05                # epsilon of KLD-sampling
+    pf_z: 0.99                  # 1 - delta
+    recovery_alpha_slow: 0.001  # augmented MCL: zero disables injection
+    recovery_alpha_fast: 0.1
+    update_min_d: 0.25          # metres
+    update_min_a: 0.2           # radians
+    max_beams: 60
+    sigma_hit: 0.2
+```
+
+In practice the robot is given an approximate starting pose (from a saved pose, a docking station, or a person clicking on the map in RViz), and global localisation over the whole map is reserved for recovery. The two recovery averages are disabled by default; the ROS documentation suggests values around 0.001 and 0.1 when enabling them. A good diagnostic is the particle cloud itself, visualised in RViz: a tight cloud that suddenly fragments is a robot that has lost its way.
+
+Particle filters reach well beyond 2-D localisation. **Rao–Blackwellised** particle filters sample the robot's trajectory and solve the map analytically for each particle; FastSLAM and the long-popular GMapping work this way, as <LessonLink slug="slam">SLAM</LessonLink> describes. Visual trackers follow people and objects with particles. And research on **differentiable particle filters** learns the motion and measurement models end to end from data, keeping the algorithm's structure as a prior; Lumenary CS's [neural networks](/en/cs/neural-networks/) lesson covers the learning machinery. In large outdoor spaces, 3-D lidar localisation more often matches scans to a map with registration methods (the ICP of <LessonLink slug="depth-and-point-clouds">Depth sensing and point clouds</LessonLink>) inside a Kalman filter or optimiser, with a particle filter, if any, only to find the starting pose.
+
+<Narrator who="gideon">
+
+Particle filters scale badly with dimension. Covering a belief of fixed width per axis takes a number of particles that grows roughly exponentially with the number of axes, so a 3-D pose is easy, a 6-D pose for a drone is hard, and a 15-D inertial state is out of reach. The exceptions exploit structure: Rao–Blackwellisation samples only the hard, low-dimensional part and handles the rest with Kalman filters.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The weighted mean of the particles is the robot's position."** Only when the belief has one peak. With two clusters, the mean lies between them, possibly inside a wall. Report the mean of the dominant cluster, or the mode, and check how spread the cloud is before trusting either. In the first program the mean was 2.5 to 3.1 m off for the first six steps, while the truth itself held a share of the particles throughout.
+
+</Misconception>
+
+<Misconception>
+
+**"More particles always fix a struggling filter."** They help with deprivation at the start, but not with a wrong model. If the motion noise is set too small, particles cannot spread enough to follow real slip; if the measurement model is too sharp, a single bad reading wipes out the right particles. Both make the filter fail confidently whatever $N$ is.
+
+</Misconception>
+
+<Misconception>
+
+**"Resampling adds information."** It adds none; it only moves computation to where the weights already say the robot probably is, and each resampling throws a little diversity away. That is why systematic resampling and resampling only when $N_{\text{eff}}$ is low are both good practice.
+
+</Misconception>
+
+<Misconception>
+
+**"A converged particle filter cannot be wrong."** A tight cloud is a confident filter, not a correct one. In a symmetric building, a filter can converge on a look-alike and stay there, and without injection or an outside check it will never notice.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Monte Carlo methods, named after the casino, were developed by Stanisław Ulam, John von Neumann and Nicholas Metropolis in the 1940s for problems in physics. Sequential versions for tracking appeared in scattered forms in the 1960s and 1970s, but the method took off with the 1993 bootstrap filter of Gordon, Salmond and Smith, built for tracking targets in defence research in the United Kingdom, and, independently, with Michael Isard and Andrew Blake's CONDENSATION algorithm (1996) for tracking outlines in video at Oxford. In 1999 Dellaert, Fox, Burgard and Thrun applied it to robot localisation, showing that a museum robot could localise itself globally from a uniform start. KLD-sampling followed in 2001, and Andrew Howard's `amcl` for the Player robot server packaged these ideas in open-source software that, through ROS, became one of the most widely used localisers in robotics.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,479 @@
+---
+title: Force, impedance and compliant control
+subtitle: When a robot touches the world, controlling position is not enough — control how it pushes back, and build actuators that can give way.
+minutes: 75
+objectives:
+  - Explain why stiff position control produces large, unpredictable forces in contact, using springs in series
+  - Implement impedance control on a torque-controlled arm and admittance control on a position-controlled one, and say when each suits
+  - Simulate an end effector meeting a wall with stiff and soft impedance, and read off the trade-off between contact force and free-space accuracy
+  - Combine force control along some directions with position control along others (hybrid control), mapping task forces to joint torques with the Jacobian transpose
+  - Explain how series elastic and quasi-direct-drive actuators limit impact forces, and why compliance is a safety feature that control alone cannot replace
+prerequisites: [jacobians-and-velocity, robot-dynamics, feedback-and-pid, trajectories-and-tracking]
+related: [math.applied.classical-mechanics, math.analysis.ordinary-differential-equations, math.algebra.linear-algebra]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Impedance Control: An Approach to Manipulation (Parts I–III)"
+    author: Neville Hogan
+    year: 1985
+    note: The papers that framed manipulation as controlling the dynamic relation between motion and force. Journal of Dynamic Systems, Measurement, and Control 107(1).
+  - title: "Hybrid position/force control of manipulators"
+    author: Marc H. Raibert and John J. Craig
+    year: 1981
+    note: Force control along some task directions and position control along the others, chosen by a selection matrix. Journal of Dynamic Systems, Measurement, and Control 103(2).
+  - title: "Compliance and force control for computer controlled manipulators"
+    author: Matthew T. Mason
+    year: 1981
+    note: Natural and artificial constraints, the language for deciding which directions to control in force. IEEE Transactions on Systems, Man, and Cybernetics 11(6).
+  - title: "A unified approach for motion and force control of robot manipulators: the operational space formulation"
+    author: Oussama Khatib
+    year: 1987
+    note: Dynamics and control written directly in task space, the basis of much modern whole-body control. IEEE Journal of Robotics and Automation 3(1).
+  - title: "Series elastic actuators"
+    author: Gill A. Pratt and Matthew M. Williamson
+    year: 1995
+    note: Putting a spring between gearbox and load on purpose, to measure and control force through its deflection. IEEE/RSJ IROS 1995.
+  - title: "Proprioceptive actuator design in the MIT Cheetah"
+    author: Patrick M. Wensing, Albert Wang, Sangok Seok, David Otten, Jeffrey Lang and Sangbae Kim
+    year: 2017
+    note: The case for low-ratio, high-torque-density motors that sense force through their own current. IEEE Transactions on Robotics 33(3).
+  - title: "Unified impedance and admittance control"
+    author: Christian Ott, Ranjan Mukherjee and Yoshihiko Nakamura
+    year: 2010
+    note: Why impedance control suits stiff environments and admittance control soft ones, and how to switch between them. IEEE ICRA 2010.
+  - title: "Modern Robotics: Mechanics, Planning, and Control"
+    author: Kevin M. Lynch and Frank C. Park
+    year: 2017
+    url: https://hades.mech.northwestern.edu/index.php/Modern_Robotics
+    note: Chapter 11 covers force control, hybrid motion–force control and impedance control; free preprint and videos.
+  - title: "International Organization for Standardization (ISO)"
+    url: https://www.iso.org/
+    note: Publisher of ISO 10218 (safety of industrial robots) and ISO/TS 15066 (collaborative robots, including power and force limiting).
+  - title: "ros2_control"
+    url: https://control.ros.org/
+    note: The ROS 2 controller framework; its controller collection includes an admittance controller.
+---
+
+<Section id="motivation" kind="motivation" title="When the robot touches the world">
+
+Every lesson so far has been about putting a robot where it should be. That is the right goal in free space. But much of what we want robots to do happens in contact: wiping a table, sanding a car door, plugging in a charger, inserting a shaft into a bearing, opening a drawer, handing a cup to a person, or simply walking, since every step is a collision with the ground.
+
+In contact, position control is the wrong tool. Suppose a camera locates a whiteboard to within 5 mm and an arm is told to press its sponge to the board's surface. If the board is really 5 mm closer than the camera thought, a stiff position controller will try to drive the sponge 5 mm *through* it, and the force it generates in trying could be tens or hundreds of newtons. If the board is 5 mm farther away, the sponge never touches. Either way, the task fails, and in the first case something may break.
+
+The answer, developed in the 1980s and now built into every collaborative robot, is to control not position alone or force alone but **the relationship between them**: how hard the robot pushes back when it is pushed, as a function of how far it is displaced. This lesson shows why stiff position control fails in contact, how impedance, admittance and hybrid force–position control work, how the design of the actuator itself changes what any controller can achieve, and why that matters for robots that work beside people.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Two springs in series">
+
+A position-controlled joint behaves like a very stiff spring: displace the tool from its set-point and the controller pushes back in proportion, with a stiffness set by the gains. The environment is a spring too: a steel table is very stiff, a sponge or a person's arm much softer. When the tool touches something, the two springs are in series, and if the set-point lies a distance $\delta$ beyond the surface, the steady contact force is
+
+$$
+F = \frac{K_{\text{robot}}\,K_{\text{env}}}{K_{\text{robot}} + K_{\text{env}}}\,\delta .
+$$
+
+When both are stiff, a millimetre of error makes a large force. When the robot is soft, the force is small and forgiving, whatever the environment: the soft spring takes up the error.
+
+<Analogy>
+
+Shake hands with someone whose arm is locked rigid and the handshake hurts, and any mismatch in where you each expected the hands to meet becomes a jolt. A good handshake is firm but compliant: each arm gives a little, and the hands meet where they meet. Neville Hogan, who formalised impedance control at MIT, also studied how people tune the stiffness of their own arms.
+
+</Analogy>
+
+The idea in one sentence: **a robot cannot choose both the position and the force at a point of contact; the environment decides one of them.** Against a rigid wall, the wall decides the position along its normal, and the robot can only choose the force. In free space, nothing resists, so the force is zero and the robot chooses the position. The controller should be designed for the relationship between the two.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="mechanical impedance">
+
+The **mechanical impedance** of a system at a port is the map from the motion imposed on it to the force it returns; its **admittance** is the inverse map, from applied force to resulting motion. A mass–spring–damper with displacement $e$ has impedance $F = M\ddot e + D\dot e + K e$.
+
+</Definition>
+
+<Definition term="impedance control">
+
+**Impedance control** makes the robot's tool behave like a chosen mass–spring–damper attached to a moving set-point $x_d$: with $e = x - x_d$, the target behaviour is $M_d\ddot e + D_d\dot e + K_d e = F_{\text{ext}}$. On a torque-controlled arm it is commonly implemented without changing the apparent mass, as
+
+$$
+\tau = J(q)^\top \big( K_d (x_d - x) + D_d (\dot x_d - \dot x) \big) + g(q),
+$$
+
+which needs joint torque control but no force sensor.
+
+</Definition>
+
+<Definition term="admittance control">
+
+**Admittance control** measures the external force (typically with a six-axis force–torque sensor at the wrist), integrates the chosen virtual dynamics $M_a \ddot x_r + D_a \dot x_r + K_a (x_r - x_d) = F_{\text{ext}}$ to get a reference $x_r$, and sends $x_r$ to a stiff position controller.
+
+</Definition>
+
+<Definition term="hybrid position/force control">
+
+**Hybrid position/force control** splits the task directions, in a frame attached to the contact, into those where the robot regulates force (where the environment constrains motion) and those where it regulates position (where the environment constrains force). A diagonal **selection matrix** $S$ of ones and zeros picks them.
+
+</Definition>
+
+</Section>
+
+<Section id="wall" kind="examples" title="An end effector meets a wall">
+
+Let us make the intuition quantitative. A tool of effective mass 2 kg moves along a line towards a wall at 0.30 m. The wall is modelled as a stiff spring–damper (50 kN/m) that can push but not pull. The controller is the impedance law above, in one dimension: $u = K(x_d - x) + D(\dot x_d - \dot x)$, with the damping chosen for a critically damped response in free space. The set-point approaches at 0.1 m/s and stops 5 mm beyond the wall's surface, the size of a typical error in a camera's estimate of where a surface is. We vary $K$ from the stiffness of an industrial position loop down to a gentle 300 N/m. A second run, in free space, asks the tool to stop at 0.28 m against 3 N of friction, the kind of drag a cable or an unmodelled gearbox adds.
+
+```python run
+import numpy as np
+
+# A 1-D end effector of mass m driven by a force u, moving towards a wall at x = 0.30 m.
+m = 2.0                                   # effective mass of the arm at the tool (kg)
+X_WALL, K_WALL, B_WALL = 0.30, 50_000.0, 50.0   # wall position, stiffness (N/m), damping (N s/m)
+DT = 0.0005                               # 2 kHz control loop
+
+def wall_force(x, v):
+    """Force the wall pushes back with (>= 0, it can push but not pull)."""
+    if x <= X_WALL:
+        return 0.0
+    return max(0.0, K_WALL * (x - X_WALL) + B_WALL * v)
+
+def run(K, D, x_goal, speed=0.1, friction=0.0, seconds=1.5):
+    """Impedance control u = K (x_d - x) + D (v_d - v); x_d moves to x_goal at a constant speed."""
+    x, v, peak = 0.25, 0.0, 0.0
+    for k in range(int(seconds / DT)):
+        t = k * DT
+        x_d = min(0.25 + speed * t, x_goal)
+        v_d = speed if x_d < x_goal else 0.0
+        u = K * (x_d - x) + D * (v_d - v)
+        f_wall = wall_force(x, v)
+        f_fric = -friction * np.tanh(v / 0.001)           # smoothed Coulomb friction
+        for _ in range(5):                                # finer steps for the stiff contact
+            a = (u - f_wall + f_fric) / m
+            v += a * DT / 5
+            x += v * DT / 5
+            f_wall = wall_force(x, v)
+        peak = max(peak, f_wall)
+    return x, f_wall, peak
+
+print("commanded 5 mm into the wall, approaching at 0.1 m/s")
+print(f"{'controller stiffness':>21} {'steady force':>13} {'peak force':>11} {'free space, 3 N friction':>25}")
+for K in [1_000_000.0, 20_000.0, 5_000.0, 300.0]:
+    D = 2 * np.sqrt(K * m)                                # critically damped in free space
+    x, f, peak = run(K, D, X_WALL + 0.005)
+    x_free, _, _ = run(K, D, 0.28, friction=3.0)          # stop short of the wall, against friction
+    print(f"{K:17,.0f} N/m {f:11.1f} N {peak:9.1f} N   stops {abs(x_free - 0.28) * 1000:5.2f} mm short"
+          f" (could be up to {3.0 / K * 1000:.3f} mm)")
+```
+
+Read the table row by row. The stiff position loop presses with 238 N to correct a 5 mm error, enough to crack a panel or a gearbox. At 300 N/m the same error makes 1.5 N. That is the case for compliance. The last column is the price: with only 300 N/m of stiffness, 3 N of friction can hold the tool anywhere within 10 mm of where it was sent. Accuracy in free space and gentleness in contact pull in opposite directions, and the stiffness $K$ sets the balance. Many robots therefore change $K$ during a task: stiff while moving through free space, soft just before and during contact.
+
+<Narrator who="margaret">
+
+Look at the peak-force column. Softening the controller from 20,000 to 300 N/m cut the steady force fifty-fold but the peak only from 92 N to 30 N. The peak is the impact itself: a 2 kg mass at 0.1 m/s meeting a 50 kN/m spring peaks at about $v\sqrt{mk} = 0.1\sqrt{2 \times 50\,000} \approx 32$ N, and it rises to that peak within about 10 ms, too fast for feedback to do much. To lower it you must approach more slowly or move less mass — which is what the actuators section is about.
+
+</Narrator>
+
+</Section>
+
+<Section id="impedance-admittance" kind="human" title="Impedance and admittance: two ways to be compliant">
+
+<Figure caption="Impedance control in one picture. The controller makes the tool behave as if a virtual spring K and damper D connected it to a set-point carriage. The set-point x_d lies beyond the wall, so the spring is stretched and the tool presses on the wall with force K(x_d − x); the wall's own stiffness decides how far the tool actually penetrates.">
+<svg viewBox="0 0 460 190" role="img" aria-label="On the left, a dashed carriage labelled set-point. A zigzag spring labelled K and a damper labelled D connect the carriage to a solid block labelled tool. The tool's right face touches a hatched wall. A dashed outline of the tool, labelled x d, overlaps the wall, showing where the tool would rest if the wall were not there. An arrow from the tool into the wall is labelled K times x d minus x." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="fi-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="20" y="45" width="40" height="90" rx="3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 4" />
+  <polyline points="60,70 80,70 90,56 105,84 120,56 135,84 150,56 165,84 175,70 200,70" fill="none" stroke="currentColor" strokeWidth="1.8" />
+  <line x1="60" y1="112" x2="120" y2="112" stroke="currentColor" strokeWidth="1.8" />
+  <path d="M 160 100 L 120 100 L 120 124 L 160 124" fill="none" stroke="currentColor" strokeWidth="1.8" />
+  <line x1="145" y1="103" x2="145" y2="121" stroke="currentColor" strokeWidth="2.5" />
+  <line x1="145" y1="112" x2="200" y2="112" stroke="currentColor" strokeWidth="1.8" />
+  <rect x="200" y="50" width="70" height="80" rx="4" fill="none" stroke="var(--gold)" strokeWidth="2.5" />
+  <rect x="300" y="50" width="70" height="80" rx="4" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 4" />
+  <line x1="272" y1="25" x2="272" y2="165" stroke="currentColor" strokeWidth="2.5" />
+  <g stroke="currentColor" strokeWidth="1" opacity="0.6">
+    <line x1="272" y1="35" x2="292" y2="25" /><line x1="272" y1="55" x2="302" y2="40" /><line x1="272" y1="75" x2="312" y2="55" />
+    <line x1="272" y1="95" x2="322" y2="70" /><line x1="272" y1="115" x2="332" y2="85" /><line x1="272" y1="135" x2="342" y2="100" />
+    <line x1="272" y1="155" x2="352" y2="115" /><line x1="290" y1="165" x2="362" y2="130" /><line x1="330" y1="165" x2="372" y2="145" />
+  </g>
+  <line x1="235" y1="155" x2="300" y2="155" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#fi-arrow)" />
+  <g fontFamily="sans-serif" fontSize="13" fill="currentColor" textAnchor="middle">
+    <text x="40" y="35">set-point</text>
+    <text x="128" y="48">K</text>
+    <text x="140" y="142">D</text>
+    <text x="235" y="94">tool</text>
+    <text x="335" y="94">x_d</text>
+    <text x="400" y="40">wall</text>
+    <text x="250" y="180">K (x_d − x)</text>
+  </g>
+</svg>
+</Figure>
+
+There are two ways to build this behaviour, mirror images of each other.
+
+**Impedance control** reads motion and commands force. The controller measures where the tool is and how fast it moves, and computes the force the virtual spring and damper would exert; the Jacobian transpose turns that force into joint torques, $\tau = J^\top F$, because a force $F$ at the tool and torques $\tau$ at the joints do the same work through any small motion: $\tau^\top \delta q = F^\top \delta x = F^\top J\,\delta q$ (<LessonLink slug="jacobians-and-velocity">the Jacobians lesson</LessonLink> derives this duality). It needs joints that can produce a commanded torque accurately and, ideally, that can be **backdriven**, moved by an external push without fighting it. Torque-controlled arms with joint torque sensors and the low-friction actuators of legged robots are built for this.
+
+**Admittance control** reads force and commands motion. Most industrial arms have high-ratio gearboxes with so much friction that they cannot be backdriven, and their drives accept only position commands. Bolt a force–torque sensor to the wrist, and the controller can compute how a virtual mass–damper–spring *would* move under the measured force and send that motion to the stiff position loop. This is how many industrial robots are hand-guided and how they perform force-controlled polishing and assembly.
+
+The two have complementary strengths. Impedance control is inherently stable against stiff environments (the robot is a spring, and pressing a spring into a wall is benign) but its free-space accuracy suffers from friction and model errors, as the table showed. Admittance control is accurate in free space, because the stiff inner position loop rejects friction, but it can become unstable against a stiff environment: the force loop's gain is roughly the environment stiffness divided by the virtual mass, so a stiff wall and a light virtual mass make a loop that, with the inner loop's lag and the sensor's delay, oscillates. Admittance controllers therefore use large virtual damping in contact, and some systems switch between the two schemes.
+
+<Narrator who="chloe">
+
+Impedance and admittance are not just two control tricks; they are a statement about physics. When two systems are coupled at a contact, one must accept motion and return force (an impedance) and the other accept force and return motion (an admittance), just as two electrical networks connected at a port must agree on one voltage and one current. A wall is an admittance in the extreme (any force, no motion), so the robot should be an impedance; free space is the opposite extreme.
+
+</Narrator>
+
+</Section>
+
+<Section id="hybrid" kind="human" title="Force control and hybrid position/force control">
+
+Sometimes the task really is about force: press a sanding disc with 20 N, insert a connector until the force reaches 15 N, polish with a constant pressure. **Explicit force control** measures the contact force and corrects the command to make it equal a target, usually with integral action, since the steady force must be exact. It has one awkward property: the force loop's gain is proportional to the stiffness of whatever the tool touches. A gain tuned on a soft foam block may be violently unstable on steel. Practical force controllers therefore add damping on the tool's motion along the force direction, which keeps the loop well behaved over a wide range of stiffnesses, and they treat the moment of first contact carefully, approaching slowly with a "guarded move" that stops on a force threshold.
+
+Most contact tasks need force control in some directions and position control in others. Matthew Mason described each task by its **natural constraints**, what the environment fixes, and **artificial constraints**, what the task asks of the remaining directions. For wiping a whiteboard: the board fixes motion along its normal, so control the normal force; it fixes nothing along its surface, so control position there. Marc Raibert and John Craig's **hybrid controller** (1981) implements exactly this, with a selection matrix.
+
+Below, the two-link arm of <LessonLink slug="trajectories-and-tracking">the trajectories lesson</LessonLink>, now lying in a horizontal plane, wipes along a wall: PI force control with damping along the wall's normal ($x$), PD position control along it ($y$), and the commanded tool force mapped to joint torques by $J^\top$. The robot believes the wall is the line $x = 0.60$ m, but it is tilted by 2°, so its true position varies by ±5 mm over the stroke. For comparison, the second run replaces force control along $x$ with position control aimed 2 mm into the wall the robot believes in.
+
+```python run
+import numpy as np
+
+# The two-link arm of the trajectories lesson, now lying in a horizontal plane (no gravity),
+# wiping along a wall: press with 10 N along x, slide along y. The robot believes the wall is
+# the line x = 0.60 m, but it is tilted by 2 degrees: x = 0.60 + 0.035 y.
+L1, L2, M1, M2 = 0.5, 0.4, 2.0, 1.0
+K_WALL, B_WALL, MU = 20_000.0, 30.0, 0.3
+DT = 0.001                                          # 1 kHz
+
+def fk(q):
+    return np.array([L1 * np.cos(q[0]) + L2 * np.cos(q[0] + q[1]),
+                     L1 * np.sin(q[0]) + L2 * np.sin(q[0] + q[1])])
+
+def jacobian(q):
+    s1, c1 = np.sin(q[0]), np.cos(q[0])
+    s12, c12 = np.sin(q[0] + q[1]), np.cos(q[0] + q[1])
+    return np.array([[-L1 * s1 - L2 * s12, -L2 * s12], [L1 * c1 + L2 * c12, L2 * c12]])
+
+def arm_accel(q, dq, tau):
+    c2, s2 = np.cos(q[1]), np.sin(q[1])
+    M = np.array([[M1 * L1**2 + M2 * (L1**2 + L2**2 + 2 * L1 * L2 * c2), M2 * (L2**2 + L1 * L2 * c2)],
+                  [M2 * (L2**2 + L1 * L2 * c2), M2 * L2**2]])
+    h = M2 * L1 * L2 * s2
+    c = np.array([-h * (2 * dq[0] * dq[1] + dq[1]**2), h * dq[0]**2])
+    return np.linalg.solve(M, tau - c)
+
+def contact(p, v):
+    """Force of the wall on the tool: a stiff spring-damper along -x, friction along y."""
+    pen = p[0] - (0.60 + 0.035 * p[1])
+    if pen <= 0:
+        return np.zeros(2)
+    fn = max(0.0, K_WALL * pen + B_WALL * v[0])
+    return np.array([-fn, -MU * fn * np.tanh(v[1] / 0.002)])
+
+def ik(p, elbow=-1):
+    c2 = (p @ p - L1**2 - L2**2) / (2 * L1 * L2)
+    q2 = elbow * np.arccos(c2)
+    return np.array([np.arctan2(p[1], p[0]) - np.arctan2(L2 * np.sin(q2), L1 + L2 * np.cos(q2)), q2])
+
+def y_ref(t):
+    """Wipe from y = -0.15 to +0.15 m and back, each way a 2 s quintic, after 1 s of settling."""
+    tt = t - 1.0
+    if tt <= 0: return -0.15, 0.0
+    up = tt <= 2.0
+    s = (tt if up else tt - 2.0) / 2.0
+    s = min(s, 1.0)
+    a, b = (-0.15, 0.15) if up else (0.15, -0.15)
+    return a + (b - a) * (10*s**3 - 15*s**4 + 6*s**5), (b - a) * (30*s**2 - 60*s**3 + 30*s**4) / 2.0
+
+
+def wipe(force_control):
+    F_D, KI_F, D_X = 10.0, 20.0, 40.0               # force target (N), integral gain, damping
+    K_X = 5000.0                                     # for comparison: position control along x
+    KP_Y, KD_Y = 2000.0, 80.0                        # position gains along the wall
+    q, dq, force_int = ik(np.array([0.58, -0.15])), np.zeros(2), 0.0
+    forces, y_err = [], []
+    for k in range(int(5.0 / DT)):
+        t = k * DT
+        p, v = fk(q), jacobian(q) @ dq
+        f_meas = -contact(p, v)[0]                   # the wrist sensor reads the normal force
+        yd, vyd = y_ref(t)
+        if force_control:                            # x: regulate the force, damp the motion
+            force_int += (F_D - f_meas) * DT
+            fx = F_D + KI_F * force_int - D_X * v[0]
+        else:                                        # x: aim 2 mm into the believed wall
+            fx = K_X * (0.602 - p[0]) - D_X * v[0]
+        fy = KP_Y * (yd - p[1]) + KD_Y * (vyd - v[1])
+        tau = jacobian(q).T @ np.array([fx, fy])     # wanted tool force -> joint torques
+        for _ in range(5):
+            f_c = contact(fk(q), jacobian(q) @ dq)
+            dq = dq + arm_accel(q, dq, tau + jacobian(q).T @ f_c) * DT / 5
+            q = q + dq * DT / 5
+        if t >= 1.0:
+            forces.append(f_meas); y_err.append(abs(yd - p[1]))
+    return min(forces), max(forces), max(y_err)
+
+print(f"{'along the normal':18} {'normal force while wiping':>26} {'worst y error':>14}")
+for name, fc in [("force control", True), ("position control", False)]:
+    lo, hi, ey = wipe(fc)
+    print(f"{name:18} {round(lo, 1) + 0.0:10.1f} N to {hi:5.1f} N {ey * 1000:15.1f} mm")
+```
+
+With force control, the normal force stays within 0.6 N of its 10 N target over the whole stroke, although the wall's position changes by 10 mm and the friction force flips direction at each end. With position control, the same 2° tilt makes the force swing from 29 N at one end to zero, the sponge lifting off the board, at the other. That is the whole argument for force control in one comparison.
+
+<Narrator who="gideon">
+
+The selection matrix must be expressed in the right frame. "Force along $x$" means along the *contact normal*, which here is only approximately the robot's $x$ axis, because the wall is tilted. With a 2° tilt the error is small; on a curved part it is not, and the frame must follow the surface, estimated from the measured force direction or a model of the part. Raibert and Craig's original formulation also turned out to be unstable for some arm configurations when applied in joint space, a reminder that "force here, position there" is easy to say and subtle to implement.
+
+</Narrator>
+
+</Section>
+
+<Section id="actuators" kind="human" title="Compliance you can build: series elastic and quasi-direct-drive actuators">
+
+Return to the impact peak that no controller could remove. During the first few milliseconds of a collision, the force is set by how much mass hits, how fast and how stiffly, not by the controller. And the mass that hits is not only the link: through a gearbox of ratio $N$, a motor rotor of inertia $J_r$ appears at the joint as an inertia $N^2 J_r$, the **reflected inertia**. With $N = 160$, a rotor of only $2 \times 10^{-5}$ kg·m² (a small brushless motor) reflects $0.51$ kg·m², ten times more than the 0.5 m link it drives.
+
+Two families of actuators attack this directly.
+
+<Figure caption="Three ways to drive a joint. A high-ratio gearbox makes the small, fast rotor feel heavy at the output. A series elastic actuator puts a spring between gearbox and link, so the link is briefly decoupled from the rotor during an impact, and measuring the spring's deflection measures the torque. A quasi-direct-drive actuator uses a large-diameter motor with a low ratio, so little inertia is reflected and the motor current itself indicates the torque.">
+<svg viewBox="0 0 500 220" role="img" aria-label="Three rows. Row one, labelled high-ratio: a motor box, a gearbox box marked N equals 100 to 160, and a link box, joined rigidly. Row two, labelled series elastic: motor, gearbox, a zigzag spring, then the link, with small encoder marks on both sides of the spring and the note torque equals k times deflection. Row three, labelled quasi-direct drive: a large motor box, a gearbox marked N equals 6 to 10, and the link." xmlns="http://www.w3.org/2000/svg">
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="120" y="20" width="60" height="36" rx="4" />
+    <rect x="200" y="20" width="80" height="36" rx="4" />
+    <rect x="390" y="20" width="80" height="36" rx="4" />
+    <line x1="180" y1="38" x2="200" y2="38" />
+    <line x1="280" y1="38" x2="390" y2="38" />
+    <rect x="120" y="92" width="60" height="36" rx="4" />
+    <rect x="200" y="92" width="80" height="36" rx="4" />
+    <rect x="390" y="92" width="80" height="36" rx="4" />
+    <line x1="180" y1="110" x2="200" y2="110" />
+    <polyline points="280,110 300,110 308,98 322,122 336,98 350,122 364,98 372,110 390,110" stroke="var(--gold)" strokeWidth="2" />
+    <rect x="100" y="160" width="100" height="44" rx="4" />
+    <rect x="220" y="164" width="60" height="36" rx="4" />
+    <rect x="390" y="164" width="80" height="36" rx="4" />
+    <line x1="200" y1="182" x2="220" y2="182" />
+    <line x1="280" y1="182" x2="390" y2="182" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="290" cy="110" r="3.5" /><circle cx="381" cy="110" r="3.5" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="12" fill="currentColor">
+    <text x="8" y="42">high-ratio</text>
+    <text x="8" y="114">series elastic</text>
+    <text x="8" y="186">quasi-direct</text>
+    <text x="150" y="42" textAnchor="middle">motor</text>
+    <text x="240" y="36" textAnchor="middle">gearbox</text>
+    <text x="240" y="50" textAnchor="middle" fontSize="11">N ≈ 100–160</text>
+    <text x="430" y="42" textAnchor="middle">link</text>
+    <text x="150" y="114" textAnchor="middle">motor</text>
+    <text x="240" y="108" textAnchor="middle">gearbox</text>
+    <text x="430" y="114" textAnchor="middle">link</text>
+    <text x="336" y="145" textAnchor="middle" fontSize="11">τ = k · deflection</text>
+    <text x="150" y="186" textAnchor="middle">large motor</text>
+    <text x="250" y="180" textAnchor="middle">gears</text>
+    <text x="250" y="194" textAnchor="middle" fontSize="11">N ≈ 6–10</text>
+    <text x="430" y="186" textAnchor="middle">link</text>
+  </g>
+</svg>
+</Figure>
+
+- A **series elastic actuator** (SEA), introduced by Gill Pratt and Matthew Williamson at MIT in 1995, puts a deliberately compliant spring between the gearbox and the load. Measuring the spring's deflection with two encoders gives the torque by Hooke's law, turning force control into the much easier problem of position control of the spring. During an impact the spring decouples the heavy reflected rotor from the link for the first moments. The costs are a lower force-control bandwidth and a spring resonance to manage. SEAs have been used in humanoids, exoskeletons, collaborative arms and the drives of some quadrupeds.
+- A **quasi-direct-drive** (QDD) actuator, championed by the MIT Cheetah team, uses a large-diameter, high-torque motor with a low gear ratio, typically 6 to 10. Reflected inertia (which grows with $N^2$) and gear friction are small, so the joint is easily backdriven, absorbs impacts, and can estimate its output torque from the motor current alone: "proprioceptive" force sensing. Many of today's quadrupeds and humanoids use actuators of this kind.
+
+Here is the difference in a collision: the 0.5 m link swinging its tip into a padded obstacle (10 kN/m) at 1 m/s, driven through each kind of actuator.
+
+```python run
+import numpy as np
+
+# One joint swinging a 0.5 m link (its own inertia 0.05 kg m^2 about the joint) into a padded
+# obstacle (10 kN/m) at the tip, at 1 m/s. What does the motor behind the gearbox add?
+R, I_LINK, K_OBST, V_TIP = 0.5, 0.05, 10_000.0, 1.0
+
+def impact(I_rotor_side, k_spring=None, dt=1e-5, seconds=0.06):
+    """Peak tip force. The rotor side has inertia I_rotor_side (as seen at the joint, N^2 J).
+    Without a spring it is rigidly attached; with one (N m/rad) it sits behind it."""
+    w0 = V_TIP / R
+    th_l, w_l, th_r, w_r, peak = 0.0, w0, 0.0, w0, 0.0
+    for _ in range(int(seconds / dt)):
+        f = max(0.0, K_OBST * R * th_l)                   # obstacle force at the tip
+        tau_c = f * R                                    # its torque on the joint
+        if k_spring is None:
+            w_l -= tau_c / (I_LINK + I_rotor_side) * dt
+            th_l += w_l * dt
+        else:
+            tau_s = k_spring * (th_r - th_l)             # the spring pushes the link
+            w_l += (tau_s - tau_c) / I_LINK * dt
+            w_r -= tau_s / I_rotor_side * dt
+            th_l += w_l * dt
+            th_r += w_r * dt
+        peak = max(peak, f)
+    return peak
+
+J_ROTOR = 2e-5                                           # a small brushless motor's rotor, kg m^2
+print(f"{'actuator':38} {'reflected inertia':>17} {'peak force':>11}")
+for name, N, k in [("high-ratio gearbox, N = 160", 160, None),
+                   ("quasi-direct drive, N = 9", 9, None),
+                   ("series elastic, N = 160, 300 N m/rad", 160, 300.0),
+                   ("link alone (motor disconnected)", 0, None)]:
+    I_r = N**2 * J_ROTOR
+    peak = impact(I_r, k) if N else impact(0.0)
+    print(f"{name:38} {I_r:13.3f} kg m^2 {peak:9.1f} N")
+```
+
+The rigid high-ratio drive more than triples the peak force compared with the bare link, because the tip effectively weighs 2.25 kg instead of 0.2 kg. The SEA, with the same gearbox, halves it; the QDD actuator nearly matches the bare link. And all of this happens within the first 25 ms of the collision, in which a 1 kHz controller completes only a couple of dozen cycles and a person's reaction has not even begun: compliance and low inertia work instantly, because they are physics, not software.
+
+</Section>
+
+<Section id="safety" kind="human" title="Compliance as a safety feature">
+
+A robot that works near people must make any unintended contact survivable and, ideally, harmless. Fences and light curtains do this for traditional industrial robots by keeping people out. **Collaborative** robots, designed to share a workspace, rely instead on limiting what a collision can do, and the methods are the subject of this lesson: low moving mass and speed, compliant or backdrivable joints, torque sensing that detects a collision within milliseconds and stops or reverses the arm, and soft, rounded surfaces.
+
+The international standards for this are ISO 10218 (safety of industrial robots and robot systems, revised in 2025) and ISO/TS 15066 (collaborative operation), published by the [International Organization for Standardization](https://www.iso.org/). They describe several collaborative modes: a safety-rated monitored stop, hand guiding, speed and separation monitoring (slow down and stop as a person approaches), and **power and force limiting**, which sets permissible contact forces and pressures for different regions of the body, with the lowest limits, or no permitted contact at all, for the most sensitive areas such as the face. Meeting them is a property of the whole application, not of the robot alone: a collaborative arm carrying a sharp tool or a heavy part can be dangerous, and every installation needs a risk assessment.
+
+<Note>
+
+If you experiment with contact control, do it in simulation first and then on a small, slow, low-power arm whose maximum force you know is harmless, with an emergency stop within reach. Never test impact behaviour on yourself or another person, and never defeat the guarding or speed limits of an industrial robot: those machines can move fast enough and push hard enough to cause serious injury.
+
+</Note>
+
+</Section>
+
+<Section id="professional" kind="human" title="Contact control in practice">
+
+- **Torque-controlled arms**, such as research and collaborative arms with torque sensors in every joint, expose a 1 kHz torque interface on which users run impedance controllers, often a Cartesian version of the law above with null-space control for a seventh joint. Khatib's **operational space formulation** extends it to include the arm's task-space inertia.
+- **Industrial arms** offer force-control options built on a wrist force–torque sensor and admittance control, used for polishing, deburring, assembly and hand guiding. In ROS 2, [ros2_control](https://control.ros.org/) includes an admittance controller.
+- **Legged robots** are contact machines: every footstep is an impact, and their QDD or SEA actuators run joint-level impedance control (a PD law with torque feedforward, exactly the "position, velocity, torque" commands met in <LessonLink slug="feedback-and-pid">the PID lesson</LessonLink>), with stiffness and damping often chosen by a higher-level controller or a learned policy.
+- **Learned manipulation.** As of 2026, many learning-based manipulation systems output set-points (and sometimes stiffness) at 10 to 50 Hz and rely on a 1 kHz impedance controller underneath to make contact gentle and robust; <LessonLink slug="dexterous-manipulation">dexterous manipulation</LessonLink> at the Frontier level returns to this.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A stiffer robot is a more accurate robot, so stiffer is better."** In free space, yes. In contact, stiffness turns every millimetre of uncertainty about where the world is into force. The right stiffness depends on the task and the phase of the task.
+
+</Misconception>
+
+<Misconception>
+
+**"Force control means controlling force in every direction."** You cannot command force along a direction in which nothing resists (the tool would just accelerate), nor position along a direction in which the environment does not let you move. Hybrid control chooses force or position per direction, according to the contact.
+
+</Misconception>
+
+<Misconception>
+
+**"Software can make any robot safe to touch."** Software can limit speeds and forces and stop quickly after a collision is detected, and that matters. But the first milliseconds of an impact are governed by the moving mass, the speed and the stiffness, which only hardware design and speed limits change.
+
+</Misconception>
+
+<Misconception>
+
+**"Admittance control and impedance control are the same thing with different names."** Both aim at the same mass–spring–damper behaviour, but one commands force from measured motion and the other commands motion from measured force. They fail in opposite situations: impedance control loses accuracy in free space, admittance control can chatter against stiff surfaces.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

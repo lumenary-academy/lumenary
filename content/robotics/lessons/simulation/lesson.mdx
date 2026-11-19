@@ -1,0 +1,458 @@
+---
+title: Simulation
+subtitle: A robot that lives in a computer. How physics engines step time forward, why the choice of integrator decides whether energy leaks or grows, how contact and friction are faked, and how far to trust the result.
+minutes: 70
+objectives:
+  - Describe the loop inside a robot simulator, from collision detection and contact solving to integration, sensors and the controller
+  - Implement explicit Euler, semi-implicit Euler and RK4, and measure their energy drift on a pendulum and a bouncing ball
+  - Prove that semi-implicit Euler preserves phase-space area while explicit Euler inflates it, and explain what that means for long simulations
+  - Explain penalty and constraint-based contact, the friction cone, and the creep and stiffness problems of smoothed friction
+  - Compare MuJoCo, Gazebo, Isaac Sim, PyBullet and Drake by what they are designed for, and simulate imperfect sensors
+  - Explain what a digital twin is and list the main causes of the reality gap
+narrators: [chloe, margaret, gideon]
+prerequisites: [robot-dynamics, feedback-and-pid, ros-2-and-robot-software]
+related: [math.comp.numerical-methods, math.analysis.ordinary-differential-equations, math.applied.classical-mechanics, math.geom.symplectic-geometry]
+references:
+  - title: "MuJoCo: A physics engine for model-based control"
+    author: Emanuel Todorov, Tom Erez and Yuval Tassa
+    year: 2012
+    url: https://doi.org/10.1109/IROS.2012.6386109
+    note: The original MuJoCo paper. The engine has been open source since 2022.
+  - title: MuJoCo documentation
+    url: https://mujoco.readthedocs.io/
+    note: Includes a careful explanation of its contact model, solver and integrators.
+  - title: Gazebo
+    url: https://gazebosim.org/
+    note: The open-source robot simulator most closely tied to ROS.
+  - title: NVIDIA Isaac Lab
+    url: https://github.com/isaac-sim/IsaacLab
+    note: The open-source robot-learning framework built on Isaac Sim.
+  - title: PyBullet
+    url: https://pybullet.org/
+    note: Python bindings for the Bullet physics engine.
+  - title: Drake
+    url: https://drake.mit.edu/
+    note: Model-based design and verification for robotics, with hydroelastic contact and convex time-stepping.
+  - title: Webots
+    url: https://cyberbotics.com/
+    note: An open-source robot simulator from Cyberbotics in Switzerland, widely used in teaching.
+  - title: "Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World"
+    author: Josh Tobin, Rachel Fong, Alex Ray, Jonas Schneider, Wojciech Zaremba and Pieter Abbeel
+    year: 2017
+    url: https://arxiv.org/abs/1703.06907
+    note: Crossing the reality gap by training on many randomised simulations.
+  - title: Underactuated Robotics
+    author: Russ Tedrake
+    url: https://underactuated.mit.edu/
+    note: Free online notes that use simulation (with Drake) throughout.
+---
+
+<Section id="motivation" kind="motivation" title="Why build a robot that does not exist?">
+
+A team in Zürich wants a four-legged robot to climb stairs. On the real robot, every fall costs an hour of repairs and an attempt takes minutes to set up. In simulation, the same robot can fall a million times overnight, on a thousand staircases at once, on one graphics card, and nobody has to pick it up. That arithmetic is why simulation is now part of almost every robot project:
+
+- **Safety.** A new controller is tried first where a mistake breaks nothing and hurts no one.
+- **Speed and scale.** A simulator can run faster than real time and in thousands of copies in parallel; reinforcement learning (<LessonLink slug="reinforcement-learning-for-robots">later in this course</LessonLink>) depends on this.
+- **Testing.** Every change to the software can be driven through the same hundred scenarios in continuous integration, closed loop, which recorded data cannot do (the <LessonLink slug="ros-2-and-robot-software">previous lesson</LessonLink> showed why replay is open loop).
+- **Design.** Before buying motors, you can check whether they are strong enough for the motion you want.
+
+But a simulator is a model, and a model is a chain of approximations: equations of motion integrated in finite steps, contact that is faked one way or another, friction described by one number, sensors with invented noise. This lesson opens the box. You will build each piece small enough to see it work, and see each one fail in a way that real engines are designed to avoid.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="What happens in one time step">
+
+A rigid-body simulator holds the **state** of the world (positions and velocities of every body, or of every joint) and advances it by a small **time step** $h$, again and again. In each step it does roughly the same five things.
+
+<Figure caption="The loop inside a robot simulator. Each pass advances time by one step h, typically 1 to 5 ms for a robot. The controller sees only simulated sensor readings, never the true state, exactly as it would on the real robot.">
+<svg viewBox="0 0 460 235" role="img" aria-label="Six boxes in two rows. Top row, left to right: state (positions and velocities), collision detection, contact and joint forces. Bottom row, left to right: sensor models with noise and delay, the controller, and integrate one step h. Arrows run along the top row from state to contact forces, down to integrate, and from integrate around the bottom and left edge back to state, labelled new state. A second chain runs from state down to sensor models, then to the controller, which sends torques to the integrate box.">
+  <defs>
+    <marker id="sim-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.5" stroke="currentColor" strokeWidth="1.3">
+    <rect x="25" y="20" width="120" height="40" rx="5" />
+    <rect x="175" y="20" width="120" height="40" rx="5" />
+    <rect x="325" y="20" width="120" height="40" rx="5" />
+    <rect x="325" y="150" width="120" height="40" rx="5" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1.3">
+    <rect x="25" y="150" width="120" height="40" rx="5" />
+    <rect x="175" y="150" width="120" height="40" rx="5" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" markerEnd="url(#sim-arrow)">
+    <line x1="145" y1="40" x2="173" y2="40" />
+    <line x1="295" y1="40" x2="323" y2="40" />
+    <line x1="385" y1="60" x2="385" y2="148" />
+    <path d="M 385 190 L 385 212 L 10 212 L 10 40 L 23 40" />
+    <line x1="85" y1="60" x2="85" y2="148" />
+    <line x1="145" y1="170" x2="173" y2="170" />
+    <line x1="295" y1="170" x2="323" y2="170" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="85" y="37">state</text>
+    <text x="85" y="51">positions, velocities</text>
+    <text x="235" y="37">collision</text>
+    <text x="235" y="51">detection</text>
+    <text x="385" y="37">contact, friction,</text>
+    <text x="385" y="51">joint forces</text>
+    <text x="385" y="167">integrate</text>
+    <text x="385" y="181">one step h</text>
+    <text x="85" y="167">sensor models</text>
+    <text x="85" y="181">+ noise, delay</text>
+    <text x="235" y="167">controller</text>
+    <text x="235" y="181">(your code)</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="310" y="145">torques</text>
+    <text x="200" y="227">new state, time t + h</text>
+  </g>
+</svg>
+</Figure>
+
+1. **Collision detection** finds which shapes touch or overlap, and where: contact points, normals and penetration depths. For simple shapes this is geometry; for meshes it is most of the computing time.
+2. **Contact and constraint forces** are computed so that bodies do not pass through each other, joints hold together, and friction resists sliding.
+3. **The controller** (your code) reads the simulated sensors and sets motor torques, at its own rate.
+4. **Integration** turns forces into accelerations through the equations of motion of <LessonLink slug="robot-dynamics">Robot dynamics</LessonLink>, $M(q)\ddot q + C(q, \dot q)\dot q + g(q) = \tau + J^{\mathsf T}f_{\text{contact}}$, and advances positions and velocities by one step.
+5. **Sensor models** produce what cameras, lidars, IMUs and encoders would have reported, with noise.
+
+Engines differ in how they represent the state (MuJoCo, Drake and Bullet's multibody mode use **joint coordinates**, so a joint can never come apart; others store every body's full pose and hold the joints together with constraint forces), in how they handle contact, and in which integrator they use. The next three sections take the integrator, then contact, then friction.
+
+</Section>
+
+<Section id="integrators" kind="definitions" title="Time stepping and integrators">
+
+Write the state as $x = (q, v)$, positions and velocities, with $\dot q = v$ and $\dot v = a(q, v)$ given by the dynamics. An **integrator** turns this continuous law into a rule for $x_{k+1}$ from $x_k$. Three rules matter here.
+
+<Definition term="Explicit, semi-implicit and Runge–Kutta integration">
+
+With time step $h$:
+
+- **Explicit (forward) Euler**: $q_{k+1} = q_k + h\,v_k$, $\;v_{k+1} = v_k + h\,a(q_k, v_k)$. Both updates use the old state.
+- **Semi-implicit (symplectic) Euler**: $v_{k+1} = v_k + h\,a(q_k, v_k)$, $\;q_{k+1} = q_k + h\,v_{k+1}$. Update the velocity first, then move with the **new** velocity.
+- **Classical Runge–Kutta (RK4)**: evaluate the derivative four times within the step (at the start, twice at the midpoint, at the end) and combine them with weights $\tfrac16, \tfrac13, \tfrac13, \tfrac16$.
+
+Both Euler methods are **first order**: halving $h$ roughly halves the error over a fixed time. RK4 is **fourth order**: halving $h$ divides the error by about 16, for smooth dynamics.
+
+</Definition>
+
+The two Euler methods look almost identical; the only difference is the order of two lines. The pendulum below shows what that order does. A 1 m pendulum is released from 1 rad (about 57°). With no friction its energy should never change, so the relative energy error is a clean measure of how badly each method is lying. Lumenary Math's <TopicLink id="math.comp.numerical-methods">Numerical methods</TopicLink> derives these methods; here we watch them.
+
+```python run
+import math
+
+g, L = 9.81, 1.0                       # a 1 m pendulum
+
+def accel(theta):
+    return -(g / L) * math.sin(theta)
+
+def energy(theta, omega):              # per unit mass, zero at the bottom
+    return 0.5 * (L * omega) ** 2 + g * L * (1 - math.cos(theta))
+
+def explicit_euler(th, om, dt):
+    return th + dt * om, om + dt * accel(th)            # both updates use the OLD state
+
+def semi_implicit_euler(th, om, dt):
+    om = om + dt * accel(th)                            # velocity first...
+    return th + dt * om, om                             # ...then position with the NEW velocity
+
+def rk4(th, om, dt):
+    k1t, k1o = om, accel(th)
+    k2t, k2o = om + dt / 2 * k1o, accel(th + dt / 2 * k1t)
+    k3t, k3o = om + dt / 2 * k2o, accel(th + dt / 2 * k2t)
+    k4t, k4o = om + dt * k3o, accel(th + dt * k3t)
+    return (th + dt / 6 * (k1t + 2 * k2t + 2 * k3t + k4t),
+            om + dt / 6 * (k1o + 2 * k2o + 2 * k3o + k4o))
+
+E0 = energy(1.0, 0.0)                                   # released from 1 rad (about 57 degrees)
+print("largest relative energy error |E - E0| / E0 over the first 10 s and the first 100 s")
+print(f"{'method':22}{'dt (s)':>7}{'f-evals/s':>11}{'0-10 s':>11}{'0-100 s':>11}")
+for name, step, evals in [("explicit Euler", explicit_euler, 1), ("semi-implicit Euler", semi_implicit_euler, 1), ("RK4", rk4, 4)]:
+    for dt in (0.01, 0.001):
+        th, om, worst, worst10 = 1.0, 0.0, 0.0, 0.0
+        for k in range(1, int(round(100 / dt)) + 1):
+            th, om = step(th, om, dt)
+            worst = max(worst, abs(energy(th, om) - E0) / E0)
+            if k == int(round(10 / dt)):
+                worst10 = worst
+        print(f"{name:22}{dt:7.3f}{evals / dt:11.0f}{worst10:11.1e}{worst:11.1e}")
+```
+
+Read the table row by row.
+
+- **Explicit Euler gains energy, without limit.** At a 10 ms step, the pendulum's energy has more than doubled within 10 s and is over ten times too large by 100 s; by then the simulated pendulum is whirling over the top, which a real one released from 57° never does. A ten times smaller step only delays the disaster.
+- **Semi-implicit Euler's error stays bounded.** The energy wobbles by 1.5% at a 10 ms step (0.15% at 1 ms), and the worst error over 100 s is the same as over 10 s. It does not grow.
+- **RK4 is enormously more accurate**, about $10^{-8}$ at a 10 ms step, for four times the work per step. But look at the last column: its error grows with time, from $1.1 \times 10^{-8}$ to $9.6 \times 10^{-8}$. Run long enough and it would drift too, slowly, in one direction.
+
+<Theorem name="Semi-implicit Euler preserves area in phase space">
+
+For $\dot\theta = \omega$, $\dot\omega = a(\theta)$, the semi-implicit Euler step $(\theta, \omega) \mapsto (\theta', \omega')$ has Jacobian determinant exactly 1, for every step size $h$. The explicit Euler step has determinant $1 - h^2 a'(\theta)$.
+
+</Theorem>
+
+<Proof>
+
+Semi-implicit: $\omega' = \omega + h\,a(\theta)$ and $\theta' = \theta + h\,\omega' = \theta + h\,\omega + h^2 a(\theta)$. The Jacobian of $(\theta', \omega')$ with respect to $(\theta, \omega)$ is $\begin{pmatrix} 1 + h^2 a'(\theta) & h \\ h\,a'(\theta) & 1 \end{pmatrix}$, whose determinant is $1 + h^2 a' - h^2 a' = 1$.
+
+Explicit: $\theta' = \theta + h\,\omega$ and $\omega' = \omega + h\,a(\theta)$, with Jacobian $\begin{pmatrix} 1 & h \\ h\,a'(\theta) & 1 \end{pmatrix}$ and determinant $1 - h^2 a'(\theta)$. For the pendulum $a'(\theta) = -(g/L)\cos\theta$, so near the bottom the determinant is $1 + h^2 (g/L)\cos\theta > 1$: every step inflates areas.
+
+</Proof>
+
+<Narrator who="chloe">
+
+Area preservation is the key to the table. The exact flow of any frictionless mechanical system preserves phase-space area (Liouville's theorem), and a method that shares this property, a **symplectic** integrator, turns out to follow the exact flow of a slightly different, nearby energy function, so its energy error wobbles but cannot accumulate. Explicit Euler inflates area, so every orbit spirals outward and energy climbs. Lumenary Math's <TopicLink id="math.geom.symplectic-geometry">Symplectic geometry</TopicLink> is the general story.
+
+</Narrator>
+
+This is why many physics engines, MuJoCo's default among them, use semi-implicit Euler (with the damping terms treated implicitly for stability) rather than a higher-order method: it is cheap, it does not blow up, and its errors look like a little extra or missing energy rather than an explosion. MuJoCo also offers RK4 and implicit integrators for when accuracy matters more, and Drake offers error-controlled variable-step integrators for smooth problems.
+
+</Section>
+
+<Section id="contact" kind="computation" title="Contact: a stiff spring, or a constraint">
+
+A pendulum is easy because it is smooth. Robots touch things, and contact is not smooth: a ball falls freely, hits the floor, and in a millisecond its velocity reverses. Simulators handle this in one of two broad ways.
+
+<Definition term="Penalty contact and constraint-based contact">
+
+**Penalty (soft) contact** lets bodies overlap slightly and pushes them apart with a stiff spring-damper, a force proportional to the penetration depth $d$ (and its rate): $f = k\,d + c\,\dot d$ while in contact. **Constraint-based (hard) contact** forbids overlap: at each step it solves for contact impulses that make the bodies' approach velocity non-negative, subject to friction limits. Mathematically this is a **complementarity problem** (either the gap is open and the force is zero, or the gap is closed and the force is non-negative), or a convex optimisation that approximates one.
+
+</Definition>
+
+Penalty contact is simple and is what the code below uses: a 100 g ball dropped from 1 m onto a perfectly elastic floor, modelled as a spring of stiffness $10^4$ N/m that acts only while the ball is below the floor. Every apex should be exactly 1 m.
+
+```python run
+import numpy as np
+
+m, g = 0.1, 9.81           # a 100 g ball
+k = 1.0e4                  # contact stiffness of the floor's "spring", N/m (no damping: a perfectly elastic floor)
+
+def force(y):
+    """Gravity, plus a penalty spring pushing back while the ball is below the floor (y < 0)."""
+    return -m * g + (k * -y if y < 0 else 0.0)
+
+def simulate(dt, method, t_end=4.0, y=1.0, v=0.0):
+    apexes, min_y, rising = [], 0.0, False
+    for _ in range(int(round(t_end / dt))):
+        if method == "explicit":
+            y, v = y + dt * v, v + dt * force(y) / m
+        else:                                   # semi-implicit (symplectic) Euler
+            v = v + dt * force(y) / m
+            y = y + dt * v
+        min_y = min(min_y, y)
+        if v > 0:
+            rising = True
+        elif rising:                            # velocity just turned from up to down: an apex
+            apexes.append(y)
+            rising = False
+    return apexes, min_y
+
+omega = np.sqrt(k / m)
+print(f"contact spring: natural frequency {omega:.0f} rad/s, contact lasts {1000 * np.pi / omega:.1f} ms")
+print(f"exact: the ball meets the floor at {np.sqrt(2 * g * 1.0):.2f} m/s and sinks {100 * np.sqrt(2 * g * 1.0) / omega:.2f} cm into it; every apex is 1.000 m")
+for method in ("explicit", "semi-implicit"):
+    for dt in (1e-3, 2e-4):
+        apexes, min_y = simulate(dt, method)
+        tops = ", ".join(f"{a:.3f}" for a in apexes[:4])
+        print(f"{method:>13} Euler, dt = {dt * 1000:.1f} ms: apexes {tops} m; deepest {100 * -min_y:.2f} cm")
+```
+
+With explicit Euler at a 1 ms step the ball comes back to **2.7 m**, then 7.3 m: each contact is a few steps of a stiff oscillator, and explicit Euler multiplies the oscillator's energy by $1 + \omega^2 h^2 = 1.1$ at every one of them. Even at 0.2 ms it gains about a fifth of its height per bounce. Semi-implicit Euler at 1 ms keeps the apex within 0.7% of 1 m for four bounces. Real engines would add a damper to the spring, which removes energy on purpose and sets the **coefficient of restitution**; the point here is that the integrator must not add energy by accident.
+
+<Narrator who="margaret">
+
+The stiffness sets the time step. With $k = 10^4$ N/m and $m = 0.1$ kg the contact spring has $\omega = \sqrt{k/m} \approx 316$ rad/s, so a bounce lasts $\pi/\omega \approx 9.9$ ms, about ten steps at 1 ms. A stiffer, more realistic floor ($10^6$ N/m) would cut the penetration from 1.4 cm to 1.4 mm but shorten the contact to 1 ms, demanding steps of about 0.1 ms. Penalty methods always trade penetration against step size.
+
+</Narrator>
+
+Constraint-based methods escape this trade by working with **velocities and impulses** rather than forces: within one step they compute the impulse that stops the approach outright, so a stiff contact does not need a tiny step. The classic formulations are linear complementarity problems (Stewart and Trinkle, and Anitescu and Potra, in the mid-1990s). Modern engines solve variants of them: Bullet and PhysX (NVIDIA's engine, under Isaac Sim) use iterative impulse solvers; MuJoCo solves a convex optimisation with deliberately "soft" constraints, which makes contact smooth enough to differentiate and stable at large steps; Drake offers convex time-stepping and **hydroelastic** contact, which computes a pressure field over the overlapping volume of two soft shapes instead of a few points, giving more realistic contact patches for grasping.
+
+</Section>
+
+<Section id="friction" kind="computation" title="Friction, and why it is the hardest part">
+
+**Coulomb friction** says that a contact can push sideways with any tangential force $f_t$ up to $\mu$ times the normal force $f_n$: $\lVert f_t \rVert \le \mu f_n$. If the contact is sticking, the friction force is whatever is needed to keep it stuck; if it is sliding, friction has magnitude $\mu f_n$ and opposes the slip. In three dimensions the allowed forces form a cone around the contact normal, the **friction cone**, met again in <LessonLink slug="manipulation-and-grasping">Manipulation and grasping</LessonLink>; engines often replace the round cone by a pyramid with 4 to 8 faces, which turns the problem into a linear one.
+
+The trouble is the word "whatever". Static friction is not a function of the velocity: at zero velocity it can be anything in an interval. One shortcut is to **smooth** it, $f_t = -\mu f_n \tanh(v / v_s)$, which is a nice smooth function of velocity. The program below puts a 2 kg box on a 20° slope with $\mu = 0.5$. The friction angle is $\arctan 0.5 = 26.6°$, steeper than the slope, so a real box stays still.
+
+```python run
+import numpy as np
+
+m, g, mu = 2.0, 9.81, 0.5            # a 2 kg box, friction coefficient 0.5
+slope = np.radians(20)               # below the friction angle atan(0.5) = 26.6 deg, so it should stay put
+N = m * g * np.cos(slope)            # normal force
+pull = m * g * np.sin(slope)         # gravity's pull down the slope
+
+def coulomb_stick_slip(v, applied, dt):
+    """Velocity-level Coulomb friction: if friction can stop the box within this step, it sticks."""
+    v_free = v + dt * applied / m
+    max_impulse = mu * N * dt
+    if abs(m * v_free) <= max_impulse:
+        return 0.0                                   # static friction absorbs everything: stuck
+    return v_free - np.sign(v_free) * max_impulse / m
+
+def smooth_friction(v, applied, dt, v_s):
+    """Regularised Coulomb friction, -mu N tanh(v / v_s): smooth, but never exactly zero at rest."""
+    return v + dt * (applied - mu * N * np.tanh(v / v_s)) / m
+
+dt, T = 1e-3, 10.0
+print(f"friction angle {np.degrees(np.arctan(mu)):.1f} deg, slope {np.degrees(slope):.0f} deg: a real box stays still")
+for label, v_s in [("stick-slip Coulomb", None), ("tanh friction, v_s = 1 cm/s", 0.01),
+                   ("tanh friction, v_s = 1 mm/s", 0.001), ("tanh friction, v_s = 0.1 mm/s", 0.0001)]:
+    if v_s is None:
+        step = lambda v: coulomb_stick_slip(v, pull, dt)
+    else:
+        step = lambda v, v_s=v_s: smooth_friction(v, pull, dt, v_s)
+    x, v, vmax = 0.0, 0.0, 0.0
+    for _ in range(int(T / dt)):
+        v = step(v)
+        x += dt * v
+        vmax = max(vmax, abs(v))
+    print(f"{label:30} slid {100 * x:5.2f} cm in {T:.0f} s; speed now {1000 * v:+7.3f} mm/s, peak {1000 * vmax:6.3f} mm/s")
+    if v_s is not None:
+        creep = v_s * np.arctanh(pull / (mu * N))         # where tanh friction balances the pull
+        print(f"{'':30} (exact creep speed of this model {1000 * creep:.3f} mm/s; stiffness x dt = {dt * mu * N / (m * v_s):.2f})")
+```
+
+The velocity-level stick-slip rule, which asks each step "can friction stop the box within this step?", keeps the box exactly still. The smoothed law fails in two opposite ways:
+
+- **Creep.** With $v_s = 1$ cm/s, smoothed friction can only resist the pull while the box is moving, so the box settles into a steady slide at 9.2 mm/s and creeps 9 cm in 10 s. A simulated robot holding a cup with this model slowly drops it.
+- **Stiffness.** Making $v_s$ smaller reduces the creep in theory (0.9 and 0.09 mm/s), but the friction law becomes so steep near zero that the explicit step overshoots back and forth. Once the product of the law's stiffness and $h$ exceeds 2 (here 4.6 and 46), the numbers chatter, and the box at $v_s = 0.1$ mm/s actually slides *further*, 3.1 cm, than the one at 1 mm/s.
+
+<Narrator who="gideon">
+
+The condition "stiffness × step below 2" is not a rule of thumb; it is the exact stability limit of explicit Euler on $\dot v = -\lambda v$, whose step multiplies $v$ by $1 - \lambda h$. When $|1 - \lambda h| > 1$ the error grows every step. Engines that must hold objects still (grasping, stacking, a robot standing) therefore treat friction implicitly or at the velocity level, as the stick-slip rule does, and that is a large part of why their contact solvers are complicated.
+
+</Narrator>
+
+</Section>
+
+<Section id="engines" kind="human" title="The engines, compared fairly">
+
+No simulator is best at everything. Each was built for a purpose, and its strengths follow from it (as of 2026).
+
+| Engine | Origin | Designed for | Notes |
+| --- | --- | --- | --- |
+| **MuJoCo** | Emo Todorov and colleagues, University of Washington (2012); open source from Google DeepMind since 2022 | Fast, accurate articulated dynamics for control and learning | Joint coordinates, convex soft contact, MJCF model files; MJX runs it on GPUs and TPUs through JAX |
+| **Gazebo** | University of Southern California (2002); developed by Open Robotics | Whole-robot simulation with sensors, closely integrated with ROS | Pluggable physics engines, SDFormat world files; the older "Gazebo Classic" reached end of life in January 2025 |
+| **Isaac Sim** | NVIDIA | Photorealistic sensors and GPU-parallel physics (PhysX), on the Omniverse platform | Ray-traced cameras and lidar; Isaac Lab, built on it, trains policies in thousands of parallel environments; needs an NVIDIA RTX GPU |
+| **PyBullet** | Erwin Coumans's Bullet engine, with Python bindings from about 2016 | Easy, free, scriptable simulation | Very widely used in learning research of the late 2010s; quick to install anywhere |
+| **Drake** | MIT and Toyota Research Institute | Rigorous modelling, analysis, optimisation and verification | Hydroelastic contact, convex time-stepping, automatic differentiation; slower per step but precise |
+
+Others are worth knowing. **Webots** (Cyberbotics, Switzerland, open source since 2018) and **CoppeliaSim** (Coppelia Robotics, Switzerland) are complete, friendly environments used in many universities. **Genesis** (2024), an open-source GPU physics platform from a consortium of university and industry researchers, and **Newton**, an open-source GPU physics engine announced in 2025 by NVIDIA, Google DeepMind and Disney Research, target massively parallel robot learning. Robot makers ship their own: ABB's RobotStudio runs the real controller's software against a virtual arm, and FANUC's ROBOGUIDE and KUKA.Sim serve the same purpose for programming industrial cells offline.
+
+How to choose? For training a locomotion or manipulation policy with reinforcement learning, a GPU-parallel engine (MuJoCo with MJX or MuJoCo Warp, Isaac Lab, Genesis) is usual. For testing a ROS 2 software stack with realistic sensors, Gazebo or Isaac Sim. For contact-rich manipulation where the forces themselves matter, Drake or MuJoCo. For a first project on a laptop, any of the free ones. Teams that are serious about transfer to reality often check results in **two** engines: a policy that works only in one has probably learned that engine's quirks.
+
+### Sensors in simulation
+
+The controller should see the world only through simulated sensors, imperfect in the same ways as real ones. Cameras are rendered, by rasterisation (fast) or ray tracing (realistic light, reflections, motion blur). Lidar is simulated by **ray casting**: shoot a ray per beam and find the nearest hit. IMUs are computed from the simulated body's acceleration and angular velocity, then corrupted. The program below ray-casts a 16-beam lidar in a 6 m × 4 m room with a pillar, adds range noise and missed returns, and then simulates a gyroscope on a robot standing still.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(42)
+
+# The world: a 6 m x 4 m room with a round pillar (radius 0.3 m) at (3.5, 2.8).
+def ray_range(ox, oy, angle, max_range=5.0):
+    dx, dy = np.cos(angle), np.sin(angle)
+    hits = []
+    for t_wall in ((0 - ox) / dx if dx else -1, (6 - ox) / dx if dx else -1,
+                   (0 - oy) / dy if dy else -1, (4 - oy) / dy if dy else -1):
+        if t_wall > 1e-9:
+            hits.append(t_wall)                     # the nearest positive one is the wall we hit
+    cx, cy, r = 3.5 - ox, 2.8 - oy, 0.3             # ray-circle intersection: |t d - c|^2 = r^2
+    b = dx * cx + dy * cy
+    disc = b * b - (cx * cx + cy * cy - r * r)
+    if disc >= 0 and b - np.sqrt(disc) > 0:
+        hits.append(b - np.sqrt(disc))
+    d = min(hits)
+    return d if d <= max_range else np.inf
+
+def lidar(ox, oy, heading, n=8, sigma=0.01, dropout=0.05):
+    """Ideal ranges from ray casting, then the imperfections of a real sensor."""
+    angles = heading + np.arange(n) * 2 * np.pi / n
+    true = np.array([ray_range(ox, oy, a) for a in angles])
+    noisy = true + rng.normal(0.0, sigma, n)                  # range noise
+    noisy[rng.random(n) < dropout] = np.inf                    # missed returns (dark or shiny surfaces)
+    return np.degrees(angles - heading), true, noisy
+
+bearings, true, noisy = lidar(1.5, 2.0, 0.0, n=16)
+print("bearing   true range   simulated reading")
+for b, t, z in zip(bearings, true, noisy):
+    print(f"{b:6.1f}   {t:9.3f} m   {z:9.3f} m")
+
+# A simulated gyroscope on a robot that is standing still: white noise plus a slowly wandering bias.
+dt, steps = 0.005, 12000                                       # 200 Hz for 60 s
+bias = 0.002 + np.cumsum(rng.normal(0.0, 2e-5, steps))       # rad/s, a random walk
+rate = bias + rng.normal(0.0, 0.003, steps)                   # what the gyro reports
+heading = np.cumsum(rate) * dt                                 # integrating it, as odometry would
+print(f"gyro on a stationary robot: heading after 60 s drifted to {np.degrees(heading[-1]):.1f} deg")
+```
+
+The beam at 22.5° meets the pillar at 1.855 m, while its mirror image at 337.5° runs on to the far wall at 4.871 m; one beam (247.5°) came back empty, as real lidars do on black or mirror-like surfaces; and integrating the stationary gyro's small bias gives a heading that has wandered by 2° in a minute. A controller tested only on perfect simulated data has never met an empty beam or a drifting heading, and will meet both on its first day outside.
+
+### Digital twins
+
+A **digital twin** is a simulation of a *particular* physical system, kept up to date with data from it: this factory cell, with these robots at these positions, this conveyor's actual speed, this gripper's measured wear. Factories use twins to plan layouts and check cycle times before moving any machine, to test new programmable-logic-controller and robot programs against a virtual cell ("virtual commissioning"), and to replay incidents. The word is used loosely in marketing; the useful test is whether the model is calibrated against the real system and updated as the system changes.
+
+</Section>
+
+<Section id="reality-gap" kind="human" title="The reality gap">
+
+A controller that works in simulation and fails on the robot has fallen into the **reality gap**: the differences between the model and the world. The usual suspects, roughly in order of how often they bite:
+
+- **Actuators.** Motors have torque limits, current loops with finite bandwidth, gear backlash, friction and heating; simulators often model a joint as a perfect torque source.
+- **Contact and friction.** One coefficient of friction, a few contact points and a guessed stiffness stand in for rubber, dust, wet floors and deformable objects, as the last two sections showed.
+- **Latency.** Real sensing, computing and communication add delays of several milliseconds to tens of milliseconds that a naive simulation leaves out.
+- **Parameters.** Masses, inertias and centres of mass from a CAD model are wrong for the robot with its cables, batteries and bolts.
+- **Perception.** Rendered images differ from camera images in lighting, texture, noise and blur.
+
+Engineers narrow the gap from both sides. **System identification** measures the real robot's parameters and fits the model to them. **Domain randomisation** (Tobin and colleagues, 2017) trains on thousands of simulations with randomised masses, frictions, delays and textures, so that the real world looks like just one more variation. Learned **actuator models**, used by ETH Zürich's team for the ANYmal quadruped in 2019, replace the ideal motor with a neural network trained on data from the real drive. These ideas are the subject of <LessonLink slug="sim-to-real">Sim-to-real transfer</LessonLink>.
+
+<Narrator who="gideon">
+
+A simulator that matches reality on the tests you ran has been validated on those tests only. The classic trap is a learning algorithm that finds and exploits a simulator bug (an energy gain like explicit Euler's, a contact that lets a foot push off the inside of the floor) because it is rewarded for whatever works. If a simulated robot does something surprisingly good, suspect the physics first.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A higher-order integrator is always better."** RK4 is far more accurate on smooth problems, but its order relies on smoothness; across a contact or a friction switch it falls back to first order, at four times the cost per step. For contact-rich robots, a cheap, stable, velocity-level first-order step is often the better trade.
+
+</Misconception>
+
+<Misconception>
+
+**"A smaller time step fixes everything."** It fixes truncation error, but not modelling error: a wrong friction coefficient is wrong at any step size, and regularised friction creeps at any step size. Very small steps also accumulate rounding error and cost time.
+
+</Misconception>
+
+<Misconception>
+
+**"If it works in simulation, it will work on the robot."** Simulation success is necessary, not sufficient. Every simulator omits something; the question is whether what it omits matters for your task, which only a test on the real robot (slowly, safely, with an emergency stop at hand) can answer.
+
+</Misconception>
+
+<Misconception>
+
+**"Simulated sensors should be perfect, to make debugging easier."** Debug with perfect sensors first, by all means, but test with noise, dropouts, bias and delay: a perception or control stack that has never seen them is untested.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Numerical integration of the equations of motion is as old as the equations: Euler's method dates from the 1760s, and Carl Runge and Martin Kutta developed their methods around 1900. Efficient recursive algorithms for articulated bodies, which make simulating a many-jointed robot fast, came in the 1980s, notably from Roy Featherstone. Constraint-based contact with friction was put on a firm footing in the 1990s, by David Baraff for computer graphics and by David Stewart, Jeff Trinkle, Mihai Anitescu and Florian Potra for rigid-body mechanics. Game physics engines (Bullet, ODE, PhysX) spread these methods in the 2000s; Gazebo, born at the University of Southern California in 2002, made full-robot simulation standard in research; MuJoCo (2012) was designed for optimisation and control. Since about 2020, GPU-parallel simulators have made it routine to train robot policies on thousands of simulated robots at once.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

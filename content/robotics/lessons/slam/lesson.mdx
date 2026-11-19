@@ -1,0 +1,463 @@
+---
+title: Simultaneous localisation and mapping
+subtitle: Building a map while working out where you are in it. Why it is hard, how EKF-SLAM did it, how pose graphs and factor graphs do it today, and where neural scene representations fit in 2026.
+minutes: 80
+objectives:
+  - State the SLAM problem and explain why localisation and mapping must be solved together
+  - Describe EKF-SLAM and the reasons it gave way to optimisation
+  - Formulate pose-graph SLAM as nonlinear least squares and solve a small loop with Gauss–Newton
+  - Explain loop closures, robust kernels and why a single false loop closure is dangerous
+  - Read a factor graph, explain the sparsity that makes large problems tractable, and use GTSAM at overview level
+  - Survey visual SLAM (the ORB-SLAM family), lidar SLAM, and learned scene representations (NeRF, 3D Gaussian splatting, feed-forward reconstruction) as of 2026
+narrators: [chloe, margaret, gideon]
+prerequisites: [kalman-filters, particle-filters-and-localisation, cameras-and-vision, depth-and-point-clouds]
+related: [math.applied.optimisation, math.algebra.linear-algebra, math.discrete.graph-theory, math.prob.probability-theory, math.geom.lie-groups, math.comp.numerical-analysis]
+references:
+  - title: "Past, Present, and Future of Simultaneous Localization And Mapping: Towards the Robust-Perception Age"
+    author: Cesar Cadena et al.
+    year: 2016
+    url: https://arxiv.org/abs/1606.05830
+    note: A survey of the field by many of its leading researchers.
+  - title: "A Tutorial on Graph-Based SLAM"
+    author: Giorgio Grisetti, Rainer Kümmerle, Cyrill Stachniss and Wolfram Burgard
+    year: 2010
+    url: https://doi.org/10.1109/MITS.2010.939925
+  - title: "Factor Graphs for Robot Perception"
+    author: Frank Dellaert and Michael Kaess
+    year: 2017
+    url: https://doi.org/10.1561/2300000043
+  - title: GTSAM
+    url: https://gtsam.org/
+    note: The factor-graph library from Georgia Tech, with C++ and Python interfaces.
+  - title: "iSAM2: Incremental smoothing and mapping using the Bayes tree"
+    author: Michael Kaess et al.
+    year: 2012
+    url: https://doi.org/10.1177/0278364911430419
+  - title: "ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map SLAM"
+    author: Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, José M. M. Montiel and Juan D. Tardós
+    year: 2021
+    url: https://arxiv.org/abs/2007.11898
+  - title: "LIO-SAM: Tightly-coupled Lidar Inertial Odometry via Smoothing and Mapping"
+    author: Tixiao Shan et al.
+    year: 2020
+    url: https://arxiv.org/abs/2007.00258
+  - title: "FAST-LIO2: Fast Direct LiDAR-inertial Odometry"
+    author: Wei Xu et al.
+    year: 2021
+    url: https://arxiv.org/abs/2107.06829
+  - title: Cartographer
+    url: https://github.com/cartographer-project/cartographer
+  - title: slam_toolbox
+    url: https://github.com/SteveMacenski/slam_toolbox
+    note: The default 2-D lidar SLAM of ROS 2's navigation stack.
+  - title: "NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis"
+    author: Ben Mildenhall et al.
+    year: 2020
+    url: https://arxiv.org/abs/2003.08934
+  - title: "3D Gaussian Splatting for Real-Time Radiance Field Rendering"
+    author: Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler and George Drettakis
+    year: 2023
+    url: https://arxiv.org/abs/2308.04079
+  - title: "SplaTAM: Splat, Track & Map 3D Gaussians for Dense RGB-D SLAM"
+    author: Nikhil Keetha et al.
+    year: 2024
+    url: https://arxiv.org/abs/2312.02126
+  - title: "DUSt3R: Geometric 3D Vision Made Easy"
+    author: Shuzhe Wang et al.
+    year: 2024
+    url: https://arxiv.org/abs/2312.14132
+  - title: "MASt3R-SLAM: Real-Time Dense SLAM with 3D Reconstruction Priors"
+    author: Riku Murai, Eric Dexheimer and Andrew J. Davison
+    year: 2025
+    url: https://arxiv.org/abs/2412.12392
+  - title: "VGGT: Visual Geometry Grounded Transformer"
+    author: Jianyuan Wang et al.
+    year: 2025
+    url: https://arxiv.org/abs/2503.11651
+  - title: "DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras"
+    author: Zachary Teed and Jia Deng
+    year: 2021
+    url: https://arxiv.org/abs/2108.10869
+---
+
+<Section id="motivation" kind="motivation" title="A map and a position, each needing the other">
+
+A small survey robot is lowered into a disused mine in Cornwall to map its tunnels. There is no GNSS underground and no map: that is what the robot is there to make. To place each lidar scan into the map it must know where it was when it took the scan; to know where it was, it must match the scan against the map. Each problem needs the other's answer. This is **simultaneous localisation and mapping**, SLAM.
+
+The previous lessons solved the halves. <LessonLink slug="particle-filters-and-localisation">Monte Carlo localisation</LessonLink> finds a robot in a *known* map. The occupancy grids of <LessonLink slug="depth-and-point-clouds">Depth sensing and point clouds</LessonLink> build a map from *known* poses. SLAM must do both at once, from noisy odometry and noisy observations, and the errors of the two are entangled: a small heading error early in the run bends the whole map, and the bent map then misleads localisation.
+
+Three things make SLAM hard:
+
+- **Drift and correlation.** Every new pose is estimated from the previous one, so errors accumulate, and every landmark's position inherits the error of the pose it was seen from. The uncertainties of the map and the trajectory are all correlated with each other.
+- **Data association.** Is the doorway I see now the one I mapped ten minutes ago, or a different one that looks the same? A wrong answer, as you will see, can wreck the whole map.
+- **Scale.** A robot running for an hour has tens of thousands of poses and maybe a million landmarks, and must update its estimate in real time.
+
+**Loop closure** is what rescues SLAM. When the robot returns to a place it has mapped and recognises it, it gains a measurement linking its current pose to a pose from long ago. That one constraint lets an optimiser spread the accumulated drift back along the whole loop, as in the figure.
+
+<Figure caption="A robot drives once round a 6 m × 4 m block (dashed: the truth). Chaining its odometry, which has a small heading bias, bends the path and leaves its last pose 2.3 m from where it should be (gold). Adding one loop-closure measurement between the last pose and the first, and solving for all twenty poses together, pulls the path back into shape (blue). Coordinates are from the program later in this lesson.">
+<svg viewBox="0 0 340 280" role="img" aria-label="Three closed or nearly closed paths around a rectangle. The dashed true path is a rectangle. The gold dead-reckoning path starts at the lower left corner, bends progressively inwards and ends well below and to the right of the start. The blue optimised path follows the rectangle closely and ends next to the start.">
+  <path d="M60 230 L96 230 L132 230 L168 230 L204 230 L240 230 L276 230 L276 194 L276 158 L276 122 L276 86 L240 86 L204 86 L168 86 L132 86 L96 86 L60 86 L60 122 L60 158 L60 194 L60 230" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" />
+  <path d="M60 230 L100 235 L135 234 L167 232 L209 230 L244 228 L280 226 L277 188 L272 149 L267 114 L260 79 L227 88 L192 100 L164 113 L133 125 L100 138 L69 155 L88 186 L106 216 L124 246" fill="none" stroke="var(--gold)" strokeWidth="2.2" />
+  <path d="M60 230 L99 235 L133 234 L165 234 L206 232 L241 233 L276 232 L276 194 L274 156 L274 120 L273 84 L238 85 L200 87 L168 90 L135 90 L99 88 L62 90 L63 126 L62 160 L60 196" fill="none" stroke="var(--sky)" strokeWidth="2.2" />
+  <circle cx="60" cy="230" r="4" fill="currentColor" />
+  <circle cx="124" cy="246" r="4" fill="var(--gold)" stroke="currentColor" />
+  <circle cx="60" cy="196" r="4" fill="var(--sky)" stroke="currentColor" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="30" y="250">start</text>
+    <text x="130" y="262">dead-reckoning end</text>
+    <text x="70" y="200">optimised end</text>
+    <line x1="200" y1="30" x2="230" y2="30" stroke="currentColor" strokeDasharray="5 4" />
+    <text x="236" y="34">truth</text>
+    <line x1="200" y1="46" x2="230" y2="46" stroke="var(--gold)" strokeWidth="2.2" />
+    <text x="236" y="50">odometry only</text>
+    <line x1="200" y1="62" x2="230" y2="62" stroke="var(--sky)" strokeWidth="2.2" />
+    <text x="236" y="66">with loop closure</text>
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="ekf-slam" kind="human" title="EKF-SLAM, in brief">
+
+The first practical answer, developed from the late 1980s by Randall Smith, Matthew Self and Peter Cheeseman and by Hugh Durrant-Whyte's group, put the robot's pose *and every landmark's position* into one state vector and ran an <LessonLink slug="kalman-filters">extended Kalman filter</LessonLink> on it:
+
+$$
+\mathbf{x} = (x, y, \theta,\; m_{1,x}, m_{1,y},\; \dots,\; m_{n,x}, m_{n,y}), \qquad P \in \mathbb{R}^{(3 + 2n) \times (3 + 2n)}.
+$$
+
+Motion changes only the pose block, but each range–bearing observation of a landmark (the model of the Kalman lesson, now with the landmark's position also unknown) updates *everything*, because the off-diagonal blocks of $P$ correlate every landmark with the robot and with every other landmark. Those correlations are not a nuisance; they are what makes SLAM work. When the robot re-observes an old landmark and corrects its own pose, the correction flows through $P$ to every landmark seen from the same drifting trajectory, and the whole map moves together. In 2001 Dissanayake and colleagues proved that, for the linear-Gaussian version, the landmark uncertainties shrink monotonically towards a limit set by the uncertainty of the first observation.
+
+The smallest possible example shows the effect. A robot on a line starts within 1 cm of the origin, sees landmark $m_1$, drives 9 m, sees landmark $m_2$ for the first time, and drives back. Because everything is linear, the filter here is an exact Kalman filter.
+
+```python run
+import numpy as np
+
+# 1-D SLAM as a Kalman filter: state = (robot position r, landmark m1, landmark m2) on a line.
+rng = np.random.default_rng(0)
+truth = np.array([0.0, 2.0, 10.0])
+x = np.array([0.0, 0.0, 0.0])                       # landmarks unknown at first...
+P = np.diag([0.01**2, 1e6, 1e6])                  # ...so their variances are huge; the robot starts within 1 cm of the origin
+q, r = 0.1**2, 0.05**2                             # odometry variance per 1 m step; range variance
+
+def predict(x, P, u):
+    x = x + np.array([u, 0.0, 0.0])                # only the robot moves
+    return x, P + np.diag([q, 0.0, 0.0])
+
+def observe(x, P, k):                              # measure the signed distance m_k - r
+    H = np.zeros(3); H[0], H[k] = -1.0, 1.0
+    z = truth[k] - truth[0] + rng.normal(0, np.sqrt(r))
+    S = H @ P @ H + r
+    K = P @ H / S
+    return x + K * (z - H @ x), P - np.outer(K, H @ P)
+
+def report(label, P):
+    sd = np.sqrt(np.diag(P))
+    corr = P[0, 2] / np.sqrt(P[0, 0] * P[2, 2])
+    print(f"{label:38s} sd(r) {sd[0]:.3f}  sd(m1) {sd[1]:.3f}  sd(m2) {sd[2]:.3f}   corr(r, m2) {corr:+.2f}")
+
+x, P = observe(x, P, 1)
+report("at the start, sees m1:", P)
+for _ in range(9):                                  # drive 9 m towards m2, one metre at a time
+    truth[0] += 1.0
+    x, P = predict(x, P, 1.0 + rng.normal(0, np.sqrt(q)))
+x, P = observe(x, P, 2)
+report("after 9 m, first sight of m2:", P)
+for _ in range(8):                                  # drive back 8 m without seeing anything
+    truth[0] -= 1.0
+    x, P = predict(x, P, -1.0 + rng.normal(0, np.sqrt(q)))
+report("back near the start, before looking:", P)
+x, P = observe(x, P, 1)
+report("re-observes m1 (m2 is not seen):", P)
+print("estimates (r, m1, m2):", x.round(3), "  truth:", truth)
+```
+
+After 9 m of driving, the robot is uncertain by 30 cm, and $m_2$, measured from that uncertain position, inherits almost all of it: a standard deviation of 0.304 m, with a correlation of 0.99 between the robot and the landmark. Driving back adds uncertainty to the robot (0.41 m) but none to $m_2$. Then the robot re-observes $m_1$: its own uncertainty falls to 7 cm and, although $m_2$ was not seen, $m_2$'s falls from 0.304 to 0.215 m. The filter has reasoned that if the robot's position was wrong, the landmark measured from it was wrong in the same way.
+
+EKF-SLAM gave way for two reasons. Its cost: $P$ has $(3 + 2n)^2$ entries and each update touches all of them. And its consistency: the EKF linearises the heading once and never revisits that choice, so in long runs the covariance becomes overconfident and the filter can diverge, as several analyses in the 2000s showed. Particle-filter SLAM (FastSLAM, 2002, and the grid-based GMapping) eased the cost by sampling trajectories, with a small Kalman filter per landmark per particle. The approach that won, however, keeps the *whole trajectory* and re-solves it.
+
+<Narrator who="margaret">
+
+With 1,000 landmarks the EKF-SLAM state has 2,003 numbers and its covariance just over four million entries, 32 MB in double precision, all rewritten on every observation. At 10,000 landmarks it is 400 million entries and 3.2 GB. The pose graph below, by contrast, grows linearly with the length of the run.
+
+</Narrator>
+
+</Section>
+
+<Section id="pose-graph" kind="definitions" title="SLAM as least squares: the pose graph">
+
+Keep every pose $X_0, X_1, \dots, X_N \in SE(2)$ (or $SE(3)$) as an unknown. Each measurement says something about the *relative* pose of two of them:
+
+- **odometry** between consecutive poses, $Z_{i,i+1}$, measured by wheels, an IMU or scan matching;
+- **loop closures** between poses far apart in time, $Z_{ij}$, found by recognising a place and registering the two views (with the <LessonLink slug="depth-and-point-clouds">ICP</LessonLink> or PnP of earlier lessons).
+
+<Definition term="Pose-graph SLAM">
+
+Given relative-pose measurements $Z_{ij}$ with information matrices $\Omega_{ij}$ (inverse covariances), find the poses minimising
+
+$$
+F(X) = \sum_{(i,j)} \mathbf{e}_{ij}^{\mathsf T}\,\Omega_{ij}\,\mathbf{e}_{ij},
+\qquad
+\mathbf{e}_{ij} = \operatorname{vec}\!\big(Z_{ij}^{-1}\,X_i^{-1}X_j\big),
+$$
+
+where $X_i^{-1}X_j$ is the pose of $j$ in $i$'s frame (as in <LessonLink slug="frames-and-transforms">Frames and rigid transforms</LessonLink>) and $\operatorname{vec}$ turns a small transform into $(x, y, \theta)$.
+
+</Definition>
+
+If the measurement noise is Gaussian, minimising $F$ is exactly finding the **maximum a posteriori** trajectory: $-\log p(X \mid Z)$ is $\tfrac{1}{2}F(X)$ plus a constant. SLAM has become an optimisation problem.
+
+$F$ is nonlinear (it contains rotations), so it is solved iteratively by **Gauss–Newton**: linearise each error around the current estimate, $\mathbf{e}_{ij}(X + \Delta) \approx \mathbf{e}_{ij} + J_{ij}\Delta$, which turns $F$ into a quadratic in $\Delta$, and minimise that by solving the linear system
+
+$$
+H\,\Delta = -\mathbf{b}, \qquad H = \sum_{(i,j)} J_{ij}^{\mathsf T}\,\Omega_{ij}\,J_{ij}, \qquad \mathbf{b} = \sum_{(i,j)} J_{ij}^{\mathsf T}\,\Omega_{ij}\,\mathbf{e}_{ij}.
+$$
+
+Then update $X \leftarrow X + \Delta$ and repeat. One subtlety: every measurement is relative, so moving the entire map rigidly changes nothing, and $H$ is singular. The **gauge freedom** is removed by fixing the first pose (or adding a prior on it).
+
+<Narrator who="gideon">
+
+Adding $\Delta$ to $(x, y, \theta)$ is only legitimate because the poses here are planar and the angles are wrapped after each step. In 3-D, poses live on the curved group $SE(3)$, and production solvers apply each update through the exponential map, $X \leftarrow X \exp(\Delta^{\wedge})$, exactly as the PnP solver of <LessonLink slug="cameras-and-vision">Cameras and computer vision</LessonLink> updated its rotation. Lumenary Math's <TopicLink id="math.geom.lie-groups">Lie groups and Lie algebras</TopicLink> explains why this is the right way to take a step.
+
+</Narrator>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Closing a loop with Gauss–Newton">
+
+The program builds the pose graph of the figure: 20 poses round a 6 m by 4 m block, 19 odometry measurements with noise and a steady heading bias of 1.5° per metre, and one loop closure from the last pose back to the first, measured precisely (2 cm and 0.5°), as a scan match would be. It starts from dead reckoning and runs Gauss–Newton with numerical Jacobians. Then it adds a **false loop closure**, the kind a place-recognition system produces when two doorways on opposite sides of a courtyard look alike, and solves again with and without a robust kernel.
+
+```python run
+import numpy as np
+
+def se2(x, y, th):
+    c, s = np.cos(th), np.sin(th)
+    return np.array([[c, -s, x], [s, c, y], [0, 0, 1.0]])
+
+def vec(T):                                   # 3x3 transform -> (x, y, theta)
+    return np.array([T[0, 2], T[1, 2], np.arctan2(T[1, 0], T[0, 0])])
+
+def inv(T):
+    R, t = T[:2, :2], T[:2, 2]
+    Ti = np.eye(3); Ti[:2, :2], Ti[:2, 2] = R.T, -R.T @ t
+    return Ti
+
+# Ground truth: 20 poses, 1 m apart, round a 6 m x 4 m block, turning left at the corners.
+truth = [se2(0, 0, 0)]
+for k in range(19):
+    truth.append(truth[-1] @ se2(1.0, 0, 0) @ se2(0, 0, np.pi / 2 if k in (5, 9, 15) else 0.0))
+
+rng = np.random.default_rng(3)
+odo_info = np.diag([1 / 0.05**2, 1 / 0.05**2, 1 / np.radians(2) ** 2])
+loop_info = np.diag([1 / 0.02**2, 1 / 0.02**2, 1 / np.radians(0.5) ** 2])
+edges = []                                    # (i, j, measured pose of j in i's frame, information matrix)
+for i in range(19):                           # odometry, with noise and a 1.5 deg per step heading bias
+    z = vec(inv(truth[i]) @ truth[i + 1]) + rng.normal(0, [0.05, 0.05, np.radians(2)]) + [0, 0, np.radians(1.5)]
+    edges.append((i, i + 1, z, odo_info))
+loop = (19, 0, vec(inv(truth[19]) @ truth[0]) + rng.normal(0, [0.02, 0.02, np.radians(0.5)]), loop_info)
+false_loop = (13, 2, np.array([0.0, 1.0, np.pi]), loop_info)   # a look-alike place: a wrong loop closure
+
+def error(xi, xj, z):                         # the edge's measurement compared with the current estimate
+    return vec(inv(se2(*z)) @ inv(se2(*xi)) @ se2(*xj))
+
+def rms(x):
+    return np.sqrt(np.mean([np.sum((x[k, :2] - vec(truth[k])[:2]) ** 2) for k in range(20)]))
+
+def optimise(edges, robust=False, iters=10, verbose=False):
+    x = np.zeros((20, 3))                     # initial guess: chain the odometry (dead reckoning)
+    for i, j, z, _ in edges[:19]:
+        x[j] = vec(se2(*x[i]) @ se2(*z))
+    for it in range(iters):
+        H, b, cost = np.zeros((60, 60)), np.zeros(60), 0.0
+        for i, j, z, info in edges:
+            e = error(x[i], x[j], z)
+            m2 = e @ info @ e                 # squared Mahalanobis length of the error
+            w = 1.0 / (1.0 + m2 / 9.0) if robust else 1.0     # Cauchy kernel: big errors count less
+            cost += m2
+            J = np.zeros((3, 6))              # numerical Jacobian with respect to (x_i, x_j)
+            for k in range(6):
+                d = np.zeros(6); d[k] = 1e-6
+                de = error(x[i] + d[:3], x[j] + d[3:], z) - e
+                de[2] = (de[2] + np.pi) % (2 * np.pi) - np.pi
+                J[:, k] = de / 1e-6
+            idx = np.r_[3 * i: 3 * i + 3, 3 * j: 3 * j + 3]
+            H[np.ix_(idx, idx)] += w * J.T @ info @ J
+            b[idx] += w * J.T @ info @ e
+        if verbose:
+            print(f"  iteration {it}: cost {cost:10.1f}   RMS position error {rms(x):.3f} m")
+        H[:3, :3] += np.eye(3) * 1e9          # hold the first pose fixed (the gauge freedom)
+        x += np.linalg.solve(H, -b).reshape(20, 3)
+        x[:, 2] = (x[:, 2] + np.pi) % (2 * np.pi) - np.pi
+    return x, H
+
+print("odometry plus one correct loop closure, Gauss-Newton:")
+x, H = optimise(edges + [loop], iters=5, verbose=True)
+x_dr = np.zeros((20, 3))                      # dead reckoning again, for comparison
+for i, j, z, _ in edges:
+    x_dr[j] = vec(se2(*x_dr[i]) @ se2(*z))
+last = lambda x: np.hypot(*(x[19, :2] - vec(truth[19])[:2]))
+print(f"error of the last pose: {last(x_dr):.2f} m by dead reckoning, {last(x):.2f} m after optimising")
+for name, es, rob in [("plus a false loop closure", edges + [loop, false_loop], False),
+                      ("plus a false loop closure, Cauchy kernel", edges + [loop, false_loop], True)]:
+    x2, _ = optimise(es, robust=rob)
+    print(f"{name:42s}: RMS position error {rms(x2):.3f} m")
+
+blocks = np.abs(H).reshape(20, 3, 20, 3).sum(axis=(1, 3)) > 0
+print("\nnon-zero 3x3 blocks of H (#), for the run with one correct loop closure:")
+for row in blocks:
+    print("  " + "".join("#" if c else "." for c in row))
+print(f"{blocks.sum()} of {blocks.size} blocks are non-zero")
+```
+
+Dead reckoning is off by about a metre RMS and its last pose by 2.3 m, so the loop-closure measurement disagrees badly with it, and the cost starts at almost 22,000. Gauss–Newton reduces the cost by three orders of magnitude in two iterations and has converged by the third; the RMS position error falls to 10 cm and the last pose is within 5 cm. The remaining error is the price of the odometry bias, which the optimiser has spread evenly round the loop instead of letting it pile up at the end.
+
+A single false loop closure is a disaster: the optimiser obeys it, folding the map to pull two places 4.1 m apart to within 1 m of each other, and the RMS error rises to 1.7 m, worse than no loop closure at all. With a **Cauchy robust kernel**, each edge's weight falls as its error grows ($w = 1/(1 + m^2/c^2)$ for squared Mahalanobis error $m^2$, here with $c = 3$), so the false edge, which can never be satisfied together with everything else, is gradually ignored, and the error returns to 11 cm. Robust kernels, together with checks that loop closures are geometrically consistent with each other (switchable constraints, pairwise consistency maximisation), are standard in every serious SLAM system.
+
+The last output is the shape of $H$. Each odometry edge couples two consecutive poses, giving the band; the loop closure adds the two blocks in the corners. Only 60 of the 400 blocks are non-zero, and in a real run with thousands of poses the fraction is tiny. That **sparsity** is what makes large SLAM problems solvable: sparse Cholesky factorisation with a good variable ordering solves systems with hundreds of thousands of variables in milliseconds.
+
+<Narrator who="chloe">
+
+The sparsity pattern of $H$ is the graph itself: block $(i, j)$ is non-zero exactly when some measurement links poses $i$ and $j$. Solving the linear system by elimination is the same as eliminating variables from the graph, and the fill-in it creates depends on the order, the same graph-theoretic question that governs sparse linear algebra everywhere (Lumenary Math's <TopicLink id="math.discrete.graph-theory">Graph theory</TopicLink> is the language for it).
+
+</Narrator>
+
+</Section>
+
+<Section id="factor-graphs" kind="human" title="Factor graphs and GTSAM">
+
+A **factor graph** generalises the pose graph. It is a bipartite graph with **variables** (poses, landmarks, velocities, sensor biases, calibration parameters) and **factors**, each a term of the cost that depends on a few variables: an odometry factor between two poses, a landmark observation between a pose and a landmark, a prior on the first pose, an IMU factor between two poses and their velocities and biases, a GNSS factor on one pose. The MAP estimate minimises the sum of all factors' squared, whitened errors, and the graph's structure is the sparsity of the problem.
+
+<Figure caption="A small factor graph. Circles are unknowns (poses x₀ to x₄ and a landmark l₁); filled squares are factors, each a measurement: a prior on x₀, odometry between consecutive poses, two observations of l₁, and a loop closure between x₄ and x₀.">
+<svg viewBox="0 0 340 200" role="img" aria-label="Five pose circles labelled x0 to x4 in a row near the bottom, joined by small black squares representing odometry factors. A square on the far left attaches only to x0: the prior. A landmark circle l1 sits above, between x1 and x2, connected to each by a square: observation factors. A curved line with a square on it goes over the top from x4 back to x0: the loop closure.">
+  <path d="M290 150 C 290 20, 50 20, 50 150" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="20" y1="150" x2="290" y2="150" />
+    <line x1="110" y1="150" x2="140" y2="80" />
+    <line x1="170" y1="150" x2="140" y2="80" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5">
+    <circle cx="50" cy="150" r="16" />
+    <circle cx="110" cy="150" r="16" />
+    <circle cx="170" cy="150" r="16" />
+    <circle cx="230" cy="150" r="16" />
+    <circle cx="290" cy="150" r="16" />
+  </g>
+  <circle cx="140" cy="80" r="16" fill="var(--gold-soft)" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="currentColor">
+    <rect x="14" y="144" width="12" height="12" />
+    <rect x="74" y="144" width="12" height="12" />
+    <rect x="134" y="144" width="12" height="12" />
+    <rect x="194" y="144" width="12" height="12" />
+    <rect x="254" y="144" width="12" height="12" />
+    <rect x="119" y="109" width="12" height="12" />
+    <rect x="149" y="109" width="12" height="12" />
+    <rect x="164" y="47" width="12" height="12" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="50" y="155">x₀</text>
+    <text x="110" y="155">x₁</text>
+    <text x="170" y="155">x₂</text>
+    <text x="230" y="155">x₃</text>
+    <text x="290" y="155">x₄</text>
+    <text x="140" y="85">l₁</text>
+    <text x="20" y="182" fontSize="10">prior</text>
+    <text x="200" y="182" fontSize="10">odometry</text>
+    <text x="196" y="44" fontSize="10">loop closure</text>
+    <text x="96" y="104" fontSize="10">observation</text>
+  </g>
+</svg>
+</Figure>
+
+**GTSAM**, from Frank Dellaert's group at Georgia Tech, is the most widely used factor-graph library in robotics; g2o and Google's Ceres Solver are the other common choices. GTSAM's **iSAM2** algorithm (Kaess and colleagues, 2012) keeps the factorised problem in a data structure called the Bayes tree and, when new factors arrive, re-solves only the part of the tree they affect, so a robot can run full smoothing in real time instead of filtering. The pose graph of the program looks like this in GTSAM's Python interface (shown for reading, not run here):
+
+```python
+# GTSAM pose-graph sketch: not run here (needs the gtsam package).
+import numpy as np
+import gtsam
+
+graph = gtsam.NonlinearFactorGraph()
+prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.01, 0.01, 0.01]))
+odo_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.05, 0.05, np.radians(2)]))
+loop_noise = gtsam.noiseModel.Robust.Create(                      # Cauchy kernel on loop closures
+    gtsam.noiseModel.mEstimator.Cauchy.Create(3.0),
+    gtsam.noiseModel.Diagonal.Sigmas(np.array([0.02, 0.02, np.radians(0.5)])))
+
+graph.add(gtsam.PriorFactorPose2(0, gtsam.Pose2(0.0, 0.0, 0.0), prior_noise))
+for i, (dx, dy, dth) in enumerate(odometry):                      # measured relative motions
+    graph.add(gtsam.BetweenFactorPose2(i, i + 1, gtsam.Pose2(dx, dy, dth), odo_noise))
+graph.add(gtsam.BetweenFactorPose2(19, 0, gtsam.Pose2(*loop_measurement), loop_noise))
+
+initial = gtsam.Values()
+for i, (x, y, th) in enumerate(dead_reckoning):                   # the starting guess
+    initial.insert(i, gtsam.Pose2(x, y, th))
+result = gtsam.LevenbergMarquardtOptimizer(graph, initial).optimize()
+print(result.atPose2(10))
+print(gtsam.Marginals(graph, result).marginalCovariance(10))      # uncertainty of pose 10
+```
+
+The covariance in the last line is the information a filter would have given, recovered from the factorised $H$. The same few lines grow into visual-inertial or lidar-inertial SLAM by adding landmark, IMU and GNSS factors; GTSAM's preintegrated IMU factor, which summarises hundreds of IMU readings between two keyframes as one factor, is used by many such systems.
+
+</Section>
+
+<Section id="systems" kind="human" title="Visual SLAM and lidar SLAM in practice">
+
+**Visual SLAM.** The landmark system is **ORB-SLAM**, from Raúl Mur-Artal, José María Montiel and Juan Tardós at the University of Zaragoza: monocular in 2015, stereo and RGB-D in ORB-SLAM2 (2017), and visual-inertial and multi-map in ORB-SLAM3 (2021). It runs three threads that echo this lesson. *Tracking* matches ORB features (<LessonLink slug="cameras-and-vision">the previous lesson</LessonLink>) against the local map and estimates each frame's pose by PnP. *Local mapping* inserts keyframes, triangulates new points and runs **bundle adjustment**, a factor graph whose factors are reprojection errors of points in keyframes. *Loop closing* recognises revisited places with a bag-of-words index of features, verifies them geometrically, then optimises a pose graph and finally the whole map. Its ancestors include PTAM (Oxford, 2007), which first split tracking and mapping into parallel threads; its relatives include **direct** methods such as LSD-SLAM and DSO (Technical University of Munich), which minimise photometric error over pixel intensities instead of matching features, and visual-inertial systems such as VINS-Mono (Hong Kong University of Science and Technology, 2018), OpenVINS and Kimera (MIT, which adds semantic meshes).
+
+**Lidar SLAM.** For 2-D lidar, Google's Cartographer (2016) builds local submaps by scan matching and closes loops with a fast branch-and-bound search, and `slam_toolbox`, the default SLAM of ROS 2's Nav2, builds pose graphs with Ceres. For 3-D lidar, LOAM (Carnegie Mellon, 2014) matched edge and plane features; LIO-SAM (2020) fuses lidar, IMU and GNSS in a GTSAM factor graph; FAST-LIO2 (University of Hong Kong, 2021) is a tightly coupled iterated Kalman filter with an incremental k-d tree, efficient enough for small drones; KISS-ICP (2023) showed how far plain point-to-point ICP can go. Lidar SLAM runs in mines, forests, construction sites and on most autonomous vehicles' mapping fleets.
+
+Production SLAM is mostly engineering around the core you have just written: keyframe selection, outlier rejection, loop-closure verification, map management and relocalisation after failure, time synchronisation and calibration. The <LessonLink slug="autonomous-vehicles">Autonomous vehicles</LessonLink> and <LessonLink slug="aerial-robots">Aerial robots</LessonLink> lessons return to this.
+
+</Section>
+
+<Section id="neural" kind="human" title="Learned and neural scene representations, as of 2026">
+
+Classical SLAM maps are sparse points, occupancy voxels or surface meshes. Since 2020 a different kind of map has emerged from computer graphics and machine learning: a **radiance field**, which can render photorealistic images of the scene from any viewpoint.
+
+- **NeRF** (Mildenhall and colleagues, 2020) represents a scene as a neural network, a multilayer perceptron of the kind in Lumenary CS's [neural networks](/en/cs/neural-networks/) lesson, mapping a 3-D position and viewing direction to a colour and a density. Images are rendered by integrating along camera rays, and the network is trained by making its renderings match the photos, given their camera poses. The first NeRFs took hours to train and seconds per image; hash-grid encodings (Instant-NGP, 2022) cut this to minutes.
+- **3D Gaussian splatting** (Kerbl and colleagues, Inria, 2023) replaces the network with millions of small, coloured, semi-transparent 3-D Gaussians, rasterised directly. It trains in minutes, renders at hundreds of frames per second, and is explicit: the Gaussians can be moved, edited and deleted.
+- **Neural SLAM** makes these maps online. iMAP (2021) and NICE-SLAM (2022) tracked a camera against a neural field; Gaussian-splatting SLAM systems such as SplaTAM and MonoGS (both 2024) track and map with Gaussians from RGB-D or monocular video. DROID-SLAM (2021) instead learned the matching and kept a classical optimisation layer.
+- **Feed-forward 3-D reconstruction** is the newest strand. DUSt3R and MASt3R (Naver Labs Europe, 2024) take a pair of uncalibrated images and directly output a 3-D point for every pixel; VGGT (Oxford and Meta, 2025) predicts cameras, depth and points for many images in one pass of a transformer. MASt3R-SLAM (Imperial College London, 2025) builds real-time dense SLAM on such predictions, keeping a classical pose graph for global consistency.
+
+Where do these fit in robotics as of 2026? Measured honestly: they have changed what a map *can* be more than how deployed robots localise. Their clearest uses are **photorealistic digital twins**, reconstructed from a phone video and used to train and test robot policies in simulation (see <LessonLink slug="simulation">Simulation</LessonLink> and <LessonLink slug="sim-to-real">Crossing the sim-to-real gap</LessonLink>); **semantic maps**, where features from vision–language models are attached to the Gaussians or voxels so a robot can be asked to "go to where the fire extinguisher is"; and **learned front ends**, where networks supply depth, matches and place recognition to a classical back end. On warehouse robots, vacuum cleaners, cars and drones, pose estimation is still overwhelmingly done by feature- or lidar-based odometry with factor-graph or filter back ends, because these are fast, predictable, run on small computers and fail in ways engineers understand. The direction of travel is clear, and the most successful recent systems combine both: learned priors for what the world looks like, and geometry and probability for where the robot is.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"More loop closures are always better."** Correct ones are; one false one can fold the map, as the program showed. Systems accept loop closures conservatively, verify them geometrically, and use robust kernels so that a mistake that slips through cannot dominate.
+
+</Misconception>
+
+<Misconception>
+
+**"SLAM gives a robot its position on Earth."** SLAM's map has its own origin, usually where the robot started. Tying it to a global frame needs GNSS, surveyed markers or alignment to an existing map. Monocular visual SLAM has not even a fixed scale without an IMU or another metric sensor.
+
+</Misconception>
+
+<Misconception>
+
+**"Filtering and optimisation are rival theories."** Both compute the same posterior for linear-Gaussian problems. A filter marginalises out the past at every step and can never revisit a linearisation; a smoother keeps the past and re-linearises. With nonlinear models and loop closures, keeping the past is what lets the map be corrected, which is why optimisation won for mapping while filters remain common for fast odometry.
+
+</Misconception>
+
+<Misconception>
+
+**"A NeRF or Gaussian-splat map can replace the robot's SLAM."** As of 2026 they mostly complement it. They need good camera poses (often from classical SLAM) to build, their rendering quality says little about the geometric accuracy a planner needs, and they are heavier to run and update than a pose graph.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+The probabilistic formulation of SLAM was set out in papers by Smith, Self and Cheeseman and by Durrant-Whyte in the late 1980s, and the acronym SLAM appeared in the mid-1990s. EKF-SLAM dominated the 1990s, with landmark demonstrations at the Australian Centre for Field Robotics in Sydney; FastSLAM (Montemerlo, Thrun and colleagues, 2002) brought particle filters. In 1997 Feng Lu and Evangelos Milios formulated mapping as a network of pose constraints solved jointly, the root of today's pose graphs; through the 2000s, Frank Dellaert's square-root smoothing and mapping and work by Olson, Grisetti and others made graph optimisation fast and robust, and by around 2010 it had become the standard. PTAM (2007) and ORB-SLAM (2015) brought real-time visual SLAM to a single camera, and since 2020 learned representations and feed-forward reconstruction have joined the toolbox.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

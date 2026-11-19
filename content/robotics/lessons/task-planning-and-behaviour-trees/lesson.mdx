@@ -1,0 +1,497 @@
+---
+title: Task planning and behaviour trees
+subtitle: From where to go to what to do — symbolic planning with STRIPS and PDDL, a breadth-first planner for a kitchen, behaviour trees that react and retry, task and motion planning, and what language models can and cannot do as planners.
+minutes: 75
+objectives:
+  - Model a robot task in STRIPS and PDDL as facts, actions with preconditions and effects, and a goal
+  - Implement a breadth-first task planner, and explain why state spaces explode and how heuristics from relaxed problems tame them
+  - Compare finite-state machines with behaviour trees, and implement a behaviour-tree interpreter with sequences, fallbacks and retries
+  - Explain what task and motion planning adds when symbolic actions need geometric choices
+  - Describe how language models have been used as task planners since 2022, and their limits
+narrators: [chloe, margaret, gideon]
+prerequisites: [graph-search-planning, trajectory-optimisation]
+related: [math.found.propositional-logic, math.found.first-order-logic, math.discrete.graph-theory, math.comp.complexity-theory, math.comp.formal-methods]
+references:
+  - title: "STRIPS: A new approach to the application of theorem proving to problem solving"
+    author: Richard E. Fikes and Nils J. Nilsson
+    year: 1971
+    url: https://doi.org/10.1016/0004-3702(71)90010-5
+    note: The planning language written for the Shakey robot at the Stanford Research Institute.
+  - title: "The Fast Downward Planning System"
+    author: Malte Helmert
+    year: 2006
+    url: https://doi.org/10.1613/jair.1705
+    note: The design behind one of the most widely used classical planners; the planner itself is open source at fast-downward.org.
+  - title: "Behavior Trees in Robotics and AI: An Introduction"
+    author: Michele Colledanchise and Petter Ögren
+    year: 2018
+    url: https://arxiv.org/abs/1709.00084
+    note: The standard introduction to behaviour trees for robots, freely available.
+  - title: BehaviorTree.CPP
+    url: https://www.behaviortree.dev/
+    note: The C++ behaviour-tree library used by Nav2 and many ROS 2 robots, with the Groot editor.
+  - title: py_trees
+    url: https://github.com/splintered-reality/py_trees
+    note: A Python behaviour-tree library, with ROS 2 integration.
+  - title: "Integrated Task and Motion Planning"
+    author: Caelan Reed Garrett and colleagues
+    year: 2021
+    url: https://arxiv.org/abs/2010.01083
+    note: A survey of TAMP, published in the Annual Review of Control, Robotics, and Autonomous Systems.
+  - title: "Do As I Can, Not As I Say: Grounding Language in Robotic Affordances"
+    author: Michael Ahn and colleagues (Robotics at Google and Everyday Robots)
+    year: 2022
+    url: https://arxiv.org/abs/2204.01691
+    note: SayCan.
+  - title: "Code as Policies: Language Model Programs for Embodied Control"
+    author: Jacky Liang and colleagues
+    year: 2022
+    url: https://arxiv.org/abs/2209.07753
+  - title: "LLM+P: Empowering Large Language Models with Optimal Planning Proficiency"
+    author: Bo Liu and colleagues
+    year: 2023
+    url: https://arxiv.org/abs/2304.11477
+  - title: "On the Planning Abilities of Large Language Models: A Critical Investigation"
+    author: Karthik Valmeekam, Matthew Marquez, Sarath Sreedharan and Subbarao Kambhampati
+    year: 2023
+    url: https://arxiv.org/abs/2305.15771
+---
+
+<Section id="motivation" kind="motivation" title="From where to go to what to do">
+
+Ask a home robot for a cup of tea. Every planner in this level so far needs a goal it can measure: a cell on a map, a configuration of an arm, a trajectory to optimise. "A cup of tea" is none of those. Somebody has to decide that the cupboard must be opened before the cup can be taken out, that the kettle must be filled before it is boiled, that the cup must be on the counter before tea is poured into it, and only then hand each step to a motion planner. And when the cupboard door sticks or the cup slips from the gripper, somebody has to decide what to do next.
+
+Robotics answers with two complementary tools. **Task planners** reason ahead: given a symbolic description of the world and of what each action requires and achieves, they search for a sequence of actions that reaches the goal. **Execution structures**, such as state machines and **behaviour trees**, react: they decide, many times a second, which skill to run now, given what the sensors say, and they encode what to do when things go wrong. Most deployed robots rely heavily on the second, many research systems on the first, and the most capable systems combine both, increasingly with a language model in the loop.
+
+This lesson builds a tiny planner and a tiny behaviour-tree interpreter, both in a kitchen, looks at why symbolic planning gets hard and how planners cope, and ends with **task and motion planning** and the use of language models as planners since 2022, with what they can and cannot yet do.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Planning with facts and rules">
+
+Describe the kitchen by a list of **facts** that are currently true: the robot is at the table; its hand is empty; the cup is in the cupboard; the kettle is on the counter. Describe each action by what must be true before it (its **preconditions**) and what it changes (facts it makes true, and facts it makes false). "Pick the cup from the cupboard" needs the robot at the cupboard, the cupboard open, the cup there and the hand empty; afterwards the robot holds the cup, its hand is no longer empty and the cup is no longer in the cupboard.
+
+Now each set of facts is a **state**, each applicable action is an **edge** to a new state, and planning is search in a graph, exactly as in <LessonLink slug="graph-search-planning">Planning on graphs and grids</LessonLink>, except that the graph is never written down. It is generated on the fly from the action rules, and it can be astronomically large.
+
+<Analogy>
+
+A recipe is a plan written by a person who has already done the search: "boil the water, warm the pot, add the leaves, pour". A task planner writes recipes. Give it the cupboards, the appliances and what each action needs, and it works out the order, including the steps a recipe leaves implicit, such as opening the cupboard before taking the cup.
+
+</Analogy>
+
+The facts abstract away almost everything about geometry: "the cup is on the counter" does not say where on the counter, and "pick the cup" hides a grasp, an arm trajectory and a collision check. That abstraction is what makes symbolic planning fast, and also its weakness, which task and motion planning (later in the lesson) addresses.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="STRIPS planning problem">
+
+A **STRIPS** problem has a finite set of facts (ground atoms such as `at(cup, cupboard)`), an initial state $s_0$ (the set of facts true at the start), a goal $G$ (a set of facts), and actions $a = (\text{pre}_a, \text{add}_a, \text{del}_a)$. Action $a$ is **applicable** in state $s$ if $\text{pre}_a \subseteq s$, and then leads to $(s \setminus \text{del}_a) \cup \text{add}_a$. A **plan** is a sequence of actions, each applicable in turn, that ends in a state $s \supseteq G$.
+
+</Definition>
+
+<Definition term="PDDL">
+
+The **Planning Domain Definition Language** (PDDL, first defined in 1998 for the International Planning Competition) writes STRIPS-style problems, and many extensions (types, numbers, durations, conditional effects), in a standard text format. A **domain** file defines predicates and parameterised action schemas; a **problem** file lists objects, the initial state and the goal. Any compliant planner can read any compliant domain.
+
+</Definition>
+
+<Definition term="behaviour tree">
+
+A **behaviour tree** is a tree whose leaves are **actions** (skills that run, possibly for many cycles) and **conditions** (tests of the world), and whose internal nodes are **control-flow nodes**. The tree is executed by **ticking** the root at a fixed rate; a ticked node returns `SUCCESS`, `FAILURE` or `RUNNING`. A **sequence** ticks its children in order and returns the first status that is not `SUCCESS` (or `SUCCESS` if all succeed); a **fallback** (also called a selector) returns the first status that is not `FAILURE` (or `FAILURE` if all fail). **Decorators** have one child and modify its result, for example **retry** (re-run a failed child up to $n$ times) or **timeout**.
+
+</Definition>
+
+Here is the kitchen in PDDL, in part. It is shown for reading, not run here; the program below encodes the same domain directly in Python.
+
+```text
+(define (domain kitchen)
+  (:predicates (robot-at ?p) (at ?o ?p) (holding ?o) (hand-empty)
+               (open ?c) (full ?k) (hot ?k) (tea-in ?c))
+  (:action pick-from-cupboard
+    :parameters (?o)
+    :precondition (and (robot-at cupboard) (at ?o cupboard) (hand-empty) (open cupboard))
+    :effect (and (holding ?o) (not (at ?o cupboard)) (not (hand-empty))))
+  (:action boil
+    :parameters (?k)
+    :precondition (and (robot-at counter) (at ?k counter) (full ?k))
+    :effect (hot ?k)))
+```
+
+</Section>
+
+<Section id="planner" kind="computation" title="A breadth-first task planner">
+
+The program grounds the kitchen's action schemas into every concrete action (32 of them: moves between four places, picking and placing two objects at four places, and the appliances), represents each state as a frozen set of facts, and runs breadth-first search, which returns a plan with the fewest actions.
+
+```python run
+from collections import deque
+from itertools import product
+
+# A STRIPS domain: a state is a set of true facts; an action has preconditions, an add list
+# and a delete list. The kitchen: make a cup of tea and bring it to the table.
+PLACES = ["table", "counter", "sink", "cupboard"]
+THINGS = ["cup", "kettle"]
+
+def actions():
+    acts = []
+    def act(name, pre, add, delete):
+        acts.append((name, frozenset(pre), frozenset(add), frozenset(delete)))
+    for a, b in product(PLACES, PLACES):
+        if a != b:
+            act(f"move {a} -> {b}", [("at", "robot", a)], [("at", "robot", b)], [("at", "robot", a)])
+    act("open cupboard", [("at", "robot", "cupboard"), ("hand-empty",)], [("open", "cupboard")], [])
+    for thing, place in product(THINGS, PLACES):
+        pre = [("at", "robot", place), ("at", thing, place), ("hand-empty",)]
+        if place == "cupboard":
+            pre.append(("open", "cupboard"))
+        act(f"pick {thing} at {place}", pre, [("holding", thing)], [("at", thing, place), ("hand-empty",)])
+        act(f"place {thing} at {place}", [("at", "robot", place), ("holding", thing)],
+            [("at", thing, place), ("hand-empty",)], [("holding", thing)])
+    act("fill kettle", [("at", "robot", "sink"), ("holding", "kettle")], [("full", "kettle")], [])
+    act("boil kettle", [("at", "robot", "counter"), ("at", "kettle", "counter"), ("full", "kettle")],
+        [("hot", "kettle")], [])
+    act("pour tea", [("at", "robot", "counter"), ("holding", "kettle"), ("hot", "kettle"),
+                     ("at", "cup", "counter")], [("tea-in", "cup")], [])
+    return acts
+
+def bfs_plan(init, goal, acts):
+    """Breadth-first search over states: returns a shortest plan and the number of states seen."""
+    start = frozenset(init)
+    parent = {start: None}
+    queue = deque([start])
+    while queue:
+        s = queue.popleft()
+        if goal <= s:                                  # every goal fact is true
+            plan = []
+            while parent[s] is not None:
+                s, name = parent[s]
+                plan.append(name)
+            return plan[::-1], len(parent)
+        for name, pre, add, delete in acts:
+            if pre <= s:                               # applicable
+                t = (s - delete) | add
+                if t not in parent:
+                    parent[t] = (s, name)
+                    queue.append(t)
+    return None, len(parent)
+
+ACTS = actions()
+init = {("at", "robot", "table"), ("hand-empty",), ("at", "cup", "cupboard"), ("at", "kettle", "counter")}
+goal = frozenset({("tea-in", "cup"), ("at", "cup", "table")})
+plan, seen = bfs_plan(init, goal, ACTS)
+print(f"{len(ACTS)} ground actions; breadth-first search generated {seen} states")
+for i, step in enumerate(plan, 1):
+    print(f"{i:2d}. {step}")
+```
+
+The planner searched 387 states and found a 17-step plan, including steps a person would forget to write down: open the cupboard, put the cup on the counter so that both hands are free (this robot has one), and put the kettle down again before carrying the cup. Breadth-first search guarantees no shorter plan exists for this model. Whether the plan is *good* depends on the model: it assumes every action succeeds, takes the same time, and needs nothing the model does not mention.
+
+Small domains are easy. The next program counts the states of the classic **blocks world** (blocks on a table, stacked by a one-handed robot) and the work breadth-first search does to reverse a single tower.
+
+```python run
+from collections import deque
+
+# Blocks world with a gripper: a state is (stacks, held block). How fast does the state space grow?
+def successors(state):
+    stacks, held = state
+    out = []
+    if held is None:
+        for i, s in enumerate(stacks):                 # pick up the top block of any stack
+            rest = stacks[:i] + ((s[:-1],) if len(s) > 1 else ()) + stacks[i + 1:]
+            out.append((tuple(sorted(rest)), s[-1]))
+    else:
+        out.append((tuple(sorted(stacks + ((held,),))), None))          # put it on the table
+        for i, s in enumerate(stacks):                 # or stack it on any stack
+            out.append((tuple(sorted(stacks[:i] + (s + (held,),) + stacks[i + 1:])), None))
+    return out
+
+def bfs(start, goal=None):
+    seen, queue = {start: 0}, deque([start])
+    while queue:
+        s = queue.popleft()
+        if s == goal:
+            return seen[s], len(seen)
+        for t in successors(s):
+            if t not in seen:
+                seen[t] = seen[s] + 1
+                queue.append(t)
+    return None, len(seen)
+
+print(f"{'blocks':>6}{'reachable states':>18}{'reverse a tower: plan length':>30}{'states generated':>18}")
+for n in range(2, 8):
+    tower = tuple("ABCDEFG"[:n])
+    start, goal = ((tower,), None), ((tower[::-1],), None)
+    _, total = bfs(start)
+    length, generated = bfs(start, goal)
+    print(f"{n:6d}{total:18d}{length:30d}{generated:18d}")
+```
+
+Each extra block multiplies the number of states by more than the last (from about 4 to about 9 here), and with 7 blocks there are 65,990 states. A real household domain, with dozens of objects, places and appliances, is far too large for blind search. Planning for STRIPS problems is in fact PSPACE-complete in general (Tom Bylander, 1994), so no algorithm is fast on every instance.
+
+<Narrator who="chloe">
+
+Planners cope with the same trick as A* on grids: a heuristic from a **relaxed problem**. Ignore every action's delete list, so that facts, once true, stay true; the relaxed problem is much easier, and the length of a plan for it estimates the real distance to the goal. Planners such as FF (Jörg Hoffmann and Bernhard Nebel, 2001) and Fast Downward (Malte Helmert, 2006) are built on heuristics of this kind and solve problems with millions of states.
+
+</Narrator>
+
+</Section>
+
+<Section id="behaviour-trees" kind="human" title="Executing tasks: state machines and behaviour trees">
+
+A plan is a script, and scripts break: the cupboard door sticks, a grasp slips, a person walks into the way. The executive that runs a robot's skills must check conditions continually, retry what can be retried, recover from what can be recovered, and give up cleanly otherwise.
+
+The traditional tool is the **finite-state machine** (FSM): states such as "opening cupboard", "grasping", "carrying", and transitions labelled with events such as "door open" or "grasp failed". FSMs are simple and easy to verify, and industrial controllers have used them for decades (IEC 61131-3's sequential function charts are a form of them). But every recovery needs explicit transitions, and as a robot's repertoire grows the transitions multiply: adding a "battery low, go and charge" behaviour means a new transition out of every state. Reusing part of a machine elsewhere is awkward, because its transitions name states that may not exist in the new context.
+
+**Behaviour trees** came to robotics from computer games, where they were popularised by the AI of *Halo 2* (2004) to manage the behaviour of many characters. A behaviour tree has no transitions. Its structure says what to try, in what order, under what conditions, and the tick, sent from the root many times a second, re-evaluates the conditions every time. A subtree is a self-contained behaviour with one interface (it returns success, failure or running) and can be reused anywhere. Adding "charge when the battery is low" means adding one branch near the root, not editing every state.
+
+<Figure caption="A behaviour tree for bringing a cup to the table. The root sequence (→) runs its children in order. Each fallback (?) first checks whether its job is already done (ellipses are conditions) and only if not runs the action (boxes), wrapped in a retry decorator (hexagons) that allows up to three attempts. Because the tree is ticked from the root every cycle, a condition that becomes false, such as the cup slipping from the gripper, is noticed at once.">
+<svg viewBox="0 0 460 255" role="img" aria-label="A behaviour tree. The root is a sequence node with three children: two fallback nodes and an action, carry cup to table. The first fallback has a condition, cupboard open, and a retry decorator over the action open cupboard. The second fallback has a condition, holding cup, and a retry decorator over the action grasp cup.">
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="230" y1="42" x2="90" y2="80" />
+    <line x1="230" y1="42" x2="245" y2="80" />
+    <line x1="230" y1="42" x2="390" y2="80" />
+    <line x1="90" y1="108" x2="48" y2="145" />
+    <line x1="90" y1="108" x2="140" y2="147" />
+    <line x1="140" y1="173" x2="140" y2="200" />
+    <line x1="245" y1="108" x2="210" y2="145" />
+    <line x1="245" y1="108" x2="295" y2="147" />
+    <line x1="295" y1="173" x2="295" y2="200" />
+  </g>
+  <g fill="var(--card)" stroke="currentColor" strokeWidth="1.5">
+    <rect x="212" y="14" width="36" height="28" rx="3" />
+    <rect x="72" y="80" width="36" height="28" rx="3" />
+    <rect x="227" y="80" width="36" height="28" rx="3" />
+    <rect x="331" y="80" width="118" height="28" />
+    <ellipse cx="48" cy="160" rx="44" ry="15" />
+    <polygon points="110,160 120,147 160,147 170,160 160,173 120,173" />
+    <rect x="95" y="200" width="90" height="28" />
+    <ellipse cx="210" cy="160" rx="40" ry="15" />
+    <polygon points="265,160 275,147 315,147 325,160 315,173 275,173" />
+    <rect x="255" y="200" width="80" height="28" />
+  </g>
+  <g fill="currentColor" fontSize="16" fontWeight="bold">
+    <text x="221" y="34">→</text>
+    <text x="86" y="100">?</text>
+    <text x="241" y="100">?</text>
+  </g>
+  <g fill="currentColor" fontSize="11">
+    <text x="338" y="98">carry cup to table</text>
+    <text x="10" y="164">cupboard open?</text>
+    <text x="119" y="164">retry ×3</text>
+    <text x="101" y="218">open cupboard</text>
+    <text x="178" y="164">holding cup?</text>
+    <text x="274" y="164">retry ×3</text>
+    <text x="268" y="218">grasp cup</text>
+    <text x="10" y="250" fontSize="10">→ sequence   ? fallback   ellipse: condition   box: action   hexagon: decorator</text>
+  </g>
+</svg>
+</Figure>
+
+The next program is a complete behaviour-tree interpreter in about 80 lines, with conditions, actions that take several ticks, reactive sequences and fallbacks that **halt** running children when an earlier child changes its answer, and a retry decorator. The actions are scripted: the cupboard sticks on the first attempt, the first grasp fails, and at tick 8, while the cup is being carried, it slips out of the gripper.
+
+```python run
+SUCCESS, FAILURE, RUNNING = "SUCCESS", "FAILURE", "RUNNING"
+
+class Node:
+    def halt(self):                                  # stop a running node and reset it
+        pass
+
+class Condition(Node):
+    def __init__(self, name, test):
+        self.name, self.test = name, test
+    def tick(self):
+        return SUCCESS if self.test() else FAILURE
+
+class Action(Node):
+    """A skill that runs for a number of ticks, then succeeds or fails (scripted outcomes)."""
+    def __init__(self, name, ticks, outcomes, effect=None):
+        self.name, self.ticks, self.outcomes, self.effect = name, ticks, list(outcomes), effect
+        self.progress = 0
+    def tick(self):
+        self.progress += 1
+        if self.progress < self.ticks:
+            log.append(f"{self.name} (running)")
+            return RUNNING
+        self.progress = 0
+        ok = self.outcomes.pop(0) if self.outcomes else True
+        if ok and self.effect:
+            self.effect()
+        log.append(f"{self.name} -> {'SUCCESS' if ok else 'FAILURE'}")
+        return SUCCESS if ok else FAILURE
+    def halt(self):
+        if self.progress:
+            log.append(f"{self.name} halted")
+        self.progress = 0
+
+class Sequence(Node):
+    """Ticks children in order from the first, every tick (reactive): fails or runs with the first
+    child that fails or runs; succeeds if all succeed."""
+    def __init__(self, children):
+        self.children = children
+    def tick(self):
+        for i, child in enumerate(self.children):
+            status = child.tick()
+            if status != SUCCESS:
+                for later in self.children[i + 1:]:
+                    later.halt()
+                return status
+        return SUCCESS
+    def halt(self):
+        for child in self.children:
+            child.halt()
+
+class Fallback(Sequence):
+    """Tries children in order: succeeds or runs with the first child that does; fails if all fail."""
+    def tick(self):
+        for i, child in enumerate(self.children):
+            status = child.tick()
+            if status != FAILURE:
+                for later in self.children[i + 1:]:
+                    later.halt()
+                return status
+        return FAILURE
+
+class Retry(Node):
+    """Re-runs its child after a failure, up to `attempts` times in all."""
+    def __init__(self, attempts, child):
+        self.attempts, self.child, self.failures = attempts, child, 0
+    def tick(self):
+        status = self.child.tick()
+        if status == FAILURE:
+            self.failures += 1
+            if self.failures < self.attempts:
+                return RUNNING                       # try again on the next tick
+            self.failures = 0
+            return FAILURE
+        if status == SUCCESS:
+            self.failures = 0
+        return status
+    def halt(self):
+        self.child.halt()
+        self.failures = 0
+
+# The world, and a tree for "bring the cup to the table".
+world = {"cupboard open": False, "holding cup": False, "cup on table": False}
+def setter(key, value):
+    def effect():
+        world[key] = value
+    return effect
+
+tree = Sequence([
+    Fallback([Condition("cupboard open?", lambda: world["cupboard open"]),
+              Retry(3, Action("open cupboard", 1, [False, True], setter("cupboard open", True)))]),
+    Fallback([Condition("holding cup?", lambda: world["holding cup"]),
+              Retry(3, Action("grasp cup", 2, [False, True, True], setter("holding cup", True)))]),
+    Action("carry cup to table", 5, [True], setter("cup on table", True)),
+])
+
+for t in range(1, 30):
+    if t == 8:
+        world["holding cup"] = False                 # the cup slips while it is being carried
+        print("      (the cup slips out of the gripper)")
+    log = []
+    status = tree.tick()
+    print(f"tick {t:2d}: {status:8} " + "; ".join(log))
+    if status != RUNNING:
+        break
+```
+
+Follow the tick log. The first attempt to open the cupboard fails, and the retry decorator keeps the tree running so that the next tick tries again. The grasp fails once and is retried the same way. Carrying starts at tick 5. At tick 8 the cup slips: the tick reaches the "holding cup?" condition, which is now false, so the fallback runs the grasp again, and the sequence **halts** the carrying action, which was still in progress. The robot re-grasps and carries the cup from the start, finishing at tick 13. Nothing in the tree mentions slipping. The recovery falls out of its structure, because every tick re-checks what each action relies on.
+
+<Narrator who="gideon">
+
+"Reactive" has a cost and a condition. Re-checking conditions every tick is what caught the slip, but the conditions must be cheap and trustworthy: a noisy "holding cup?" that flickers false for one tick would halt and restart the carry for nothing. Real trees debounce such conditions, and a halted action must leave the robot in a safe state (stopping the arm, not freezing it mid-air with a hot drink).
+
+</Narrator>
+
+In practice, behaviour trees are written as XML and loaded by a library at run time. ROS 2's navigation stack, Nav2, runs its whole navigation logic (plan, follow, replan once a second, clear the costmap and back up on failure) as a [BehaviorTree.CPP](https://www.behaviortree.dev/) tree, and developers edit trees in the Groot graphical editor. The XML for the cup task would look roughly like this (not run here; the node names would be registered by the robot's own C++ code):
+
+```text
+<root BTCPP_format="4">
+  <BehaviorTree ID="BringCup">
+    <Sequence>
+      <Fallback>
+        <IsCupboardOpen/>
+        <RetryUntilSuccessful num_attempts="3"> <OpenCupboard/> </RetryUntilSuccessful>
+      </Fallback>
+      <Fallback>
+        <IsHoldingCup/>
+        <RetryUntilSuccessful num_attempts="3"> <GraspCup/> </RetryUntilSuccessful>
+      </Fallback>
+      <CarryCupTo place="table"/>
+    </Sequence>
+  </BehaviorTree>
+</root>
+```
+
+Planners and trees combine naturally. A planner can *generate* a tree (one branch per plan step, each guarded by its preconditions), which is what ROS 2's PlanSys2 framework does with the plans of PDDL planners; and a tree can *call* a planner as one of its actions, which is what Nav2's tree does with its path planner.
+
+</Section>
+
+<Section id="tamp" kind="human" title="Task and motion planning">
+
+The kitchen planner's "pick the cup" hid a question it could not answer: is there a grasp and an arm motion that actually reaches the cup, given everything else on the shelf? Symbolic plans can be geometrically impossible: the cup might be reachable only after moving the sugar jar, an action the plan never considered because, symbolically, nothing was in the way. Choices at the task level depend on choices at the motion level and the reverse: which grasp to use decides where the cup can be placed, which decides whether the next step is possible.
+
+**Task and motion planning** (TAMP) searches over both together. The symbolic actions gain continuous parameters (a grasp, a placement pose, a base position, a trajectory), and the planner must find values for them that are mutually consistent and collision-free, calling samplers and motion planners (the <LessonLink slug="sampling-based-planning">sampling-based planners</LessonLink> and <LessonLink slug="trajectory-optimisation">optimisers</LessonLink> of this level) as subroutines. Leslie Kaelbling, Tomás Lozano-Pérez and their students at MIT developed several influential approaches, including "hierarchical planning in the now" (2011) and PDDLStream (Caelan Garrett and colleagues, 2020), which extends PDDL with **streams**, generators of continuous values such as grasps and collision-free placements, so that an ordinary classical planner can drive the search. Other approaches cast the problem as one large optimisation with discrete choices (logic-geometric programming, from Marc Toussaint's group at TU Berlin and Stuttgart). The survey by Garrett and colleagues (2021) compares the main families.
+
+TAMP is powerful but slow for long tasks in cluttered scenes, which is why fielded robots usually fix many choices in advance (designated grasp poses, fixed placement spots) and leave genuine TAMP to the problems that need it, such as packing, assembly and rearranging clutter.
+
+</Section>
+
+<Section id="language-models" kind="human" title="Language models as task planners, 2022 to 2026">
+
+Writing PDDL domains and behaviour trees by hand is skilled work, and neither copes with instructions like "I spilled my drink, can you help?". Since 2022, robotics groups have tried using large language models (Lumenary CS's [language models](/en/cs/language-models/) lesson explains how they work) as task planners, because they encode a great deal of everyday knowledge about how tasks decompose.
+
+- **SayCan** (Robotics at Google and Everyday Robots, 2022) gave a mobile manipulator a library of learned skills. For an instruction, a language model scored how *useful* each skill would be as the next step, and a learned value function scored how likely each skill was to *succeed* from the current state; the robot executed the skill with the best product, then repeated. The language model supplied knowledge, the value function grounding.
+- **Inner Monologue** (2022) fed success detection, scene descriptions and human answers back to the model as text, so it could notice failures and replan. **Code as Policies** (2022) had the model write short Python programs calling perception and control functions, which naturally express loops, conditions and spatial reasoning.
+- **LLM+P** (2023) used the model only as a translator: from the user's request into a PDDL problem, solved by a classical planner, whose plan was translated back. The plans inherited the planner's correctness.
+
+Their limits were measured as carefully as their successes. Karthik Valmeekam, Subbarao Kambhampati and colleagues (2023) found that the language models of the time, asked to plan directly, solved only a minority of simple blocks-world problems and far fewer when the same problems were disguised with unfamiliar names, which suggested retrieval of familiar patterns more than search; their 2024 follow-up found the then-new "reasoning" models much better, but still unreliable on larger problems and far more expensive than a classical planner. A language model has no built-in notion of preconditions, so its plans can skip steps, invent objects or skills the robot does not have, and compound small errors over long horizons, and it cannot certify that a plan is correct.
+
+By 2026, two patterns dominate. In **hierarchical** systems, a large vision-language model plans in words or code and a learned low-level policy (the <LessonLink slug="vision-language-action-models">vision-language-action models</LessonLink> of the Frontier level) executes each step, with the planner watching the camera to decide what to do next. In **verified** systems, the model's output is constrained (to a fixed skill library, a PDDL problem, a behaviour tree) and checked by something that knows the rules (a planner, a simulator, a validator) before the robot moves. Both keep classical machinery where guarantees matter: a language model may choose *what* to do, but collision checking, safety monitoring and the behaviour tree's guards decide *whether* it is done.
+
+<Narrator who="margaret">
+
+A useful way to read any claim about language-model planners: what fraction of tasks succeeded, of how many, in how many distinct environments, and was the success judged by a person, a script or the robot? Early papers reported success rates over a hundred or so instructions in one or two kitchens; the evaluation questions are the subject of the <LessonLink slug="evaluation-safety-and-deployment">evaluation and deployment lesson</LessonLink>.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A task plan is ready to execute."** It is only as good as its model. Every step must still be grounded (a grasp, a trajectory, a check that it worked), and the executive must handle steps that fail. Plans are executed under monitoring, and replanned when the world departs from the model.
+
+</Misconception>
+
+<Misconception>
+
+**"Behaviour trees are just state machines drawn differently."** Any behaviour tree can be compiled into a state machine, but the way they are written differs: a tree has no explicit transitions, re-evaluates its conditions on every tick, and composes from reusable subtrees with one interface. That is what keeps large behaviours maintainable. State machines remain a good choice for small, fixed sequences that must be easy to certify.
+
+</Misconception>
+
+<Misconception>
+
+**"A sequence remembers where it got to."** In the classical, reactive definition used here, a sequence restarts from its first child on every tick, re-checking everything; that is what caught the slipping cup. Libraries also offer sequences *with memory*, which skip children that already succeeded. Knowing which one a tree uses matters, because they behave differently when the world changes.
+
+</Misconception>
+
+<Misconception>
+
+**"Language models have made symbolic planning obsolete."** They supply broad knowledge and a natural interface, but on their own they offer no guarantee that a plan's steps are possible, safe or complete. The strongest systems of 2026 combine them with symbolic models, planners, verifiers and behaviour trees rather than replacing those.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises run in your browser.
+
+<Exercises/>
+
+</Section>
