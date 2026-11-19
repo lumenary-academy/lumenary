@@ -1,0 +1,675 @@
+---
+title: "Project: text statistics, tests and speed"
+subtitle: A complete x86-64 program in idiomatic style, a test harness for it, a SIMD version of its inner loop, and where to go next.
+minutes: 75
+objectives:
+  - Design a multi-function assembly program with a clear register plan and documented interfaces
+  - Use GNU assembler macros, local labels, tail calls and branch-free idioms where they help
+  - Test assembly functions with a table-driven harness that sets the exit status
+  - Speed up a byte-counting loop with SSE2 vector instructions, and know how to measure the result
+  - Plan further study in systems, security, compilers or performance
+prerequisites: [stack-and-calling-convention, system-calls, calling-c-and-compiler-output]
+references:
+  - title: Using as, Macros (.macro)
+    url: https://sourceware.org/binutils/docs/as/Macro.html
+    note: Parameters, default values and local labels inside GNU assembler macros.
+  - title: Debugging with GDB
+    url: https://sourceware.org/gdb/documentation/
+    note: The official manual; the chapters on stepping by instruction and examining memory are the ones assembly programmers use most.
+  - title: Software optimization resources
+    author: Agner Fog
+    url: https://www.agner.org/optimize/
+    note: Free manuals on optimising assembly, microarchitecture details and instruction timing tables.
+  - title: uops.info
+    url: https://uops.info/
+    note: Measured latency, throughput and port usage of x86 instructions on many processor generations.
+  - title: "Computer Systems: A Programmer's Perspective"
+    author: Randal E. Bryant and David R. O'Hallaron
+    url: https://csapp.cs.cmu.edu/
+    note: A widely used textbook that connects C, x86-64 assembly, memory, linking and operating systems.
+  - title: NASM, the Netwide Assembler
+    url: https://www.nasm.us/
+    note: A popular alternative assembler with its own Intel-style syntax, used by projects such as FFmpeg.
+---
+
+<Section id="motivation" kind="motivation" title="Putting it all together">
+
+You now have every piece needed for a real program: registers and arithmetic, memory and addressing, loops and decisions, functions that follow the calling convention, and system calls for output. This lesson combines them into a small but complete tool, **textstats**, which reads a built-in text and reports its size, its lines and words, its longest word, its most common letter, and a bar chart of its vowels.
+
+Then we do what professionals do after the first version works: we **test** it with a table of cases, and we **speed up** its inner loop with vector instructions, checking that the fast version gives the same answers as the simple one. The lesson ends with a map of where assembly knowledge leads next.
+
+The program has no input, by design: the text is embedded in the executable, so that it runs identically everywhere. Reading a file instead is a small change (an `openat`, a loop of `read` calls into a buffer, a `close`), and is the first exercise to try on your own machine.
+
+</Section>
+
+<Section id="computation" kind="computation" title="The program">
+
+```asm check
+        .intel_syntax noprefix
+
+# textstats: line, word and letter statistics for a built-in text.
+# A "word" here is a run of letters (A-Z, a-z); everything else separates words.
+
+        .equ    SYS_WRITE, 1
+        .equ    SYS_EXIT, 60
+
+        # Print a string defined with a label and a length constant.
+        .macro  PRINT label, length
+        lea     rdi, [rip + \label]
+        mov     esi, \length
+        call    print_str
+        .endm
+
+        .section .rodata
+text:   .ascii  "The lamp is small, but the harbour is wide.\n"
+        .ascii  "Every ship that comes home at night\n"
+        .ascii  "follows a light it cannot touch,\n"
+        .ascii  "and trusts the keeper who stays awake.\n"
+        .equ    TEXT_LEN, . - text
+
+s_bytes:   .ascii "bytes:   "
+s_lines:   .ascii "lines:   "
+s_words:   .ascii "words:   "
+s_longest: .ascii "longest: "
+s_top:     .ascii "top:     "
+        .equ    LABEL_LEN, 9
+vowels: .ascii  "aeiou"
+
+        .section .bss
+        .balign 8
+counts: .skip   26 * 8          # one 8-byte counter per letter a..z
+line:   .skip   64              # scratch space for one histogram line
+
+        .text
+        .globl  _start
+_start:
+        lea     rdi, [rip + text]
+        mov     esi, TEXT_LEN
+        call    scan                # rax = lines, rdx = words, rcx = longest word
+        mov     r12, rax
+        mov     r13, rdx
+        mov     r14, rcx
+
+        PRINT   s_bytes, LABEL_LEN
+        mov     edi, TEXT_LEN
+        call    print_u64
+        PRINT   s_lines, LABEL_LEN
+        mov     rdi, r12
+        call    print_u64
+        PRINT   s_words, LABEL_LEN
+        mov     rdi, r13
+        call    print_u64
+        PRINT   s_longest, LABEL_LEN
+        mov     rdi, r14
+        call    print_u64
+
+        # The most common letter: the index of the largest counter.
+        lea     rsi, [rip + counts]
+        xor     ecx, ecx            # i
+        xor     ebx, ebx            # best index so far
+.Lbest:
+        mov     rax, [rsi + rcx*8]
+        cmp     rax, [rsi + rbx*8]
+        cmova   ebx, ecx            # strictly greater: ties keep the earlier letter
+        inc     ecx
+        cmp     ecx, 26
+        jb      .Lbest
+        PRINT   s_top, LABEL_LEN
+        mov     edi, ebx
+        call    print_bar
+
+        # A bar for each vowel.
+        xor     r15d, r15d
+.Lvowel:
+        lea     rax, [rip + vowels]
+        movzx   edi, BYTE PTR [rax + r15]
+        sub     edi, 'a'
+        call    print_bar
+        inc     r15d
+        cmp     r15d, 5
+        jb      .Lvowel
+
+        mov     eax, SYS_EXIT
+        xor     edi, edi
+        syscall
+
+# scan(text: rdi, length: rsi) -> rax = lines, rdx = words, rcx = longest word.
+# Also adds every letter to counts[].
+scan:
+        xor     eax, eax            # lines
+        xor     edx, edx            # words
+        xor     ecx, ecx            # longest
+        xor     r8d, r8d            # length of the current word (0 = not in a word)
+        lea     r10, [rip + counts]
+        test    rsi, rsi
+        jz      .Lend
+.Lchar:
+        movzx   r9d, BYTE PTR [rdi]
+        cmp     r9d, 10
+        jne     .Lnot_newline
+        inc     rax                 # count lines by their newline characters
+.Lnot_newline:
+        mov     r11d, r9d
+        or      r11d, 0x20          # fold A-Z onto a-z (other bytes may change too...)
+        sub     r11d, 'a'
+        cmp     r11d, 25            # ...so check: is it now in a..z? (unsigned trick)
+        ja      .Lnot_letter
+        inc     QWORD PTR [r10 + r11*8]
+        test    r8, r8
+        jnz     .Lsame_word
+        inc     rdx                 # first letter of a new word
+.Lsame_word:
+        inc     r8
+        cmp     r8, rcx
+        cmova   rcx, r8             # longest = max(longest, current)
+        jmp     .Lnext
+.Lnot_letter:
+        xor     r8d, r8d            # any other byte ends the word
+.Lnext:
+        inc     rdi
+        dec     rsi
+        jnz     .Lchar
+.Lend:
+        ret
+
+# print_bar(letter index: rdi) -- prints "x NN ####" with one # per occurrence
+print_bar:
+        lea     rsi, [rip + counts]
+        mov     r8, [rsi + rdi*8]   # the count
+        lea     r9, [rip + line]
+        lea     eax, [rdi + 'a']
+        mov     [r9], al
+        mov     BYTE PTR [r9 + 1], ' '
+        mov     rax, r8             # two-digit count (the text is short)
+        xor     edx, edx
+        mov     ecx, 10
+        div     rcx
+        add     eax, '0'
+        cmp     eax, '0'
+        jne     .Ltens
+        mov     eax, ' '            # a space instead of a leading zero
+.Ltens:
+        add     edx, '0'
+        mov     [r9 + 2], al
+        mov     [r9 + 3], dl
+        mov     BYTE PTR [r9 + 4], ' '
+        lea     rdi, [r9 + 5]
+        test    r8, r8
+        jz      .Lbar_done
+.Lhash:
+        mov     BYTE PTR [rdi], '#'
+        inc     rdi
+        dec     r8
+        jnz     .Lhash
+.Lbar_done:
+        mov     BYTE PTR [rdi], 10
+        lea     rsi, [rdi + 1]
+        sub     rsi, r9             # length
+        mov     rdi, r9
+        jmp     print_str           # tail call
+
+# print_str(address: rdi, length: rsi)
+print_str:
+        mov     rdx, rsi
+        mov     rsi, rdi
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        syscall
+        ret
+
+# print_u64(n: rdi) -- decimal and a newline
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+bytes:   152
+lines:   4
+words:   29
+longest: 7
+top:     t 15 ###############
+a 11 ###########
+e 12 ############
+i  7 #######
+o  8 ########
+u  4 ####
+```
+
+We checked the numbers independently with a few lines of Python, which is a good habit for any program whose output you cannot check by eye.
+
+### Reading the design
+
+**Interfaces first.** Every function starts with a comment giving its arguments, its results and any memory it changes, in calling-convention registers. `scan` returns three results, in `rax`, `rdx` and `rcx`. That is fine between our own functions; a function meant to be called from C can return at most two integer registers (`rax` and `rdx`), so a C-callable version would fill a structure instead.
+
+**A register plan.** `_start` keeps the three statistics in `r12`, `r13` and `r14`, callee-saved registers, because it calls `print_str` and `print_u64` between computing and printing them. Inside `scan`, every working value lives in a caller-saved register (`r8` to `r11` among them), so `scan` saves nothing.
+
+**One pass.** `scan` looks at each byte once and updates everything at the same time: the line count, the word count, the current word's length, the longest word and the letter counters. Text processing in any language is usually fastest written this way.
+
+**Two small tricks.** To test "is this a letter?", the code sets bit 5 of the byte with `or r11d, 0x20`, which turns `A`–`Z` into `a`–`z` and leaves `a`–`z` alone, then subtracts `'a'` and does one **unsigned** comparison against 25. Anything that was below `a` becomes a huge unsigned number, so a single `ja` rejects everything that is not a letter. The same "subtract the lower bound, compare unsigned" pattern turns any range check into one comparison, and compilers use it constantly. Second, the maximums use `cmova` instead of a branch, as in lesson 4.
+
+**A macro.** The GNU assembler's `.macro … .endm` defines a named template; `PRINT s_bytes, LABEL_LEN` expands to the three lines inside, with `\label` and `\length` replaced. Macros remove repetition without the cost of a call. Use them sparingly: when something goes wrong, the debugger shows the expanded instructions, not your macro.
+
+**A tail call.** `print_bar` ends with `jmp print_str` instead of `call` and `ret`, so `print_str`'s `ret` returns directly to `print_bar`'s caller.
+
+**Honest limits.** `print_bar` prints counts as two characters and its line buffer holds 64 bytes, so it assumes no letter appears more than 58 times. That is true for this text and false for a novel. Production code would check, or scale the bars; this kind of hidden assumption is exactly what the tests in the next section are for.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Testing assembly">
+
+Assembly has no test framework built in, but the idea of a unit test needs none: call the function with known inputs and compare the results with expected values. A **table-driven** harness keeps the cases as data, so adding a case means adding one line. Each row below holds a text, its length, a name, and the expected lines, words and longest word; the harness prints one line per case and exits with status 1 if anything failed, so that a build script or continuous-integration job notices.
+
+```asm check
+        .intel_syntax noprefix
+
+# Unit tests for scan(): each case gives a text and the expected
+# lines, words and longest word. Prints one line per case and a summary.
+
+        .equ    SYS_WRITE, 1
+        .equ    SYS_EXIT, 60
+
+        .section .rodata
+t_empty:  .ascii ""
+t_one:    .ascii "one"
+t_spaces: .ascii "  two  words\n"
+t_blank:  .ascii "Hello, World!\n\n"
+t_apos:   .ascii "it's"
+t_end:
+
+n_empty:  .ascii "empty   "
+n_one:    .ascii "one     "
+n_spaces: .ascii "spaces  "
+n_blank:  .ascii "blank   "
+n_apos:   .ascii "apos    "
+        .equ    NAME_LEN, 8
+
+        .balign 8
+        # text, length, name, expected lines, words, longest
+cases:  .quad   t_empty,  t_one - t_empty,    n_empty,  0, 0, 0
+        .quad   t_one,    t_spaces - t_one,   n_one,    0, 1, 3
+        .quad   t_spaces, t_blank - t_spaces, n_spaces, 1, 2, 5
+        .quad   t_blank,  t_apos - t_blank,   n_blank,  2, 2, 5
+        .quad   t_apos,   t_end - t_apos,     n_apos,   0, 2, 2
+        .equ    CASE_SIZE, 6 * 8
+        .equ    CASES, (. - cases) / CASE_SIZE
+
+s_ok:     .ascii "ok\n"
+s_fail:   .ascii "FAIL\n"
+s_passed: .ascii "passed: "
+s_failed: .ascii "failed: "
+        .equ    TOTAL_LEN, 8
+
+        .section .bss
+        .balign 8
+counts: .skip   26 * 8
+
+        .text
+        .globl  _start
+_start:
+        lea     rbx, [rip + cases]  # rbx = current case
+        mov     r12d, CASES         # cases left
+        xor     r13d, r13d          # passed
+        xor     r14d, r14d          # failed
+.Lcase:
+        mov     rdi, [rbx]          # text
+        mov     rsi, [rbx + 8]      # length
+        call    scan
+        xor     r15d, r15d          # r15 = 0 if everything matches
+        cmp     rax, [rbx + 24]
+        setne   r15b
+        cmp     rdx, [rbx + 32]
+        setne   r8b
+        or      r15b, r8b
+        cmp     rcx, [rbx + 40]
+        setne   r8b
+        or      r15b, r8b
+
+        mov     rdi, [rbx + 16]     # the case's name
+        mov     esi, NAME_LEN
+        call    print_str
+        lea     rdi, [rip + s_ok]   # then "ok" or "FAIL"
+        mov     esi, 3
+        lea     rax, [rip + s_fail]
+        mov     ecx, 5
+        test    r15d, r15d
+        cmovnz  rdi, rax
+        cmovnz  esi, ecx
+        call    print_str
+
+        inc     r13                 # count a pass...
+        add     r14, r15            # ...or a failure
+        sub     r13, r15
+        add     rbx, CASE_SIZE
+        dec     r12d
+        jnz     .Lcase
+
+        lea     rdi, [rip + s_passed]
+        mov     esi, TOTAL_LEN
+        call    print_str
+        mov     rdi, r13
+        call    print_u64
+        lea     rdi, [rip + s_failed]
+        mov     esi, TOTAL_LEN
+        call    print_str
+        mov     rdi, r14
+        call    print_u64
+
+        mov     eax, SYS_EXIT
+        xor     edi, edi
+        test    r14, r14
+        setnz   dil                 # exit status 1 if any test failed
+        syscall
+
+# scan(text: rdi, length: rsi) -> rax = lines, rdx = words, rcx = longest word.
+# (Exactly the function from the textstats program.)
+scan:
+        xor     eax, eax
+        xor     edx, edx
+        xor     ecx, ecx
+        xor     r8d, r8d
+        lea     r10, [rip + counts]
+        test    rsi, rsi
+        jz      .Lend
+.Lchar:
+        movzx   r9d, BYTE PTR [rdi]
+        cmp     r9d, 10
+        jne     .Lnot_newline
+        inc     rax
+.Lnot_newline:
+        mov     r11d, r9d
+        or      r11d, 0x20
+        sub     r11d, 'a'
+        cmp     r11d, 25
+        ja      .Lnot_letter
+        inc     QWORD PTR [r10 + r11*8]
+        test    r8, r8
+        jnz     .Lsame_word
+        inc     rdx
+.Lsame_word:
+        inc     r8
+        cmp     r8, rcx
+        cmova   rcx, r8
+        jmp     .Lnext
+.Lnot_letter:
+        xor     r8d, r8d
+.Lnext:
+        inc     rdi
+        dec     rsi
+        jnz     .Lchar
+.Lend:
+        ret
+
+print_str:
+        mov     rdx, rsi
+        mov     rsi, rdi
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        syscall
+        ret
+
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, SYS_WRITE
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+empty   ok
+one     ok
+spaces  ok
+blank   ok
+apos    ok
+passed: 5
+failed: 0
+```
+
+The cases are chosen the way good tests are always chosen: the **empty input** (does the loop survive a length of zero?), a word with **no newline** at the end, **leading and repeated spaces**, a text that ends in a **blank line**, and a **design decision** made visible. Our definition of a word is a run of letters, so `it's` counts as two words, `it` and `s`. That might be the wrong choice for your purpose, but the test documents it, and anyone who changes the rule will see this test fail and must decide deliberately.
+
+Notice also the `setne`/`or` sequence that combines three comparisons into one pass/fail flag without branches, and the summary arithmetic: `r13` and `r14` are updated by adding the failure flag rather than by jumping.
+
+In a larger project you would test assembly from C: link the assembly file with a C test program, use a C unit-test library, and compare every assembly function against a plain C **reference implementation** on thousands of random inputs. That last technique, differential testing, catches the bugs that hand-picked cases miss, and fuzzers such as libFuzzer automate it.
+
+</Section>
+
+<Section id="performance" kind="computation" title="Sixteen bytes at a time">
+
+The inner loop of `scan` handles one byte per iteration. For a few hundred bytes that is instant; for a gigabyte log file it is the whole running time. The classic way to go faster is **SIMD** (single instruction, multiple data): the `xmm` registers hold 16 bytes, and instructions such as `pcmpeqb` compare all 16 against 16 others at once.
+
+This program counts the occurrences of one byte both ways. It uses only SSE2 instructions, which every x86-64 processor has.
+
+```asm check
+        .intel_syntax noprefix
+
+# Count how often a byte occurs in a text: once a byte at a time,
+# and once sixteen bytes at a time with SSE2 vector instructions.
+
+        .section .rodata
+text:   .ascii  "The lamp is small, but the harbour is wide.\n"
+        .ascii  "Every ship that comes home at night\n"
+        .ascii  "follows a light it cannot touch,\n"
+        .ascii  "and trusts the keeper who stays awake.\n"
+        .equ    TEXT_LEN, . - text
+
+        .text
+        .globl  _start
+_start:
+        lea     rdi, [rip + text]
+        mov     esi, TEXT_LEN
+        mov     edx, 'e'
+        call    count_scalar
+        mov     rdi, rax
+        call    print_u64
+
+        lea     rdi, [rip + text]
+        mov     esi, TEXT_LEN
+        mov     edx, 'e'
+        call    count_sse2
+        mov     rdi, rax
+        call    print_u64
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# count_scalar(text: rdi, length: rsi, byte: dl) -> rax
+count_scalar:
+        xor     eax, eax
+        test    rsi, rsi
+        jz      2f
+1:      cmp     [rdi], dl
+        sete    cl                  # cl = 1 if equal, else 0
+        movzx   ecx, cl
+        add     rax, rcx            # no branch to mispredict
+        inc     rdi
+        dec     rsi
+        jnz     1b
+2:      ret
+
+# count_sse2(text: rdi, length: rsi, byte: dl) -> rax
+count_sse2:
+        movd    xmm1, edx           # broadcast the byte to all 16 lanes of xmm1
+        punpcklbw xmm1, xmm1
+        punpcklwd xmm1, xmm1
+        pshufd  xmm1, xmm1, 0
+        pxor    xmm3, xmm3          # xmm3 = all zeros
+        pxor    xmm4, xmm4          # xmm4 = two 64-bit running totals
+        mov     rcx, rsi
+        shr     rcx, 4              # number of whole 16-byte blocks
+        jz      .Lcombine
+.Lblock:
+        movdqu  xmm0, [rdi]         # load 16 bytes (no alignment needed)
+        pcmpeqb xmm0, xmm1          # each byte: 0xFF if equal, 0x00 if not
+        pxor    xmm2, xmm2
+        psubb   xmm2, xmm0          # 0 - 0xFF = 1: now each byte is 1 or 0
+        psadbw  xmm2, xmm3          # add up each group of 8 bytes into a 64-bit lane
+        paddq   xmm4, xmm2
+        add     rdi, 16
+        dec     rcx
+        jnz     .Lblock
+.Lcombine:
+        pshufd  xmm0, xmm4, 0x4E    # swap the two 64-bit halves
+        paddq   xmm4, xmm0
+        movq    rax, xmm4           # rax = count over the whole blocks
+        and     esi, 15             # 0..15 bytes are left over
+        jz      .Ldone
+.Ltail:
+        cmp     [rdi], dl
+        sete    cl
+        movzx   ecx, cl
+        add     rax, rcx
+        inc     rdi
+        dec     esi
+        jnz     .Ltail
+.Ldone:
+        ret
+
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints `11` twice: the text contains eleven lowercase `e`s, and both methods agree.
+
+How `count_sse2` works, one block of 16 bytes at a time:
+
+1. Before the loop, the target byte is copied into all 16 lanes of `xmm1` (the `punpck…` and `pshufd` steps).
+2. `pcmpeqb` compares the 16 text bytes with the 16 copies, producing `0xFF` in each lane that matched and `0x00` elsewhere.
+3. Subtracting that from zero turns each `0xFF` into `1`.
+4. `psadbw` ("sum of absolute differences") against a zero register adds up each group of 8 bytes into a 64-bit number, so a whole block is counted in one instruction, and `paddq` accumulates.
+5. After the loop, the two 64-bit halves are added together, and a scalar loop handles the last 0 to 15 bytes.
+
+The text is 152 bytes: nine blocks of 16 and a tail of 8. Notice that even the scalar version avoids branching on the data: `sete` turns the comparison into 0 or 1 and adds it.
+
+### Measuring, not guessing
+
+How much faster is the vector version? On 152 bytes the question is meaningless: both finish in well under a microsecond, and the program's start-up costs far more. To measure, you would run each function over many megabytes, many times, and use `perf stat` on Linux to read cycles and instructions, or time it from a C benchmark harness. On large inputs a loop like `count_sse2` typically processes several times more bytes per cycle than the scalar loop, and a version with 32-byte AVX2 registers goes further. But the honest professional answer is always "measure it on the target machine": memory bandwidth, alignment and the processor generation all change the result. Tools such as `llvm-mca` and the tables at uops.info help you predict, and `perf` tells you what really happened.
+
+It is also worth knowing when to stop. A modern C compiler will often vectorise a simple counting loop by itself at `-O3`, and C intrinsics such as `_mm_cmpeq_epi8` give you SIMD control without writing assembly. Hand-written SIMD assembly is justified for the hottest loops of libraries used by millions, which is exactly where you find it: in codecs, compression libraries, string libraries and cryptography.
+
+</Section>
+
+<Section id="human" kind="human" title="How professionals work with assembly">
+
+**Keep it small and isolated.** Professional assembly is a handful of functions behind a C interface, each with a portable C version beside it. The C version is the reference for tests, the fallback for other architectures, and the documentation of what the assembly is supposed to do.
+
+**Document the register plan.** Every function states its inputs, outputs, clobbered registers and assumptions (alignment, maximum length, whether the length may be zero). In assembly, the comments are the type system.
+
+**Step through everything once.** `gdb` with `layout asm` and `layout regs`, `stepi`, `info registers` and `x/16xb $rsi` shows exactly what each instruction did. Watch a new loop through its first iteration, its last iteration and an empty input.
+
+**Know the pitfalls of your assembler.** One we met while writing this course: in GNU `as` Intel-syntax mode, a constant used in an instruction **before** its `.equ` line is treated as a memory address, so `mov r13d, COUNT` with `COUNT` defined at the end of the file assembled into a load from address 7 and the program crashed. Defining constants before the code that uses them, as every program in this course does, avoids it. Other teams prefer NASM, whose Intel-style syntax is a little different (`mov eax, [msg]` with no `PTR`, `section .data`, `%macro`); the concepts carry over unchanged.
+
+**Test across machines.** Instruction-set extensions differ: SSE2 is guaranteed on x86-64, but AVX2 and AVX-512 are not. Real libraries detect the processor's features at run time with `cpuid` and choose the best version of each function.
+
+</Section>
+
+<Section id="reading" kind="reading" title="Where to go next">
+
+Assembly opens several doors. Pick the one that fits your interests:
+
+- **Systems and operating systems.** Write a tiny boot loader or kernel that runs in QEMU; the [OSDev wiki](https://wiki.osdev.org/) is the community's reference. *Computer Systems: A Programmer's Perspective* ([csapp.cs.cmu.edu](https://csapp.cs.cmu.edu/)) connects assembly to linking, memory and processes, and its labs are famous. [Nand to Tetris](https://www.nand2tetris.org/) builds a whole computer from logic gates up to a compiler.
+- **Security.** Exploitation and reverse engineering are mostly assembly reading. [pwn.college](https://pwn.college/) offers free, hands-on modules, and the free reverse-engineering suite [Ghidra](https://ghidra-sre.org/) is the standard starting tool.
+- **Performance engineering.** Agner Fog's [optimisation manuals](https://www.agner.org/optimize/) and [uops.info](https://uops.info/) explain why code runs as fast as it does. Pair them with `perf` and Compiler Explorer.
+- **Compilers.** The Lumenary CS lesson on [compilers and interpreters](/en/cs/compilers-and-interpreters/) shows how languages are translated; reading [Compiler Explorer](https://godbolt.org/) output for the languages you use daily keeps the connection alive.
+- **Other architectures.** The cross toolchains and QEMU from <LessonLink slug="arm64-and-risc-v">the previous lesson</LessonLink> let you redo this project in AArch64 or RISC-V, which is the best way to learn a second assembly language.
+- **Reference.** Keep Intel's [Software Developer's Manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html) and the [System V ABI](https://gitlab.com/x86-psABIs/x86-64-ABI) within reach; when a tutorial and the manual disagree, the manual wins.
+
+Above all, keep reading the assembly that your compilers produce. Every time you check a hunch on Compiler Explorer, you practise everything this course taught.
+
+<Reflection title="Faithful in small things">
+
+An assembly program is built from instructions that each do almost nothing: move eight bytes, add two numbers, compare. Nothing impressive happens in any single line, and yet a careful sequence of them prints a chart, counts a text, or runs a spacecraft. There is something here that many traditions, Christian among them, have noticed about ordinary life: that faithfulness in very small things is not separate from great things but is what they are made of. A misplaced byte crashes the program; a single honest test catches the bug. The patient, unglamorous care you practised in these lessons is worth keeping, in code and outside it.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes in larger programs">
+
+<Misconception>
+
+**Assuming the data will stay small.** Fixed-size buffers, two-digit printing and 32-bit counters are fine in a demonstration and dangerous in a tool. Write the limit down next to the code, check it, or remove it.
+
+</Misconception>
+
+<Misconception>
+
+**Optimising before testing.** A fast function that gives wrong answers is worthless. Write the simple version, test it, keep it as the reference, and only then write the fast version and test that it agrees with the simple one on many inputs, including lengths that are not multiples of 16.
+
+</Misconception>
+
+<Misconception>
+
+**Believing a micro-benchmark on a tiny input.** Timing 152 bytes measures start-up, cache warming and timer resolution, not your loop. Benchmark on realistic sizes, repeat, and report the spread as well as the average.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Every output below was checked by running the program or the variant described.
+
+<Exercises/>
+
+</Section>

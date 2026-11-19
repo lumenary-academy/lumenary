@@ -1,0 +1,434 @@
+---
+title: ARM64 and RISC-V
+subtitle: Two younger instruction sets compared with x86-64, from registers and encodings to calls, system calls and memory ordering.
+minutes: 60
+objectives:
+  - Explain what a load/store architecture is, and how fixed-length encodings differ from x86-64's variable lengths
+  - Read short AArch64 and RISC-V programs and map them onto their x86-64 equivalents
+  - Compare how each architecture handles comparisons, calls and returns, and system calls on Linux
+  - Describe the calling conventions of AArch64 and RISC-V at the level needed to read a debugger
+  - Explain why weaker memory ordering on ARM and RISC-V matters for concurrent code
+prerequisites: [calling-c-and-compiler-output]
+references:
+  - title: Arm A-profile A64 Instruction Set Architecture
+    author: Arm
+    url: https://developer.arm.com/documentation/
+    note: Arm's official documentation portal, where the A64 instruction reference and the Arm Architecture Reference Manual live.
+  - title: RISC-V Ratified Specifications
+    author: RISC-V International
+    url: https://riscv.org/specifications/
+    note: The unprivileged and privileged ISA specifications, free to download.
+  - title: RISC-V ELF psABI
+    url: https://github.com/riscv-non-isa/riscv-elf-psabi-doc
+    note: The RISC-V calling convention and register names used here.
+  - title: Procedure Call Standard for the Arm 64-bit Architecture (AAPCS64)
+    url: https://github.com/ARM-software/abi-aa
+    note: The AArch64 calling convention, in Arm's ABI repository.
+  - title: QEMU user-mode emulation
+    url: https://www.qemu.org/docs/master/user/main.html
+    note: How qemu-aarch64 and qemu-riscv64 run Linux programs for another architecture on your x86-64 machine.
+---
+
+<Section id="motivation" kind="motivation" title="One idea, three dialects">
+
+Everything you have learned so far, registers, memory, flags or comparisons, calls, the stack and system calls, exists on every processor. The details do not. Your phone almost certainly runs an **ARM64** (AArch64) processor; so do Apple's Macs since 2020, the Raspberry Pi, and a growing share of cloud servers such as AWS's Graviton machines. **RISC-V**, an open instruction set that anyone may implement without a licence fee, is spreading quickly through microcontrollers, storage controllers, research chips and, increasingly, application processors.
+
+You will not become fluent in two more assembly languages in one lesson. The aim is narrower and more useful: to be able to **read** short AArch64 and RISC-V code, to know what is different from x86-64 and why, and to know where to look things up. When a crash report from an Android phone or a Graviton server shows you a few lines of disassembly, you should recognise the shapes.
+
+The ARM64 and RISC-V programs in this lesson are shown for reading. They are not run by this course's checker, which runs x86-64 only, so they are shown without output. The final section explains how to run them yourself with a cross-assembler and QEMU.
+
+</Section>
+
+<Section id="history" kind="history" title="CISC, RISC and two families">
+
+x86 grew from the 8086, designed in the late 1970s when memory was expensive and many programs were still written by hand in assembly. Its instructions do a lot each (an `add` can read memory, compute an address with scaling and add, all at once) and are encoded in anywhere from 1 to 15 bytes to save space. Designs like this were later called **CISC**, complex instruction set computers.
+
+In the early 1980s, research groups led by David Patterson at Berkeley (RISC) and John Hennessy at Stanford (MIPS) argued for the opposite: few, simple, regular instructions that a pipelined processor can decode and run quickly, with compilers doing the clever work. That is **RISC**, reduced instruction set computing. Its typical traits are many registers, instructions of a single fixed size, and a **load/store** design in which only load and store instructions touch memory; arithmetic works on registers only.
+
+**ARM** began at Acorn Computers in Cambridge, England, where Sophie Wilson and Steve Furber designed the first ARM processor, which ran in 1985. Its low power use made it the natural choice for mobile devices. The 64-bit architecture, **AArch64** (its instruction set is called A64), was announced in 2011 with ARMv8-A, and is a clean redesign rather than an extension of the 32-bit instruction set.
+
+**RISC-V** started in 2010 at UC Berkeley, in a group including Krste Asanović, Yunsup Lee, Andrew Waterman and David Patterson, who wanted a simple, open instruction set for research and teaching. It is now maintained by RISC-V International. It is **modular**: a small base integer set (RV32I or RV64I) plus optional standard extensions, named by letters, such as M (multiply and divide), A (atomics), F and D (floating point), C (compressed 16-bit instructions) and V (vectors). A Linux-capable 64-bit chip typically implements the bundle known as RV64GC.
+
+Today the CISC/RISC line is blurry. Modern x86 processors translate their instructions internally into simple RISC-like micro-operations, and AArch64 has some quite rich instructions. The differences that remain visible are the ones you meet in the code.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Side by side">
+
+<Definition term="load/store architecture">
+
+A **load/store architecture** is one in which only explicit load and store instructions access memory; every arithmetic and logic instruction takes its operands from registers (or small constants) and writes its result to a register. ARM64 and RISC-V are load/store architectures; x86-64 is not.
+
+</Definition>
+
+| | x86-64 | AArch64 | RISC-V (RV64) |
+| --- | --- | --- | --- |
+| General registers | 16 (`rax` … `r15`) | 31 (`x0`–`x30`), plus `sp` and the zero register `xzr` | 32 (`x0`–`x31`), where `x0` is always zero |
+| 32-bit views | `eax` etc. | `w0`–`w30` (writing one zeroes the upper half) | instructions ending in `w`, such as `addw` |
+| Instruction length | 1 to 15 bytes | always 4 bytes | 4 bytes; 2 with the C extension |
+| Memory operands in arithmetic | yes | no (load/store) | no (load/store) |
+| Operand form | 2 operands, destination also a source | 3 operands: `add x0, x1, x2` | 3 operands: `add a0, a1, a2` |
+| Comparisons | flags, set by most arithmetic | flags (NZCV), set only by instructions such as `cmp` and `subs` | no flags: compare-and-branch instructions |
+| Return address | pushed on the stack by `call` | put in register `x30` (the link register) by `bl` | put in `ra` (`x1`) by `jal` / `call` |
+| Linux `write` / `exit` numbers | 1 / 60 | 64 / 93 | 64 / 93 |
+| System-call instruction | `syscall` | `svc #0` | `ecall` |
+
+RISC-V registers have **ABI names** that state their role, which assembly programmers use instead of the numbers: `zero` (x0), `ra` (return address), `sp`, `a0`–`a7` (arguments and results), `t0`–`t6` (temporaries, caller-saved) and `s0`–`s11` (saved, callee-saved).
+
+### Calling conventions in one paragraph each
+
+**AArch64** (the AAPCS64): integer arguments in `x0`–`x7`, result in `x0`; `x19`–`x28` are callee-saved; `x29` is the frame pointer and `x30` the link register; `sp` must always stay 16-byte aligned. A function that calls others must save `x30` first, because the next `bl` will overwrite it.
+
+**RISC-V** (the standard psABI): integer arguments in `a0`–`a7`, results in `a0` (and `a1`); `s0`–`s11` are callee-saved; `sp` is 16-byte aligned; a non-leaf function saves `ra` on the stack.
+
+Note how both pass **eight** register arguments to x86-64's six, and how both keep the return address in a register. A leaf function on these machines never touches the stack at all to return.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Reading the same programs three times">
+
+### Hello, world
+
+Here is the first program of this course on each architecture, in the GNU assembler's syntax for each. First AArch64:
+
+```asm
+        .section .rodata
+msg:    .ascii  "Hello from AArch64\n"
+        .equ    msg_len, . - msg
+
+        .text
+        .globl  _start
+_start:
+        mov     x0, #1                  // fd: standard output
+        adrp    x1, msg                 // the address of the 4 KB page holding msg
+        add     x1, x1, :lo12:msg       // plus msg's offset within that page
+        mov     x2, #msg_len
+        mov     x8, #64                 // system call 64 is write
+        svc     #0
+        mov     x0, #0                  // status 0
+        mov     x8, #93                 // system call 93 is exit
+        svc     #0
+```
+
+Then RISC-V:
+
+```riscv
+        .section .rodata
+msg:    .ascii  "Hello from RISC-V\n"
+        .equ    msg_len, . - msg
+
+        .text
+        .globl  _start
+_start:
+        li      a0, 1                   # fd: standard output
+        la      a1, msg                 # load the address of msg
+        li      a2, msg_len
+        li      a7, 64                  # system call 64 is write
+        ecall
+        li      a0, 0                   # status 0
+        li      a7, 93                  # system call 93 is exit
+        ecall
+```
+
+The shape is identical to the x86-64 version: arguments in registers, number in a designated register (`x8` or `a7`), a trap instruction, then exit. The differences are in the details:
+
+- **Loading an address takes two steps.** A fixed 4-byte instruction cannot hold a 64-bit address or even a large offset. AArch64's `adrp` finds the 4 KB page containing `msg` relative to the current instruction, and `add … :lo12:msg` adds the low 12 bits. RISC-V's `la` is a **pseudo-instruction** that the assembler expands into `auipc` (add an upper immediate to the program counter) plus `addi`. Both are position-independent, like x86-64's `[rip + msg]`.
+- **Pseudo-instructions are everywhere in RISC-V.** `li` (load immediate), `la`, `mv`, `ret`, `call`, `beqz` and `bnez` are conveniences: `mv a0, t0` is really `addi a0, t0, 0`, and `ret` is really `jalr zero, 0(ra)`, a jump to the address in `ra` that discards its own return address by writing it to the zero register.
+- **Comments differ.** AArch64 GNU syntax uses `//`; RISC-V, like x86-64 in GNU syntax, uses `#`. Immediates on AArch64 are traditionally written with `#`.
+
+### A loop over an array
+
+The `sum_array` function from lesson 7, `long sum_array(const long *a, size_t n)`, in AArch64:
+
+```asm
+// a in x0, n in x1; the result goes in x0
+sum_array:
+        mov     x2, #0                  // total = 0
+        cbz     x1, 2f                  // n == 0? done
+1:      ldr     x3, [x0], #8            // x3 = *a, then a += 8 (post-index addressing)
+        add     x2, x2, x3              // three operands: x2 = x2 + x3
+        subs    x1, x1, #1              // n -= 1 and set the flags ("s" suffix)
+        b.ne    1b
+2:      mov     x0, x2
+        ret                             // jump to the address in x30
+```
+
+and in RISC-V:
+
+```riscv
+# a in a0, n in a1; the result goes in a0
+sum_array:
+        li      t0, 0                   # total = 0
+        beqz    a1, 2f                  # n == 0? done
+1:      ld      t1, 0(a0)               # t1 = the 8 bytes at a0 + 0
+        add     t0, t0, t1
+        addi    a0, a0, 8               # a++
+        addi    a1, a1, -1              # n-- (there is no subtract-immediate; add -1)
+        bnez    a1, 1b                  # compare with zero and branch, one instruction
+2:      mv      a0, t0
+        ret
+```
+
+Three contrasts stand out. In both, the addition reads only registers, so the memory read is a separate `ldr` or `ld`: that is load/store. AArch64 arithmetic does **not** set flags unless you ask (`subs` instead of `sub`), which lets the compiler schedule instructions freely between a comparison and its branch. And RISC-V has **no flags at all**: `bnez a1, 1b` tests a register and branches in one step, and for two registers there are `beq`, `bne`, `blt`, `bge`, `bltu` and `bgeu`. Without flags, there is less hidden state to save and restore and to track in an out-of-order processor; the price is that checking for overflow takes extra instructions.
+
+To make the comparison concrete in a language we *can* run here, the following x86-64 program writes the same function twice: once in x86 style, letting `add` read memory, and once in the load/store style that ARM64 and RISC-V require. Both are valid x86-64.
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+data:   .quad   3, 1, 4, 1, 5, 9, 2, 6
+        .equ    N, (. - data) / 8
+
+        .text
+        .globl _start
+_start:
+        lea     rdi, [rip + data]
+        mov     esi, N
+        call    sum_cisc
+        mov     rdi, rax
+        call    print_u64
+
+        lea     rdi, [rip + data]
+        mov     esi, N
+        call    sum_load_store
+        mov     rdi, rax
+        call    print_u64
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# x86-64 style: the add reads memory directly.
+sum_cisc:
+        xor     eax, eax
+        test    rsi, rsi
+        jz      2f
+1:      add     rax, [rdi]
+        add     rdi, 8
+        dec     rsi
+        jnz     1b
+2:      ret
+
+# The same loop written the way ARM64 and RISC-V must: load, then add registers.
+sum_load_store:
+        xor     eax, eax
+        test    rsi, rsi
+        jz      2f
+1:      mov     rdx, [rdi]          # load
+        add     rax, rdx            # register-to-register arithmetic
+        add     rdi, 8
+        dec     rsi
+        jnz     1b
+2:      ret
+
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints `31` twice. Disassembling it, `sum_cisc` takes 20 bytes and `sum_load_store` 23. The AArch64 version above is eight instructions of exactly 4 bytes, 32 bytes; the RISC-V version is nine 4-byte instructions, 36 bytes, before the C extension shrinks many of them to 2 bytes. Code size is one of the few places where x86's variable-length encoding still pays off.
+
+### Variable versus fixed length
+
+The assembler can measure instruction lengths for us: the difference between two labels is the number of bytes between them. This program prints the length of seven x86-64 instructions, which are placed after the exit and never executed.
+
+```asm check
+        .intel_syntax noprefix
+
+        # The length of each measured instruction, computed by the assembler.
+        .section .rodata
+sizes:  .byte   i1 - i0, i2 - i1, i3 - i2, i4 - i3, i5 - i4, i6 - i5, i7 - i6
+        .equ    COUNT, . - sizes
+
+        .text
+        .globl _start
+_start:
+        lea     r12, [rip + sizes]
+        mov     r13d, COUNT
+.Lnext:
+        movzx   edi, BYTE PTR [r12]     # the length of one instruction, in bytes
+        call    print_digits
+        inc     r12
+        dec     r13d
+        jnz     .Lnext
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+        # These instructions are never executed: they are here to be measured.
+i0:     syscall
+i1:     xor     eax, eax
+i2:     add     rax, rdx
+i3:     mov     eax, 1
+i4:     add     rax, [rbx + rcx*8 + 16]
+i5:     lea     rsi, [rip + sizes]
+i6:     mov     rax, 0x1122334455667788
+i7:
+
+# print_digits(n: rdi) -- n (0..99) and a newline
+print_digits:
+        sub     rsp, 8
+        mov     eax, edi
+        mov     ecx, 10
+        xor     edx, edx
+        div     ecx
+        lea     rsi, [rsp + 1]          # assume one digit...
+        add     edx, '0'
+        mov     [rsp + 1], dl
+        test    eax, eax
+        jz      1f
+        add     eax, '0'                # ...unless there are two
+        mov     [rsp], al
+        dec     rsi
+1:      mov     BYTE PTR [rsp + 2], 10
+        lea     rdx, [rsp + 3]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 8
+        ret
+```
+
+It prints:
+
+```text
+2
+2
+3
+5
+5
+7
+10
+```
+
+From 2 bytes for `syscall` to 10 for a 64-bit constant. A decoder for such an instruction stream cannot know where the next instruction starts until it has partly decoded the current one, which is one reason x86 processors spend so much hardware on decoding and on caches of already-decoded micro-operations. An AArch64 decoder knows that instruction *n* starts at byte 4*n*, which makes decoding many instructions per cycle simpler. The price is that a 64-bit constant needs up to four AArch64 instructions (`movz` and three `movk`), or a load from a nearby constant pool.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Calls without a pushed return address">
+
+Here is the recursive `factorial` from lesson 5 on both machines. Compare where the return address lives.
+
+```asm
+// AArch64: n in x0, result in x0
+factorial:
+        cmp     x0, #1
+        b.hi    1f                      // unsigned "higher": n > 1
+        mov     x0, #1
+        ret
+1:      stp     x29, x30, [sp, #-32]!   // push the frame pointer and the link register
+        str     x19, [sp, #16]          // save callee-saved x19 in the same frame
+        mov     x19, x0                 // keep n
+        sub     x0, x0, #1
+        bl      factorial               // x30 = return address, then jump
+        mul     x0, x0, x19
+        ldr     x19, [sp, #16]
+        ldp     x29, x30, [sp], #32     // restore both and pop the frame
+        ret
+```
+
+```riscv
+# RISC-V: n in a0, result in a0
+factorial:
+        li      t0, 1
+        bgtu    a0, t0, 1f              # unsigned: n > 1
+        li      a0, 1
+        ret
+1:      addi    sp, sp, -16             # make a 16-byte frame
+        sd      ra, 8(sp)               # save the return address
+        sd      s0, 0(sp)               # save callee-saved s0
+        mv      s0, a0                  # keep n
+        addi    a0, a0, -1
+        call    factorial               # ra = return address, then jump
+        mul     a0, a0, s0
+        ld      s0, 0(sp)
+        ld      ra, 8(sp)
+        addi    sp, sp, 16
+        ret
+```
+
+On x86-64, `call` always writes the return address to memory. Here `bl` and `call` write it to a **register**, and the function decides whether it needs to save it. The base case, which calls nothing, returns without any memory traffic; only the recursive case saves `x30` or `ra`. AArch64's `stp`/`ldp` (store and load a *pair* of registers) and its pre- and post-indexed addressing (`[sp, #-32]!` adjusts `sp` before the store, `[sp], #32` after the load) make the frame set-up compact.
+
+### Memory ordering: the difference that bites
+
+There is one difference you cannot see in a single-threaded program. When several cores share memory, each architecture promises a **memory model**: which orders of loads and stores other cores may observe. x86-64 is relatively strict (a model close to "total store order"): one core's stores become visible to others in program order. AArch64 and RISC-V are **weakly ordered**: without explicit barriers or acquire/release instructions, another core may see your stores in a different order.
+
+Lock-free code that "works" on x86 can therefore fail on ARM. The fix is never to hand-place barriers by guesswork, but to use your language's atomics (C11's `stdatomic.h`, C++'s `std::atomic`, Rust's `std::sync::atomic`) with the right memory orders; the compiler then emits `ldar`/`stlr` on AArch64, `fence` or `.aq`/`.rl` annotated atomics on RISC-V, and often plain moves on x86-64. This is also why translators that run x86 programs on ARM have to work hard to preserve x86 ordering.
+
+</Section>
+
+<Section id="reading" kind="reading" title="Running ARM64 and RISC-V code on an x86-64 machine">
+
+You do not need new hardware to practise. On Debian or Ubuntu, install the cross assemblers and QEMU's user-mode emulator:
+
+```bash
+sudo apt install binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+```
+
+Then assemble, link and run, using the cross tools' prefixed names:
+
+```bash
+aarch64-linux-gnu-as -o hello.o hello.s && aarch64-linux-gnu-ld -o hello hello.o
+qemu-aarch64 ./hello
+
+riscv64-linux-gnu-as -o hello.o hello.s && riscv64-linux-gnu-ld -o hello hello.o
+qemu-riscv64 ./hello
+```
+
+QEMU translates each foreign instruction into x86-64 code on the fly and forwards the system calls to your Linux kernel, so these little programs behave as they would on real hardware. Cross C compilers (`gcc-aarch64-linux-gnu`, `gcc-riscv64-linux-gnu`) let you generate AArch64 and RISC-V output from C, and Compiler Explorer offers both architectures in its compiler list, the quickest way to compare all three on the same function. A Raspberry Pi 4 or 5 running 64-bit Linux runs the AArch64 programs natively.
+
+A Mac with Apple silicon is ARM64, but it is not Linux: macOS uses different system calls, a different executable format and slightly different conventions (for example, register `x18` is reserved), so the Linux programs above need a Linux virtual machine there.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"RISC means fewer instructions in total."** The R refers to simple, regular instructions, not a short list. AArch64 has many hundreds of instructions, including rich SIMD and cryptography extensions; a full RV64GCV implementation is large too. What RISC designs keep small is the work each instruction does and the variety of encodings.
+
+</Misconception>
+
+<Misconception>
+
+**"Programs that use only registers and arithmetic are portable between these machines."** Even "pure" code differs: register names, operand order, available addressing modes, whether arithmetic sets flags, and how constants are loaded. Assembly does not port; it is rewritten. That is the strongest argument for writing almost everything in a compiled language and keeping assembly to small, well-tested functions per architecture.
+
+</Misconception>
+
+<Misconception>
+
+**"x86 is CISC, so it must be slower."** The decoders of modern x86 cores turn instructions into RISC-like micro-operations, and the fastest x86 and ARM cores perform within a similar range on general code. Differences in power efficiency and performance come mostly from microarchitecture and manufacturing, not from the instruction set alone.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The x86-64 outputs below were checked by running the programs; the ARM64 and RISC-V questions are about how those architectures are defined.
+
+<Exercises/>
+
+</Section>

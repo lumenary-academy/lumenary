@@ -1,0 +1,438 @@
+---
+title: Headers, the preprocessor and the standard library
+subtitle: How C programs are split into files, what the preprocessor really does, and a working tour of the standard library.
+minutes: 65
+objectives:
+  - Split a program into header and source files, with include guards, extern and static used correctly
+  - Explain separate compilation and what the linker joins together
+  - Write object-like and function-like macros safely, and use #, ## and X-macros
+  - Use conditional compilation, predefined macros and static_assert
+  - Find your way around the standard library's main headers, including file input and output
+prerequisites: [dynamic-memory]
+references:
+  - title: cppreference.com, Preprocessor
+    url: https://en.cppreference.com/w/c/preprocessor
+    note: Every directive, the # and ## operators, predefined macros and conditional inclusion.
+  - title: cppreference.com, C standard library headers
+    url: https://en.cppreference.com/w/c/header
+    note: All standard headers, with the standard version that introduced each one.
+  - title: The GNU C Preprocessor manual
+    url: https://gcc.gnu.org/onlinedocs/cpp/
+    note: GCC's detailed preprocessor documentation, including macro pitfalls.
+  - title: The GNU C Library manual
+    url: https://www.gnu.org/software/libc/manual/
+    note: glibc's documentation of the standard functions and the POSIX extensions it provides.
+---
+
+<Section id="motivation" kind="motivation" title="Beyond one file">
+
+Every program so far has fitted in one file. Real C projects have hundreds or thousands: the Linux kernel has tens of thousands. C's way of dividing a program is old and simple. Each **source file** (`.c`) is compiled on its own into an object file; **header files** (`.h`) carry the declarations that let files call each other; and the **linker** joins the object files at the end. Nothing in the language itself knows about modules or packages. The glue is a separate text-processing step that runs before compilation: the **preprocessor**.
+
+This lesson explains that machinery, because every professional C project depends on it, and because the preprocessor is both genuinely useful and a famous source of confusing bugs. It then takes a tour of the **standard library**: not every function, but the headers you will use every week, with working examples of the ones you have not met yet.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Headers and separate compilation">
+
+<Definition term="translation unit">
+
+A **translation unit** is one source file after preprocessing, with all its `#include`d headers pasted in. The compiler translates each translation unit independently into an object file; it never sees two `.c` files at once.
+
+</Definition>
+
+Because each file is compiled alone, a file that calls a function defined elsewhere needs a **declaration** of it. Headers exist to share those declarations. A small temperature module looks like this, as three files:
+
+```c
+/* temperature.h */
+#ifndef TEMPERATURE_H
+#define TEMPERATURE_H
+
+/* Public interface of temperature.c */
+
+double celsius_to_fahrenheit(double c);
+double average(const double *values, int count);
+
+extern int conversions_done;   /* defined once, in temperature.c */
+
+#endif /* TEMPERATURE_H */
+```
+
+```c
+/* temperature.c */
+#include "temperature.h"
+
+int conversions_done = 0;
+
+static double scale(double c) {    /* private helper: internal linkage */
+    return c * 9.0 / 5.0;
+}
+
+double celsius_to_fahrenheit(double c) {
+    conversions_done++;
+    return scale(c) + 32.0;
+}
+
+double average(const double *values, int count) {
+    double total = 0;
+    for (int i = 0; i < count; i++) total += values[i];
+    return count > 0 ? total / count : 0.0;
+}
+```
+
+```c
+/* main.c */
+#include <stdio.h>
+#include "temperature.h"
+
+int main(void) {
+    double week[] = {21.5, 23.0, 19.5, 25.0, 24.5};
+    double avg = average(week, 5);
+    printf("average %.1f C = %.1f F\n", avg, celsius_to_fahrenheit(avg));
+    printf("conversions: %d\n", conversions_done);
+    return 0;
+}
+```
+
+Build each file separately, then link:
+
+```bash
+gcc -std=c17 -Wall -Wextra -c temperature.c     # produces temperature.o
+gcc -std=c17 -Wall -Wextra -c main.c            # produces main.o
+gcc temperature.o main.o -o weather
+./weather
+```
+
+```text
+average 22.7 C = 72.9 F
+conversions: 1
+```
+
+The pieces, and why each is there:
+
+- **Include guards.** `#ifndef TEMPERATURE_H` / `#define` / `#endif` make the header's contents appear only once per translation unit, even if it is included twice through different paths. Most compilers also accept the non-standard but universal `#pragma once`.
+- **Angle brackets and quotes.** `#include <stdio.h>` searches the system's include directories; `#include "temperature.h"` searches the current file's directory first. Use quotes for your own headers.
+- **Declarations in headers, definitions in source files.** The header declares the functions and, with `extern`, the variable; `temperature.c` defines them exactly once. Defining a variable in a header would create one copy per file that includes it and a linker error.
+- **`static` for private names.** `scale` is invisible outside its file. Running `nm temperature.o` lists the symbols: `T average` and `T celsius_to_fahrenheit` (global code), `B conversions_done` (a global zero-initialised variable) and `t scale`, the lowercase `t` meaning local to this object file.
+- **Including your own header first** in the matching `.c` file is a common convention: it proves the header compiles on its own, without depending on something else having been included before it.
+
+Splitting into files is what makes **incremental builds** possible: change `main.c` and only `main.o` is recompiled before relinking. The build tools in lesson 10 automate exactly that.
+
+</Section>
+
+<Section id="computation" kind="computation" title="The preprocessor">
+
+The preprocessor works on **text**, before the compiler sees anything. Its directives start with `#`. You have seen `#include`; the other workhorse is `#define`, which defines a **macro**: a name that is replaced by text wherever it appears.
+
+```c check
+#include <stdio.h>
+
+#define BAD_SQUARE(x) x * x                 /* no parentheses: a trap */
+#define SQUARE(x) ((x) * (x))               /* parenthesise every use and the whole */
+#define ARRAY_LEN(a) (sizeof (a) / sizeof (a)[0])
+#define STRINGIFY(x) #x                     /* # turns an argument into a string */
+#define SHOW(expr) printf("%-22s = %d\n", #expr, (expr))
+#define LOG(msg) printf("[%s:%d] %s\n", __func__, __LINE__, msg)
+
+int main(void) {
+    SHOW(BAD_SQUARE(2 + 3));                /* expands to 2 + 3 * 2 + 3 */
+    SHOW(SQUARE(2 + 3));
+
+    int primes[] = {2, 3, 5, 7, 11, 13};
+    printf("primes has %zu elements\n", ARRAY_LEN(primes));
+
+    printf("%s\n", STRINGIFY(hello world));
+    printf("compiled as C version %ld\n", __STDC_VERSION__);
+    LOG("starting up");
+    return 0;
+}
+```
+
+```text
+BAD_SQUARE(2 + 3)      = 11
+SQUARE(2 + 3)          = 25
+primes has 6 elements
+hello world
+compiled as C version 201710
+[main:19] starting up
+```
+
+The first line is the classic macro bug. `BAD_SQUARE(2 + 3)` is replaced textually by `2 + 3 * 2 + 3`, which is 11. The rules that prevent it: wrap **every parameter** in parentheses and **the whole body** too. Even then, a function-like macro evaluates its argument as many times as it appears, so `SQUARE(i++)` increments `i` twice, which is undefined behaviour. When a macro is only standing in for a function, write a function instead (a `static inline` function in a header costs nothing after optimisation, and has types and single evaluation).
+
+What macros can do that functions cannot:
+
+- `#x` turns an argument into a **string literal**, so `SHOW` can print an expression next to its value.
+- `__func__` (a predefined identifier) and `__LINE__` and `__FILE__` (predefined macros) let logging macros report where they were called from. A function would always report its own location.
+- `ARRAY_LEN` works on arrays of any type, because it is expanded where the array is in scope (and silently gives the wrong answer on a pointer, so use it with care).
+- `__STDC_VERSION__` tells you which standard you are compiled as: `201710L` for C17, `202311L` for C23.
+
+To see what the preprocessor produced, run `gcc -E file.c`; for a single macro, it is often the fastest way to understand a confusing error.
+
+### Conditional compilation and compile-time checks
+
+```c check
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/* An X-macro: one list, expanded several ways, so names and values never drift apart. */
+#define COLOURS(X) \
+    X(RED)         \
+    X(GREEN)       \
+    X(BLUE)
+
+#define AS_ENUM(name) COLOUR_##name,       /* ## pastes tokens: COLOUR_RED */
+#define AS_STRING(name) #name,
+
+enum colour { COLOURS(AS_ENUM) COLOUR_COUNT };
+static const char *colour_names[] = { COLOURS(AS_STRING) };
+
+/* Checked when compiling, not when running. */
+static_assert(sizeof(int32_t) == 4, "int32_t must be 4 bytes");
+static_assert(COLOUR_COUNT == sizeof colour_names / sizeof colour_names[0],
+              "every colour needs a name");
+
+int main(void) {
+    for (int c = 0; c < COLOUR_COUNT; c++) {
+        printf("%d %s\n", c, colour_names[c]);
+    }
+
+#ifdef NDEBUG
+    printf("assertions are off\n");
+#else
+    printf("assertions are on\n");
+#endif
+
+#if __STDC_VERSION__ >= 202311L
+    printf("C23 or later\n");
+#else
+    printf("older than C23\n");
+#endif
+    return 0;
+}
+```
+
+```text
+0 RED
+1 GREEN
+2 BLUE
+assertions are on
+older than C23
+```
+
+- An **X-macro** keeps related lists in step. `COLOURS` is defined once; it is expanded once to build the enum and once to build the array of names. Adding a colour updates both. The `##` operator pastes tokens together, so `COLOUR_##name` becomes `COLOUR_RED`.
+- `#ifdef`, `#if`, `#else` and `#endif` include or exclude code before compilation. They are how code adapts to the platform, the compiler, the standard version, or build options such as `NDEBUG` (which switches `assert` off in release builds, as lesson 9 shows). Use them sparingly: every branch is code that some builds never compile, and so never check.
+- `static_assert` (from `<assert.h>` in C11; a keyword in C23) checks a constant condition **at compile time**. If `int32_t` were not 4 bytes, or someone added a colour without a name, the program would not compile at all, which is far better than failing at run time.
+
+</Section>
+
+<Section id="examples" kind="examples" title="A tour of the standard library">
+
+The C standard library is small compared with those of Python or Java, which is part of why C runs everywhere. Its main headers:
+
+| Header | What it gives you |
+| --- | --- |
+| `stdio.h` | `printf`, `snprintf`, `fopen`, `fgets`, `fread`, `fwrite`, `perror` |
+| `stdlib.h` | `malloc`, `free`, `qsort`, `bsearch`, `strtol`, `strtod`, `exit`, `getenv`, `abs`, `div` |
+| `string.h` | string and memory functions (lesson 5) |
+| `ctype.h` | character classes (lesson 5) |
+| `math.h` | `sqrt`, `pow`, `sin`, `exp`, `log`, `round`, `floor`, `fmod`, `hypot` (link with `-lm`) |
+| `stdint.h`, `inttypes.h`, `limits.h`, `stdbool.h`, `stddef.h` | types and limits (lesson 2) |
+| `assert.h`, `errno.h` | checks and error codes |
+| `time.h` | `time`, `clock`, `strftime`, `timespec_get` |
+| `stdatomic.h`, `threads.h` | atomics and threads (C11; threads are optional and not available everywhere) |
+
+Everything else, such as networking, directories, processes and terminals, comes from the operating system's interfaces (POSIX on Linux and macOS, the Windows API on Windows) or from third-party libraries.
+
+```c check
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static int compare_ints(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+int main(void) {
+    /* qsort and bsearch: sort once, then search in O(log n). */
+    int ids[] = {4021, 17, 980, 3, 7741, 256, 64};
+    size_t n = sizeof ids / sizeof ids[0];
+    qsort(ids, n, sizeof ids[0], compare_ints);
+    int wanted[] = {980, 5};
+    for (int i = 0; i < 2; i++) {
+        int *hit = bsearch(&wanted[i], ids, n, sizeof ids[0], compare_ints);
+        if (hit) printf("%d found at index %td\n", wanted[i], hit - ids);
+        else printf("%d not found\n", wanted[i]);
+    }
+
+    /* math.h: link with -lm on Linux. */
+    printf("hypot(3, 4) = %.1f\n", hypot(3.0, 4.0));
+    printf("pow(2, 0.5) = %.6f\n", pow(2.0, 0.5));
+    printf("round(2.5) = %.1f, floor(-2.5) = %.1f, fmod(7.5, 2) = %.1f\n",
+           round(2.5), floor(-2.5), fmod(7.5, 2.0));
+
+    /* stdlib.h conversions and integer helpers. */
+    char *end;
+    double grams = strtod("12.75kg", &end);
+    printf("strtod read %.2f and stopped at \"%s\"\n", grams, end);
+    div_t qr = div(17, 5);
+    printf("17 / 5 = %d remainder %d, abs(-9) = %d\n", qr.quot, qr.rem, abs(-9));
+    return 0;
+}
+```
+
+```text
+980 found at index 4
+5 not found
+hypot(3, 4) = 5.0
+pow(2, 0.5) = 1.414214
+round(2.5) = 3.0, floor(-2.5) = -3.0, fmod(7.5, 2) = 1.5
+strtod read 12.75 and stopped at "kg"
+17 / 5 = 3 remainder 2, abs(-9) = 9
+```
+
+`bsearch` uses the same comparator as `qsort` and returns a pointer to the match or `NULL`, so the index is a pointer subtraction. `round` rounds halves away from zero, unlike the ties-to-even rounding `printf` used in lesson 1. `div` returns a struct holding both quotient and remainder. `strtod` reports where it stopped, just like `strtol`.
+
+### Files
+
+`stdio.h` handles files through a `FILE *`, an opaque pointer to a stream. This program writes a small CSV file and reads it back. It uses `tmpfile`, which creates a temporary file that is deleted automatically, so the program leaves nothing behind; with a real file you would call `fopen(path, "w")` and `fopen(path, "r")`.
+
+```c check
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    FILE *f = tmpfile();                /* a temporary file, deleted automatically */
+    if (f == NULL) {
+        perror("tmpfile");              /* prints the reason, from errno */
+        return EXIT_FAILURE;
+    }
+
+    const char *crops[] = {"maize", "cassava", "sorghum", "millet"};
+    for (int i = 0; i < 4; i++) {
+        fprintf(f, "%s,%d\n", crops[i], (i + 1) * 120);
+    }
+
+    rewind(f);                          /* back to the start to read it again */
+    char line[64];
+    int lines = 0, total = 0;
+    while (fgets(line, sizeof line, f) != NULL) {
+        line[strcspn(line, "\n")] = '\0';
+        char *comma = strchr(line, ',');
+        if (comma == NULL) continue;
+        *comma = '\0';                  /* split the line in two */
+        total += atoi(comma + 1);       /* trusted data we just wrote */
+        lines++;
+        printf("%-8s %s\n", line, comma + 1);
+    }
+    if (ferror(f)) {
+        perror("reading");
+    }
+    printf("%d lines, total %d\n", lines, total);
+
+    if (fclose(f) != 0) {
+        perror("fclose");
+        return EXIT_FAILURE;
+    }
+    return 0;
+}
+```
+
+```text
+maize    120
+cassava  240
+sorghum  360
+millet   480
+4 lines, total 1200
+```
+
+The habits to copy: check the result of every function that can fail (`tmpfile` and `fopen` return `NULL`, `fclose` returns `EOF`); report failures with `perror`, which prints your message and the reason from `errno`, such as `No such file or directory`; read lines with `fgets` and a buffer size; and after the reading loop, use `ferror` to distinguish "end of file" from "a read failed". Output to a `FILE *` is **buffered**, so data reaches the file only when the buffer fills, on `fflush`, or on `fclose`. That is why checking `fclose`'s result matters: it is often where a full disk is first reported.
+
+</Section>
+
+<Section id="history" kind="history" title="What C23 adds here">
+
+C23 is the biggest update to C since C99, and much of it touches this lesson's territory. A short snippet, checked with GCC 14 and `-std=c23`:
+
+```c
+#include <stdbit.h>      /* new header: bit utilities */
+#include <stdckdint.h>   /* new header: checked integer arithmetic */
+#include <stdio.h>
+
+#if __has_include(<threads.h>)       /* ask whether a header exists */
+#define HAS_THREADS 1
+#else
+#define HAS_THREADS 0
+#endif
+
+constexpr int SIZE = 4;              /* a true compile-time constant, not a macro */
+
+int main(void) {
+    typeof(SIZE) n = SIZE;           /* typeof is now standard */
+    int sum;
+    bool overflow = ckd_add(&sum, 2147483647, 1);   /* bool without stdbool.h */
+    int *p = nullptr;                               /* a typed null pointer */
+    printf("%d %d %d %u %d\n", n, overflow, HAS_THREADS,
+           stdc_count_ones(0xF0u), p == nullptr);
+    return 0;
+}
+```
+
+It printed `4 1 1 4 1`. Besides these, C23 adds `#elifdef` and `#elifndef`, the `#embed` directive (which includes a binary file's bytes as an initialiser, supported in GCC 15 and recent Clang releases), the attributes `[[nodiscard]]`, `[[maybe_unused]]`, `[[deprecated]]` and `[[fallthrough]]`, and `static_assert` without a message. `constexpr` constants in particular replace many uses of `#define` for numbers: they have a type and a scope, and the debugger can see them. If your compiler supports C23, use these; if your code must also build with older compilers, keep to C17 and check `__STDC_VERSION__`.
+
+</Section>
+
+<Section id="human" kind="human" title="Header hygiene in large projects">
+
+In a project with thousands of files, headers decide how long builds take and how tangled the code becomes. Teams that care about both follow a few rules:
+
+- **Include what you use.** Every file includes the headers for the names it uses directly, and nothing more. Relying on a declaration that arrived indirectly, through some other header, breaks the day that header changes. The tool include-what-you-use automates the check.
+- **Declare instead of including when you can.** A header that only passes around `struct parser *` pointers needs just `struct parser;`, a forward declaration, not the header that defines the struct. Fewer includes mean fewer files rebuilt after a change.
+- **Keep headers small and stable.** A header is a promise to every file that includes it. Opaque types (lesson 6) keep struct layouts out of headers so that they can change without recompiling the world.
+- **Prefix public names.** C has one global namespace for functions and global variables across the whole program. Libraries prefix every public name (`sqlite3_open`, `curl_easy_init`, `png_create_read_struct`) so that two libraries never collide.
+- **Make each header self-contained.** It must compile when included first and alone, which the "include your own header first" convention tests automatically.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Defining things in headers.** A function or variable *definition* in a header is compiled into every file that includes it, and the linker complains about multiple definitions (or, worse, with some old compiler settings, silently merges them). Put declarations in headers, definitions in exactly one `.c` file. The exceptions are `static inline` functions and macros.
+
+</Misconception>
+
+<Misconception>
+
+**Treating macros like functions.** Macros ignore types, scope and evaluation order. `MAX(a, b)` written as `((a) > (b) ? (a) : (b))` evaluates the larger argument twice. Prefer functions, `static inline` functions, `enum` constants and `const` variables; keep macros for what only macros can do.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting `-lm`.** On Linux with glibc, `sqrt` and friends live in a separate library. A program that uses them may compile but fail to link with `undefined reference to 'sqrt'` unless `-lm` comes after the source files on the command line. (Some calls are optimised into instructions and link anyway, which only makes the failure more confusing when it happens.)
+
+</Misconception>
+
+<Misconception>
+
+**Ignoring return values from I/O.** `printf`, `fprintf`, `fclose` and friends can all fail. Small programs often ignore them; programs that write important data check them, because a full disk or a closed pipe is reported only through those return values.
+
+</Misconception>
+
+<Misconception>
+
+**Two headers that include each other.** If `a.h` includes `b.h` and `b.h` includes `a.h`, include guards stop the infinite loop but leave one header seeing the other's declarations missing, with baffling "unknown type" errors. Break the cycle with a forward declaration (`struct a;`) in one of them, or move the shared declarations into a third header.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with GCC.
+
+<Exercises/>
+
+</Section>

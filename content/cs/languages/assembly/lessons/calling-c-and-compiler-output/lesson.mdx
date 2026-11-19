@@ -1,0 +1,548 @@
+---
+title: Calling C, and reading what compilers write
+subtitle: Assembly functions called from C, C functions called from assembly, and a guided tour of real compiler output and its idioms.
+minutes: 65
+objectives:
+  - Write an assembly function that C code can call, with the right symbol directives
+  - Call C library functions such as printf from assembly, including the rules for variadic calls
+  - Link C and assembly together with gcc, and embed a small assembly function in a C file
+  - Generate Intel-syntax assembly from C with gcc -S and with Compiler Explorer
+  - Recognise common compiler idioms, such as lea arithmetic, cmov, multiplication by a magic constant, and vectorised loops
+prerequisites: [system-calls]
+references:
+  - title: Compiler Explorer
+    url: https://godbolt.org/
+    note: Paste a C function, choose a compiler and flags such as -O2 -masm=intel, and read the assembly as you type.
+  - title: GCC manual, Options That Control Optimization
+    url: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+    note: What -O1, -O2, -O3 and -Os switch on.
+  - title: GCC manual, How to Use Inline Assembly Language in C Code
+    url: https://gcc.gnu.org/onlinedocs/gcc/Using-Assembly-Language-with-C.html
+    note: Basic and extended asm, the alternative to separate assembly files.
+  - title: Hacker's Delight
+    author: Henry S. Warren, Jr.
+    url: https://en.wikipedia.org/wiki/Hacker%27s_Delight
+    note: The classic book of bit tricks, including the mathematics of division by multiplication.
+---
+
+<Section id="motivation" kind="motivation" title="Assembly lives next to other languages">
+
+Real assembly rarely stands alone. It sits inside projects written mostly in C, C++, Rust or Go: a hand-tuned checksum or cipher in a cryptography library, a few lines of start-up code in an operating system, a SIMD inner loop in a video decoder. Everything else in those projects is compiled code. So two skills matter more than writing whole programs in assembly:
+
+1. **Interoperating**: writing assembly functions that compiled code calls, and calling compiled code (including the C library) from assembly. The calling convention from lesson 5 is the whole contract.
+2. **Reading compiler output**: looking at what `gcc` or `clang` produced for your C, to understand a performance problem, to check that a security-sensitive function did not get "optimised" into something unsafe, or simply to learn. This is the assembly skill most professional programmers use most often.
+
+This lesson needs a C compiler in addition to Binutils: `sudo apt install gcc` on Debian or Ubuntu, `sudo dnf install gcc` on Fedora. It was tested with GCC 11.4 and Clang 14.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Calling assembly from C">
+
+To C, an assembly function is just a symbol with an address and a promise to follow the calling convention. Here is `sum_array`, written by hand in its own file:
+
+```asm
+        .intel_syntax noprefix
+        .text
+        .globl  sum_array
+        .type   sum_array, @function
+# long sum_array(const long *a, size_t n)
+#   a in rdi, n in rsi; the result goes in rax.
+sum_array:
+        xor     eax, eax            # total = 0
+        test    rsi, rsi
+        jz      .Ldone              # n == 0: return 0
+.Lloop:
+        add     rax, [rdi]          # total += *a
+        add     rdi, 8              # a++ (one long is 8 bytes)
+        dec     rsi
+        jnz     .Lloop
+.Ldone:
+        ret
+        .size   sum_array, . - sum_array
+
+        .section .note.GNU-stack, "", @progbits   # this code does not need an executable stack
+```
+
+And a C file that declares and calls it:
+
+```c
+#include <stdio.h>
+
+long sum_array(const long *a, size_t n);   /* written in sum_array.s */
+
+int main(void) {
+    long scores[] = {72, 85, 90, 64, 88};
+    printf("total: %ld\n", sum_array(scores, 5));
+    printf("empty: %ld\n", sum_array(scores, 0));
+    return 0;
+}
+```
+
+`gcc` assembles `.s` files as well as compiling `.c` files, and links everything with the C library:
+
+```bash
+gcc -std=c17 -Wall -Wextra -O2 -o demo main.c sum_array.s
+./demo
+```
+
+```text
+total: 399
+empty: 0
+```
+
+The directives around the function matter:
+
+- `.globl sum_array` exports the name, so the linker can connect the C call to it.
+- `.type … @function` and `.size` record what the symbol is and how long it is. Nothing breaks without them, but debuggers, profilers and `objdump` use them to show the function properly.
+- `.section .note.GNU-stack` with empty flags declares that this file does not need an executable stack. Without it, the linker assumes the worst for compatibility and may make the whole program's stack executable, which weakens a key security defence; recent versions of `ld` print a warning about it.
+
+### One file, two languages
+
+For short functions you can also put the assembly inside a C file as a top-level `__asm__` statement. GCC copies the text into its output unchanged. This is handy for experiments, and it lets our checker run both sides together. The function below works in both directions: C calls `map_sum`, and `map_sum` calls back into a C function through a pointer, so it must obey the convention as a callee *and* as a caller.
+
+```c check
+#include <stdio.h>
+
+/* Written in assembly below: replaces each a[i] with f(a[i]) and returns
+   the sum of the new values. */
+long map_sum(long *a, size_t n, long (*f)(long));
+
+__asm__(
+    ".pushsection .text\n"
+    ".intel_syntax noprefix\n"
+    ".globl map_sum\n"
+    ".type map_sum, @function\n"
+    "map_sum:\n"
+    "    push  rbx\n"            /* rbx = pointer to the current element */
+    "    push  r12\n"            /* r12 = elements left                   */
+    "    push  r13\n"            /* r13 = the C function to call          */
+    "    push  r14\n"            /* r14 = running total                   */
+    "    sub   rsp, 8\n"         /* 8 + 4*8 + 8 = 48: rsp is 16-byte aligned again */
+    "    mov   rbx, rdi\n"
+    "    mov   r12, rsi\n"
+    "    mov   r13, rdx\n"
+    "    xor   r14d, r14d\n"
+    "    test  r12, r12\n"
+    "    jz    2f\n"
+    "1:  mov   rdi, [rbx]\n"     /* argument: the element                 */
+    "    call  r13\n"            /* rax = f(element)                      */
+    "    mov   [rbx], rax\n"
+    "    add   r14, rax\n"
+    "    add   rbx, 8\n"
+    "    dec   r12\n"
+    "    jnz   1b\n"
+    "2:  mov   rax, r14\n"
+    "    add   rsp, 8\n"
+    "    pop   r14\n"
+    "    pop   r13\n"
+    "    pop   r12\n"
+    "    pop   rbx\n"
+    "    ret\n"
+    ".size map_sum, . - map_sum\n"
+    ".att_syntax prefix\n"       /* give the compiler back its default syntax */
+    ".popsection\n"
+);
+
+static long square(long x) { return x * x; }
+
+static long to_fahrenheit(long celsius) { return celsius * 9 / 5 + 32; }
+
+int main(void) {
+    long a[] = {1, 2, 3, 4};
+    long total = map_sum(a, 4, square);
+    printf("squares: %ld %ld %ld %ld, sum %ld\n", a[0], a[1], a[2], a[3], total);
+
+    long temps[] = {-40, 0, 25, 100};
+    map_sum(temps, 4, to_fahrenheit);
+    printf("fahrenheit: %ld %ld %ld %ld\n", temps[0], temps[1], temps[2], temps[3]);
+    return 0;
+}
+```
+
+It prints:
+
+```text
+squares: 1 4 9 16, sum 30
+fahrenheit: -40 32 77 212
+```
+
+Every value that must survive the calls to `f` lives in a callee-saved register (`rbx`, `r12`, `r13`, `r14`), and the function saves and restores them, because its own caller relies on them too. Four pushes on top of the return address leave `rsp` 8 bytes off alignment, so `sub rsp, 8` fixes it before the first `call`; a C callback compiled with vector instructions could crash otherwise. `call r13` is an **indirect call**: the target address comes from a register, which is exactly what a C function pointer is. The `.att_syntax prefix` at the end matters: GCC writes AT&T syntax by default, and if we left Intel syntax switched on, the assembler would misread everything GCC writes after our function.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Calling C from assembly">
+
+Going the other way, an assembly file can define `main` and let the C library start the program. The C start-up code runs first (setting up the library, then calling `main`), and when `main` returns, the library flushes buffered output and calls `exit_group` for you. Here is `printf` called from assembly:
+
+```asm
+        .intel_syntax noprefix
+        .section .rodata
+fmt:    .asciz  "%s has %d letters\n"
+city:   .asciz  "Nairobi"
+
+        .text
+        .globl  main
+main:                               # called by the C library's start-up code
+        push    rbx                 # entry rsp is 8 off 16-byte alignment; one push fixes it
+        lea     rdi, [rip + fmt]    # 1st argument: the format string
+        lea     rsi, [rip + city]   # 2nd argument
+        mov     edx, 7              # 3rd argument
+        xor     eax, eax            # variadic call: al = number of vector registers used (none)
+        call    printf@PLT
+        xor     eax, eax            # return 0 from main
+        pop     rbx
+        ret
+
+        .section .note.GNU-stack, "", @progbits
+```
+
+```bash
+gcc -o hello_printf hello_printf.s && ./hello_printf
+```
+
+```text
+Nairobi has 7 letters
+```
+
+Three rules show up here:
+
+- **C strings end in a zero byte**, so the data uses `.asciz`, not `.ascii`.
+- **Variadic functions** such as `printf` need `al` set to the number of vector registers that carry arguments (at most 8). For integer and pointer arguments only, that is zero, hence `xor eax, eax`. Forgetting it usually works by luck and occasionally crashes.
+- **`printf@PLT`** calls through the *procedure linkage table*. `printf` lives in the shared C library, whose address is unknown until the program runs; the PLT entry is a small stub that jumps to wherever the dynamic linker loaded it. GCC on most Linux distributions builds position-independent executables by default, and calls to shared-library functions must go through the PLT.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Reading compiler output">
+
+### Getting the assembly
+
+Two ways, both worth knowing:
+
+```bash
+gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - ex.c
+```
+
+`-S` stops after generating assembly, `-masm=intel` chooses Intel syntax, `-o -` prints to the terminal, and the last two flags hide unwinding directives (`.cfi_…`) and the `endbr64` landing pads of Intel's control-flow protection, which are important in real builds but noise while reading. `objdump -d -M intel` on a compiled binary shows the same code after linking.
+
+The second way is **Compiler Explorer** at [godbolt.org](https://godbolt.org/), created by Matt Godbolt: type C on the left, choose any of hundreds of compilers and versions, add flags such as `-O2 -masm=intel`, and see the assembly on the right with each line coloured to match the source line it came from. It is the fastest way to compare compilers, flags and versions, and links to its snippets are a common currency in code reviews and bug reports.
+
+### Four small functions
+
+We compiled this C with GCC 11.4 at `-O2`:
+
+```c
+unsigned div10(unsigned x) { return x / 10; }
+
+long scale(long x) { return x * 9 + 2; }
+
+int max_int(int a, int b) { return a > b ? a : b; }
+
+long sum_array(const long *a, unsigned long n) {
+    long total = 0;
+    for (unsigned long i = 0; i < n; i++)
+        total += a[i];
+    return total;
+}
+```
+
+The output, with directives trimmed:
+
+```asm
+div10:
+	mov	eax, edi
+	mov	edx, 3435973837
+	imul	rax, rdx
+	shr	rax, 35
+	ret
+scale:
+	lea	rax, 2[rdi+rdi*8]
+	ret
+max_int:
+	cmp	esi, edi
+	mov	eax, edi
+	cmovge	eax, esi
+	ret
+sum_array:
+	test	rsi, rsi
+	je	.L8
+	lea	rdx, [rdi+rsi*8]
+	xor	eax, eax
+.L7:
+	add	rax, QWORD PTR [rdi]
+	add	rdi, 8
+	cmp	rdi, rdx
+	jne	.L7
+	ret
+.L8:
+	xor	eax, eax
+	ret
+```
+
+Read them one at a time.
+
+**`div10` has no division.** `div` is one of the slowest integer instructions, taking tens of cycles on many processors, while `imul` takes about three. For a constant divisor the compiler multiplies by a "magic" number close to 2³⁵ / 10 and shifts right by 35. The constant 3435973837 (`0xCCCCCCCD`) is 2³⁵ / 10 rounded up, and the rounding error is small enough that the result is exact for every 32-bit input. The theory is in *Hacker's Delight* and in Granlund and Montgomery's 1994 paper on division by invariant integers. You will see such constants everywhere in optimised code; when you meet a strange large constant followed by a shift, think "division".
+
+**`scale` is one `lea`.** `x * 9 + 2` is `x + x*8 + 2`, exactly the addressing form. GNU's Intel syntax writes the displacement outside the brackets, `2[rdi+rdi*8]`, which means the same as `[rdi + rdi*8 + 2]`.
+
+**`max_int` does not branch.** It sets the result to `a`, compares, and conditionally moves `b` in, avoiding a hard-to-predict jump, as discussed in lesson 4.
+
+**`sum_array` turned the index into a pointer.** The C loop counts `i` from 0 to `n`; the compiler computes an end pointer `rdi + rsi*8` once and walks `rdi` up to it, so the loop body has no index arithmetic. The `n == 0` check was hoisted out of the loop, and the loop itself is a do-while.
+
+### At -O0 and at -O3
+
+Without optimisation, GCC keeps every variable in memory so that a debugger can always find it. `scale` at `-O0` stores its argument on the stack and reloads it:
+
+```asm
+scale:
+	push	rbp
+	mov	rbp, rsp
+	mov	QWORD PTR -8[rbp], rdi
+	mov	rdx, QWORD PTR -8[rbp]
+	mov	rax, rdx
+	sal	rax, 3
+	add	rax, rdx
+	add	rax, 2
+	pop	rbp
+	ret
+```
+
+That is why reading `-O0` output teaches you little about performance. At `-O3`, by contrast, GCC **vectorises** `sum_array`: the heart of its loop adds two 64-bit numbers at a time using a 16-byte `xmm` register:
+
+```asm
+.L8:
+	movdqu	xmm2, XMMWORD PTR [rax]
+	add	rax, 16
+	paddq	xmm0, xmm2
+	cmp	rdx, rax
+	jne	.L8
+```
+
+followed by code that adds the two halves of `xmm0` together and handles an odd last element. With `-march=native` on a processor with AVX2 or AVX-512, the same loop processes four or eight numbers per instruction.
+
+### Two compilers, one idea
+
+Compilers differ in details but share idioms. For `clamp(x, lo, hi)` written with two `if`s, GCC 11 and Clang 14 both produced branch-free code with two `cmov`s, in a different order:
+
+| GCC 11.4 `-O2` | Clang 14 `-O2` |
+| --- | --- |
+| `cmp rdi, rdx` | `mov rax, rdx` |
+| `mov rax, rsi` | `cmp rdi, rdx` |
+| `cmovle rdx, rdi` | `cmovle rax, rdi` |
+| `cmp rdi, rsi` | `cmp rdi, rsi` |
+| `cmovge rax, rdx` | `cmovl rax, rsi` |
+| `ret` | `ret` |
+
+</Section>
+
+<Section id="try-it" kind="computation" title="Trying the idioms yourself">
+
+Reading compiler output becomes a skill only when you check your understanding. These two programs put the idioms above into complete, library-free programs. The first compares the compiler's multiply-and-shift with a real `div` for several inputs, including the largest 32-bit value:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+values: .long   7, 99, 1234567, 4294967295
+        .equ    COUNT, 4
+
+        .text
+        .globl _start
+_start:
+        lea     r12, [rip + values]
+        mov     r13d, COUNT
+.Lnext:
+        mov     ebx, [r12]          # x, an unsigned 32-bit value
+
+        # The compiler's way: x / 10 == (x * 3435973837) >> 35
+        mov     eax, ebx
+        mov     edx, 3435973837     # 0xCCCCCCCD, about 2^35 / 10
+        imul    rax, rdx            # a 64-bit product: no overflow possible
+        shr     rax, 35
+        mov     rdi, rax
+        mov     esi, ' '
+        call    print_u64
+
+        # The obvious way, with div.
+        mov     eax, ebx
+        xor     edx, edx
+        mov     ecx, 10
+        div     ecx
+        mov     edi, eax
+        mov     esi, 10             # end the line
+        call    print_u64
+
+        add     r12, 4
+        dec     r13d
+        jnz     .Lnext
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# print_u64(n: rdi, end: rsi) -- n in decimal, followed by the character in sil
+print_u64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     [r8], sil
+        mov     rsi, r8
+        mov     rax, rdi
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+0 0
+9 9
+123456 123456
+429496729 429496729
+```
+
+The second takes GCC's `clamp`, instruction for instruction, and calls it from `_start` on three inputs, with comments that reconstruct what each `cmov` means:
+
+```asm check
+        .intel_syntax noprefix
+
+        .section .rodata
+inputs: .quad   -5, 42, 250
+        .equ    COUNT, 3
+
+        .text
+        .globl _start
+_start:
+        lea     r12, [rip + inputs]
+        mov     r13d, COUNT
+.Lnext:
+        mov     rdi, [r12]          # clamp(x, 0, 100)
+        xor     esi, esi
+        mov     edx, 100
+        call    clamp
+        mov     rdi, rax
+        call    print_i64
+        add     r12, 8
+        dec     r13d
+        jnz     .Lnext
+
+        mov     eax, 60
+        xor     edi, edi
+        syscall
+
+# long clamp(long x, long lo, long hi) -- the same instructions GCC 11 wrote at -O2
+clamp:
+        cmp     rdi, rdx
+        mov     rax, rsi            # result = lo
+        cmovle  rdx, rdi            # if x <= hi: rdx = x       (rdx = min(x, hi))
+        cmp     rdi, rsi
+        cmovge  rax, rdx            # if x >= lo: result = min(x, hi)
+        ret
+
+# print_i64(n: rdi) -- signed decimal and a newline
+print_i64:
+        sub     rsp, 24
+        lea     r8, [rsp + 23]
+        mov     BYTE PTR [r8], 10
+        mov     rsi, r8
+        mov     rax, rdi
+        test    rax, rax
+        jns     .Lpositive
+        neg     rax
+.Lpositive:
+        mov     ecx, 10
+.Ldigit:
+        xor     edx, edx
+        div     rcx
+        add     dl, '0'
+        dec     rsi
+        mov     [rsi], dl
+        test    rax, rax
+        jnz     .Ldigit
+        test    rdi, rdi
+        jns     .Lwrite
+        dec     rsi
+        mov     BYTE PTR [rsi], '-'
+.Lwrite:
+        lea     rdx, [r8 + 1]
+        sub     rdx, rsi
+        mov     eax, 1
+        mov     edi, 1
+        syscall
+        add     rsp, 24
+        ret
+```
+
+It prints:
+
+```text
+0
+42
+100
+```
+
+Annotating compiler output with comments like these, line by line, is the best way to learn to read it. Do it for a few functions of your own on Compiler Explorer, and the patterns quickly become familiar.
+
+</Section>
+
+<Section id="human" kind="human" title="Where professionals read assembly">
+
+A few places where the skill from this lesson is used every day:
+
+- **Profiling.** `perf record` followed by `perf annotate` on Linux shows the assembly of a hot function with the share of samples on each instruction. The hot spot is often not where the source suggests: a load that misses the cache, a `div` hidden in a modulo, a loop that failed to vectorise.
+- **Performance analysis tools.** `llvm-mca` estimates how a sequence of instructions will flow through a particular processor's pipeline, and the tables at [uops.info](https://uops.info/) give measured latency and throughput for every instruction on many processor generations. They replace guessing with numbers.
+- **Code review of hot paths.** Teams working on databases, game engines, compilers and trading systems paste Compiler Explorer links into reviews to show that a change removed a branch or kept a loop vectorised.
+- **Reverse engineering and security.** Malware analysts and vulnerability researchers read disassembly of programs without source, using tools such as Ghidra (open-sourced by the US National Security Agency in 2019) or radare2, which turn machine code back into annotated assembly and approximate C.
+- **Compiler and runtime development.** People who write compilers, JIT engines and language runtimes read assembly constantly to check that their code generators produce what they intend.
+
+In each case the work looks like this lesson: get the assembly, find the loop or the function that matters, and annotate it until every line makes sense.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Reading `-O0` output to judge performance.** Unoptimised code keeps every variable on the stack and is many times slower than what you ship. Look at `-O2` (or whatever your build uses), and remember that the same source can compile very differently with another compiler, version or `-march` setting.
+
+</Misconception>
+
+<Misconception>
+
+**Thinking a compiler that "deleted" your code is buggy.** Compilers remove computations whose results are unused, and they assume that the program has no undefined behaviour. A loop that "disappeared" usually computed nothing observable. A security wipe of a password buffer that disappeared is a real problem, and the fix is a function the compiler must keep, such as `explicit_bzero` or C23's `memset_explicit`, not hand-written assembly.
+
+</Misconception>
+
+<Misconception>
+
+**Using inline assembly where an intrinsic would do.** GCC's extended `asm` lets you write single instructions inside C, but it hides the code from the optimiser and is easy to get subtly wrong (forgotten clobbers, wrong constraints). For SIMD and special instructions, compiler **intrinsics** such as `_mm_add_epi64` or `__builtin_popcountll` are usually better: they compile to the same instruction and the compiler can still schedule and optimise around them.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting that `main` is called, not jumped to.** Assembly that defines `main` is an ordinary function called by the C library: it must preserve callee-saved registers, keep the stack aligned before its own calls, and return with `ret` (result in `eax`), not with an `exit` system call that would skip flushing `printf`'s buffered output.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code.
+
+<Exercises/>
+
+</Section>
