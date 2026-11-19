@@ -1,0 +1,452 @@
+---
+title: Errors, legacy code and migration
+subtitle: Structured exceptions with Try, Catch, When and Using, the On Error style you will meet in old code, and how professionals upgrade and migrate Visual Basic systems safely.
+minutes: 65
+objectives:
+  - Handle errors with Try, Catch, Finally, exception filters (When), Throw and custom exceptions
+  - Release resources reliably with Using and IDisposable, and predict the order in which filters and cleanup run
+  - Read and convert legacy On Error GoTo and On Error Resume Next code
+  - Name the semantic differences that make naive Visual Basic to C# translation change behaviour
+  - Plan an upgrade or migration with characterisation tests and small, reversible steps
+prerequisites: [files-text-and-async]
+references:
+  - title: Try...Catch...Finally statement
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/visual-basic/language-reference/statements/try-catch-finally-statement
+    note: The language reference for Try, Catch, When, Finally and Throw.
+  - title: Port from .NET Framework to .NET
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/core/porting/
+    note: Microsoft's guide to moving applications to modern .NET, with the current tools.
+  - title: Code Converter (VB to C# and C# to VB)
+    url: https://github.com/icsharpcode/CodeConverter
+    note: An open-source converter between the two languages, available as a Visual Studio extension.
+  - title: Working Effectively with Legacy Code
+    author: Michael Feathers
+    year: 2004
+    note: The classic book on getting untested code under test, including characterisation tests.
+  - title: Strangler Fig Application
+    author: Martin Fowler
+    url: https://martinfowler.com/bliki/StranglerFigApplication.html
+    note: Replacing a legacy system gradually, piece by piece, instead of in one rewrite.
+---
+
+<Section id="motivation" kind="motivation" title="When things go wrong, and when systems grow old">
+
+Two kinds of trouble fill a Visual Basic maintainer's week. The first is ordinary failure: a file that is missing, a quantity typed as "two", a database that does not answer. A program must notice, react sensibly, release what it was holding and tell someone. The second is age: code written for VB6, or for the .NET Framework of 2005, that the business still depends on and that now has to move to modern .NET, or to C#, without anyone noticing a change except that it still works.
+
+This lesson covers both. First, Visual Basic's structured exception handling, which it shares with C# but with one feature C# gained only in 2015. Then the unstructured `On Error` style of classic Visual Basic, which VB.NET still compiles and which you will meet in old code. Finally, how professionals plan and carry out upgrades and migrations, including the exact places where a line-by-line translation to C# silently changes what a program does.
+
+</Section>
+
+<Section id="exceptions" kind="definitions" title="Exceptions">
+
+<Definition term="Exception">
+
+An **exception** is an object, of a class derived from `System.Exception`, that represents an error. **`Throw`** raises one; the runtime then unwinds the call stack until it finds a matching **`Catch`**. A `Try` block may have several `Catch` clauses, tried in order, each optionally with a **`When`** condition (an **exception filter**), and a **`Finally`** block that runs however the `Try` block is left.
+
+</Definition>
+
+Here is a small stock system that withdraws items, with the kinds of failure such code meets:
+
+```vb check
+Option Strict On
+
+Imports System.Globalization
+
+' A custom exception: derive from Exception and keep the standard constructors.
+Public Class StockException
+    Inherits Exception
+
+    Public ReadOnly Property ItemCode As String
+
+    Public Sub New(itemCode As String, message As String, Optional inner As Exception = Nothing)
+        MyBase.New(message, inner)
+        Me.ItemCode = itemCode
+    End Sub
+End Class
+
+Module Program
+    Private ReadOnly stock As New Dictionary(Of String, Integer) From {{"MAIZE-25", 40}, {"BEANS-10", 3}}
+
+    Function ParseQuantity(text As String) As Integer
+        Return Integer.Parse(text, CultureInfo.InvariantCulture)
+    End Function
+
+    Sub Withdraw(code As String, quantityText As String)
+        Dim quantity As Integer
+        Try
+            quantity = ParseQuantity(quantityText)
+        Catch ex As FormatException
+            ' Wrap the low-level error in one that means something here, keeping the original.
+            Throw New StockException(code, $"quantity '{quantityText}' is not a whole number", ex)
+        End Try
+        If Not stock.ContainsKey(code) Then Throw New KeyNotFoundException($"no item {code}")
+        If quantity > stock(code) Then
+            Throw New StockException(code, $"only {stock(code)} left, {quantity} requested")
+        End If
+        stock(code) -= quantity
+    End Sub
+
+    Sub Main()
+        Dim processed As Integer = 0
+        Dim requests = {("MAIZE-25", "12"), ("BEANS-10", "5"), ("RICE-50", "1"), ("MAIZE-25", "two"), ("MAIZE-25", "-3")}
+        For Each r In requests
+            Console.Write($"{r.Item1} x {r.Item2}: ")
+            Try
+                Withdraw(r.Item1, r.Item2)
+                Console.WriteLine($"ok, {stock(r.Item1)} left")
+            Catch ex As StockException When ex.InnerException IsNot Nothing
+                Console.WriteLine($"bad input ({ex.Message}; cause: {ex.InnerException.GetType().Name})")
+            Catch ex As StockException
+                Console.WriteLine($"refused ({ex.Message})")
+            Catch ex As KeyNotFoundException
+                Console.WriteLine($"unknown item ({ex.Message})")
+            Finally
+                processed += 1                  ' runs however the Try block ends
+            End Try
+        Next
+        Console.WriteLine($"{processed} requests processed; maize left: {stock("MAIZE-25")}")
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+MAIZE-25 x 12: ok, 28 left
+BEANS-10 x 5: refused (only 3 left, 5 requested)
+RICE-50 x 1: unknown item (no item RICE-50)
+MAIZE-25 x two: bad input (quantity 'two' is not a whole number; cause: FormatException)
+MAIZE-25 x -3: ok, 31 left
+5 requests processed; maize left: 31
+```
+
+- **Catch specific types, most specific first.** The program catches `StockException` and `KeyNotFoundException` separately because it reacts to them differently. It does not catch `Exception`: an unexpected `NullReferenceException` is a bug, and swallowing it would hide the bug.
+- **`When` filters.** `Catch ex As StockException When ex.InnerException IsNot Nothing` catches only stock exceptions that wrap another error, here the bad input. Visual Basic has had exception filters since its first .NET version; C# added them in 2015.
+- **Wrap with meaning, keep the cause.** `ParseQuantity` throws a `FormatException` that knows nothing about stock. `Withdraw` catches it and throws a `StockException` that says what went wrong *in this program's terms*, passing the original as the `InnerException`, so no information is lost.
+- **A custom exception** is a class that `Inherits Exception`, passes the message and inner exception to `MyBase.New`, and adds whatever properties help the handler, here the `ItemCode`.
+- **`Finally`** counted five requests, including the ones that failed: it runs after the `Try` block, after a `Catch`, and even when an exception escapes.
+- **Exceptions are not validation.** The last request withdrew `-3`, and the program cheerfully *added* three bags. Nothing threw, because nothing checked. The fix is a guard at the top of `Withdraw`, such as `If quantity <= 0 Then Throw New ArgumentOutOfRangeException(NameOf(quantityText))`. Exception handling decides what to do with errors; it cannot discover ones nobody tests for.
+
+To rethrow an exception you have caught, write **`Throw`** on its own, which preserves the original stack trace. `Throw ex` throws the same object but resets the trace to the current line, which makes the real origin much harder to find; it is a common mistake in older code.
+
+</Section>
+
+<Section id="using" kind="examples" title="Using, IDisposable and the order of events">
+
+Files, network connections, database connections and locks must be released when you are done with them, failure or not. In .NET such objects implement **`IDisposable`**, and the **`Using`** statement calls their `Dispose` method when the block ends, however it ends. This program uses a fake connection class that reports what happens:
+
+```vb check
+Option Strict On
+
+' Anything holding an outside resource (a file, a connection, a lock) implements IDisposable.
+Public NotInheritable Class Connection
+    Implements IDisposable
+
+    Private ReadOnly _name As String
+
+    Public Sub New(name As String)
+        _name = name
+        Console.WriteLine($"  open {_name}")
+    End Sub
+
+    Public Sub Send(message As String)
+        If message.Length > 10 Then Throw New InvalidOperationException($"{_name}: message too long")
+        Console.WriteLine($"  sent '{message}' on {_name}")
+    End Sub
+
+    Public Sub Dispose() Implements IDisposable.Dispose
+        Console.WriteLine($"  close {_name}")
+    End Sub
+End Class
+
+Module Program
+    Function LogAndContinue(ex As Exception) As Boolean
+        Console.WriteLine($"  filter saw: {ex.Message}")
+        Return False                       ' False: do not catch here, keep looking
+    End Function
+
+    Sub SendBoth(first As String, second As String)
+        ' Using guarantees Dispose, in reverse order, however the block is left.
+        Using primary As New Connection("primary"), backup As New Connection("backup")
+            primary.Send(first)
+            backup.Send(second)
+        End Using
+    End Sub
+
+    Sub Main()
+        Console.WriteLine("normal run:")
+        SendBoth("hello", "hi")
+
+        Console.WriteLine("failing run:")
+        Try
+            Try
+                SendBoth("hello", "a very long message")
+            Catch ex As Exception When LogAndContinue(ex)
+                Console.WriteLine("  never printed")
+            End Try
+        Catch ex As InvalidOperationException
+            Console.WriteLine($"  handled: {ex.Message}")
+        End Try
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+normal run:
+  open primary
+  open backup
+  sent 'hello' on primary
+  sent 'hi' on backup
+  close backup
+  close primary
+failing run:
+  open primary
+  open backup
+  sent 'hello' on primary
+  filter saw: backup: message too long
+  close backup
+  close primary
+  handled: backup: message too long
+```
+
+- **`Using` disposes in reverse order.** With two resources in one `Using` statement, `backup` was closed before `primary`, the reverse of opening, so that a resource can rely on one opened before it.
+- **Disposal happens on failure too.** When `backup.Send` threw, both connections were still closed. `Using` is shorthand for `Try ... Finally ... Dispose`, and it is how professional code handles every disposable object.
+- **Filters run before cleanup.** Look at the order of the failing run: the filter `LogAndContinue` saw the exception *before* the connections were closed. .NET handles an exception in two passes: first it searches up the stack for a handler, running filters as it goes; only then does it unwind, running `Finally` blocks and `Dispose`. A filter therefore sees the program's state at the moment of failure, which is why the pattern `Catch ex As Exception When Log(ex)`, with a `Log` function that returns `False`, is a popular way to record errors without handling them. It also means a filter must not depend on cleanup having happened.
+
+</Section>
+
+<Section id="on-error" kind="examples" title="On Error: the legacy style">
+
+Before .NET, Visual Basic had no exceptions. A procedure declared what to do when an error occurred with **`On Error GoTo label`** (jump to an error handler) or **`On Error Resume Next`** (ignore the error and carry on), and inspected the global **`Err`** object for the error's number and description. VB.NET kept this *unstructured* error handling so that upgraded code would compile, and it still works on .NET 10:
+
+```vb check
+Option Strict On
+
+Module Program
+    ' Classic, unstructured error handling, still accepted by VB.NET for compatibility.
+    Function AverageOld(values As Integer(), count As Integer) As Integer
+        On Error GoTo Failed
+        AverageOld = 0
+        AverageOld = CInt(values.Sum() \ count)
+        Exit Function
+Failed:
+        Console.WriteLine($"  error {Err.Number}: {Err.Description}")
+        AverageOld = -1
+    End Function
+
+    ' On Error Resume Next: keep going after any error, which hides problems.
+    Sub ResumeNextDemo()
+        On Error Resume Next
+        Dim parts As String() = {"12", "x7", "30"}
+        Dim total As Integer = 0
+        For Each p In parts
+            total += Integer.Parse(p)
+            If Err.Number <> 0 Then
+                Console.WriteLine($"  skipped '{p}' (error {Err.Number})")
+                Err.Clear()
+            End If
+        Next
+        Console.WriteLine($"  total {total}")
+    End Sub
+
+    ' The same logic with structured exceptions.
+    Function AverageNew(values As Integer(), count As Integer) As Integer?
+        Try
+            Return values.Sum() \ count
+        Catch ex As DivideByZeroException
+            Return Nothing
+        End Try
+    End Function
+
+    Sub Main()
+        Console.WriteLine("On Error GoTo:")
+        Console.WriteLine($"  {AverageOld({4, 8, 9}, 3)}")
+        Console.WriteLine($"  {AverageOld({4, 8, 9}, 0)}")
+        Console.WriteLine("On Error Resume Next:")
+        ResumeNextDemo()
+        Console.WriteLine("Try...Catch:")
+        Dim result = AverageNew({4, 8, 9}, 0)
+        Console.WriteLine($"  has value? {result.HasValue}")
+        Try
+            Err.Raise(vbObjectError + 513, "Inventory", "item code not recognised")
+        Catch ex As Exception
+            Console.WriteLine($"Err.Raise arrives as {ex.GetType().Name}: {ex.Message}")
+        End Try
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+On Error GoTo:
+  7
+  error 11: Attempted to divide by zero.
+  -1
+On Error Resume Next:
+  skipped 'x7' (error 13)
+  total 42
+Try...Catch:
+  has value? False
+Err.Raise arrives as Exception: item code not recognised
+```
+
+- **`On Error GoTo Failed`** sends any error to the `Failed:` label. The function must `Exit Function` before the label, or the normal path would fall into the handler. Inside the handler, `Err.Number` holds the classic error number, which VB.NET derives from the .NET exception: division by zero is error 11, a failed conversion error 13 ("type mismatch"), numbers that VB6 code often tests for.
+- **`On Error Resume Next`** continued after the failed `Integer.Parse` with the next statement, so `total` simply did not include `x7`. This code checks `Err.Number` after the risky line and clears it, which is the responsible way to use it. Much old code does not check at all, so errors vanish and the program continues with wrong data.
+- **`Err.Raise`** is the old way to throw. In VB.NET it raises a real exception, which `Try ... Catch` can catch.
+- **The two styles cannot be mixed in one procedure**: the compiler reports *BC30544: Method cannot contain both a 'Try' statement and an 'On Error' or 'Resume' statement*. So conversion happens a whole procedure at a time.
+
+Converting a procedure from `On Error` to `Try ... Catch` is mostly mechanical: the code between `On Error GoTo` and the label becomes the `Try` block, the handler becomes a `Catch` (narrowed to the exceptions that can really occur, rather than all of them), and any cleanup that ran in both paths moves to `Finally` or a `Using`. `On Error Resume Next` needs more thought, because you must decide, line by line, which errors were expected and which were being hidden; the honest conversion often reveals bugs. As `AverageNew` shows, a modern version may also signal "no answer" with a value, here `Nothing` in an `Integer?`, instead of a magic `-1`.
+
+</Section>
+
+<Section id="migration" kind="human" title="Upgrading and migrating Visual Basic systems">
+
+Three journeys are common, and each has its own difficulties.
+
+**VB6 to Visual Basic .NET.** Microsoft shipped an Upgrade Wizard in Visual Studio until the 2008 edition; it converted syntax but left large amounts of code marked for manual work, especially forms, data access with ADO and the COM components that VB6 applications were built from. Most organisations that still have VB6 today face a rewrite rather than an upgrade, and they usually do it gradually: new .NET code calls the old COM components (or the reverse, through COM interop) while pieces are replaced one at a time. Remember the defaults that change meaning, such as parameters being `ByRef` in VB6 and `ByVal` in VB.NET (see <LessonLink slug="procedures-and-functions">the procedures lesson</LessonLink>), arrays, `Variant`, and default properties.
+
+**.NET Framework to modern .NET.** A Visual Basic application on .NET Framework 4.x can usually move to .NET 10 with its language unchanged. The work is in the project and the libraries: convert the project file to the modern SDK style, replace packages that have no modern version, and deal with what does not exist on modern .NET. Windows Forms and WPF are supported (on Windows only); ASP.NET Web Forms and WCF services are not, and parts of the `My` namespace, such as `My.Computer`, are missing from many project types. Microsoft's porting guide describes the current tooling, which analyses a solution and performs much of the mechanical work.
+
+**Visual Basic to C#.** Since Visual Basic will not evolve further, many teams move to C# eventually. Because both compile to the same intermediate language and share one type system, the move can be gradual: a solution can contain Visual Basic and C# projects that reference each other, so new code can be written in C# while old code keeps running. Converters, such as the open-source Code Converter, translate whole files. The danger is in the semantics, because many lines that *look* identical in the two languages are not. Here is a Visual Basic program built from such lines:
+
+```vb check
+Option Strict On
+
+Module Program
+    Sub Main()
+        Dim items As Integer = 7, boxes As Integer = 2
+        Console.WriteLine($"items / boxes     = {items / boxes}")
+        Console.WriteLine($"CInt(2.5), CInt(3.5) = {CInt(2.5)}, {CInt(3.5)}")
+
+        Dim name As String = Nothing
+        Console.WriteLine($"Nothing = """"     -> {name = ""}")
+
+        Dim big As Integer = Integer.MaxValue
+        Try
+            big += 1
+            Console.WriteLine($"MaxValue + 1      = {big}")
+        Catch ex As OverflowException
+            Console.WriteLine("MaxValue + 1      -> OverflowException")
+        End Try
+
+        Console.WriteLine($"Mid(""Cusco"", 2, 3) = {Mid("Cusco", 2, 3)}")
+
+        Dim limit As Integer = 5, passes As Integer = 0
+        For i As Integer = 1 To limit
+            passes += 1
+            limit = 2                        ' the bound was fixed when the loop began
+        Next
+        Console.WriteLine($"loop passes       = {passes}")
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+items / boxes     = 3.5
+CInt(2.5), CInt(3.5) = 2, 4
+Nothing = ""     -> True
+MaxValue + 1      -> OverflowException
+Mid("Cusco", 2, 3) = usc
+loop passes       = 5
+```
+
+and here is the line-by-line C# translation that a hurried person might write:
+
+```csharp check
+// A line-by-line C# translation of the Visual Basic program, as a hurried person might write it
+int items = 7, boxes = 2;
+Console.WriteLine($"items / boxes     = {items / boxes}");
+Console.WriteLine($"(int)2.5, (int)3.5 = {(int)2.5}, {(int)3.5}");
+
+string? name = null;
+Console.WriteLine($"null == \"\"        -> {name == ""}");
+
+int big = int.MaxValue;
+try
+{
+    big += 1;
+    Console.WriteLine($"MaxValue + 1      = {big}");
+}
+catch (OverflowException)
+{
+    Console.WriteLine("MaxValue + 1      -> OverflowException");
+}
+
+Console.WriteLine($"\"Cusco\".Substring(2, 3) = {"Cusco".Substring(2, 3)}");
+
+int limit = 5, passes = 0;
+for (int i = 1; i <= limit; i++)
+{
+    passes += 1;
+    limit = 2;                              // the condition is tested again on every pass
+}
+Console.WriteLine($"loop passes       = {passes}");
+```
+
+It printed:
+
+```text
+items / boxes     = 3
+(int)2.5, (int)3.5 = 2, 3
+null == ""        -> False
+MaxValue + 1      = -2147483648
+"Cusco".Substring(2, 3) = sco
+loop passes       = 2
+```
+
+Every line changed meaning:
+
+| Visual Basic | Naive C# | What changed |
+| --- | --- | --- |
+| `items / boxes` is 3.5 | `items / boxes` is 3 | VB's `/` always divides as floating point; use `\` for integer division |
+| `CInt(2.5)`, `CInt(3.5)` are 2 and 4 | `(int)` gives 2 and 3 | `CInt` rounds halves to even; a C# cast truncates |
+| `Nothing = ""` is `True` | `null == ""` is `false` | VB string comparison treats `Nothing` as the empty string |
+| overflow throws | overflow wraps to −2147483648 | VB checks integer arithmetic by default; C# does not, unless `checked` |
+| `Mid("Cusco", 2, 3)` is `usc` | `Substring(2, 3)` is `sco` | `Mid` counts from 1, `Substring` from 0 |
+| the loop ran 5 times | the loop ran 2 times | VB evaluates a `For` loop's bounds once; C# tests its condition on every pass |
+
+Good converters know these rules and preserve behaviour, often by calling helper functions from the `Microsoft.VisualBasic` library in the generated C#; the result is correct but not idiomatic, and cleaning it up is a second, careful step. Others to watch for: case-insensitive names that collide in C#, `Option Compare Text` at the top of a file, `Static` locals, optional parameters, `Like`, XML literals, `When` filters, `Handles` clauses and the `My` namespace.
+
+### How professionals do it
+
+- **Characterisation tests first.** Before changing old code, write tests that record what it *does* now, right or wrong: feed it real inputs and assert today's outputs. These tests, a term from Michael Feathers's book on legacy code, are what tell you that a conversion changed nothing.
+- **Small, reversible steps.** Turn on `Option Strict` one file at a time; replace one `On Error` procedure at a time; move one project to modern .NET or to C# at a time. Each step should leave a working, releasable system.
+- **Strangle, don't rewrite.** Martin Fowler's "strangler fig" pattern grows a new system around the old one, routing one feature at a time to new code until the old code can be removed. Big-bang rewrites of business systems have a poor record: the old code embodies decades of rules nobody wrote down.
+- **Know when to stop.** A stable Visual Basic library on modern .NET, with tests and `Option Strict On`, is a perfectly good place to be. Migration should serve a goal (hiring, a platform the old code cannot reach, a feature only C# offers), not fashion.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Catching `Exception` everywhere makes a program robust."** It makes it quiet. Catch the exceptions you can handle meaningfully, close to where you can handle them, and let the rest reach a top-level handler that logs them and stops cleanly.
+
+</Misconception>
+
+<Misconception>
+
+**"`On Error Resume Next` handles errors."** It ignores them. Unless the code checks `Err.Number` after each risky statement, the program continues with whatever values it happened to have.
+
+</Misconception>
+
+<Misconception>
+
+**"Visual Basic and C# compile to the same IL, so translation is mechanical."** The IL is the same *after* compilation; the rules that produce it differ, as the table above shows. Translation without tests changes behaviour silently.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

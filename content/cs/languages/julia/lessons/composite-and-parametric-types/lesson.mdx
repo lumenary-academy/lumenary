@@ -1,0 +1,363 @@
+---
+title: Composite and parametric types
+subtitle: Defining your own types with struct, constructors that protect invariants, parametric types that stay fast, and the interfaces that plug your types into the whole language.
+minutes: 65
+objectives:
+  - Define immutable and mutable composite types, with const fields and keyword constructors
+  - Write inner constructors that enforce invariants and outer constructors that add convenience
+  - Define parametric types and parametric methods with where clauses
+  - Explain why concrete field types matter for performance and memory layout
+  - Make your own types work with Base functions by extending show, arithmetic, iteration and the AbstractArray interface
+prerequisites: [arrays-and-linear-algebra]
+references:
+  - title: Julia manual, Types
+    url: https://docs.julialang.org/en/v1/manual/types/
+    note: Composite, mutable, parametric, union and singleton types.
+  - title: Julia manual, Constructors
+    url: https://docs.julialang.org/en/v1/manual/constructors/
+    note: Inner and outer constructors, new, and parametric constructors.
+  - title: Julia manual, Interfaces
+    url: https://docs.julialang.org/en/v1/manual/interfaces/
+    note: The methods to implement for iteration, indexing, AbstractArray and broadcasting.
+  - title: Julia manual, Missing Values
+    url: https://docs.julialang.org/en/v1/manual/missing/
+    note: How missing propagates through arithmetic and comparisons.
+---
+
+<Section id="motivation" kind="motivation" title="Types that carry meaning">
+
+So far your data has lived in numbers, strings, arrays and dictionaries. That takes you a long way, but real programs are about *things*: weather stations, bank accounts, particles, measurements with uncertainty. You could store a station as a tuple `("Ushuaia", -54.8, -68.3)` and remember that position 2 is the latitude, but the code would be fragile and unreadable, and you could not give stations their own behaviour.
+
+In Julia you define a **composite type** with `struct`. What makes this more interesting than a record in other languages is how it combines with multiple dispatch: once your type exists, you can add methods to `show`, `+`, `iterate`, `getindex` and hundreds of other Base functions, and your type becomes a first-class citizen that works with code written by people who have never heard of it. Done well, this is how Julia packages are built.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="struct and mutable struct">
+
+```julia check
+# Composite types: struct (immutable) and mutable struct
+struct Station
+    name::String
+    latitude::Float64
+    longitude::Float64
+end
+
+s = Station("Ushuaia", -54.8, -68.3)
+println(s)
+println(s.name, " is at latitude ", s.latitude)
+println(fieldnames(Station))
+
+try
+    s.latitude = 0.0
+catch err
+    println("cannot change a struct: ", typeof(err))
+end
+
+mutable struct Account
+    const owner::String             # a const field cannot change (Julia 1.8+)
+    balance::Int                    # in cents
+end
+
+acct = Account("Ngozi", 10_000)
+acct.balance -= 2_550
+println(acct.owner, " has ", acct.balance ÷ 100, ".", lpad(acct.balance % 100, 2, '0'), " left")
+
+# Keyword constructors with defaults, from Base.@kwdef
+Base.@kwdef struct SimulationSettings
+    steps::Int = 1_000
+    dt::Float64 = 0.01
+    verbose::Bool = false
+end
+println(SimulationSettings())
+println(SimulationSettings(dt = 0.001, verbose = true))
+
+# Two structs with equal fields are equal (and immutable ones are values)
+println(Station("Ushuaia", -54.8, -68.3) == s)
+```
+
+It prints:
+
+```text
+Station("Ushuaia", -54.8, -68.3)
+Ushuaia is at latitude -54.8
+(:name, :latitude, :longitude)
+cannot change a struct: ErrorException
+Ngozi has 74.50 left
+SimulationSettings(1000, 0.01, false)
+SimulationSettings(1000, 0.001, true)
+true
+```
+
+<Definition term="Composite type">
+
+A **composite type** is a named collection of **fields**, declared with `struct Name ... end`. By default it is **immutable**: once constructed, its fields cannot be reassigned. Declared with `mutable struct`, its fields can be changed with `obj.field = value`. Julia automatically provides a **default constructor**, called with the field values in order, which converts each argument to its field's declared type.
+
+</Definition>
+
+- **Immutable is the default** and usually the right choice. Immutable values can be copied freely, compared by value, stored inline in arrays, and kept in registers by the compiler. "Changing" one means constructing a new one, which is cheap for small types. Trying to assign a field fails, as the `ErrorException` above shows.
+- **Mutable structs** are for things with identity that change over time, like an account whose balance moves. Since Julia 1.8 you can mark individual fields of a mutable struct `const` to say they never change.
+- **`Base.@kwdef`** generates a keyword constructor with default values, which is ideal for settings and configuration objects.
+- **Equality.** `==` on two structs compares them field by field, so two separately constructed `Station`s with the same fields are equal.
+
+Note the money: the balance is stored as an integer number of cents, and printed with `÷`, `%` and `lpad`, so no floating-point rounding can ever creep in.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Constructors and parametric types">
+
+Many types have rules that every value must obey. A fraction cannot have a zero denominator; a probability lies between 0 and 1; an interval's lower bound is not above its upper bound. Julia lets you enforce such an **invariant** with an **inner constructor**, written inside the `struct` block. Inside it, the special function `new` creates the object; once you write an inner constructor, the default one disappears, so there is no way to build a value that skips your check.
+
+The next program defines an **interval** type for **interval arithmetic**, a technique used in rigorous numerics to track measurement uncertainty: each quantity is a range guaranteed to contain the true value, and every operation produces a range guaranteed to contain the true result.
+
+```julia check
+# A parametric type with an inner constructor that enforces an invariant,
+# plus methods that make it behave like a number: interval arithmetic.
+struct Interval{T<:Real}
+    lo::T
+    hi::T
+    function Interval{T}(lo, hi) where {T<:Real}
+        lo <= hi || throw(ArgumentError("empty interval: $lo > $hi"))
+        return new{T}(lo, hi)
+    end
+end
+
+# Outer constructors: infer T, and promote mixed arguments to a common type
+Interval(lo::T, hi::T) where {T<:Real} = Interval{T}(lo, hi)
+Interval(lo::Real, hi::Real) = Interval(promote(lo, hi)...)
+Interval(x::Real) = Interval(x, x)
+
+Base.show(io::IO, x::Interval) = print(io, "[", x.lo, ", ", x.hi, "]")
+Base.:+(a::Interval, b::Interval) = Interval(a.lo + b.lo, a.hi + b.hi)
+function Base.:*(a::Interval, b::Interval)
+    products = (a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi)
+    return Interval(minimum(products), maximum(products))
+end
+Base.:*(c::Real, b::Interval) = Interval(c) * b
+Base.zero(::Interval{T}) where {T} = Interval(zero(T))
+Base.one(::Interval{T}) where {T} = Interval(one(T))
+Base.in(x::Real, a::Interval) = a.lo <= x <= a.hi
+
+length_m = Interval(2.0, 2.1)          # a measured length, with its uncertainty
+width_m = Interval(3, 4)                # Int64 bounds
+println(typeof(length_m), " ", typeof(width_m))
+println("area is in ", length_m * width_m)
+println("perimeter is in ", 2 * (length_m + width_m))
+println(8.0 in length_m * width_m)
+
+try
+    Interval(5, 1)
+catch err
+    println(err)
+end
+
+# Horner's rule from lesson 3, unchanged, now evaluates a polynomial over an interval
+function horner(coeffs, x)
+    result = zero(x)
+    for c in reverse(coeffs)
+        result = result * x + c * one(x)
+    end
+    return result
+end
+println(horner([1, -3, 2], Interval(0.0, 1.0)))
+```
+
+It prints:
+
+```text
+Interval{Float64} Interval{Int64}
+area is in [6.0, 8.4]
+perimeter is in [10.0, 12.2]
+true
+ArgumentError("empty interval: 5 > 1")
+[-2.0, 1.0]
+```
+
+### Parametric types
+
+`struct Interval{T<:Real}` declares a **parametric type**: `T` is a type parameter, constrained to be some subtype of `Real`. `Interval{Float64}` and `Interval{Int64}` are two different concrete types created from one definition, just as `Vector{Float64}` and `Vector{Int64}` are. The program shows the usual layering of constructors:
+
+1. The **inner constructor** `Interval{T}(lo, hi)` checks the invariant and calls `new{T}`.
+2. An **outer constructor** `Interval(lo::T, hi::T) where {T<:Real}` infers `T` from the arguments, so you can write `Interval(3, 4)` instead of `Interval{Int64}(3, 4)`. The `where {T<:Real}` clause makes this a **parametric method**: it matches any two arguments of the *same* real type and names that type `T`.
+3. Another outer constructor `Interval(lo::Real, hi::Real)` catches mixed types, such as an `Int` and a `Float64`, and **promotes** them to a common type first. Without it, `Interval(1, 2.5)` would be a `MethodError`.
+
+Then come the methods that make intervals behave like numbers: `show` for printing, `+` and `*` for arithmetic, `*` between a plain number and an interval, `zero` and `one`, and `in`. Notice that they are added to Base's functions, written `Base.:+` and `Base.show`: you extend the existing generic functions so that every piece of code calling `+` can now handle intervals.
+
+The payoff is the last line. The `horner` function from lesson 3, copied unchanged, now evaluates $1 - 3x + 2x^2$ for every $x$ in $[0, 1]$ at once, and returns an interval containing every possible result. The true range is $[-\tfrac18, 1]$; interval arithmetic returned the wider $[-2, 1]$, because it treats each occurrence of $x$ as independent. That overestimation, called the **dependency problem**, is the price of a guarantee, and real interval libraries such as IntervalArithmetic.jl work hard to reduce it.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Concrete fields, unions and missing values">
+
+When you design a struct, the types of its fields decide how it is stored in memory, and that decides how fast code using it can be.
+
+```julia check
+# Why concrete field types matter
+struct LooseBox
+    x::Real                 # abstract: the field can hold any Real
+end
+
+struct TightBox{T<:Real}
+    x::T                    # concrete once T is known
+end
+
+println(TightBox(1.5), " ", TightBox(2), " ", typeof(TightBox(2)))
+println("isbitstype: LooseBox ", isbitstype(LooseBox), ", TightBox{Float64} ", isbitstype(TightBox{Float64}))
+
+total(boxes) = sum(b.x for b in boxes)
+
+loose = [LooseBox(Float64(i)) for i in 1:1_000]
+tight = [TightBox(Float64(i)) for i in 1:1_000]
+total(loose); total(tight)                       # compile both first
+
+println("sums: ", total(loose), " ", total(tight))
+println("bytes allocated summing loose boxes: ", @allocated total(loose))
+println("bytes allocated summing tight boxes: ", @allocated total(tight))
+
+# Union types: a value that may be absent
+function first_negative(xs)
+    i = findfirst(<(0), xs)
+    return i === nothing ? nothing : xs[i]
+end
+println(first_negative([3, -1, 4]), " ", something(first_negative([3, 1, 4]), "none"))
+println(typeof(missing), " ", missing + 1, " ", sum(skipmissing([1, missing, 3])))
+```
+
+It prints:
+
+```text
+TightBox{Float64}(1.5) TightBox{Int64}(2) TightBox{Int64}
+isbitstype: LooseBox false, TightBox{Float64} true
+sums: 500500.0 500500.0
+bytes allocated summing loose boxes: 15984
+bytes allocated summing tight boxes: 0
+-1 none
+Missing missing 4
+```
+
+A `LooseBox` declares its field as `Real`, an abstract type. The field could hold an `Int`, a `Float64` or a `BigFloat`, so Julia must store a pointer to a separately allocated, tagged value, and code that reads the field must check its type at run time. A `TightBox{Float64}` has a field that is exactly a `Float64`, so the struct is just eight bytes of data (`isbitstype` is `true`), a vector of them is a flat block of numbers, and summing them needs no allocation at all. On this run, summing a thousand loose boxes allocated 15 984 bytes, because each value read from a field had to be handled as an unknown `Real`; the tight version allocated nothing.
+
+<Note>
+
+**The rule:** give every field a concrete type, or make the struct parametric so the field's type is concrete once the parameter is known. `x::Real` in a struct is a performance trap; `x::T` with `T<:Real` is not. This is the one place where adding type information makes Julia code faster, because it is information the compiler could not otherwise know.
+
+</Note>
+
+### Absent values: `nothing` and `missing`
+
+Julia has two different ways to say "no value", and they mean different things:
+
+- **`nothing`** (of type `Nothing`) means *there is no value here*, as when `findfirst` finds nothing. A function that may or may not return an `Int` has a return type of `Union{Int, Nothing}`. Check for it with `=== nothing`, and use `something(x, default)` to supply a fallback.
+- **`missing`** (of type `Missing`) means *there is a value, but we do not know it*, as in a survey answer that was left blank. It is designed for statistics: it **propagates** through arithmetic (`missing + 1` is `missing`), and functions such as `skipmissing` let you ignore it on purpose.
+
+`Union{T, Nothing}` and `Union{T, Missing}` with a single concrete `T` are handled specially by the compiler, so arrays like `Vector{Union{Float64, Missing}}` stay compact and fast.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Interfaces: a few methods, the whole language">
+
+Julia has no `interface` keyword. Instead, an **interface** is an informal contract: a short list of methods that, once defined for your type, make a large set of generic functions work with it. The manual lists them. Two are especially valuable.
+
+```julia check
+# Implementing Julia's interfaces: get dozens of functions for free
+
+# 1. Iteration: define Base.iterate and your type works in for loops, collect, sum, ...
+struct Countdown
+    from::Int
+end
+Base.iterate(c::Countdown, n = c.from) = n < 1 ? nothing : (n, n - 1)
+Base.length(c::Countdown) = max(c.from, 0)
+Base.eltype(::Type{Countdown}) = Int
+
+for k in Countdown(3)
+    print(k, "... ")
+end
+println("liftoff")
+println(collect(Countdown(5)), " ", sum(Countdown(100)), " ", maximum(Countdown(7)))
+
+# 2. AbstractArray: define size and getindex, and it becomes a full array
+struct OneHot <: AbstractVector{Bool}
+    n::Int          # length
+    k::Int          # the one position that is true
+end
+Base.size(v::OneHot) = (v.n,)
+Base.getindex(v::OneHot, i::Int) = (checkbounds(v, i); i == v.k)
+
+h = OneHot(6, 4)
+display(h)
+println(sum(h), " ", findfirst(h), " ", h .* 10, " ", h[2:5])
+println([1, 2, 3, 4, 5, 6]' * h)       # it even works in linear algebra
+```
+
+It prints:
+
+```text
+3... 2... 1... liftoff
+[5, 4, 3, 2, 1] 5050 7
+6-element OneHot:
+ 0
+ 0
+ 0
+ 1
+ 0
+ 0
+1 4 [0, 0, 0, 10, 0, 0] Bool[0, 0, 1, 0]
+4
+```
+
+**Iteration.** A `for` loop over `x` is turned by the compiler into calls of `iterate(x)`, which returns the first element and a state, then `iterate(x, state)` repeatedly until it returns `nothing`. Define those (here, one method with a default argument does both), and `for`, `collect`, `sum`, `maximum`, comprehensions and generators all work. Adding `length` and `eltype` tells `collect` how large an array to allocate and of what type; when this program was first run without the `eltype` method, `collect(Countdown(5))` returned `Any[5, 4, 3, 2, 1]`, a slow, untyped array.
+
+**AbstractArray.** Declare `OneHot <: AbstractVector{Bool}`, define `size` and `getindex`, and the type is a full array: it prints like one, sums, broadcasts, slices and even takes part in a matrix product, though it stores only two integers instead of `n` booleans. Machine-learning libraries use exactly this trick for one-hot encodings, and Base itself uses it for ranges: `1:1_000_000` stores two numbers, not a million.
+
+`checkbounds(v, i)` throws the standard `BoundsError` for an index outside the array; always check bounds in your own `getindex` methods, because the default error messages and `@inbounds` (lesson 6) depend on it.
+
+</Section>
+
+<Section id="human" kind="human" title="Designing types like a Julia programmer">
+
+Programmers arriving from Java, C# or Python often try to build deep class hierarchies in Julia and find that the language resists. That is deliberate, and it helps to know why.
+
+**Abstract types have no fields.** In Julia you cannot inherit data. An abstract type such as `abstract type Shape end` is a label that groups concrete types for dispatch, nothing more; each concrete subtype declares all of its own fields. If several types share data, they share it by **composition**: a `Circle` *has* a `center::Point`, rather than *being* a kind of `Point`.
+
+**Abstract types describe behaviour.** A good abstract type comes with an informal promise: "every `Shape` supports `area` and `perimeter`". Generic functions are then written against the abstract type, calling only those methods, and concrete types fulfil the promise. Keep hierarchies shallow, usually one or two levels, and use them only where you actually dispatch.
+
+**When a type cannot have the supertype you need, use a trait.** Because a type has exactly one supertype, it cannot be both an `AbstractArray` and, say, a `Shape`. Julia programmers solve this with **traits**: a function that maps a type to a small marker value, which other methods then dispatch on. Base does this for iteration, asking `Base.IteratorSize(T)` whether a type knows its length. You do not need traits often, but recognising the pattern helps when reading package code.
+
+**Give your type two ways to print.** The two-argument `Base.show(io::IO, x)` gives a compact form, used inside arrays and in `print`. For a richer, multi-line display in the REPL, also define the three-argument `Base.show(io::IO, ::MIME"text/plain", x)`. Notebooks such as Jupyter and Pluto use further MIME types, like `"text/html"`, to show values as tables or pictures.
+
+**Name things the Julia way.** Types use `CamelCase`, field names `lowercase`, and constructors share the type's name. It is idiomatic for a constructor to accept convenient inputs and normalise them, as `Interval(1, 2.5)` promoted its arguments, and for invalid inputs to throw an `ArgumentError` or a `DomainError` with a message that explains what was wrong.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"A struct field typed `Real` is general and therefore better."** It is general and slow. Make the struct parametric instead: `struct Box{T<:Real}; x::T; end` is just as general to its users and just as fast as a `Float64`-only version.
+
+</Misconception>
+
+<Misconception>
+
+**"Immutable structs can never change, so they are useless for simulations."** The variables holding them can be reassigned: `p = Particle(p.x + dt * p.v, p.v)` builds a new immutable value, and for small structs this is often faster than mutating, because the compiler can keep them in registers and avoid the heap. Packages such as Accessors.jl make "change one field" convenient.
+
+</Misconception>
+
+<Misconception>
+
+**"`nothing` and `missing` are interchangeable."** They are not: `nothing + 1` is a `MethodError`, deliberately, while `missing + 1` is `missing`. Use `nothing` for "no result" in program logic and `missing` for unknown values in data.
+
+</Misconception>
+
+<Misconception>
+
+**"I can redefine a struct after changing its fields."** Until Julia 1.12, redefining a struct with different fields in the same session was an error, which is why many people restarted Julia while designing types. Since 1.12 the redefinition is allowed and later code sees the new type; values and methods made with the old definition keep referring to the old one, so tools like Revise help keep a session consistent.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

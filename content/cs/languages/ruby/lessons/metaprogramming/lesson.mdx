@@ -1,0 +1,405 @@
+---
+title: Metaprogramming
+subtitle: Code that writes code — dynamic method calls and definitions, method_missing, open classes and refinements, hooks and class macros — and the judgement to use them sparingly.
+minutes: 55
+objectives:
+  - Inspect objects and classes at run time and call methods by name with send and public_send
+  - Define methods dynamically with define_method
+  - Implement method_missing together with respond_to_missing?
+  - Explain open classes and monkey patching, and limit their reach with refinements
+  - Use hooks (included, inherited) and class macros to build small DSLs
+  - Decide when metaprogramming helps and when plain code is better
+prerequisites: [classes-and-modules]
+references:
+  - title: "Ruby docs: Module"
+    url: https://docs.ruby-lang.org/en/master/Module.html
+    note: define_method, instance_methods, const_get, the hook methods and more.
+  - title: "Ruby docs: BasicObject"
+    url: https://docs.ruby-lang.org/en/master/BasicObject.html
+    note: method_missing, instance_eval and the root of the object model.
+  - title: "Ruby docs: Refinements"
+    url: https://docs.ruby-lang.org/en/master/syntax/refinements_rdoc.html
+    note: How refine and using work, and their scope rules.
+  - title: "Ruby docs: Object"
+    url: https://docs.ruby-lang.org/en/master/Object.html
+    note: send, public_send, respond_to?, instance_variable_get and friends.
+---
+
+<Section id="motivation" kind="motivation" title="A language that can rewrite itself">
+
+In the last lesson you saw that classes are objects and that `attr_reader :name` creates a method. Think about what that means: `attr_reader` is not special syntax. It is an ordinary method, called on the class while the class body runs, that *defines other methods*. Ruby lets your code do the same. Programs can inspect their own classes, call methods whose names are computed at run time, define new methods in a loop, react to calls to methods that do not exist, and reopen any class, including built-in ones, to add or change behaviour.
+
+This is **metaprogramming**, and it is how Rails can give a database-backed model methods named after its columns, how RSpec reads almost like English, and how a few lines of configuration can stand in for hundreds of lines of repetitive code. It is also how codebases become impossible to search and debug, when a method you are trying to find was never written down anywhere. This lesson teaches the main techniques, each with a working example, and ends with the rules of thumb that experienced Rubyists follow. Keep one test in mind throughout: could a new colleague find where a method is defined, and why, in under a minute? If not, the cleverness is costing more than it saves.
+
+</Section>
+
+<Section id="introspection" kind="examples" title="Introspection, send and define_method">
+
+```ruby check
+class Order
+  STATUSES = %i[pending paid shipped cancelled].freeze
+
+  attr_reader :status
+
+  def initialize
+    @status = :pending
+  end
+
+  # Write eight methods with one loop: pending?, mark_pending!, paid?, mark_paid!, ...
+  STATUSES.each do |name|
+    define_method(:"#{name}?") { status == name }
+    define_method(:"mark_#{name}!") do
+      @status = name
+      self
+    end
+  end
+end
+
+order = Order.new
+order.mark_paid!
+p order.paid?, order.pending?
+p Order.instance_methods(false).sort
+
+# Calling methods whose names are only known at run time.
+p order.public_send(:shipped?), order.respond_to?(:mark_shipped!)
+requested = "mark_cancelled!"                     # e.g. from a form button
+if Order::STATUSES.map { :"mark_#{it}!" }.include?(requested.to_sym)
+  order.public_send(requested)
+end
+p order.status
+
+# Looking inside objects and classes.
+p order.instance_variables, order.instance_variable_get(:@status)
+p Order.method_defined?(:paid?), order.method(:mark_paid!).arity, Object.const_get(:Order)
+p 5.public_methods.include?(:succ), String.instance_method(:upcase).owner
+```
+
+```text
+true
+false
+[:cancelled?, :mark_cancelled!, :mark_paid!, :mark_pending!, :mark_shipped!, :paid?, :pending?, :shipped?, :status]
+false
+true
+:cancelled
+[:@status]
+:cancelled
+true
+0
+Order
+true
+String
+```
+
+**`define_method`** takes a name and a block and adds a method to the class. The loop over `STATUSES` writes eight methods (`paid?`, `mark_paid!` and so on) from one list, so adding a status means adding one symbol. The block is a closure, so each method remembers its own `name`. `:"#{name}?"` builds a symbol from an interpolated string. `instance_methods(false)` lists the methods defined in the class itself, confirming they exist like any hand-written method.
+
+**`public_send` and `send`** call a method whose name is a symbol or string. `public_send` respects visibility, while `send` can call private methods too, which is why it is used in tests and almost nowhere else. *Never* pass raw user input to either: `order.send(params[:action])` would let a visitor call any method, including ones that delete data or `instance_eval` code. The program checks the requested name against an allowlist built from `STATUSES` first.
+
+**Introspection.** `instance_variables`, `instance_variable_get`, `method_defined?`, `method(:name)` (its `arity` is the number of required arguments), `const_get` (look up a class by name, as when loading a class named in a configuration file) and `instance_method(:upcase).owner` (which class or module defines a method) let a program examine itself. They are invaluable in `irb` while debugging: when a method does something unexpected, `obj.method(:foo).owner` and `obj.method(:foo).source_location` tell you whose code you are actually running.
+
+</Section>
+
+<Section id="method-missing" kind="human" title="method_missing, open classes and refinements">
+
+```ruby check
+# method_missing answers calls to methods that do not exist.
+class Settings
+  def initialize(values)
+    @values = values.transform_keys(&:to_s)
+  end
+
+  def method_missing(name, *args)
+    key = name.to_s
+    if key.end_with?("=")
+      @values[key.chomp("=")] = args.first
+    elsif @values.key?(key)
+      @values[key]
+    else
+      super                       # unknown: raise the usual NoMethodError
+    end
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    @values.key?(name.to_s.chomp("=")) || super
+  end
+end
+
+settings = Settings.new(timeout: 30, region: "af-south")
+p settings.timeout, settings.region
+settings.timeout = 45
+p settings.timeout, settings.respond_to?(:region), settings.respond_to?(:colour)
+begin
+  settings.colour
+rescue NoMethodError => e
+  puts "NoMethodError: #{e.message}"
+end
+
+# Open classes: any class can be reopened and changed, even Integer.
+class Integer
+  def minutes = self * 60
+end
+p 5.minutes
+
+# A refinement changes a class only where you ask for it, with `using`.
+module Slugs
+  refine String do
+    def to_slug = downcase.gsub(/[^a-z0-9]+/, "-").delete_prefix("-").delete_suffix("-")
+  end
+end
+
+module Blog
+  using Slugs
+
+  def self.slug_for(title) = title.to_slug
+end
+
+p Blog.slug_for("  Hello, Kampala! ")
+p "outside".respond_to?(:to_slug)
+```
+
+```text
+30
+"af-south"
+45
+true
+false
+NoMethodError: undefined method 'colour' for an instance of Settings
+300
+"hello-kampala"
+false
+```
+
+**`method_missing`.** When Ruby cannot find a method anywhere in the lookup chain, it calls `method_missing` with the name and arguments, and the default implementation raises `NoMethodError`. Overriding it lets `Settings` respond to `timeout`, `region` and `timeout=` without defining them. Two rules make it safe. First, call `super` for names you do not handle, so typos still raise a normal `NoMethodError` (as `colour` does). Second, always define **`respond_to_missing?`** to match, so `respond_to?` tells the truth and `method(:timeout)` works. Even so, `method_missing` is slower than real methods, invisible to editors and documentation tools, and easy to get subtly wrong. When the set of names is known in advance, `define_method` is almost always better.
+
+**Open classes.** Any class can be reopened with `class Integer … end` and changed, so `5.minutes` now works everywhere in the program. Rails' ActiveSupport adds hundreds of such conveniences (`5.minutes.ago`, `"word".pluralize`). This is called **monkey patching**, and its danger is that it is global: two libraries that add a method with the same name to `String` silently overwrite each other, and code that redefines an existing core method can break unrelated libraries in ways that are very hard to trace.
+
+**Refinements** (stable since Ruby 2.1) are the scoped alternative. `refine String do … end` inside a module describes changes; they take effect only in a file, module or class body that says `using Slugs`, and only from that point to the end of it. Inside `Blog`, strings have `to_slug`; outside, `"outside".respond_to?(:to_slug)` is false. Libraries that need to extend core classes for their own use can do it without touching anyone else's code. Refinements are *lexically* scoped: a method defined in another file does not see them, even when it is called from inside the refined code. That is the point, but it surprises people, so check the documentation before relying on refinements in a tricky spot.
+
+</Section>
+
+<Section id="dsl" kind="examples" title="Hooks, class macros and DSLs">
+
+The most valuable kind of metaprogramming in everyday Ruby is not clever tricks inside methods but **class macros**: class methods called in the class body, like `attr_reader`, `has_many` or `validates`, that configure the class in a declarative style. Here is a miniature version of Rails' validations, a plugin registry and a block-based DSL:
+
+```ruby check
+# A class macro: a class method that writes code into the class that calls it.
+module Validations
+  def self.included(base)
+    base.extend(ClassMethods)          # a hook: runs when a class includes this module
+  end
+
+  module ClassMethods
+    def rules = @rules ||= []
+
+    def validates(attribute, presence: false, length: nil, format: nil)
+      rules << { attribute:, presence:, length:, format: }
+    end
+  end
+
+  def errors
+    self.class.rules.flat_map do |rule|
+      value = public_send(rule[:attribute]).to_s
+      name = rule[:attribute]
+      problems = []
+      problems << "#{name} can't be blank" if rule[:presence] && value.strip.empty?
+      problems << "#{name} must be #{rule[:length].min} to #{rule[:length].max} characters" if rule[:length] && !rule[:length].cover?(value.length)
+      problems << "#{name} is not valid" if rule[:format] && !value.empty? && !value.match?(rule[:format])
+      problems
+    end
+  end
+
+  def valid? = errors.empty?
+end
+
+class Signup
+  include Validations
+
+  attr_reader :name, :email
+
+  validates :name, presence: true, length: 2..40
+  validates :email, presence: true, format: /\A[^@\s]+@[^@\s]+\z/
+
+  def initialize(name:, email:)
+    @name = name
+    @email = email
+  end
+end
+
+p Signup.new(name: "Mahlet", email: "mahlet@example.org").valid?
+p Signup.new(name: "M", email: "not an email").errors
+p Signup.rules.map { it[:attribute] }
+
+# The inherited hook: every subclass registers itself.
+class Exporter
+  @registry = {}
+
+  class << self
+    attr_reader :registry
+
+    def inherited(subclass)
+      super
+      Exporter.registry[subclass.name.delete_suffix("Exporter").downcase] = subclass
+    end
+  end
+end
+
+class CsvExporter < Exporter; end
+class JsonExporter < Exporter; end
+p Exporter.registry
+
+# instance_eval runs a block with a different self: the basis of many Ruby DSLs.
+class Menu
+  def self.build(&definition) = new.tap { it.instance_eval(&definition) }
+
+  def initialize = @items = []
+  def item(name, price) = @items << "#{name.ljust(8, '.')} #{price}"
+  def to_s = @items.join("\n")
+end
+
+puts Menu.build {
+  item "injera", 4
+  item "arepa", 3
+}
+```
+
+```text
+true
+["name must be 2 to 40 characters", "email is not valid"]
+[:name, :email]
+{"csv" => CsvExporter, "json" => JsonExporter}
+injera.. 4
+arepa... 3
+```
+
+**Hooks.** Ruby calls certain methods when things happen to classes and modules. `included(base)` runs when a module is included; `Validations` uses it to `extend` the including class with `ClassMethods`, the standard idiom for a module that adds both instance methods and class methods. `inherited(subclass)` runs whenever a class is subclassed; `Exporter` uses it to keep a registry of every exporter by name, so new formats register themselves just by existing. Other hooks include `extended`, `prepended`, `method_added` and `const_missing` (which older Rails versions used for autoloading).
+
+**The class macro.** `validates` is an ordinary class method that records a rule in an instance variable of the class (each class gets its own `@rules`, as in the last lesson). The instance method `errors` later reads the rules back and checks them with `public_send`. The result reads like a specification: anyone can see at a glance what a valid `Signup` is.
+
+**`instance_eval` DSLs.** `Menu.build { item "injera", 4 }` runs the block with `self` set to a new menu, so the bare `item` calls inside it go to that menu. Configuration files, routing tables (`get "/books", to: …` in Rails) and test frameworks use this pattern. The cost is that inside such a block, `self` is not what it appears to be, so instance variables and methods of the surrounding code are not available; many libraries offer a block parameter (`Menu.build { |m| m.item … }`) as a clearer alternative.
+
+</Section>
+
+<Section id="decorators" kind="examples" title="Wrapping methods, and classes made at run time">
+
+Two more techniques complete the toolkit. The first is the most useful pattern in this lesson after class macros: a macro that *wraps* a method someone else wrote.
+
+```ruby check
+# A decorator as a class macro: wrap an existing method with caching.
+module Memoize
+  def memoize(name)
+    original = instance_method(name)          # the method as it is now
+    cache_name = :"@#{name}_cache"
+
+    define_method(name) do |*args|
+      cache = instance_variable_get(cache_name) || instance_variable_set(cache_name, {})
+      cache.fetch(args) { cache[args] = original.bind_call(self, *args) }
+    end
+  end
+end
+
+class RoutePlanner
+  extend Memoize
+
+  attr_reader :computations
+
+  def initialize = @computations = 0
+
+  def distance(from, to)
+    @computations += 1
+    (from.ord - to.ord).abs * 10              # stands in for an expensive calculation
+  end
+  memoize :distance
+end
+
+planner = RoutePlanner.new
+p planner.distance("A", "D"), planner.distance("A", "D"), planner.distance("B", "C")
+p planner.computations
+
+# Classes can be created at run time; assigning one to a constant names it.
+Greeter = Class.new do
+  define_method(:hello) { |name| "Hello, #{name}" }
+end
+p Greeter.new.hello("Noor"), Greeter.name, Class.new.name
+
+# A method on one object only, defined at run time.
+robot = Object.new
+robot.define_singleton_method(:beep) { "beep-beep" }
+p robot.beep, robot.singleton_methods
+```
+
+```text
+30
+30
+10
+2
+"Hello, Noor"
+"Greeter"
+nil
+"beep-beep"
+[:beep]
+```
+
+**`memoize`** is called in the class body *after* `distance` is defined. It grabs the current method as an `UnboundMethod` with `instance_method(:distance)`, then uses `define_method` to replace `distance` with a new version that checks a per-object cache first and calls the original (`bind_call` binds it to the current object and calls it) only on a cache miss. The output shows the effect: three calls, but only two computations, because the second `distance("A", "D")` came from the cache. Python programmers will recognise a decorator; in Ruby the same idea is a class method plus `define_method`, or a module that you `prepend` and that calls `super`.
+
+**`Class.new`** builds a class from a block. Assigned to a constant, it takes the constant's name (`"Greeter"`); unassigned, it is anonymous and its `name` is `nil`. Libraries use this to generate classes from configuration or schemas, and tests use it to create throwaway classes. `define_singleton_method` does for one object what `define_method` does for a class.
+
+</Section>
+
+<Section id="in-the-wild" kind="reading" title="Where you will meet metaprogramming">
+
+You may write little metaprogramming yourself, but you will use a great deal of it, because Ruby's best-known libraries are built on these techniques:
+
+- **Active Record**, Rails' database layer, reads a table's columns when a model class loads and defines a reader and writer for each one, so a `users` table with an `email` column gives `user.email` and `user.email = …` with no code in the class. Associations (`has_many :orders`) and validations (`validates :email, presence: true`) are class macros, much like the lesson's `validates`.
+- **ActiveSupport::Concern** packages the `included` hook idiom from this lesson into a neater syntax (`included do … end` and `class_methods do … end`), and most Rails applications use it to share behaviour between models and controllers.
+- **Controller callbacks** (`before_action :require_login`) store method names and call them with `send` at the right moment.
+- **RSpec** builds its test syntax (`describe`, `it`, `let`, `expect(…).to eq(…)`) out of blocks, `instance_exec` and dynamically created classes.
+- **Delegation helpers** such as `Forwardable` (in the standard library) and Rails' `delegate` define forwarding methods for you: `def_delegators :@items, :size, :each`.
+
+Knowing the mechanisms takes the magic out of these libraries. When a method seems to come from nowhere, `obj.method(:name).owner` and `.source_location` will show you which module defined it and where, and `Model.ancestors` shows every module mixed in.
+
+</Section>
+
+<Section id="judgement" kind="misconceptions" title="When not to metaprogram">
+
+<Misconception>
+
+**"Less code is always better, so generate everything."** Code is read far more often than written. Eight methods written out by hand are searchable, show up in documentation and stack traces with their real names, and can be understood without running anything. Generate methods when the list is long or changes often, keep the generating code next to its data (as `STATUSES` is), and name things so a search for `paid?` finds the loop.
+
+</Misconception>
+
+<Misconception>
+
+**"`method_missing` is the Ruby way to handle dynamic names."** It is the last resort. If the names are known when the class loads, `define_method` gives real methods. If they are truly open-ended (keys of arbitrary JSON), a plain `[]` method (`settings["timeout"]`) is honest about what is happening. When you must use `method_missing`, pair it with `respond_to_missing?` and `super`.
+
+</Misconception>
+
+<Misconception>
+
+**"Monkey patching core classes is fine because Rails does it."** Rails is a framework whose users opt in to its extensions and whose maintainers coordinate them carefully. In your own application, prefer helper modules or refinements, and never change the meaning of an existing core method. In a gem, monkey patching core classes is almost always a mistake, because it changes the behaviour of every application that installs it.
+
+</Misconception>
+
+<Misconception>
+
+**"`send` is just a way to call a method."** It also bypasses `private`, and with untrusted input it can call anything. Use `public_send` when calling by name, check names against an allowlist, and treat `send(params[...])`, `const_get(params[...])` and `instance_eval(string)` as security bugs.
+
+</Misconception>
+
+<Misconception>
+
+**"String `eval` is the most powerful form, so use it when in doubt."** `eval`, `class_eval` and `instance_eval` all accept a string of code as well as a block. The string forms hide code from your editor, syntax highlighter, linter and static analysis, give confusing line numbers in errors unless you pass them explicitly, and become code-injection holes the moment any part of the string comes from outside. Everything in this lesson was done with blocks, `define_method` and `public_send`; the string forms are almost never needed.
+
+</Misconception>
+
+<Misconception>
+
+**"Checking `respond_to?` everywhere is good duck typing."** Duck typing means *calling* the method and trusting the object. A method full of `respond_to?` and `is_a?` checks is usually trying to handle too many kinds of input; convert the input once at the boundary (with `Array(x)`, `String(x)` or a small value object) and let the rest of the code assume it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

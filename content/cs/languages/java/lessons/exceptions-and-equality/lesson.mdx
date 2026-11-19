@@ -1,0 +1,449 @@
+---
+title: Exceptions, equality and immutability
+subtitle: How Java reports failure and cleans up after it, what it means for two objects to be equal, and why the best objects never change.
+minutes: 60
+objectives:
+  - Distinguish checked exceptions, unchecked exceptions and errors, and know when to use each
+  - Throw exceptions with useful messages and causes, and catch them at the right level
+  - Use try-with-resources and finally, and predict the order in which cleanup runs
+  - Read a stack trace
+  - State the equals and hashCode contract and explain what breaks when it is violated
+  - Design immutable classes with final fields, defensive copies and "wither" methods
+prerequisites: [records-and-pattern-matching]
+related: [math.found.equivalence-relations]
+references:
+  - title: "Learn Java: Exceptions (dev.java)"
+    author: Oracle
+    url: https://dev.java/learn/
+    note: The official tutorial's chapter on exceptions and try-with-resources.
+  - title: "Object.equals and Object.hashCode (Java SE 25 API)"
+    author: Oracle
+    url: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Object.html
+    note: The contract every class's equals and hashCode must obey, stated precisely.
+  - title: "java.time package (Java SE 25 API)"
+    author: Oracle
+    url: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/time/package-summary.html
+    note: A well-designed immutable API for dates and times.
+  - title: Effective Java, third edition
+    author: Joshua Bloch
+    year: 2018
+    note: Its chapters on methods common to all objects and on exceptions are the standard references for this lesson.
+---
+
+<Section id="motivation" kind="motivation" title="Failure, sameness and change">
+
+Three questions sit underneath almost every Java bug report.
+
+**What happens when something goes wrong?** A configuration file has a typo, a network call times out, a list is empty when it should not be. A program that crashes with a clear message pointing at the cause is a good program having a bad day. A program that carries on with a made-up value, or swallows the error and fails mysteriously an hour later, is a bad program. Java's **exceptions** are the language's way of reporting failure, and using them well is mostly about *where* and *how* you throw and catch.
+
+**When are two objects "the same"?** Two `Isbn` objects created from the same code should count as one book in a `HashSet`. Whether they do depends entirely on two methods, `equals` and `hashCode`, and on a contract between them that the compiler does not check.
+
+**Can this object change?** Every bug involving an object that changed "somewhere else" disappears when objects cannot change at all. Immutability is the quiet discipline behind much of good Java design, and it makes the other two questions easier too.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="Exception hierarchy">
+
+Everything that can be thrown extends `Throwable`. **`Error`** (such as `OutOfMemoryError` or `StackOverflowError`) signals a serious problem in the JVM that applications should not normally try to handle. **`Exception`** is for conditions a program might handle. Its subclass **`RuntimeException`** and its descendants are **unchecked**; all other exceptions are **checked**.
+
+</Definition>
+
+<Definition term="Checked and unchecked exceptions">
+
+A **checked** exception (such as `IOException`) must be either caught or declared in the method's `throws` clause, and the compiler enforces it. It is meant for failures a correct program should anticipate and recover from: a missing file, a refused connection. An **unchecked** exception (such as `IllegalArgumentException`, `NullPointerException` or `ArithmeticException`) need not be declared; it usually means a programming error or a violated precondition.
+
+</Definition>
+
+<Definition term="try, catch, finally and try-with-resources">
+
+`try { ... } catch (SomeException e) { ... }` runs the handler when the block throws a matching exception. Several types can share a handler: `catch (IOException | SQLException e)`. A `finally` block runs whether or not an exception occurred. **try-with-resources**, `try (var r = open()) { ... }`, closes every resource declared in its header, in reverse order, when the block ends; a resource is any object implementing `AutoCloseable`.
+
+</Definition>
+
+<Definition term="The equals and hashCode contract">
+
+`equals` must be an **equivalence relation** on non-null references: reflexive (`x.equals(x)`), symmetric, and transitive. It must be consistent (the same answer while nothing relevant changes), and `x.equals(null)` must be false. And **equal objects must have equal hash codes**. (Unequal objects may share a hash code; that only costs speed.)
+
+</Definition>
+
+<Definition term="Immutable object">
+
+An object whose observable state cannot change after construction. In Java that usually means: the class is `final` (or a record), every field is `private final`, no method changes state, and any mutable object received or returned is copied.
+
+</Definition>
+
+</Section>
+
+<Section id="exceptions" kind="examples" title="Throwing, catching and cleaning up">
+
+The first half of this program parses configuration lines, turning low-level failures into a checked exception with context. The second half shows the order in which resources are closed.
+
+```java check
+import java.util.ArrayList;
+import java.util.List;
+
+public class Main {
+    /** Thrown when a configuration line cannot be understood. Checked: callers must handle it. */
+    static class ConfigException extends Exception {
+        ConfigException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    record Setting(String key, int value) {}
+
+    static Setting parse(String line, int lineNumber) throws ConfigException {
+        String[] parts = line.split("=", 2);
+        if (parts.length != 2) {
+            throw new ConfigException("line " + lineNumber + ": expected key=value", null);
+        }
+        try {
+            return new Setting(parts[0].strip(), Integer.parseInt(parts[1].strip()));
+        } catch (NumberFormatException e) {
+            // Add context, keep the original as the cause
+            throw new ConfigException("line " + lineNumber + ": bad number for " + parts[0].strip(), e);
+        }
+    }
+
+    /** A resource that reports when it is opened and closed. */
+    static class Connection implements AutoCloseable {
+        private final String name;
+
+        Connection(String name) {
+            this.name = name;
+            System.out.println("open " + name);
+        }
+
+        void send(String message) {
+            if (message.isEmpty()) {
+                throw new IllegalArgumentException("empty message on " + name);
+            }
+            System.out.println(name + " <- " + message);
+        }
+
+        @Override
+        public void close() {
+            System.out.println("close " + name);
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Setting> settings = new ArrayList<>();
+        String[] lines = {"port = 8080", "threads=x16", "timeout"};
+        for (int i = 0; i < lines.length; i++) {
+            try {
+                settings.add(parse(lines[i], i + 1));
+            } catch (ConfigException e) {
+                System.out.println("skipped: " + e.getMessage()
+                        + (e.getCause() != null ? " (cause: " + e.getCause().getClass().getSimpleName() + ")" : ""));
+            }
+        }
+        System.out.println(settings);
+
+        // try-with-resources closes in reverse order, even when the body throws
+        try (Connection db = new Connection("db"); Connection cache = new Connection("cache")) {
+            db.send("SELECT 1");
+            cache.send("");
+            System.out.println("not reached");
+        } catch (IllegalArgumentException e) {
+            System.out.println("caught: " + e.getMessage());
+        } finally {
+            System.out.println("finally runs last");
+        }
+    }
+}
+```
+
+```text
+skipped: line 2: bad number for threads (cause: NumberFormatException)
+skipped: line 3: expected key=value
+[Setting[key=port, value=8080]]
+open db
+open cache
+db <- SELECT 1
+close cache
+close db
+caught: empty message on cache
+finally runs last
+```
+
+Points worth absorbing:
+
+- **`throws ConfigException`** in `parse`'s signature is part of its contract. Every caller must catch it or declare it in turn; forget, and the program does not compile.
+- **Exception chaining.** `Integer.parseInt` reports `NumberFormatException`, which knows nothing about configuration files or line numbers. `parse` catches it and throws a `ConfigException` whose message adds the context (line 2, key `threads`) and whose **cause** is the original exception. Nothing is lost: a stack trace of the new exception prints the old one too, under "Caused by:".
+- **The loop recovers per line.** Catching inside the loop means one bad line is reported and skipped while good lines are kept. Where you catch decides how much work a failure throws away.
+- **try-with-resources** closed `cache` and then `db`, in reverse order of opening, *before* the `catch` block ran. Resources are closed even when the body throws, which is why this construct replaced hand-written `finally { x.close(); }` blocks everywhere. If `close()` itself throws while an exception is already in flight, the second exception is attached to the first as a **suppressed** exception rather than replacing it.
+- **`finally`** runs after the try and any catch, whether the block completed normally, threw, or returned.
+
+When an exception is not caught anywhere, the thread ends and the JVM prints its **stack trace**. Here is a real one, from a method asked to average three scores from an array of two:
+
+```java
+public class Main {
+    static double average(int[] scores, int count) {
+        int total = 0;
+        for (int i = 0; i < count; i++) {
+            total += scores[i];
+        }
+        return (double) total / count;
+    }
+
+    public static void main(String[] args) {
+        int[] scores = {90, 85};
+        System.out.println(average(scores, 3));
+    }
+}
+```
+
+```text
+Exception in thread "main" java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at Main.average(Main.java:5)
+	at Main.main(Main.java:12)
+```
+
+Read it top down: the exception's class and message (what went wrong), then the chain of method calls, innermost first, each with the file and line number. Line 5 is `total += scores[i];`; it was called from line 12. Learning to read a stack trace calmly, including the "Caused by:" sections of chained exceptions, is one of the most valuable debugging skills in Java.
+
+</Section>
+
+<Section id="practice" kind="human" title="Exceptions in professional code">
+
+Java's designers made checked exceptions a central feature, and they remain the most debated one. Their promise is that the compiler forces you to think about failures. Their cost is that every layer must mention every failure below it, which tempts people to wrap code in `catch (Exception e) {}` just to make it compile. Lambdas made the friction worse, because the standard functional interfaces (`Function`, `Predicate`...) cannot throw checked exceptions. Later JVM languages such as Kotlin and Scala dropped checked exceptions entirely, and much modern Java code (including many popular frameworks) prefers unchecked ones. The standard library still uses checked exceptions for I/O, so you must be fluent in both.
+
+The habits that experienced developers share, whichever side of that debate they are on:
+
+- **Throw early.** Check arguments at the start of a method or constructor and throw `IllegalArgumentException`, `IllegalStateException` or `NullPointerException` (via `Objects.requireNonNull`) with a message that names the bad value. The closer the throw is to the mistake, the shorter the debugging.
+- **Catch late, at a level that can act.** A low-level method usually cannot know whether to retry, skip, or give up; the code that started the operation can. Let exceptions travel up to it.
+- **Never swallow.** An empty `catch` block, or one that only prints and continues as if nothing happened, hides bugs. If you truly expect and ignore an exception, write a comment saying why.
+- **Translate at boundaries, keeping the cause.** When a storage layer throws `SQLException`, a service layer might rethrow its own `OrderNotSavedException(message, e)`. The caller gets an exception in its own vocabulary, and the original is still attached for the logs.
+- **Do not use exceptions for ordinary control flow.** Looking a key up in a map and not finding it is normal; return an `Optional` or an empty collection. An exception should mean "this could not be done".
+- **Catch specific types.** `catch (Exception e)` also catches the `NullPointerException` caused by your own bug. Catch the exceptions you can handle.
+
+For results that are routinely one of several outcomes (a payment approved, declined, or sent for review), a sealed interface of records, as in the previous lesson, often models the situation better than exceptions, and the compiler checks that every outcome is handled.
+
+</Section>
+
+<Section id="equality" kind="examples" title="Equality and hashing">
+
+```java check
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+public class Main {
+    /** equals without hashCode: a classic bug. */
+    static class BrokenIsbn {
+        private final String code;
+
+        BrokenIsbn(String code) {
+            this.code = code;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof BrokenIsbn other && code.equals(other.code);
+        }
+        // no hashCode: inherits Object's identity-based one
+    }
+
+    /** equals and hashCode written together, by hand. */
+    static final class Isbn {
+        private final String code;
+
+        Isbn(String code) {
+            this.code = Objects.requireNonNull(code);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Isbn other && code.equals(other.code);
+        }
+
+        @Override
+        public int hashCode() {
+            return code.hashCode();
+        }
+    }
+
+    /** The modern way: a record generates both. */
+    record Book(String isbn, String title) {}
+
+    /** A mutable class used as a key: another classic bug. */
+    static class Seat {
+        int row;
+
+        Seat(int row) {
+            this.row = row;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Seat s && s.row == row;
+        }
+
+        @Override
+        public int hashCode() {
+            return Integer.hashCode(row);
+        }
+    }
+
+    public static void main(String[] args) {
+        // == compares references; equals compares contents
+        String a = "lumen";
+        String b = new String("lumen");
+        System.out.println((a == b) + " " + a.equals(b));
+
+        Integer small1 = 127, small2 = 127, big1 = 128, big2 = 128;
+        System.out.println((small1 == small2) + " " + (big1 == big2) + " " + big1.equals(big2));
+
+        Set<BrokenIsbn> broken = new HashSet<>();
+        broken.add(new BrokenIsbn("978-0-00-000000-2"));
+        broken.add(new BrokenIsbn("978-0-00-000000-2"));
+        System.out.println("broken set size: " + broken.size());
+
+        Set<Isbn> fixed = new HashSet<>();
+        fixed.add(new Isbn("978-0-00-000000-2"));
+        fixed.add(new Isbn("978-0-00-000000-2"));
+        System.out.println("fixed set size: " + fixed.size());
+
+        Set<Book> books = new HashSet<>();
+        books.add(new Book("978-0-00-000000-2", "Things Fall Apart"));
+        System.out.println("record lookup: " + books.contains(new Book("978-0-00-000000-2", "Things Fall Apart")));
+
+        Set<Seat> taken = new HashSet<>();
+        Seat seat = new Seat(4);
+        taken.add(seat);
+        seat.row = 5;                                   // mutate a key while it is in the set
+        System.out.println("contains row 5? " + taken.contains(new Seat(5)) + ", contains itself? " + taken.contains(seat));
+    }
+}
+```
+
+```text
+false true
+true false true
+broken set size: 2
+fixed set size: 1
+record lookup: true
+contains row 5? false, contains itself? false
+```
+
+(The ISBN is made up; only its shape is realistic.)
+
+**Strings and boxed numbers.** `new String("lumen")` forces a separate object, so `==` is false while `equals` is true. String literals with the same text usually *are* the same object, because the JVM keeps a pool of them, which is exactly why `==` on strings can seem to work in a test and then fail in production. The `Integer` line is the same trap: `Integer.valueOf` caches the values from −128 to 127, so two boxed 127s are one object and two boxed 128s are not. **For objects, always use `equals`.**
+
+**Why `BrokenIsbn` fails.** A `HashSet` first uses `hashCode` to choose a bucket, and only compares with `equals` inside that bucket. `BrokenIsbn` inherits `Object.hashCode`, which is based on identity, so two equal ISBNs almost certainly land in different buckets and are never compared. The set ends up holding "duplicates". Override `equals` and you *must* override `hashCode` consistently: compute it from exactly the fields `equals` compares. `Objects.hash(a, b, c)` is a convenient way to combine several fields. Better still, use a record and let the compiler do both.
+
+**Why the mutated `Seat` vanishes.** The seat was filed in the bucket for row 4. After its row changes to 5, a lookup for row 5 searches the bucket for 5 and finds nothing, and a lookup for the seat object itself computes the new hash, searches the wrong bucket, and also finds nothing. The object is still in the set, unreachable by any lookup. Never change the fields that `equals` and `hashCode` depend on while an object is a key in a hash-based collection; the simplest way to guarantee that is to make keys immutable.
+
+Writing a correct `equals` by hand has more traps (symmetry breaks easily when a subclass adds fields, which is one reason classes like `Isbn` are made `final`). `equals` must behave like an <TopicLink id="math.found.equivalence-relations">equivalence relation</TopicLink>: the hash table relies on that mathematical property, and nothing checks it but you.
+
+</Section>
+
+<Section id="immutability" kind="computation" title="Immutability by design">
+
+```java check
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+
+/** An immutable timetable: final class, final fields, no setters, defensive copies. */
+final class Timetable {
+    private final String route;
+    private final List<String> departures;
+
+    Timetable(String route, List<String> departures) {
+        this.route = route;
+        this.departures = List.copyOf(departures);      // copy in
+    }
+
+    List<String> departures() {
+        return departures;                              // already unmodifiable: safe to share
+    }
+
+    Timetable withDeparture(String time) {              // "change" by returning a new object
+        List<String> more = new ArrayList<>(departures);
+        more.add(time);
+        return new Timetable(route, more);
+    }
+
+    @Override
+    public String toString() {
+        return route + " " + departures;
+    }
+}
+
+void main() {
+    List<String> times = new ArrayList<>(List.of("06:10", "07:40"));
+    Timetable bus = new Timetable("Route 12", times);
+    times.add("23:59");                                 // the caller changes its own list
+    Timetable later = bus.withDeparture("09:15");
+    IO.println(bus);
+    IO.println(later);
+
+    try {
+        bus.departures().add("10:00");
+    } catch (UnsupportedOperationException e) {
+        IO.println("cannot modify from outside");
+    }
+
+    // The standard library's value types are immutable too: methods return new objects
+    LocalDate start = LocalDate.of(2026, 2, 27);
+    LocalDate due = start.plusDays(3);
+    IO.println(start + " -> " + due);
+
+    String s = "immutable";
+    s.toUpperCase();                                    // result discarded: s is unchanged
+    IO.println(s + " " + s.toUpperCase());
+}
+```
+
+```text
+Route 12 [06:10, 07:40]
+Route 12 [06:10, 07:40, 09:15]
+cannot modify from outside
+2026-02-27 -> 2026-03-02
+immutable IMMUTABLE
+```
+
+An immutable object is valid forever once constructed, can be shared freely between methods and between threads without locks, and is always a safe key in a map. The recipe is visible in `Timetable`: a `final` class (so no subclass can add mutable state), `private final` fields, a constructor that copies the mutable list it is given, accessors that hand out only unmodifiable data, and "wither" methods that return a modified *copy*. The caller's later `times.add("23:59")` had no effect on `bus`, and `withDeparture` produced a second timetable while leaving the first untouched.
+
+The JDK is full of immutable classes designed this way: `String`, the boxed numbers, `BigDecimal`, `LocalDate` and the rest of `java.time`, `Path`, `URI`, and the `List.of` family. Their methods return new objects, so the classic mistake is to call one and discard the result, as the `s.toUpperCase();` line does. (2026 is not a leap year, so three days after 27 February is 2 March, and `java.time` knows it.)
+
+Immutability is not free. Every change allocates a new object, which matters in tight loops over large data; that is why `StringBuilder` exists alongside `String`. The professional default is still "immutable unless there is a measured reason not to be", and records make that default cheap to follow.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Catching `Exception` makes code robust."** It makes code *quiet*. It also catches bugs such as `NullPointerException` and hides them. Catch the specific exceptions you can handle, and let the rest reach code that can report them.
+
+</Misconception>
+
+<Misconception>
+
+**"`finally` can change what a method returns."** In the exercise below, the return value is computed before `finally` runs; appending to the builder afterwards does not change the string already returned. (A `return` *inside* `finally` would replace it, and is a well-known anti-pattern: it also discards any exception.)
+
+</Misconception>
+
+<Misconception>
+
+**"If I override `equals`, `hashCode` is optional."** Hash-based collections then break silently, as `BrokenIsbn` showed. The two are one contract.
+
+</Misconception>
+
+<Misconception>
+
+**"`final` makes an object immutable."** A `final` field cannot be reassigned, but the object it refers to can still change. A field declared <code>final List&lt;String&gt; xs</code> still accepts `xs.add(...)` unless the list itself is unmodifiable.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

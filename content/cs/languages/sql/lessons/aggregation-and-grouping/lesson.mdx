@@ -1,0 +1,358 @@
+---
+title: Aggregation and grouping
+subtitle: Turning many rows into a few numbers with aggregate functions, GROUP BY and HAVING, and the NULL rules and dialect quirks that come with them.
+minutes: 55
+objectives:
+  - Use count, sum, avg, min and max, and explain how each treats NULL and empty input
+  - Group rows with GROUP BY, filter groups with HAVING, and explain how HAVING differs from WHERE
+  - Build pivot-style summaries with FILTER and CASE, and lists with group_concat or string_agg
+  - Explain the rule about non-aggregated columns in a grouped query, and how SQLite, MySQL and PostgreSQL each apply it
+  - Compute subtotals with ROLLUP in PostgreSQL and MySQL, and medians with ordered-set aggregates
+prerequisites: [filtering-sorting-and-null]
+related: [math.prob.statistics-intro, math.found.equivalence-relations]
+references:
+  - title: "SQLite: Built-in Aggregate Functions"
+    url: https://www.sqlite.org/lang_aggfunc.html
+  - title: "SQLite: The SELECT statement"
+    url: https://www.sqlite.org/lang_select.html
+    note: Includes SQLite's rules for bare columns in aggregate queries.
+  - title: "PostgreSQL: Aggregate Functions"
+    url: https://www.postgresql.org/docs/current/functions-aggregate.html
+    note: General, statistical and ordered-set aggregates such as percentile_cont.
+  - title: "PostgreSQL: GROUPING SETS, CUBE, and ROLLUP"
+    url: https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS
+  - title: "MySQL: MySQL Handling of GROUP BY"
+    url: https://dev.mysql.com/doc/refman/8.4/en/group-by-handling.html
+    note: The ONLY_FULL_GROUP_BY mode and functional dependence.
+---
+
+<Section id="motivation" kind="motivation" title="From rows to summaries">
+
+The questions people bring to a database are usually about many rows at once. How much did each branch sell last month? What is the average rating, and how many customers bothered to give one? Which products sold fewer than ten units? A table of individual sales does not answer them directly; you need to **summarise**: collapse many rows into a few numbers.
+
+In a general-purpose language you would loop over the rows, keep a dictionary of running totals keyed by branch, and print it at the end. SQL does this with two features. **Aggregate functions** (`count`, `sum`, `avg`, `min`, `max` and others) reduce a set of values to one value. **`GROUP BY`** splits the rows into groups first, so that each aggregate is computed once per group. Together they are the heart of reporting, dashboards and data analysis, and much of the SQL written by analysts every day is variations on this lesson.
+
+This lesson's examples use the sales of a small chain of tea and coffee shops in three cities. Each row records one line of a sale: the item, its category, the quantity and the unit price in cents, and the customer's rating if they gave one.
+
+</Section>
+
+<Section id="aggregates" kind="definitions" title="Aggregate functions">
+
+<Definition term="Aggregate function">
+
+An **aggregate function** takes a whole set of values, one from each row in a group, and returns a single value. Without `GROUP BY`, the whole table (after `WHERE`) is one group and the query returns exactly one row.
+
+</Definition>
+
+The standard ones, and how they treat `NULL`:
+
+| Function | Result | NULLs |
+| --- | --- | --- |
+| `count(*)` | number of rows | counted: it counts rows, not values |
+| `count(expr)` | number of rows where `expr` is not NULL | skipped |
+| `count(DISTINCT expr)` | number of distinct non-NULL values | skipped |
+| `sum(expr)`, `avg(expr)` | total and mean of the non-NULL values | skipped; NULL if there are none |
+| `min(expr)`, `max(expr)` | smallest and largest non-NULL value | skipped; NULL if there are none |
+
+```sql check
+.mode column
+CREATE TABLE sale (
+  id          INTEGER PRIMARY KEY,
+  branch      TEXT    NOT NULL,
+  item        TEXT    NOT NULL,
+  category    TEXT    NOT NULL,
+  qty         INTEGER NOT NULL,
+  price_cents INTEGER NOT NULL,     -- price of one unit
+  rating      INTEGER               -- customer rating 1-5, NULL if not given
+);
+INSERT INTO sale (branch, item, category, qty, price_cents, rating) VALUES
+  ('Nairobi', 'masala chai',   'drink', 4, 250, 5),
+  ('Nairobi', 'mandazi',       'food',  6, 100, 4),
+  ('Nairobi', 'filter coffee', 'drink', 2, 300, NULL),
+  ('Hanoi',   'egg coffee',    'drink', 4, 350, 5),
+  ('Hanoi',   'banh mi',       'food',  2, 400, 3),
+  ('Hanoi',   'masala chai',   'drink', 1, 250, NULL),
+  ('Hanoi',   'banh mi',       'food',  3, 400, 4),
+  ('Quito',   'filter coffee', 'drink', 7, 300, 4),
+  ('Quito',   'empanada',      'food',  4, 200, NULL),
+  ('Quito',   'empanada',      'food',  2, 200, 2);
+
+-- Aggregates over the whole table: one result row.
+SELECT count(*)               AS sales,
+       count(rating)          AS rated,
+       count(DISTINCT branch) AS branches,
+       sum(qty)               AS units,
+       sum(qty * price_cents) AS revenue_cents,
+       min(price_cents)       AS cheapest,
+       max(price_cents)       AS dearest,
+       avg(rating)            AS avg_rating
+FROM sale;
+```
+
+```text
+sales  rated  branches  units  revenue_cents  cheapest  dearest  avg_rating
+-----  -----  --------  -----  -------------  --------  -------  ----------------
+10     7      3         35     9150           100       400      3.85714285714286
+```
+
+Ten sales, but only seven ratings: `count(rating)` skipped the three `NULL`s, and so did `avg(rating)`, which is the sum of the seven ratings divided by seven, not by ten. That is usually what you want (customers who did not rate are not zero-star customers), but it is a decision, and it should be a conscious one. If unrated sales should count as zero, write `avg(coalesce(rating, 0))`.
+
+An aggregate's argument can be any expression evaluated per row: `sum(qty * price_cents)` multiplies within each row and then adds up the products.
+
+The type of `avg` differs between databases. SQLite returns a floating-point number, PostgreSQL returns an exact `numeric` (for this data, `3.8571428571428571`), and MySQL returns a `DECIMAL` with four extra digits. Round explicitly with `round(avg(rating), 2)` when you present a result, so that every database shows the same thing.
+
+</Section>
+
+<Section id="group-by" kind="examples" title="GROUP BY and HAVING">
+
+`GROUP BY` partitions the rows: all rows with the same values in the grouping columns go into one group, and the query returns one row per group. Mathematically, the grouping columns define an <TopicLink id="math.found.equivalence-relations">equivalence relation</TopicLink> on the rows, and the groups are its equivalence classes.
+
+`HAVING` is a `WHERE` for groups: it is evaluated after grouping and can test aggregates. Recall the logical order from the first lesson: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, `SELECT`, `ORDER BY`, `LIMIT`. `WHERE` decides which rows enter the groups; `HAVING` decides which groups survive.
+
+```sql check
+.mode column
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, branch TEXT NOT NULL, item TEXT NOT NULL, category TEXT NOT NULL,
+  qty INTEGER NOT NULL, price_cents INTEGER NOT NULL, rating INTEGER
+);
+INSERT INTO sale (branch, item, category, qty, price_cents, rating) VALUES
+  ('Nairobi', 'masala chai',   'drink', 4, 250, 5),
+  ('Nairobi', 'mandazi',       'food',  6, 100, 4),
+  ('Nairobi', 'filter coffee', 'drink', 2, 300, NULL),
+  ('Hanoi',   'egg coffee',    'drink', 4, 350, 5),
+  ('Hanoi',   'banh mi',       'food',  2, 400, 3),
+  ('Hanoi',   'masala chai',   'drink', 1, 250, NULL),
+  ('Hanoi',   'banh mi',       'food',  3, 400, 4),
+  ('Quito',   'filter coffee', 'drink', 7, 300, 4),
+  ('Quito',   'empanada',      'food',  4, 200, NULL),
+  ('Quito',   'empanada',      'food',  2, 200, 2);
+
+-- One row per branch.
+SELECT branch,
+       count(*)                         AS sales,
+       sum(qty * price_cents)           AS revenue_cents,
+       round(avg(rating), 2)            AS avg_rating
+FROM sale
+GROUP BY branch
+ORDER BY revenue_cents DESC;
+
+-- Group by two columns; WHERE filters rows before grouping,
+-- HAVING filters groups after.
+SELECT branch, category, sum(qty) AS units
+FROM sale
+WHERE item <> 'masala chai'
+GROUP BY branch, category
+HAVING sum(qty) >= 5
+ORDER BY branch, category;
+```
+
+```text
+branch   sales  revenue_cents  avg_rating
+-------  -----  -------------  ----------
+Hanoi    4      3650           4.0
+Quito    3      3300           3.0
+Nairobi  3      2200           4.5
+branch   category  units
+-------  --------  -----
+Hanoi    food      5
+Nairobi  food      6
+Quito    drink     7
+Quito    food      6
+```
+
+Trace the second query by hand once; it is the best way to understand grouping. `WHERE` removes the two masala chai rows. The eight remaining rows fall into six groups by (branch, category). Their unit totals are Hanoi drink 4, Hanoi food 5, Nairobi drink 2, Nairobi food 6, Quito drink 7, Quito food 6. `HAVING sum(qty) >= 5` keeps four of them.
+
+Could the `WHERE` condition have been written in `HAVING` instead? No: after grouping there is no single `item` per group to test. Conversely, `sum(qty) >= 5` cannot go in `WHERE`, because aggregates do not exist yet when `WHERE` runs. When a condition could go in either place (a condition on a grouping column, such as `branch <> 'Quito'`), put it in `WHERE`: it removes rows before the work of grouping, and every database optimises it better there.
+
+### Grouping by computed values
+
+You can group by any expression, not only by a column. Monthly reports group dates by month: with ISO dates stored as text, `GROUP BY substr(sold_on, 1, 7)` puts `'2026-03-02'` and `'2026-03-29'` in the group `'2026-03'`. PostgreSQL would write `date_trunc('month', sold_on)` and MySQL `DATE_FORMAT(sold_on, '%Y-%m')`. Price bands, age brackets and "weekday or weekend" work the same way, usually with a `CASE` expression:
+
+```sql
+SELECT CASE WHEN price_cents < 250 THEN 'under 2.50'
+            WHEN price_cents < 350 THEN '2.50 to 3.49'
+            ELSE '3.50 and over' END AS band,
+       sum(qty) AS units
+FROM sale
+GROUP BY band;
+```
+
+Grouping by the alias `band`, as here, works in SQLite, PostgreSQL and MySQL, though the standard requires you to repeat the expression. Analysts also write `GROUP BY 1`, meaning "the first column of the `SELECT` list", which is quick to type in exploratory work but easy to break when someone reorders the columns; most style guides keep it out of saved queries.
+
+It also helps to notice what `GROUP BY` without any aggregate does: `SELECT branch, category FROM sale GROUP BY branch, category` returns each distinct pair once, exactly like `SELECT DISTINCT branch, category`. Use `DISTINCT` when that is all you mean; it says so more clearly.
+
+Finally, a grouped query only returns groups that *exist* in the data. A branch with no sales at all does not appear with a zero; it does not appear. To report zeros you need a table listing every branch and an outer join to the sales, which is one of the first things the lesson on joins shows.
+
+</Section>
+
+<Section id="conditional" kind="computation" title="Conditional aggregation, lists and subtotals">
+
+A very common report puts categories side by side as columns: one row per branch, a column for drinks and a column for food. This is **conditional aggregation**. The standard way is the `FILTER` clause, which restricts the rows an aggregate sees; SQLite has supported it since 3.30 and PostgreSQL since 9.4, but MySQL does not. The way that works everywhere is a `CASE` inside the aggregate, relying on the fact that `sum` skips the `NULL`s a `CASE` without `ELSE` produces.
+
+To collect values into a string, SQLite and MySQL have `group_concat`, while PostgreSQL and SQL Server have `string_agg` (SQLite added `string_agg` as an alias in version 3.44).
+
+```sql check
+.mode column
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, branch TEXT NOT NULL, item TEXT NOT NULL, category TEXT NOT NULL,
+  qty INTEGER NOT NULL, price_cents INTEGER NOT NULL, rating INTEGER
+);
+INSERT INTO sale (branch, item, category, qty, price_cents, rating) VALUES
+  ('Nairobi', 'masala chai',   'drink', 4, 250, 5),
+  ('Nairobi', 'mandazi',       'food',  6, 100, 4),
+  ('Nairobi', 'filter coffee', 'drink', 2, 300, NULL),
+  ('Hanoi',   'egg coffee',    'drink', 4, 350, 5),
+  ('Hanoi',   'banh mi',       'food',  2, 400, 3),
+  ('Hanoi',   'masala chai',   'drink', 1, 250, NULL),
+  ('Hanoi',   'banh mi',       'food',  3, 400, 4),
+  ('Quito',   'filter coffee', 'drink', 7, 300, 4),
+  ('Quito',   'empanada',      'food',  4, 200, NULL),
+  ('Quito',   'empanada',      'food',  2, 200, 2);
+
+-- Conditional aggregation: a small pivot table, two ways.
+SELECT branch,
+       sum(qty) FILTER (WHERE category = 'drink')        AS drinks,   -- standard; SQLite 3.30+
+       sum(CASE WHEN category = 'food' THEN qty END)      AS food,     -- works everywhere
+       group_concat(DISTINCT item)                        AS items     -- SQLite and MySQL
+FROM sale
+GROUP BY branch
+ORDER BY branch;
+
+-- An empty group: sum() of no rows is NULL, count() is 0.
+SELECT count(*) AS n, sum(qty) AS units, coalesce(sum(qty), 0) AS units_or_zero
+FROM sale WHERE branch = 'Lima';
+```
+
+```text
+branch   drinks  food  items
+-------  ------  ----  ---------------------------------
+Hanoi    5       5     egg coffee,banh mi,masala chai
+Nairobi  6       6     masala chai,mandazi,filter coffee
+Quito    7       6     filter coffee,empanada
+n  units  units_or_zero
+-  -----  -------------
+0         0
+```
+
+Two details deserve a second look. The order of the items inside `group_concat` is whatever order the rows happened to arrive in; SQLite (since 3.44), PostgreSQL and MySQL all let you write an `ORDER BY` inside the aggregate when the order matters. And the query about Lima, which has no sales, still returned one row, because an aggregate query without `GROUP BY` always does; but `sum` over no rows is `NULL`, not 0, which surprises everyone once. When a total feeds a report or a calculation, wrap it in `coalesce(…, 0)`. (SQLite also has a non-standard `total()` that returns 0.0 for no rows.)
+
+### Subtotals and grand totals
+
+Reports often want subtotals per branch and a grand total under the detail rows. The standard provides `ROLLUP`, `CUBE` and `GROUPING SETS`, which PostgreSQL, SQL Server and Oracle support; MySQL writes `GROUP BY branch, category WITH ROLLUP`. SQLite has none of them. Here is the query and what PostgreSQL 16 prints for the same data; the rows with blanks are the subtotals (blank means `NULL`, "all categories" or "all branches"):
+
+```sql
+SELECT branch, category, sum(qty) AS units
+FROM sale
+GROUP BY ROLLUP (branch, category)
+ORDER BY branch, category;
+```
+
+```text
+ branch  | category | units
+---------+----------+-------
+ Hanoi   | drink    |     5
+ Hanoi   | food     |     5
+ Hanoi   |          |    10
+ Nairobi | drink    |     6
+ Nairobi | food     |     6
+ Nairobi |          |    12
+ Quito   | drink    |     7
+ Quito   | food     |     6
+ Quito   |          |    13
+         |          |    35
+(10 rows)
+```
+
+In SQLite you get the same rows by combining three grouped queries with `UNION ALL` (one grouped by branch and category, one by branch alone, one with no grouping), a set operation covered in the lesson on joins. PostgreSQL's `GROUPING(category)` function tells a subtotal row's `NULL` apart from a real `NULL` in the data.
+
+</Section>
+
+<Section id="bare-columns" kind="misconceptions" title="The column that is neither grouped nor aggregated">
+
+What should this query return?
+
+```sql
+SELECT branch, item, count(*) FROM sale GROUP BY branch;
+```
+
+Each branch has several items, and the query asks for one row per branch. There is no single right `item`. Standard SQL therefore has a rule: every column in the `SELECT` list of a grouped query must either appear in `GROUP BY` or be inside an aggregate (or be *functionally dependent* on the grouping columns, for example any column of a table whose primary key is grouped). PostgreSQL enforces it; running the query there prints:
+
+```text
+ERROR:  column "sale.item" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT branch, item, count(*) FROM sale GROUP BY branch;
+                       ^
+```
+
+MySQL enforces the rule too, by default since version 5.7, through its `ONLY_FULL_GROUP_BY` mode; older MySQL code that relies on the mode being off is a well-known source of upgrade pain.
+
+SQLite accepts such "bare" columns and takes the value from some row of the group. It makes one useful promise: when the query has a single `min()` or `max()` aggregate, the bare columns come from the row that holds the minimum or maximum.
+
+```sql check
+.mode column
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, branch TEXT NOT NULL, item TEXT NOT NULL, category TEXT NOT NULL,
+  qty INTEGER NOT NULL, price_cents INTEGER NOT NULL, rating INTEGER
+);
+INSERT INTO sale (branch, item, category, qty, price_cents, rating) VALUES
+  ('Nairobi', 'masala chai',   'drink', 4, 250, 5),
+  ('Nairobi', 'mandazi',       'food',  6, 100, 4),
+  ('Nairobi', 'filter coffee', 'drink', 2, 300, NULL),
+  ('Hanoi',   'egg coffee',    'drink', 4, 350, 5),
+  ('Hanoi',   'banh mi',       'food',  2, 400, 3),
+  ('Hanoi',   'masala chai',   'drink', 1, 250, NULL),
+  ('Hanoi',   'banh mi',       'food',  3, 400, 4),
+  ('Quito',   'filter coffee', 'drink', 7, 300, 4),
+  ('Quito',   'empanada',      'food',  4, 200, NULL),
+  ('Quito',   'empanada',      'food',  2, 200, 2);
+
+-- A "bare" column: item is neither grouped nor aggregated.
+-- SQLite accepts this; with max() it takes item from the row with the maximum.
+SELECT branch, item, max(qty * price_cents) AS best_line_cents
+FROM sale
+GROUP BY branch
+ORDER BY branch;
+```
+
+```text
+branch   item           best_line_cents
+-------  -------------  ---------------
+Hanoi    egg coffee     1400
+Nairobi  masala chai    1000
+Quito    filter coffee  2100
+```
+
+Convenient, but not portable, and it breaks down when two rows tie for the maximum. The portable ways to ask "which row has the largest value in each group" use a subquery or a window function, the subjects of lessons 6 and 7.
+
+<Misconception>
+
+"The average of the branch averages is the overall average." Only if every branch has the same number of values. Hanoi's ratings average 4.0 over three ratings, Nairobi's 4.5 over two, Quito's 3.0 over two; the mean of those three averages is about 3.83, but the overall average rating is 27 / 7 ≈ 3.86. When you combine groups, carry sums and counts and divide at the end.
+
+</Misconception>
+
+<Misconception>
+
+"`count(column)` and `count(*)` are interchangeable." `count(*)` counts rows; `count(column)` counts non-`NULL` values. In this lesson's data they differ by three for `rating`. Use the one that matches the question.
+
+</Misconception>
+
+</Section>
+
+<Section id="statistics" kind="human" title="Statistics in SQL">
+
+Analysts use SQL for far more than totals. A few tools you will meet:
+
+- **Medians and percentiles.** The median is often a better summary than the mean for skewed data such as incomes or response times. The standard's ordered-set aggregates do it: in PostgreSQL, `percentile_cont(0.5) WITHIN GROUP (ORDER BY qty)` returned `3.5` for this lesson's quantities. SQLite has no built-in median (you can compute one with window functions, or load an extension); MySQL has none either.
+- **Spread.** PostgreSQL and MySQL have `stddev_samp`, `var_samp` and friends; PostgreSQL also has `corr` and `regr_slope` for simple <TopicLink id="math.prob.statistics-intro">statistics</TopicLink> directly in the database.
+- **Approximate aggregates.** Warehouses such as BigQuery and Snowflake offer `APPROX_COUNT_DISTINCT`, based on the HyperLogLog sketch, because an exact distinct count over billions of rows is expensive and a 1% error is often fine.
+
+A habit of experienced application developers: let the database aggregate. Fetching a hundred thousand rows into a program only to add them up moves all that data across the network and through the driver, and the program's loop is rarely faster than the database's. A `GROUP BY` that returns twelve monthly totals sends twelve rows. The same reasoning explains why analytics warehouses store data by column rather than by row: an aggregate over one column of a wide table then reads only that column from disk.
+
+A habit of experienced analysts: before trusting any aggregate, run a few sanity checks. Does `count(*)` match what you expect? Do the per-group totals add up to the overall total? How many `NULL`s are in the column you are averaging? Grouping mistakes rarely raise errors; they produce numbers that look reasonable and are wrong.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

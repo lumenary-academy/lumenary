@@ -1,0 +1,560 @@
+---
+title: "A complete project: an expression calculator"
+subtitle: A tokenizer, a recursive-descent parser and an evaluator in idiomatic Zig, with arenas, diagnostics, buffered output and leak-checked tests, and where to go next.
+minutes: 80
+objectives:
+  - Read and extend a complete Zig program of about three hundred lines that uses most of the course
+  - Structure a small language implementation as tokenizer, parser, syntax tree and evaluator
+  - Use an arena per unit of work, an environment that owns its keys, and a diagnostics struct for error positions
+  - Write tests that check behaviour, errors and memory ownership with std.testing.allocator
+  - Plan extensions and know where to continue learning Zig
+prerequisites: [testing-build-and-c]
+related: [math.comp.algorithm-design]
+references:
+  - title: "Zig language reference (0.17)"
+    url: https://ziglang.org/documentation/0.17.0/
+  - title: Zig standard library source
+    url: https://codeberg.org/ziglang/zig
+    note: lib/std is the best large example of idiomatic Zig; its own tokenizer and parser for Zig are in lib/std/zig.
+  - title: Zig community resources
+    url: https://ziglang.org/community/
+    note: Forums, chat and meetups, listed by the project itself.
+---
+
+<Section id="motivation" kind="motivation" title="Putting it together">
+
+A calculator is a classic final project because it is small enough to finish and big enough to need real structure. Reading `2 * (3 + 4)` and printing `14` requires breaking text into **tokens**, arranging tokens into a **syntax tree** that respects operator precedence, and **evaluating** the tree, with useful errors at every stage. The same three stages are inside every compiler, interpreter, database query engine and configuration-file reader, including Zig's own.
+
+The program below supports numbers, the operators `+ - * / % ^`, parentheses, unary minus and variables (`let r = 2.5`). It uses nearly every idea from this course: tagged unions for tokens and tree nodes, error unions and a diagnostics struct for failures, an arena for each line's syntax tree, a hash map that owns its keys, `defer` for cleanup, a buffered writer for output, and tests that check results, errors and memory.
+
+</Section>
+
+<Section id="grammar" kind="definitions" title="The design">
+
+<Definition term="grammar">
+
+The rules for well-formed input, written at the top of the file. Each rule becomes one parser function. Precedence comes from the nesting: `expr` handles `+` and `-` over `term`s, `term` handles `*`, `/` and `%` over `unary`s, so multiplication binds tighter than addition without any precedence table.
+
+</Definition>
+
+<Definition term="recursive descent">
+
+A parsing technique in which each grammar rule is a function that consumes tokens and calls the functions for the rules it contains. It is simple, fast, gives good error messages, and is what most hand-written parsers in industry use, including those of Clang, GCC and Zig.
+
+</Definition>
+
+<Definition term="syntax tree">
+
+The parser's output: a tree of `Node`s, a tagged union with a number, a variable, a negation or a binary operation. `2 * (3 + 4)` becomes a `binary` node for `*` whose right child is a `binary` node for `+`. Parentheses leave no trace in the tree; they only shaped it.
+
+</Definition>
+
+</Section>
+
+<Section id="program" kind="computation" title="The program">
+
+```zig check
+//! calc: a small calculator language with variables.
+//!   statement := "let" name "=" expr | expr
+//!   expr      := term (("+" | "-") term)*
+//!   term      := unary (("*" | "/" | "%") unary)*
+//!   unary     := "-" unary | power
+//!   power     := primary ("^" unary)?
+//!   primary   := number | name | "(" expr ")"
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const Error = error{
+    UnexpectedCharacter,
+    UnexpectedToken,
+    UnknownVariable,
+    DivisionByZero,
+    OutOfMemory,
+};
+
+/// Where the last error happened, filled in for the caller.
+pub const Diagnostics = struct { column: usize = 0 };
+
+const Token = struct {
+    tag: Tag,
+    text: []const u8,
+    column: usize,
+
+    const Tag = enum { number, name, plus, minus, star, slash, percent, caret, lparen, rparen, equals, end };
+};
+
+const Tokenizer = struct {
+    src: []const u8,
+    pos: usize = 0,
+
+    fn next(t: *Tokenizer, diag: *Diagnostics) Error!Token {
+        while (t.pos < t.src.len and t.src[t.pos] == ' ') t.pos += 1;
+        const start = t.pos;
+        if (t.pos == t.src.len) return .{ .tag = .end, .text = "", .column = start + 1 };
+        const c = t.src[t.pos];
+        const tag: Token.Tag = switch (c) {
+            '0'...'9', '.' => {
+                while (t.pos < t.src.len and (std.ascii.isDigit(t.src[t.pos]) or t.src[t.pos] == '.')) t.pos += 1;
+                return .{ .tag = .number, .text = t.src[start..t.pos], .column = start + 1 };
+            },
+            'a'...'z', 'A'...'Z', '_' => {
+                while (t.pos < t.src.len and (std.ascii.isAlphanumeric(t.src[t.pos]) or t.src[t.pos] == '_')) t.pos += 1;
+                return .{ .tag = .name, .text = t.src[start..t.pos], .column = start + 1 };
+            },
+            '+' => .plus,
+            '-' => .minus,
+            '*' => .star,
+            '/' => .slash,
+            '%' => .percent,
+            '^' => .caret,
+            '(' => .lparen,
+            ')' => .rparen,
+            '=' => .equals,
+            else => {
+                diag.column = start + 1;
+                return error.UnexpectedCharacter;
+            },
+        };
+        t.pos += 1;
+        return .{ .tag = tag, .text = t.src[start..t.pos], .column = start + 1 };
+    }
+};
+
+pub const Node = union(enum) {
+    number: f64,
+    variable: []const u8,
+    negate: *const Node,
+    binary: struct { op: Token.Tag, left: *const Node, right: *const Node },
+};
+
+const Parser = struct {
+    tokens: Tokenizer,
+    current: Token,
+    arena: Allocator, // every node of one statement lives in this arena
+    diag: *Diagnostics,
+
+    fn init(src: []const u8, arena: Allocator, diag: *Diagnostics) Error!Parser {
+        var p: Parser = .{ .tokens = .{ .src = src }, .current = undefined, .arena = arena, .diag = diag };
+        p.current = try p.tokens.next(diag);
+        return p;
+    }
+
+    fn advance(p: *Parser) Error!Token {
+        const tok = p.current;
+        p.current = try p.tokens.next(p.diag);
+        return tok;
+    }
+
+    fn expect(p: *Parser, tag: Token.Tag) Error!Token {
+        if (p.current.tag != tag) return p.fail();
+        return p.advance();
+    }
+
+    fn fail(p: *Parser) Error {
+        p.diag.column = p.current.column;
+        return error.UnexpectedToken;
+    }
+
+    fn make(p: *Parser, node: Node) Error!*const Node {
+        const n = try p.arena.create(Node);
+        n.* = node;
+        return n;
+    }
+
+    fn expr(p: *Parser) Error!*const Node {
+        var left = try p.term();
+        while (p.current.tag == .plus or p.current.tag == .minus) {
+            const op = (try p.advance()).tag;
+            left = try p.make(.{ .binary = .{ .op = op, .left = left, .right = try p.term() } });
+        }
+        return left;
+    }
+
+    fn term(p: *Parser) Error!*const Node {
+        var left = try p.unary();
+        while (p.current.tag == .star or p.current.tag == .slash or p.current.tag == .percent) {
+            const op = (try p.advance()).tag;
+            left = try p.make(.{ .binary = .{ .op = op, .left = left, .right = try p.unary() } });
+        }
+        return left;
+    }
+
+    fn unary(p: *Parser) Error!*const Node {
+        if (p.current.tag == .minus) {
+            _ = try p.advance();
+            return p.make(.{ .negate = try p.unary() });
+        }
+        return p.power();
+    }
+
+    fn power(p: *Parser) Error!*const Node {
+        const base = try p.primary();
+        if (p.current.tag != .caret) return base;
+        _ = try p.advance();
+        return p.make(.{ .binary = .{ .op = .caret, .left = base, .right = try p.unary() } });
+    }
+
+    fn primary(p: *Parser) Error!*const Node {
+        switch (p.current.tag) {
+            .number => {
+                const tok = try p.advance();
+                const value = std.fmt.parseFloat(f64, tok.text) catch {
+                    p.diag.column = tok.column;
+                    return error.UnexpectedToken;
+                };
+                return p.make(.{ .number = value });
+            },
+            .name => return p.make(.{ .variable = (try p.advance()).text }),
+            .lparen => {
+                _ = try p.advance();
+                const inner = try p.expr();
+                _ = try p.expect(.rparen);
+                return inner;
+            },
+            else => return p.fail(),
+        }
+    }
+};
+
+/// Variables, with names owned by the environment.
+pub const Env = struct {
+    gpa: Allocator,
+    vars: std.StringHashMapUnmanaged(f64) = .empty,
+
+    pub fn deinit(env: *Env) void {
+        var it = env.vars.keyIterator();
+        while (it.next()) |k| env.gpa.free(k.*);
+        env.vars.deinit(env.gpa);
+    }
+
+    pub fn set(env: *Env, name: []const u8, value: f64) Allocator.Error!void {
+        const slot = try env.vars.getOrPut(env.gpa, name);
+        if (!slot.found_existing) {
+            slot.key_ptr.* = env.gpa.dupe(u8, name) catch |err| {
+                env.vars.removeByPtr(slot.key_ptr);
+                return err;
+            };
+        }
+        slot.value_ptr.* = value;
+    }
+};
+
+fn eval(node: *const Node, env: *const Env) Error!f64 {
+    return switch (node.*) {
+        .number => |n| n,
+        .variable => |name| env.vars.get(name) orelse error.UnknownVariable,
+        .negate => |inner| -(try eval(inner, env)),
+        .binary => |b| {
+            const l = try eval(b.left, env);
+            const r = try eval(b.right, env);
+            return switch (b.op) {
+                .plus => l + r,
+                .minus => l - r,
+                .star => l * r,
+                .slash => if (r == 0) error.DivisionByZero else l / r,
+                .percent => if (r == 0) error.DivisionByZero else @rem(l, r),
+                .caret => std.math.pow(f64, l, r),
+                else => unreachable, // the parser only builds the operators above
+            };
+        },
+    };
+}
+
+/// Runs one statement. Returns the value of an expression, or null for "let".
+pub fn run(line: []const u8, env: *Env, scratch: Allocator, diag: *Diagnostics) Error!?f64 {
+    var p = try Parser.init(line, scratch, diag);
+    if (p.current.tag == .name and std.mem.eql(u8, p.current.text, "let")) {
+        _ = try p.advance();
+        const name = try p.expect(.name);
+        _ = try p.expect(.equals);
+        const value = try eval(try p.expr(), env);
+        _ = try p.expect(.end);
+        try env.set(name.text, value);
+        return null;
+    }
+    const tree = try p.expr();
+    _ = try p.expect(.end);
+    return try eval(tree, env);
+}
+
+pub fn main(init: std.process.Init) !void {
+    var out_buf: [4096]u8 = undefined;
+    var out_file: std.Io.File.Writer = .init(.stdout(), init.io, &out_buf);
+    const out = &out_file.interface;
+
+    var env: Env = .{ .gpa = init.gpa };
+    defer env.deinit();
+    var arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena.deinit();
+
+    const script =
+        \\let r = 2.5
+        \\let area = 3.14159 * r ^ 2
+        \\area
+        \\(1 + 2) * 3 - 4 / 2
+        \\-2 ^ 2
+        \\10 % 4 + 2 ^ 3 ^ 2
+        \\1 / (r - 2.5)
+        \\2 * (3 +
+        \\height + 1
+        \\7 $ 3
+    ;
+    var lines = std.mem.splitScalar(u8, script, '\n');
+    while (lines.next()) |line| {
+        defer _ = arena.reset(.retain_capacity); // free this line's syntax tree
+        var diag: Diagnostics = .{};
+        try out.print("> {s}\n", .{line});
+        if (run(line, &env, arena.allocator(), &diag)) |result| {
+            if (result) |value| try out.print("{d}\n", .{value});
+        } else |err| switch (err) {
+            error.UnexpectedCharacter, error.UnexpectedToken => try out.print("error: {t} at column {d}\n", .{ err, diag.column }),
+            else => try out.print("error: {t}\n", .{err}),
+        }
+    }
+    try out.flush();
+}
+
+/// Test helper: a calculator with leak-checked memory.
+const TestCalc = struct {
+    arena: std.heap.ArenaAllocator,
+    env: Env,
+    diag: Diagnostics = .{},
+
+    fn init() TestCalc {
+        return .{ .arena = .init(std.testing.allocator), .env = .{ .gpa = std.testing.allocator } };
+    }
+
+    fn deinit(t: *TestCalc) void {
+        t.env.deinit();
+        t.arena.deinit();
+    }
+
+    fn exec(t: *TestCalc, line: []const u8) Error!?f64 {
+        return run(line, &t.env, t.arena.allocator(), &t.diag);
+    }
+};
+
+test "precedence and associativity" {
+    var c: TestCalc = .init();
+    defer c.deinit();
+    try std.testing.expectEqual(@as(?f64, 7), try c.exec("1 + 2 * 3"));
+    try std.testing.expectEqual(@as(?f64, 512), try c.exec("2 ^ 3 ^ 2"));
+    try std.testing.expectEqual(@as(?f64, -4), try c.exec("-2 ^ 2"));
+    try std.testing.expectEqual(@as(?f64, 2), try c.exec("8 / 2 / 2"));
+}
+
+test "variable names are copied, not borrowed" {
+    var c: TestCalc = .init();
+    defer c.deinit();
+    var line = "let x = 4".*; // a mutable buffer, overwritten below
+    try std.testing.expectEqual(@as(?f64, null), try c.exec(&line));
+    @memcpy(&line, "zzzzzzzzz");
+    try std.testing.expectEqual(@as(?f64, 8), try c.exec("x * 2"));
+}
+
+test "errors are reported, with a column for syntax errors" {
+    var c: TestCalc = .init();
+    defer c.deinit();
+    try std.testing.expectError(error.UnexpectedCharacter, c.exec("7 $ 3"));
+    try std.testing.expectEqual(@as(usize, 3), c.diag.column);
+    try std.testing.expectError(error.DivisionByZero, c.exec("1 / 0"));
+    try std.testing.expectError(error.UnknownVariable, c.exec("nope"));
+}
+```
+
+```text
+> let r = 2.5
+> let area = 3.14159 * r ^ 2
+> area
+19.6349375
+> (1 + 2) * 3 - 4 / 2
+7
+> -2 ^ 2
+-4
+> 10 % 4 + 2 ^ 3 ^ 2
+514
+> 1 / (r - 2.5)
+error: DivisionByZero
+> 2 * (3 +
+error: UnexpectedToken at column 9
+> height + 1
+error: UnknownVariable
+> 7 $ 3
+error: UnexpectedCharacter at column 3
+```
+
+The test blocks at the end do not run under `zig run`; the next section runs them.
+
+</Section>
+
+<Section id="walkthrough" kind="human" title="A walk through the code">
+
+**Errors.** One error set, `Error`, covers the whole calculator, including `OutOfMemory` from the allocators. Errors carry no data, so syntax errors record their position in the caller's `Diagnostics` before returning. `main` prints the column for syntax errors and just the name for the others.
+
+**Tokenizer.** `Tokenizer.next` skips spaces and returns one `Token` per call: a tag, the slice of the source it covers, and its column. The `switch` on the current byte uses ranges (`'0'...'9'`, `'a'...'z'`) for numbers and names, and a prong per operator. Tokens are slices of the input line, so tokenizing allocates nothing.
+
+**Parser.** `Parser` holds the tokenizer, one token of look-ahead (`current`) and the arena. `expr` and `term` are loops, which makes `8 / 2 / 2` group from the left, as in arithmetic: (8 / 2) / 2 = 2. `power` calls `unary` for its right side, which makes `^` group from the right, so `2 ^ 3 ^ 2` is 2 ^ 9 = 512, the usual mathematical convention, and the script's `10 % 4 + 2 ^ 3 ^ 2` gives 2 + 512 = 514. Because `unary` is above `power` in the grammar, `-2 ^ 2` means −(2²) = −4, as in mathematics (and unlike some spreadsheets). `make` allocates each node in the arena with `create`.
+
+**Statements.** `run` looks at the first token: the name `let` starts an assignment, anything else is an expression. Both paths finish with `expect(.end)`, which insists that the whole line was consumed. That one call is what turns `2 3` or `(1 + 2))` into an error instead of silently evaluating the first part and ignoring the rest. (`2 * (3 +` fails even earlier, in `primary`, which finds the end of the line where a number should be: column 9.) `let` is not a reserved word in the tokenizer; it is recognised only in the first position, a common trick in small languages.
+
+**Evaluator.** `eval` is a single `switch` over the node's tag that recurses into children. The `else => unreachable` in the operator `switch` records a fact the compiler cannot see: the parser only builds binary nodes for six operators. Division and remainder by zero are checked, because floating-point division by zero would otherwise quietly produce an infinity.
+
+**Memory.** Two lifetimes, two strategies. The syntax tree of a line is needed only while that line runs, so `main` gives the parser an arena and calls `arena.reset(.retain_capacity)` after each line, freeing every node in one step while keeping the arena's memory for the next line. Variables must outlive the line that defined them, so `Env.set` copies each new name with the general-purpose allocator, and `Env.deinit` frees the names before the map. If copying the name fails, `set` removes the half-inserted entry before returning the error, so the map never holds a key it does not own.
+
+**Output.** Results go to standard output through a 4 KiB buffer, flushed once at the end, which is how command-line tools in Zig should print. In a long-running tool you would flush after each result so a user sees it immediately.
+
+</Section>
+
+<Section id="map" kind="human" title="Where each lesson shows up">
+
+| Lesson | In the calculator |
+| --- | --- |
+| Values, types and control flow | `switch` with byte ranges in the tokenizer; `while` loops with conditions in the parser |
+| Arrays, slices and strings | tokens and variable names are slices of the input; `std.mem.eql`, `splitScalar` |
+| Structs, enums and tagged unions | `Token.Tag` enum, `Node` tagged union, methods on `Tokenizer`, `Parser` and `Env` |
+| Errors and optionals | one `Error` set, `try` everywhere, `Diagnostics`, `?f64` results, `orelse error.UnknownVariable` |
+| Explicit allocators | an arena per line with `reset`, a general-purpose allocator for long-lived names |
+| Comptime | the built-in function table; format strings checked at compile time |
+| Tests and the build system | three leak-checked tests in the same file |
+
+</Section>
+
+<Section id="tests" kind="examples" title="Testing the calculator">
+
+`zig test calc.zig` runs the three tests:
+
+```text
+1/3 calc.test.precedence and associativity...OK
+2/3 calc.test.variable names are copied, not borrowed...OK
+3/3 calc.test.errors are reported, with a column for syntax errors...OK
+All 3 tests passed.
+```
+
+The `TestCalc` helper bundles an arena, an environment and a `Diagnostics`, all on `std.testing.allocator`, so every test is also a leak test. The second test deserves a closer look. It runs `let x = 4` from a *mutable* buffer, overwrites the buffer, and then reads `x`. If `Env.set` stored the slice instead of a copy, the key would now read `zzzzzzzzz` and the lookup would fail. The test pins down an ownership decision that no type signature expresses.
+
+The testing allocator earned its place while this lesson was written. The first draft of the tests passed the testing allocator directly to the parser, forgetting that nobody frees parser nodes individually. Every test passed, and the run still failed (abridged):
+
+```text
+[SafeAllocator] (err): leaked [addr: 796532260208, len: 32 (0x20) align: 8] allocated at:
+...
+All 3 tests passed.
+4 errors were logged.
+1 tests leaked memory.
+```
+
+Four leaked 32-byte blocks: one per syntax-tree node that the error tests built. The fix was the `TestCalc` helper with its arena, exactly as in `main`.
+
+</Section>
+
+<Section id="extending" kind="examples" title="Extending it: built-in functions">
+
+A natural next feature is functions such as `sqrt(2)`. The lookup part is a good use of comptime: a `std.StaticStringMap` builds an efficient name-to-function table during compilation.
+
+```zig check
+const std = @import("std");
+
+// A table of built-in functions, built at compile time.
+const Builtin = *const fn (f64) f64;
+
+fn sqrt(x: f64) f64 {
+    return @sqrt(x);
+}
+fn abs(x: f64) f64 {
+    return @abs(x);
+}
+fn floor(x: f64) f64 {
+    return @floor(x);
+}
+fn sin(x: f64) f64 {
+    return @sin(x);
+}
+
+const builtins = std.StaticStringMap(Builtin).initComptime(.{
+    .{ "sqrt", sqrt },
+    .{ "abs", abs },
+    .{ "floor", floor },
+    .{ "sin", sin },
+});
+
+fn call(name: []const u8, arg: f64) error{UnknownFunction}!f64 {
+    const f = builtins.get(name) orelse return error.UnknownFunction;
+    return f(arg);
+}
+
+pub fn main() void {
+    const calls = [_]struct { []const u8, f64 }{
+        .{ "sqrt", 2 }, .{ "abs", -7.5 }, .{ "floor", 3.99 }, .{ "sin", 0 }, .{ "cbrt", 27 },
+    };
+    for (calls) |c| {
+        const name, const arg = c;
+        if (call(name, arg)) |v| {
+            std.debug.print("{s}({d}) = {d}\n", .{ name, arg, v });
+        } else |err| {
+            std.debug.print("{s}({d}): {t}\n", .{ name, arg, err });
+        }
+    }
+    std.debug.print("{d} built-in functions\n", .{builtins.keys().len});
+}
+```
+
+```text
+sqrt(2) = 1.4142135623730951
+abs(-7.5) = 7.5
+floor(3.99) = 3
+sin(0) = 0
+cbrt(27): UnknownFunction
+4 built-in functions
+```
+
+To add this to the calculator: give `Node` a `call` variant holding a `Builtin` and an argument node; in `primary`, when a name is followed by `(`, look the name up in `builtins` (recording the column and returning a new `error.UnknownFunction` if it is missing), parse the argument and the closing parenthesis; and in `eval`, evaluate the argument and call the function. Then add tests for each function and for an unknown name. Each step is a few lines, and the compiler's exhaustive `switch` checking will point at every place that must learn about the new node type.
+
+Other extensions, in rough order of difficulty: read lines from standard input to make an interactive calculator (through `init.io` and a `std.Io.File.Reader`); add comparison operators and an `if` expression; report the column of evaluation errors as well as syntax errors by storing columns in nodes; compile the tree to a list of stack-machine instructions and run those instead of walking the tree. That last one is the first step from interpreter to compiler.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A recursive parser can handle any input."** Each `(` costs a few stack frames, so an input of a hundred thousand opening parentheses can overflow the stack and crash the program. Parsers that read untrusted input limit their nesting depth (a counter in `Parser`, checked in `primary`, returning an error such as `error.TooDeep`), which is a small change worth making before this calculator faces the outside world.
+
+</Misconception>
+
+<Misconception>
+
+**"Floating point is fine for a calculator."** For most purposes it is, but users will notice that `0.1 + 0.2` prints `0.30000000000000004`. Real calculators use decimal arithmetic or round their output; financial ones use integers or decimal types. Choosing the number representation is a design decision, not a detail.
+
+</Misconception>
+
+<Misconception>
+
+**"Resetting an arena after each line wastes the work of allocating."** `reset(.retain_capacity)` keeps the memory the arena obtained and only marks it free, so after the first few lines the parser allocates nothing from the operating system at all. That is one reason arena-per-request designs are fast.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="From calculators to compilers">
+
+The structure used here, a tokenizer feeding a parser that builds a tree for an evaluator, goes back to the earliest compilers of the 1950s and 1960s, and recursive-descent parsing was already in use for ALGOL compilers in the early 1960s. An influential alternative for expressions is Vaughan Pratt's "top-down operator precedence" parsing (1973), which attaches binding powers to tokens instead of writing one function per precedence level; many modern hand-written parsers use it for expressions.
+
+Production interpreters usually go one step further than this calculator: rather than walking the tree every time, they compile it to **bytecode**, a compact list of instructions for a virtual machine, and run that, which is faster and easier to optimise. Python, Lua and many JavaScript engines' first tiers work this way. Zig's own compiler goes further still, through several intermediate representations, down to machine code. All of them begin with the three stages in this lesson.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the core of Zig: its types and control flow, slices and strings, structs and tagged unions, errors and optionals, explicit allocators, comptime, tests, the build system and C interoperability. Some ways to continue:
+
+- **Read real Zig.** The standard library, shipped with every download, is the largest body of idiomatic Zig and is meant to be read; `lib/std/zig/` contains the tokenizer and parser for Zig itself, a bigger cousin of this lesson's project. Projects such as TigerBeetle, Ghostty and Bun show Zig at large scale, each with its own conventions.
+- **Learn concurrency and I/O the Zig way.** This course has used `std.Io` only for printing. It also provides files, networking, timers and concurrency (`io.async`, `io.concurrent`, groups and queues), designed so that the same code can run on a thread pool or an event loop. It is new and still changing, so read the documentation for your version.
+- **Practise.** Ziglings, a community collection of small broken programs to fix, covers the language step by step; Advent of Code puzzles are a popular way to get fluent.
+- **Follow the project.** The [Zig website](https://ziglang.org/), its release notes and the [community page](https://ziglang.org/community/) list the places where Zig programmers discuss the language, including how to prepare for each new release on the way to 1.0.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,342 @@
+---
+title: Transactions and isolation
+subtitle: All-or-nothing changes, savepoints, the anomalies that concurrent users cause, the isolation levels that prevent them, and the patterns professionals use to stay correct.
+minutes: 65
+objectives:
+  - Group statements into transactions with BEGIN, COMMIT and ROLLBACK, and use savepoints
+  - State what atomicity, consistency, isolation and durability each promise
+  - Explain how SQLite and PostgreSQL differ when a statement fails inside a transaction
+  - Describe dirty reads, non-repeatable reads, phantoms, lost updates and write skew, and which isolation levels prevent them
+  - Explain MVCC and why serializable transactions must be retried
+  - Prevent lost updates with atomic updates, optimistic version checks and SELECT … FOR UPDATE, and use SQLite safely with several connections
+prerequisites: [indexes-and-query-plans]
+references:
+  - title: "SQLite: Transaction"
+    url: https://www.sqlite.org/lang_transaction.html
+    note: BEGIN DEFERRED, IMMEDIATE and EXCLUSIVE, and what happens on errors.
+  - title: "SQLite: Isolation In SQLite"
+    url: https://www.sqlite.org/isolation.html
+  - title: "SQLite: Write-Ahead Logging"
+    url: https://www.sqlite.org/wal.html
+  - title: "PostgreSQL: Transaction Isolation"
+    url: https://www.postgresql.org/docs/current/transaction-iso.html
+    note: Which anomalies each level allows in PostgreSQL, with worked examples of serialization failures.
+  - title: "PostgreSQL: Explicit Locking"
+    url: https://www.postgresql.org/docs/current/explicit-locking.html
+  - title: "MySQL: Transaction Isolation Levels (InnoDB)"
+    url: https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html
+---
+
+<Section id="motivation" kind="motivation" title="Two problems: half-finished work and other people">
+
+Moving money between two accounts takes two statements: subtract from one, add to the other. If the program crashes, the power fails or the second statement is rejected between them, money has vanished. Every serious system has operations like this, where several changes only make sense together: create an order *and* its lines *and* reduce the stock; enrol a student *and* charge the fee.
+
+The second problem is other people. A database serves many programs and users at the same moment. Two booking clerks see that one seat is left and both sell it. Two people edit the same document and one person's work silently disappears. A report adds up balances while transfers are moving money between them, and the total is wrong.
+
+**Transactions** solve both problems. A transaction groups statements into one unit that either happens completely or not at all, and that runs as if it had the database to itself, to a degree you can choose. This lesson shows how to use them, what the guarantees really are in SQLite, PostgreSQL and MySQL, and the habits that keep concurrent programs correct.
+
+</Section>
+
+<Section id="acid" kind="definitions" title="Transactions and ACID">
+
+<Definition term="Transaction">
+
+A **transaction** is a sequence of statements that the database treats as a single unit. It starts with `BEGIN` (the standard also allows `START TRANSACTION`) and ends with `COMMIT`, which makes all its changes permanent, or `ROLLBACK`, which undoes all of them. A statement run outside any explicit transaction is a transaction on its own: this is called **autocommit** mode, and it is the default in the sqlite3 shell, psql and most drivers.
+
+</Definition>
+
+The guarantees are traditionally summarised as **ACID**:
+
+- **Atomicity**: all of a transaction's changes happen, or none do. A crash in the middle leaves no trace of it.
+- **Consistency**: a transaction takes the database from one valid state to another; every constraint holds at commit. (This is the one property that depends on you as well: the database enforces the rules you declared, not the ones you forgot.)
+- **Isolation**: concurrent transactions do not see each other's unfinished work, and, at the strictest level, behave as if they ran one after another.
+- **Durability**: once `COMMIT` returns, the changes survive crashes and power cuts. Databases achieve this by writing a log to disk before acknowledging the commit.
+
+</Section>
+
+<Section id="commit-rollback" kind="examples" title="BEGIN, COMMIT and ROLLBACK">
+
+```sql check
+.mode column
+CREATE TABLE account (
+  id      INTEGER PRIMARY KEY,
+  owner   TEXT    NOT NULL,
+  balance INTEGER NOT NULL CHECK (balance >= 0)    -- in cents
+);
+INSERT INTO account VALUES (1, 'Kalani', 10000), (2, 'Zanele', 2500);
+
+-- A transfer is two updates that must succeed or fail together.
+BEGIN;
+UPDATE account SET balance = balance - 3000 WHERE id = 1;
+UPDATE account SET balance = balance + 3000 WHERE id = 2;
+COMMIT;
+
+SELECT id, owner, balance FROM account;
+
+-- Changed our mind halfway: ROLLBACK undoes everything since BEGIN.
+BEGIN;
+UPDATE account SET balance = balance - 5000 WHERE id = 2;
+SELECT 'inside the transaction' AS moment, balance FROM account WHERE id = 2;
+ROLLBACK;
+SELECT 'after rollback' AS moment, balance FROM account WHERE id = 2;
+
+-- The invariant: money is neither created nor destroyed.
+SELECT sum(balance) AS total FROM account;
+```
+
+```text
+id  owner   balance
+--  ------  -------
+1   Kalani  7000
+2   Zanele  5500
+moment                  balance
+----------------------  -------
+inside the transaction  500
+moment          balance
+--------------  -------
+after rollback  5500
+total
+-----
+12500
+```
+
+Inside its own transaction, a session sees its uncommitted changes (Zanele's balance of 500); after `ROLLBACK` they are gone. Other sessions would never have seen the 500 at all. Checking an invariant such as the total balance after a series of operations is a cheap and effective test.
+
+### When a statement fails inside a transaction
+
+What happens if one statement in a transaction breaks a constraint? Here the transfer is 12,000 cents, more than Kalani has. The credit to Zanele succeeds, the debit from Kalani fails the `CHECK`, and then the script says `COMMIT`:
+
+```sql
+BEGIN;
+UPDATE account SET balance = balance + 12000 WHERE id = 2;
+UPDATE account SET balance = balance - 12000 WHERE id = 1;   -- fails the CHECK
+COMMIT;
+SELECT id, balance FROM account;
+```
+
+Run in the sqlite3 shell without `-bail` (starting from balances of 10,000 and 2,500), it prints:
+
+```text
+Error: near line 6: stepping, CHECK constraint failed: balance >= 0 (19)
+1|10000
+2|14500
+```
+
+The same script in PostgreSQL 16 prints:
+
+```text
+ERROR:  new row for relation "account" violates check constraint "account_balance_check"
+DETAIL:  Failing row contains (1, Kalani, -2000).
+ id | balance
+----+---------
+  1 |   10000
+  2 |    2500
+(2 rows)
+```
+
+In SQLite (and in MySQL), a failed statement is undone, but **the transaction stays open**, and the later `COMMIT` committed the credit: 12,000 cents were created from nothing. PostgreSQL instead marks the whole transaction as failed; every later statement is refused until the transaction ends, and `COMMIT` performs a rollback. Neither behaviour is wrong, but they demand different code. The universal rule in application code: **if any statement in a transaction fails, roll the transaction back**. Every database driver and framework offers a construct that does this for you (for example a `with connection:` block in Python's `sqlite3`, or `@Transactional` methods in Spring), and you should use it rather than issuing `BEGIN` and `COMMIT` by hand.
+
+### Savepoints
+
+A **savepoint** marks a point inside a transaction that you can roll back to without abandoning the whole transaction. It is useful for "try this part; if it fails, carry on without it", for instance when importing a batch where some records may be rejected.
+
+```sql check
+.mode column
+CREATE TABLE booking (room TEXT NOT NULL, night TEXT NOT NULL, guest TEXT NOT NULL,
+                      PRIMARY KEY (room, night));
+
+-- Savepoints are named points inside a transaction you can roll back to.
+BEGIN;
+INSERT INTO booking VALUES ('101', '2026-08-01', 'Ingrid'), ('101', '2026-08-02', 'Ingrid');
+
+SAVEPOINT family;
+INSERT INTO booking VALUES ('102', '2026-08-01', 'Oyelaran'), ('103', '2026-08-01', 'Oyelaran');
+SELECT count(*) AS rows_so_far FROM booking;
+ROLLBACK TO family;          -- undo only the family's rooms
+RELEASE family;
+
+INSERT INTO booking VALUES ('104', '2026-08-01', 'Oyelaran');
+COMMIT;
+
+SELECT room, night, guest FROM booking ORDER BY room, night;
+```
+
+```text
+rows_so_far
+-----------
+4
+room  night       guest
+----  ----------  --------
+101   2026-08-01  Ingrid
+101   2026-08-02  Ingrid
+104   2026-08-01  Oyelaran
+```
+
+`ROLLBACK TO family` undid the two inserts made after the savepoint and kept Ingrid's; `RELEASE` discarded the savepoint itself. Savepoints are standard and work the same way in PostgreSQL and MySQL; in PostgreSQL they are also how you recover from an error without losing the whole transaction.
+
+</Section>
+
+<Section id="anomalies" kind="definitions" title="What can go wrong between transactions">
+
+If transactions really ran one at a time, there would be nothing more to say. But a database that made everyone queue would be slow, so it runs transactions concurrently and promises a certain level of **isolation**. Weaker levels allow certain **anomalies**, named situations where concurrency produces a result no one-at-a-time order could:
+
+| Anomaly | What happens |
+| --- | --- |
+| Dirty read | T1 reads a change T2 has made but not committed; T2 then rolls back, so T1 used data that never existed. |
+| Non-repeatable read | T1 reads a row twice and gets different values, because T2 updated it and committed in between. |
+| Phantom | T1 runs the same query twice and gets a different *set* of rows, because T2 inserted or deleted matching rows. |
+| Lost update | T1 and T2 both read a value, both compute a new value from it, and both write; one write overwrites the other. |
+| Write skew | T1 and T2 read overlapping data, make *different* changes that are each valid alone, and together break a rule (two doctors both leave the on-call rota because each saw the other still on it). |
+
+The standard defines four isolation levels by which of the first three anomalies they forbid. Real databases implement them differently, so the table shows the names, what the standard requires, and the defaults:
+
+| Level | Standard forbids | Default in |
+| --- | --- | --- |
+| `READ UNCOMMITTED` | nothing | (rarely used; PostgreSQL treats it as `READ COMMITTED`) |
+| `READ COMMITTED` | dirty reads | PostgreSQL, Oracle, SQL Server |
+| `REPEATABLE READ` | also non-repeatable reads | MySQL (InnoDB) |
+| `SERIALIZABLE` | also phantoms; the result must equal some serial order | SQLite (in effect) |
+
+You choose a level per transaction, for example `BEGIN ISOLATION LEVEL SERIALIZABLE;` in PostgreSQL or `SET TRANSACTION ISOLATION LEVEL …` before `START TRANSACTION` in MySQL. SQLite has no such setting: because it allows only one writer at a time and gives each reader a consistent snapshot, its transactions are serializable.
+
+</Section>
+
+<Section id="mvcc" kind="computation" title="Seeing a lost update happen">
+
+Concurrency cannot be shown with a single script in one connection, so this example ran two `psql` sessions against PostgreSQL 16 at the same time. Each is a program doing a classic **read-modify-write**: read a balance, compute a new one in the program, write it back. In psql, `\gset` stores a query's result in a variable and `\echo` prints; `:b` inserts the variable's value. Session B starts 0.3 seconds after A and holds its transaction a little longer.
+
+```text
+-- Session A                                     -- Session B (starts 0.3 s later)
+BEGIN ISOLATION LEVEL :iso;                      BEGIN ISOLATION LEVEL :iso;
+SELECT balance AS b FROM account                 SELECT balance AS b FROM account
+  WHERE id = 1 \gset                               WHERE id = 1 \gset
+\echo A read :b                                  \echo B read :b
+SELECT pg_sleep(1) \g /dev/null                  SELECT pg_sleep(1.2) \g /dev/null
+UPDATE account SET balance = :b + 50             UPDATE account SET balance = :b + 20
+  WHERE id = 1;                                    WHERE id = 1;
+COMMIT;                                          COMMIT;
+\echo A committed                                \echo B finished
+```
+
+Starting each time from a balance of 100, once under `READ COMMITTED` and once under `REPEATABLE READ`, the output was:
+
+```text
+=== READ COMMITTED
+  session A: A read 100
+  session A: A committed
+  session B: B read 100
+  session B: B finished
+  final balance: 120
+=== REPEATABLE READ
+  session A: A read 100
+  session A: A committed
+  session B: B read 100
+  session B: psql:/w/b.sql:6: ERROR:  could not serialize access due to concurrent update
+  session B: B finished
+  final balance: 150
+```
+
+Under `READ COMMITTED`, both sessions read 100. A wrote 150 and committed; B, holding a value it read before A's commit, wrote 120 over it. A's deposit of 50 is **lost**, and no error was reported anywhere. Under `REPEATABLE READ`, PostgreSQL noticed that the row B wanted to update had been changed by a transaction that committed after B's snapshot was taken, and refused B's update with a **serialization failure**. The balance is A's 150, and B's program learns that it must try again.
+
+### MVCC and why retries are normal
+
+PostgreSQL, MySQL's InnoDB, Oracle and SQLite in WAL mode all use **multi-version concurrency control** (MVCC): an update writes a new version of a row instead of overwriting it, and each transaction reads from a **snapshot**, the versions committed when its snapshot was taken. Readers therefore never wait for writers, and writers never wait for readers. Writers that touch the *same* row still conflict, and at the stricter levels the database resolves a conflict by aborting one transaction, as you just saw.
+
+PostgreSQL's `SERIALIZABLE` level (since version 9.1) uses **serializable snapshot isolation**, which also detects write skew. The price of strong isolation is that transactions sometimes fail with a serialization error (SQLSTATE `40001`) even though nothing is wrong with them, and **the application must retry them**. Code that uses `REPEATABLE READ` or `SERIALIZABLE` without a retry loop is incomplete. Keep such transactions short, so that conflicts are rare and retries are cheap.
+
+</Section>
+
+<Section id="patterns" kind="examples" title="Patterns that prevent lost updates">
+
+You do not always need a stricter isolation level. Three patterns, all usable at `READ COMMITTED`, cover most real cases.
+
+**1. Let the database do the arithmetic.** `UPDATE account SET balance = balance + 50 WHERE id = 1` reads and writes in one statement, under the row's lock, so two such updates cannot lose each other's work. Put the business rule in the same statement (`… AND balance >= 50`) and check how many rows changed.
+
+**2. Optimistic concurrency.** Give the row a `version` column. A program remembers the version it read and writes with `WHERE id = ? AND version = ?`, incrementing the version. If someone else changed the row first, zero rows are updated, and the program re-reads and tries again (or tells the user). Web applications, where a user may keep an edit form open for minutes, use this constantly.
+
+**3. Pessimistic locking.** In PostgreSQL and MySQL, `SELECT … FOR UPDATE` locks the selected rows until the transaction ends, so a second transaction trying to lock them waits. Use it when a read-modify-write must happen in the program and conflicts are frequent. (`FOR UPDATE SKIP LOCKED` lets many workers take jobs from a queue table without colliding.) SQLite has no row locks; see below.
+
+```sql check
+.mode column
+CREATE TABLE seat (
+  id      INTEGER PRIMARY KEY,
+  event   TEXT    NOT NULL,
+  seats_left INTEGER NOT NULL CHECK (seats_left >= 0),
+  version INTEGER NOT NULL DEFAULT 1
+);
+INSERT INTO seat (id, event, seats_left) VALUES (1, 'Concert in Kraków', 2);
+
+-- Safe pattern 1: one atomic UPDATE that checks and changes in a single step.
+UPDATE seat SET seats_left = seats_left - 1 WHERE id = 1 AND seats_left >= 1;
+SELECT changes() AS sold_first;
+UPDATE seat SET seats_left = seats_left - 1 WHERE id = 1 AND seats_left >= 1;
+SELECT changes() AS sold_second;
+UPDATE seat SET seats_left = seats_left - 1 WHERE id = 1 AND seats_left >= 1;
+SELECT changes() AS sold_third;     -- 0 rows changed: sold out, no error, no oversell
+
+-- Safe pattern 2: optimistic concurrency with a version number.
+-- A program read the row when version was 1, and now writes back only if
+-- nobody else has changed it in the meantime.
+UPDATE seat SET event = 'Concert in Kraków (moved to 20:00)', version = version + 1
+WHERE id = 1 AND version = 1;
+SELECT changes() AS first_writer;
+
+-- A second program also read version 1; its write must not overwrite the first.
+UPDATE seat SET event = 'Concert in Kraków (cancelled)', version = version + 1
+WHERE id = 1 AND version = 1;
+SELECT changes() AS second_writer;  -- 0: re-read the row and try again
+
+SELECT event, seats_left, version FROM seat;
+```
+
+```text
+sold_first
+----------
+1
+sold_second
+-----------
+1
+sold_third
+----------
+0
+first_writer
+------------
+1
+second_writer
+-------------
+0
+event                               seats_left  version
+----------------------------------  ----------  -------
+Concert in Kraków (moved to 20:00)  0           2
+```
+
+The third sale changed no rows, so the program knows the concert is sold out; the `CHECK` constraint is a second line of defence. The second writer's update matched nothing because the version had moved on, so its stale change did not overwrite the first. In a driver, the "rows changed" count comes back from every `UPDATE`, as `cursor.rowcount` in Python or the return value of `executeUpdate` in Java's JDBC.
+
+</Section>
+
+<Section id="sqlite-concurrency" kind="human" title="Concurrency in SQLite, and habits that keep you safe">
+
+SQLite's model is simple: **any number of readers, one writer at a time**, for the whole database file. In the default rollback-journal mode a writer briefly blocks readers while it commits; in **WAL mode** (`PRAGMA journal_mode = WAL;`), readers continue from their snapshot while a writer appends to a write-ahead log, which is why most applications that use SQLite with several connections enable it. A connection that wants to write while another is writing gets `SQLITE_BUSY` ("database is locked") unless it sets `PRAGMA busy_timeout = 5000;` (milliseconds) to wait instead.
+
+One subtlety catches many people. A plain `BEGIN` is **deferred**: it takes no lock until the first statement that needs one. A transaction that reads and then writes may find, at the write, that another connection got the write lock first, and fail with `SQLITE_BUSY` in a way that waiting cannot fix. Transactions that will write should start with `BEGIN IMMEDIATE`, which takes the write lock at the start (and waits for it, with a busy timeout).
+
+Habits that experienced engineers apply in every database:
+
+- **Keep transactions short.** Never hold one open while waiting for a user, a network call or a slow computation. Long transactions hold locks, block other writers, and in PostgreSQL prevent old row versions from being cleaned up.
+- **Do the work in a consistent order.** Two transactions that lock rows A then B and B then A can **deadlock**; databases detect this and abort one of them, which your retry logic must handle.
+- **Make retries safe.** A transaction that may be retried should be **idempotent** or fully inside the database. Sending an e-mail inside a transaction that is later retried sends it twice; send it after the commit.
+- **Choose the weakest level that is correct, knowingly.** `READ COMMITTED` plus the patterns above serves most applications. Reach for `SERIALIZABLE` (with retries) when invariants span many rows, as in write skew.
+
+<Misconception>
+
+"Wrapping statements in a transaction makes them safe from other users." A transaction at `READ COMMITTED` is atomic, but it does not stop the lost update you saw above: both sessions were inside transactions. Atomicity and isolation are different promises.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

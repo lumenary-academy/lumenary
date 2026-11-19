@@ -1,0 +1,535 @@
+---
+title: "Project: a calculator language"
+subtitle: A complete interpreter in idiomatic Scala 3, with a lexer, a recursive-descent parser, an evaluator, a simplifier and a property test, and where to go next.
+minutes: 75
+objectives:
+  - Design a program around algebraic data types for tokens, expressions and statements
+  - Write a lexer and a recursive-descent parser that return errors as values
+  - Evaluate and transform trees with pattern matching, Either and for comprehensions
+  - Thread state through a session with foldLeft instead of mutation
+  - Check a transformation with a seeded property test, and plan how to grow the project with real tools
+prerequisites: [concurrency-and-the-ecosystem]
+references:
+  - title: Programming in Scala, Fifth Edition
+    author: Martin Odersky, Lex Spoon, Bill Venners and Frank Sommers
+    year: 2021
+    url: https://www.artima.com/shop/programming_in_scala_5ed
+    note: The comprehensive book by the language's designer and colleagues, updated for Scala 3.
+  - title: Functional Programming in Scala, Second Edition
+    author: Michael Pilquist, Rúnar Bjarnason and Paul Chiusano
+    url: https://www.manning.com/books/functional-programming-in-scala-second-edition
+    note: A demanding, exercise-driven book on functional design, using Scala 3.
+  - title: Online courses (Scala documentation)
+    url: https://docs.scala-lang.org/online-courses.html
+    note: Free and paid courses listed by the Scala documentation, including EPFL's.
+  - title: "Scala CLI: package"
+    url: https://scala-cli.virtuslab.org/docs/commands/package/
+    note: Turn a program into a runnable JAR, a native image or a Scala Native executable.
+---
+
+<Section id="motivation" kind="motivation" title="What we are building">
+
+Programming languages are, among other things, programs, and Scala is one of the best languages there is for writing them. The Scala compiler itself is written in Scala; so are many tools that read, check or transform code and data. The reason is the trio you met in lesson 4: algebraic data types describe syntax trees precisely, pattern matching takes them apart, and the exhaustiveness check tells you when you have forgotten a case.
+
+In this lesson you build a small but complete interpreter for a calculator language. It understands numbers, variables, the operators `+ - * / ^` with the usual precedence, unary minus, parentheses, function calls such as `sqrt(x)` and `max(a, b, c)`, and assignments such as `r = 1.5`. It reports mistakes with clear messages instead of crashing, and it can simplify expressions, turning `x * 1 + 0` into `x`. Along the way you will use nearly everything from this course: enums and case classes, pattern matching, recursion with `@tailrec`, collections and folds, `Either` and for comprehensions, and a property test.
+
+The interpreter has four stages, each a function from one representation to the next:
+
+| Stage | From | To |
+| --- | --- | --- |
+| Lexer | `String` | `List[Token]` |
+| Parser | `List[Token]` | `Stmt` (containing an `Expr` tree) |
+| Evaluator | `Expr` and the variables | `Double` |
+| Simplifier and printer | `Expr` | a simpler `Expr`, and back to text |
+
+Every stage that can fail returns `Result[A]`, our name for `Either[CalcError, A]`. That one decision makes the stages compose: the whole pipeline is a chain of `flatMap`s, and the first error stops it.
+
+</Section>
+
+<Section id="step-one" kind="examples" title="Step one: the tree and the evaluator">
+
+Start from the middle. Before worrying about text, decide what an expression *is*, and how to compute its value. Here is the core, with trees built by hand:
+
+```scala check
+enum Expr:
+  case Num(value: Double)
+  case Var(name: String)
+  case Neg(operand: Expr)
+  case Bin(op: Char, left: Expr, right: Expr)
+
+case class CalcError(message: String)
+type Result[A] = Either[CalcError, A]
+def fail[A](message: String): Result[A] = Left(CalcError(message))
+
+def applyOp(op: Char, a: Double, b: Double): Result[Double] = op match
+  case '+' => Right(a + b)
+  case '-' => Right(a - b)
+  case '*' => Right(a * b)
+  case '/' => if b == 0 then fail("division by zero") else Right(a / b)
+  case '^' => Right(math.pow(a, b))
+  case _   => fail(s"unknown operator '$op'")
+
+def eval(e: Expr, env: Map[String, Double]): Result[Double] = e match
+  case Expr.Num(v) => Right(v)
+  case Expr.Var(n) => env.get(n).toRight(CalcError(s"unknown variable '$n'"))
+  case Expr.Neg(x) => eval(x, env).map(v => -v)
+  case Expr.Bin(op, l, r) =>
+    for
+      a <- eval(l, env)
+      b <- eval(r, env)
+      v <- applyOp(op, a, b)
+    yield v
+
+@main def stepOne(): Unit =
+  import Expr.*
+  val env = Map("r" -> 2.0)
+  val area = Bin('*', Num(3.0), Bin('^', Var("r"), Num(2)))
+  println(area)
+  println(eval(area, env))
+  println(eval(Bin('/', Num(1), Bin('-', Var("r"), Num(2))), env))
+  println(eval(Neg(Bin('+', Var("h"), Num(1))), env))
+```
+
+```text
+Bin(*,Num(3.0),Bin(^,Var(r),Num(2.0)))
+Right(12.0)
+Left(CalcError(division by zero))
+Left(CalcError(unknown variable 'h'))
+```
+
+`Expr` is an enum with four cases: a number, a variable, a negation and a binary operation. The tree for 3 × r² is a `Bin('*', ...)` whose right child is a `Bin('^', ...)`; operator precedence is already settled by the shape of the tree, which is the parser's job to build. `eval` is a recursive pattern match, and the `Bin` case is a for comprehension over `Either`: evaluate the left side, then the right, then apply the operator, stopping at the first failure. Division by zero and unknown variables come back as `Left` values with readable messages. Nothing throws.
+
+Building from the inside out like this is a good habit for any project. The data types are the contract between stages; once they are right, each stage can be written and tested on its own.
+
+</Section>
+
+<Section id="full-program" kind="computation" title="The complete interpreter">
+
+Here is the finished program, about 250 lines. Read it once from top to bottom; the next section walks through the interesting decisions.
+
+```scala check
+import scala.annotation.tailrec
+
+// ---------- Data ----------
+
+enum Token:
+  case Num(value: Double)
+  case Ident(name: String)
+  case Op(symbol: Char)
+  case LParen, RParen, Comma, Equals
+
+enum Expr:
+  case Num(value: Double)
+  case Var(name: String)
+  case Neg(operand: Expr)
+  case Bin(op: Char, left: Expr, right: Expr)
+  case Call(function: String, args: List[Expr])
+
+enum Stmt:
+  case Assign(name: String, expr: Expr)
+  case Show(expr: Expr)
+
+case class CalcError(message: String)
+type Result[A] = Either[CalcError, A]
+def fail[A](message: String): Result[A] = Left(CalcError(message))
+
+// ---------- Lexer: text to tokens ----------
+
+object Lexer:
+  def tokenize(src: String): Result[List[Token]] =
+    @tailrec
+    def loop(i: Int, acc: List[Token]): Result[List[Token]] =
+      if i >= src.length then Right(acc.reverse)
+      else
+        val c = src(i)
+        if c.isWhitespace then loop(i + 1, acc)
+        else if c.isDigit || c == '.' then
+          val text = src.drop(i).takeWhile(ch => ch.isDigit || ch == '.')
+          text.toDoubleOption match
+            case Some(v) => loop(i + text.length, Token.Num(v) :: acc)
+            case None    => fail(s"bad number '$text'")
+        else if c.isLetter then
+          val name = src.drop(i).takeWhile(ch => ch.isLetterOrDigit || ch == '_')
+          loop(i + name.length, Token.Ident(name) :: acc)
+        else
+          c match
+            case '+' | '-' | '*' | '/' | '^' => loop(i + 1, Token.Op(c) :: acc)
+            case '('                         => loop(i + 1, Token.LParen :: acc)
+            case ')'                         => loop(i + 1, Token.RParen :: acc)
+            case ','                         => loop(i + 1, Token.Comma :: acc)
+            case '='                         => loop(i + 1, Token.Equals :: acc)
+            case other                       => fail(s"unexpected character '$other' at position ${i + 1}")
+    loop(0, Nil)
+
+// ---------- Parser: tokens to a tree ----------
+//   statement := name '=' expr | expr
+//   expr      := term (('+' | '-') term)*
+//   term      := unary (('*' | '/') unary)*
+//   unary     := '-' unary | power
+//   power     := primary ('^' unary)?
+//   primary   := number | name | name '(' args ')' | '(' expr ')'
+
+object Parser:
+  private type Parsed[A] = Result[(A, List[Token])]
+
+  def statement(tokens: List[Token]): Result[Stmt] = tokens match
+    case Token.Ident(name) :: Token.Equals :: rest => complete(expr(rest)).map(Stmt.Assign(name, _))
+    case _                                         => complete(expr(tokens)).map(Stmt.Show(_))
+
+  private def complete(parsed: Parsed[Expr]): Result[Expr] = parsed.flatMap {
+    case (e, Nil)          => Right(e)
+    case (_, token :: _)   => fail(s"unexpected ${describe(token)}")
+  }
+
+  private def expr(ts: List[Token]): Parsed[Expr] = leftAssociative(ts, term, Set('+', '-'))
+  private def term(ts: List[Token]): Parsed[Expr] = leftAssociative(ts, unary, Set('*', '/'))
+
+  private def leftAssociative(ts: List[Token], operand: List[Token] => Parsed[Expr], ops: Set[Char]): Parsed[Expr] =
+    @tailrec
+    def loop(left: Expr, rest: List[Token]): Parsed[Expr] = rest match
+      case Token.Op(op) :: more if ops(op) =>
+        operand(more) match
+          case Right((right, after)) => loop(Expr.Bin(op, left, right), after)
+          case Left(error)           => Left(error)
+      case _ => Right((left, rest))
+    operand(ts).flatMap((left, rest) => loop(left, rest))
+
+  private def unary(ts: List[Token]): Parsed[Expr] = ts match
+    case Token.Op('-') :: rest => unary(rest).map((e, after) => (Expr.Neg(e), after))
+    case _                     => power(ts)
+
+  private def power(ts: List[Token]): Parsed[Expr] = primary(ts).flatMap {
+    case (base, Token.Op('^') :: rest) => unary(rest).map((exp, after) => (Expr.Bin('^', base, exp), after))
+    case done                          => Right(done)
+  }
+
+  private def primary(ts: List[Token]): Parsed[Expr] = ts match
+    case Token.Num(v) :: rest                   => Right((Expr.Num(v), rest))
+    case Token.Ident(f) :: Token.LParen :: rest => arguments(rest, Nil).map((args, after) => (Expr.Call(f, args), after))
+    case Token.Ident(name) :: rest              => Right((Expr.Var(name), rest))
+    case Token.LParen :: rest =>
+      expr(rest).flatMap {
+        case (e, Token.RParen :: after) => Right((e, after))
+        case _                          => fail("missing ')'")
+      }
+    case token :: _ => fail(s"unexpected ${describe(token)}")
+    case Nil        => fail("unexpected end of input")
+
+  private def arguments(ts: List[Token], acc: List[Expr]): Parsed[List[Expr]] = ts match
+    case Token.RParen :: rest if acc.isEmpty => Right((Nil, rest))
+    case _ =>
+      expr(ts).flatMap {
+        case (e, Token.Comma :: rest)  => arguments(rest, e :: acc)
+        case (e, Token.RParen :: rest) => Right(((e :: acc).reverse, rest))
+        case _                         => fail("expected ',' or ')' in the arguments")
+      }
+
+  private def describe(t: Token): String = t match
+    case Token.Num(v)    => s"number ${format(v)}"
+    case Token.Ident(n)  => s"name '$n'"
+    case Token.Op(c)     => s"'$c'"
+    case Token.LParen    => "'('"
+    case Token.RParen    => "')'"
+    case Token.Comma     => "','"
+    case Token.Equals    => "'='"
+
+// ---------- Evaluation ----------
+
+type Env = Map[String, Double]
+
+def oneArg(name: String)(f: Double => Double): List[Double] => Result[Double] =
+  case List(x) => Right(f(x))
+  case args    => fail(s"$name takes 1 argument, got ${args.size}")
+
+val builtins: Map[String, List[Double] => Result[Double]] = Map(
+  "sqrt" -> oneArg("sqrt")(math.sqrt),
+  "abs"  -> oneArg("abs")(math.abs),
+  "max"  -> (args => if args.isEmpty then fail("max needs an argument") else Right(args.max)),
+  "min"  -> (args => if args.isEmpty then fail("min needs an argument") else Right(args.min))
+)
+
+def applyOp(op: Char, a: Double, b: Double): Result[Double] = op match
+  case '+' => Right(a + b)
+  case '-' => Right(a - b)
+  case '*' => Right(a * b)
+  case '/' => if b == 0 then fail("division by zero") else Right(a / b)
+  case '^' => Right(math.pow(a, b))
+  case _   => fail(s"unknown operator '$op'")
+
+def traverse[A, B](as: List[A])(f: A => Result[B]): Result[List[B]] =
+  as.foldRight(Right(Nil): Result[List[B]]) { (a, acc) =>
+    for b <- f(a); bs <- acc yield b :: bs
+  }
+
+def eval(e: Expr, env: Env): Result[Double] = e match
+  case Expr.Num(v)  => Right(v)
+  case Expr.Var(n)  => env.get(n).toRight(CalcError(s"unknown variable '$n'"))
+  case Expr.Neg(x)  => eval(x, env).map(v => -v)
+  case Expr.Bin(op, l, r) =>
+    for
+      a <- eval(l, env)
+      b <- eval(r, env)
+      v <- applyOp(op, a, b)
+    yield v
+  case Expr.Call(name, args) =>
+    for
+      f      <- builtins.get(name).toRight(CalcError(s"unknown function '$name'"))
+      values <- traverse(args)(eval(_, env))
+      v      <- f(values)
+    yield v
+
+// ---------- Simplifying and printing trees ----------
+
+def simplify(e: Expr): Expr = e match
+  case Expr.Bin(op, l, r) =>
+    (op, simplify(l), simplify(r)) match
+      case (_, Expr.Num(a), Expr.Num(b)) =>
+        applyOp(op, a, b).fold(_ => Expr.Bin(op, Expr.Num(a), Expr.Num(b)), Expr.Num(_))
+      case ('+', Expr.Num(0), x) => x
+      case ('+', x, Expr.Num(0)) => x
+      case ('*', Expr.Num(1), x) => x
+      case ('*', x, Expr.Num(1)) => x
+      case ('^', x, Expr.Num(1)) => x
+      case (_, a, b)             => Expr.Bin(op, a, b)
+  case Expr.Neg(x) =>
+    simplify(x) match
+      case Expr.Num(v) => Expr.Num(-v)
+      case Expr.Neg(y) => y
+      case y           => Expr.Neg(y)
+  case Expr.Call(f, args) => Expr.Call(f, args.map(simplify))
+  case other              => other
+
+def format(v: Double): String =
+  if v.isWhole && v.abs < 1e15 then v.toLong.toString else v.toString
+
+def show(e: Expr): String = e match
+  case Expr.Num(v)        => format(v)
+  case Expr.Var(n)        => n
+  case Expr.Neg(x)        => s"-${atom(x)}"
+  case Expr.Call(f, args) => args.map(show).mkString(s"$f(", ", ", ")")
+  case Expr.Bin(op, l, r) => s"${atom(l)} $op ${atom(r)}"
+
+def atom(e: Expr): String = e match
+  case _: Expr.Bin | _: Expr.Neg => s"(${show(e)})"
+  case _                         => show(e)
+
+// ---------- Running lines ----------
+
+def parse(line: String): Result[Stmt] = Lexer.tokenize(line).flatMap(Parser.statement)
+
+def execute(line: String, env: Env): (Env, String) =
+  val outcome = parse(line).flatMap {
+    case Stmt.Assign(name, e) => eval(e, env).map(v => (env.updated(name, v), s"$name = ${format(v)}"))
+    case Stmt.Show(e)         => eval(e, env).map(v => (env, format(v)))
+  }
+  outcome.fold(error => (env, s"error: ${error.message}"), identity)
+
+@main def calculator(): Unit =
+  val session = List(
+    "1 + 2 * 3",
+    "(1 + 2) * 3",
+    "2 ^ 3 ^ 2",
+    "-2 ^ 2",
+    "r = 1.5",
+    "area = pi * r ^ 2",
+    "sqrt(area / pi)",
+    "max(3, r * 4, 5)",
+    "10 / (r - 1.5)",
+    "2 * radius",
+    "sqrt(1, 2)",
+    "3 + * 4",
+    "4 $ 2",
+    "(1 + 2"
+  )
+  val start: Env = Map("pi" -> math.Pi)
+  session.foldLeft(start) { (env, line) =>
+    val (next, output) = execute(line, env)
+    println(f"$line%-20s => $output")
+    next
+  }
+
+  println()
+  val env: Env = Map("x" -> 2.0, "y" -> -3.0, "z" -> 5.0, "w" -> 0.25)
+  for
+    source <- List("x * 1 + 0", "2 * 3 + y", "-(-z) ^ 1", "sqrt(4 * 4) + w * (10 - 9)")
+    case Stmt.Show(e) <- parse(source).toOption
+  do
+    val simpler = simplify(e)
+    val same = eval(e, env) == eval(simpler, env)
+    println(s"${show(e)}  simplifies to  ${show(simpler)}  (same value: $same)")
+```
+
+```text
+1 + 2 * 3            => 7
+(1 + 2) * 3          => 9
+2 ^ 3 ^ 2            => 512
+-2 ^ 2               => -4
+r = 1.5              => r = 1.5
+area = pi * r ^ 2    => area = 7.0685834705770345
+sqrt(area / pi)      => 1.5
+max(3, r * 4, 5)     => 6
+10 / (r - 1.5)       => error: division by zero
+2 * radius           => error: unknown variable 'radius'
+sqrt(1, 2)           => error: sqrt takes 1 argument, got 2
+3 + * 4              => error: unexpected '*'
+4 $ 2                => error: unexpected character '$' at position 3
+(1 + 2               => error: missing ')'
+
+(x * 1) + 0  simplifies to  x  (same value: true)
+(2 * 3) + y  simplifies to  6 + y  (same value: true)
+-((-z) ^ 1)  simplifies to  z  (same value: true)
+sqrt(4 * 4) + (w * (10 - 9))  simplifies to  sqrt(16) + w  (same value: true)
+```
+
+</Section>
+
+<Section id="walkthrough" kind="human" title="How it works">
+
+### The lexer
+
+`Lexer.tokenize` walks the input with an index and an accumulator, in a `@tailrec` loop. At each position it looks at one character: whitespace is skipped, a digit or `.` starts a number (read with `takeWhile`), a letter starts a name, and the punctuation characters become tokens. Tokens are prepended to the accumulator (cheap on a `List`) and the list is reversed once at the end, the standard way to build a list in order. An unexpected character such as `$` produces a `Left` with its position, which you can see in the session output.
+
+### The parser
+
+The comment above `Parser` is a **grammar**: one rule per level of precedence. Each rule becomes one method, and each method calls the methods for tighter-binding rules. This technique is called **recursive descent**, and it is how many production compilers, including Scala's own, parse their languages.
+
+Each parsing method has type `List[Token] => Parsed[Expr]`, where `Parsed[A]` is `Result[(A, List[Token])]`: either an error, or the tree it built *and the tokens it did not consume*. That is how state flows through the parser without any mutable position variable.
+
+- `expr` and `term` share `leftAssociative`, which parses one operand and then loops while the next token is one of its operators, building `Bin` nodes leaning to the left. So `10 - 4 - 3` means `(10 - 4) - 3`, as in arithmetic.
+- `power` handles `^` by calling `unary` for its right-hand side, which may itself contain `^`. That makes `^` **right-associative**: `2 ^ 3 ^ 2` is `2 ^ 9`, which is 512, not `8 ^ 2`.
+- `unary` sits *above* `power`, so `-2 ^ 2` means `-(2 ^ 2)`, which is -4, following the usual mathematical convention. Getting such details right is exactly what a grammar is for.
+- `primary` uses list patterns to look ahead: `Token.Ident(f) :: Token.LParen :: rest` recognises a function call by its first two tokens. The cases are ordered so that the call pattern is tried before the plain variable pattern.
+- `statement` recognises an assignment by the pattern `Ident :: Equals :: rest`, and `complete` insists that all tokens were consumed, which is how `3 + * 4` is reported as `unexpected '*'`.
+
+### The evaluator
+
+`eval` is step one's evaluator plus function calls. The built-in functions live in a `Map` from names to functions of type `List[Double] => Result[Double]`, so adding a function is one line. `oneArg` builds such a function from an ordinary `Double => Double`, using a **pattern-matching anonymous function** (the bare `case` lines) to check the number of arguments. `traverse` turns a list of results into a result of a list, failing on the first error; you met the same idea for Futures in lesson 8, and functional libraries provide it for every such type.
+
+### The simplifier and the printer
+
+`simplify` is where pattern matching shines. It first simplifies both children, then matches on a **tuple** of the operator and the simplified children, which lets one `case` line express each algebraic rule: `('*', x, Expr.Num(1)) => x` is "anything times one is itself". Two constants are folded into one by calling `applyOp`, the same function the evaluator uses, so the simplifier can never disagree with the evaluator about arithmetic; if folding fails (division by zero) the node is left alone so the error still happens at evaluation time. `show` prints a tree back as text, wrapping compound children in parentheses so the output always parses back to the same tree.
+
+### The session
+
+`execute` runs one line: parse, then either assign or evaluate. It returns the *new* environment along with the text to print. The session is then a `foldLeft` over the lines, threading the environment from each line to the next. This is the functional answer to "the program has state": instead of mutating a global map, each step receives the old state and returns a new one. The same shape, `(State, Input) => (State, Output)`, describes a game loop, a bank ledger or a web session.
+
+</Section>
+
+<Section id="property-test" kind="examples" title="Testing the simplifier with random trees">
+
+How do you know `simplify` is correct? Hand-written examples catch the cases you thought of. A **property test** checks a rule you believe always holds, here "simplifying never changes an expression's value", on many randomly generated inputs. ScalaCheck automates this; the idea fits in a page of plain Scala with a seeded random generator, so the run is reproducible:
+
+```scala check
+import scala.util.Random
+
+enum Expr:
+  case Num(value: Double)
+  case Var(name: String)
+  case Neg(operand: Expr)
+  case Bin(op: Char, left: Expr, right: Expr)
+
+type Result[A] = Either[String, A]
+
+def applyOp(op: Char, a: Double, b: Double): Result[Double] = op match
+  case '+' => Right(a + b)
+  case '-' => Right(a - b)
+  case '*' => Right(a * b)
+  case '/' => if b == 0 then Left("division by zero") else Right(a / b)
+  case _   => Right(math.pow(a, b))
+
+def eval(e: Expr, env: Map[String, Double]): Result[Double] = e match
+  case Expr.Num(v)        => Right(v)
+  case Expr.Var(n)        => env.get(n).toRight(s"unknown variable '$n'")
+  case Expr.Neg(x)        => eval(x, env).map(v => -v)
+  case Expr.Bin(op, l, r) => for a <- eval(l, env); b <- eval(r, env); v <- applyOp(op, a, b) yield v
+
+def simplify(e: Expr): Expr = e match
+  case Expr.Bin(op, l, r) =>
+    (op, simplify(l), simplify(r)) match
+      case (_, Expr.Num(a), Expr.Num(b)) =>
+        applyOp(op, a, b).fold(_ => Expr.Bin(op, Expr.Num(a), Expr.Num(b)), Expr.Num(_))
+      case ('+', Expr.Num(0), x) => x
+      case ('+', x, Expr.Num(0)) => x
+      case ('*', Expr.Num(1), x) => x
+      case ('*', x, Expr.Num(1)) => x
+      case ('^', x, Expr.Num(1)) => x
+      case (_, a, b)             => Expr.Bin(op, a, b)
+  case Expr.Neg(x) =>
+    simplify(x) match
+      case Expr.Num(v) => Expr.Num(-v)
+      case Expr.Neg(y) => y
+      case y           => Expr.Neg(y)
+  case other => other
+
+def size(e: Expr): Int = e match
+  case Expr.Bin(_, l, r) => 1 + size(l) + size(r)
+  case Expr.Neg(x)       => 1 + size(x)
+  case _                 => 1
+
+def randomExpr(rng: Random, depth: Int): Expr =
+  if depth == 0 || rng.nextInt(4) == 0 then
+    if rng.nextBoolean() then Expr.Num(rng.nextInt(4)) else Expr.Var(if rng.nextBoolean() then "x" else "y")
+  else if rng.nextInt(6) == 0 then Expr.Neg(randomExpr(rng, depth - 1))
+  else Expr.Bin("+-*/^"(rng.nextInt(5)), randomExpr(rng, depth - 1), randomExpr(rng, depth - 1))
+
+def sameResult(a: Result[Double], b: Result[Double]): Boolean = (a, b) match
+  case (Right(x), Right(y)) => x == y || (x.isNaN && y.isNaN)
+  case _                    => a == b
+
+@main def property(): Unit =
+  val rng = Random(2026)
+  val env = Map("x" -> 3.0, "y" -> -0.5)
+  val trees = List.fill(1000)(randomExpr(rng, 5))
+  val failures = trees.filterNot(e => sameResult(eval(e, env), eval(simplify(e), env)))
+  println(s"checked ${trees.size} random expressions, ${failures.size} counterexamples")
+  println(s"nodes before: ${trees.map(size).sum}, after: ${trees.map(e => size(simplify(e))).sum}")
+  println(s"never larger: ${trees.forall(e => size(simplify(e)) <= size(e))}")
+  println(s"idempotent: ${trees.forall(e => simplify(simplify(e)) == simplify(e))}")
+```
+
+```text
+checked 1000 random expressions, 0 counterexamples
+nodes before: 15120, after: 12293
+never larger: true
+idempotent: true
+```
+
+`randomExpr` builds random trees up to five levels deep, using small constants 0 to 3 so that the rules about 0 and 1 fire often, and all five operators, so that division by zero and fractional powers of negative numbers also occur. `sameResult` compares results with one subtlety: `NaN` (for example `(-0.5) ^ 0.5`) is not equal to itself in floating point, so two `NaN`s must be treated as the same outcome. The program also checks two more properties: simplification never makes a tree larger, and simplifying twice gives the same tree as simplifying once.
+
+When property tests do find a failure, the first counterexample is often large and confusing. Libraries like ScalaCheck **shrink** it, repeatedly trying smaller versions until they find a minimal tree that still fails, which is usually the bug in plain sight.
+
+</Section>
+
+<Section id="next" kind="reading" title="Growing the project, and where to go next">
+
+Ideas for taking the calculator further, roughly in order of difficulty:
+
+1. **An interactive prompt.** Read lines with `scala.io.StdIn.readLine()` in a loop until it returns `null`, keeping the `foldLeft` structure by writing the loop as a tail-recursive function of the environment.
+2. **Proper project structure.** Split the program into files (`Lexer.scala`, `Parser.scala`, `Eval.scala`) in a package, add MUnit tests in `.test.scala` files, and run them with `scala test .`. Move to sbt or Mill if the project grows.
+3. **Better errors.** Record each token's position so that every parse error can point at a column, as the Scala compiler does.
+4. **New features.** User-defined functions (`f(x) = x ^ 2 + 1`), which need a new `Stmt` case and an environment of functions; or symbolic differentiation, a classic exercise in pattern matching on trees.
+5. **Packaging.** `scala package` can produce a runnable JAR or, with Scala Native or GraalVM, a native executable that starts instantly.
+
+Where to go after this course:
+
+- The official [Scala 3 Book](https://docs.scala-lang.org/scala3/book/introduction.html) and [Scala 3 Reference](https://docs.scala-lang.org/scala3/reference/) cover every feature in more depth.
+- *Programming in Scala* by Odersky, Spoon, Venners and Sommers is the comprehensive reference book; *Functional Programming in Scala* is the classic deep dive into functional design, and its second edition uses Scala 3.
+- EPFL's online courses on functional programming in Scala, taught by the language's designers, are listed on the documentation's [online courses page](https://docs.scala-lang.org/online-courses.html).
+- For concurrency and services, pick one ecosystem and work through its own documentation: [Typelevel](https://typelevel.org/) (Cats Effect, fs2, http4s) or [ZIO](https://zio.dev/). For data engineering, start with the [Apache Spark](https://spark.apache.org/) programming guides.
+- Read real code. Small, well-written libraries on [Scaladex](https://index.scala-lang.org/) are a good way to see how experienced people structure Scala projects, write tests and design APIs.
+
+<Reflection title="Words that make worlds">
+
+An interpreter is a small parable about language. A line of text means nothing to the machine until a grammar gives it shape, and then the same few symbols can describe a circle's area or a mistake. Many traditions have noticed how much depends on words spoken carefully: in the opening of the Gospel of John, all things come to be through the Word. As programmers we only borrow that dignity in miniature, but it is a good reason to name things well, to say exactly what we mean, and to give clear, kind messages when someone else's words do not parse.
+
+</Reflection>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+The exercises refer to the complete interpreter above. Run it, change it, and check your predictions.
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,338 @@
+---
+title: Window functions
+subtitle: Rankings, running totals, moving averages and comparisons with the previous row, computed without collapsing a single row.
+minutes: 65
+objectives:
+  - Explain how a window function differs from an aggregate with GROUP BY, and where it fits in the evaluation order
+  - Use PARTITION BY, ORDER BY and named windows
+  - Rank rows with row_number, rank, dense_rank and ntile, and choose between them when there are ties
+  - Compute running totals, moving averages, and differences from the previous or next row with lag and lead
+  - Control the frame with ROWS, RANGE and GROUPS, and avoid the default-frame traps of last_value and running sums
+  - Solve top-N-per-group and gaps-and-islands problems
+prerequisites: [subqueries-ctes-and-views]
+related: [math.prob.statistics-intro, math.found.order-theory]
+references:
+  - title: "SQLite: Window Functions"
+    url: https://www.sqlite.org/windowfunctions.html
+    note: Every window function and the full frame syntax, with small examples.
+  - title: "PostgreSQL tutorial: Window Functions"
+    url: https://www.postgresql.org/docs/current/tutorial-window.html
+  - title: "PostgreSQL: Window Functions (reference)"
+    url: https://www.postgresql.org/docs/current/functions-window.html
+  - title: "PostgreSQL: Window Function Calls (syntax and frames)"
+    url: https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS
+  - title: "MySQL: Window Functions"
+    url: https://dev.mysql.com/doc/refman/8.4/en/window-functions.html
+---
+
+<Section id="motivation" kind="motivation" title="Aggregates that keep the rows">
+
+`GROUP BY` answers "what is the total per team?" by collapsing each team into one row. But many questions need the total *and* the rows. How far is each player above or below their team's average? What is each day's running total of energy produced? Which were each learner's two longest practice sessions? How much did today's value change from yesterday's?
+
+Before 2003, SQL answered these with self joins and correlated subqueries that were hard to read and often slow. The SQL:2003 standard added **window functions**, which compute a value for each row from a set of related rows, its *window*, without merging them. PostgreSQL has had them since version 8.4 (2009), SQL Server and Oracle for even longer, SQLite since 3.25 (2018) and MySQL since 8.0 (2018). Analysts consider them one of the most useful features of modern SQL; once you know them, a whole class of awkward queries becomes a single clear `SELECT`.
+
+<Analogy>
+
+Think of a teacher marking a pile of exam papers. `GROUP BY` is writing a separate summary sheet: one line per class, with its average. A window function is writing on *each student's own paper* their position in the class, the class average and how far they are from it. Every paper stays in the pile; each simply gains some information computed from the others.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The OVER clause">
+
+<Definition term="Window function">
+
+A **window function** call has the form `function(arguments) OVER (window)`. For each row of the result it computes a value from the rows in that row's window, and the row stays in the result. The window is described by up to three parts:
+
+- `PARTITION BY expressions`: split the rows into independent groups, like `GROUP BY` but without collapsing them. Without it, all rows form one partition.
+- `ORDER BY expressions`: order the rows within each partition. Ranking and offset functions need it; for aggregates it turns "the whole partition" into "the rows so far".
+- a **frame** such as `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`: which rows of the ordered partition, relative to the current row, the function sees.
+
+</Definition>
+
+Window functions are evaluated **after** `WHERE`, `GROUP BY` and `HAVING` and **before** the final `ORDER BY` and `LIMIT`. Two consequences follow. A window function can be applied to the result of a grouped query (`rank() OVER (ORDER BY sum(qty) DESC)` ranks groups by their totals). And a window function **cannot appear in `WHERE`**, because it has not been computed yet; to filter on one, compute it in a CTE or subquery and filter outside. (Snowflake, BigQuery and DuckDB add a non-standard `QUALIFY` clause for exactly this; SQLite, PostgreSQL and MySQL do not have it.)
+
+Any aggregate (`sum`, `avg`, `count`, `min`, `max`) can be used as a window function by adding `OVER`. There are also functions that only make sense over a window:
+
+| Kind | Functions |
+| --- | --- |
+| Ranking | `row_number()`, `rank()`, `dense_rank()`, `ntile(n)`, `percent_rank()`, `cume_dist()` |
+| Offset | `lag(x, n, default)`, `lead(x, n, default)`, `first_value(x)`, `last_value(x)`, `nth_value(x, n)` |
+
+</Section>
+
+<Section id="ranking" kind="examples" title="Partitions and rankings">
+
+```sql check
+.mode column
+CREATE TABLE score (team TEXT NOT NULL, player TEXT NOT NULL, points INTEGER NOT NULL);
+INSERT INTO score VALUES
+  ('Owls',   'Asha',   92), ('Owls',   'Bruno', 85), ('Owls',   'Chiara', 92),
+  ('Owls',   'Dawit',  78), ('Foxes',  'Elif',  88), ('Foxes',  'Felipe', 95),
+  ('Foxes',  'Gita',   88);
+
+-- Aggregate vs window: the window keeps every row.
+SELECT team, player, points,
+       round(avg(points) OVER (PARTITION BY team), 2)          AS team_avg,
+       round(points - avg(points) OVER (PARTITION BY team), 2) AS vs_team
+FROM score
+ORDER BY team, points DESC, player;
+
+-- Three ways to number rows with ties, within each team.
+SELECT team, player, points,
+       row_number() OVER w AS row_number,
+       rank()       OVER w AS rank,
+       dense_rank() OVER w AS dense_rank
+FROM score
+WINDOW w AS (PARTITION BY team ORDER BY points DESC)
+ORDER BY team, points DESC, player;
+```
+
+```text
+team   player  points  team_avg  vs_team
+-----  ------  ------  --------  -------
+Foxes  Felipe  95      90.33     4.67
+Foxes  Elif    88      90.33     -2.33
+Foxes  Gita    88      90.33     -2.33
+Owls   Asha    92      86.75     5.25
+Owls   Chiara  92      86.75     5.25
+Owls   Bruno   85      86.75     -1.75
+Owls   Dawit   78      86.75     -8.75
+team   player  points  row_number  rank  dense_rank
+-----  ------  ------  ----------  ----  ----------
+Foxes  Felipe  95      1           1     1
+Foxes  Elif    88      2           2     2
+Foxes  Gita    88      3           2     2
+Owls   Asha    92      1           1     1
+Owls   Chiara  92      2           1     1
+Owls   Bruno   85      3           3     2
+Owls   Dawit   78      4           4     3
+```
+
+In the first query each player's row carries their team's average, so the difference is a simple subtraction. With `GROUP BY team` you would have had the averages but lost the players.
+
+The second query shows the three ranking functions side by side, using a **named window** (`WINDOW w AS (…)`, supported by SQLite, PostgreSQL and MySQL) so the definition is written once. They differ only on ties:
+
+- `row_number()` numbers rows 1, 2, 3, … with no ties. Between tied rows the order is **arbitrary**: Asha and Chiara both scored 92, and nothing in the window's `ORDER BY` says which is first. If you need a stable numbering, add a tie-breaker (`ORDER BY points DESC, player`).
+- `rank()` gives tied rows the same rank and then skips: 1, 1, 3, 4, like the positions in a race where two runners share first place.
+- `dense_rank()` gives tied rows the same rank without gaps: 1, 1, 2, 3.
+
+`ntile(4)` would split each partition into four nearly equal buckets (quartiles), and `percent_rank()` gives each row's relative position from 0 to 1.
+
+</Section>
+
+<Section id="running" kind="computation" title="Running totals, moving averages, lag and lead">
+
+When a window has an `ORDER BY`, an aggregate over it becomes cumulative: `sum(x) OVER (ORDER BY day)` is a running total. `lag(x)` reads `x` from the previous row of the partition and `lead(x)` from the next, which turns "change since yesterday" into a subtraction. Both return `NULL` past the edge of the partition unless you give a default as the third argument. A frame clause such as `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` restricts an aggregate to a sliding window of rows, which gives a moving average.
+
+```sql check
+.mode column
+-- Daily energy from two small solar installations, in kWh.
+CREATE TABLE energy (site TEXT NOT NULL, day TEXT NOT NULL, kwh REAL NOT NULL,
+                     PRIMARY KEY (site, day));
+INSERT INTO energy VALUES
+  ('Accra', '2026-06-01', 21.0), ('Accra', '2026-06-02', 18.5), ('Accra', '2026-06-03', 23.5),
+  ('Accra', '2026-06-04', 12.0), ('Accra', '2026-06-05', 20.0),
+  ('Oslo',  '2026-06-01', 14.0), ('Oslo',  '2026-06-02', 16.5), ('Oslo',  '2026-06-03', 9.5),
+  ('Oslo',  '2026-06-04', 15.0), ('Oslo',  '2026-06-05', 17.0);
+
+SELECT site, day, kwh,
+       sum(kwh) OVER (PARTITION BY site ORDER BY day)            AS running_total,
+       kwh - lag(kwh) OVER (PARTITION BY site ORDER BY day)      AS change,
+       lead(kwh, 1, 0.0) OVER (PARTITION BY site ORDER BY day)   AS next_day,
+       round(avg(kwh) OVER (PARTITION BY site ORDER BY day
+                            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS avg_3day
+FROM energy
+ORDER BY site, day;
+```
+
+```text
+site   day         kwh   running_total  change  next_day  avg_3day
+-----  ----------  ----  -------------  ------  --------  --------
+Accra  2026-06-01  21.0  21.0                   18.5      21.0
+Accra  2026-06-02  18.5  39.5           -2.5    23.5      19.75
+Accra  2026-06-03  23.5  63.0           5.0     12.0      21.0
+Accra  2026-06-04  12.0  75.0           -11.5   20.0      18.0
+Accra  2026-06-05  20.0  95.0           8.0     0.0       18.5
+Oslo   2026-06-01  14.0  14.0                   16.5      14.0
+Oslo   2026-06-02  16.5  30.5           2.5     9.5       15.25
+Oslo   2026-06-03  9.5   40.0           -7.0    15.0      13.33
+Oslo   2026-06-04  15.0  55.0           5.5     17.0      13.67
+Oslo   2026-06-05  17.0  72.0           2.0     0.0       13.83
+```
+
+Each site is a separate partition, so the running total restarts for Oslo, the first day of each site has no previous day (its `change` is `NULL`), and the last day's `next_day` falls back to the default 0.0. The moving average uses as many rows as exist: on the first day it averages one value, on the second two, and from the third day on, three.
+
+<Figure caption="The Accra partition ordered by day, with the fourth day as the current row. A running sum sees every row from the start of the partition to the current row (total 75.0); the three-row frame sees only the current row and the two before it (average 18.0).">
+
+<svg viewBox="0 0 560 175" role="img" aria-label="Five boxes for the Accra days holding 21.0, 18.5, 23.5, 12.0 and 20.0, the fourth outlined heavily as the current row. A bracket above spans the first four boxes, labelled running total 75.0. A bracket below spans boxes two to four, labelled three-row frame average 18.0.">
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="40" y="70" width="88" height="44"/>
+    <rect x="136" y="70" width="88" height="44"/>
+    <rect x="232" y="70" width="88" height="44"/>
+    <rect x="328" y="70" width="88" height="44" strokeWidth="3.5"/>
+    <rect x="424" y="70" width="88" height="44"/>
+    <path d="M40 62 L40 52 L416 52 L416 62"/>
+    <path d="M136 122 L136 132 L416 132 L416 122"/>
+  </g>
+  <g fill="currentColor" fontFamily="monospace" textAnchor="middle">
+    <text x="276" y="20" fontSize="13">partition: Accra, ORDER BY day</text>
+    <text x="228" y="44" fontSize="12">sum frame: start to CURRENT ROW = 75.0</text>
+    <text x="84" y="86" fontSize="11">06-01</text>
+    <text x="180" y="86" fontSize="11">06-02</text>
+    <text x="276" y="86" fontSize="11">06-03</text>
+    <text x="372" y="86" fontSize="11">06-04</text>
+    <text x="468" y="86" fontSize="11">06-05</text>
+    <text x="84" y="105" fontSize="15">21.0</text>
+    <text x="180" y="105" fontSize="15">18.5</text>
+    <text x="276" y="105" fontSize="15">23.5</text>
+    <text x="372" y="105" fontSize="15">12.0</text>
+    <text x="468" y="105" fontSize="15">20.0</text>
+    <text x="276" y="152" fontSize="12">ROWS 2 PRECEDING to CURRENT ROW: avg 18.0</text>
+    <text x="372" y="170" fontSize="11">(current row: 06-04)</text>
+  </g>
+</svg>
+
+</Figure>
+
+### Shares of a total, and what windows replace
+
+An empty window, `OVER ()`, is the whole result. That makes percentages straightforward: `round(100.0 * kwh / sum(kwh) OVER (PARTITION BY site), 1)` is each day's share of its site's total, and `100.0 * kwh / sum(kwh) OVER ()` its share of everything. Note the `100.0`: with integer columns, SQLite and PostgreSQL would otherwise divide as integers and report mostly zeros.
+
+It is worth seeing what a running total looked like before window functions, because you will meet such queries in older code:
+
+```sql
+SELECT e.site, e.day, e.kwh,
+       (SELECT sum(e2.kwh) FROM energy AS e2
+        WHERE e2.site = e.site AND e2.day <= e.day) AS running_total
+FROM energy AS e
+ORDER BY e.site, e.day;
+```
+
+It gives the same answer, but the correlated subquery re-reads the earlier rows for every row, so the work grows with the square of the partition size: fine for five days, painful for five years of hourly readings. The window version sorts once and keeps a running sum, which is close to linear after the sort. When you see a correlated subquery that sums, counts or finds a maximum "up to this row", it is almost always a window function waiting to be written.
+
+### Frames: ROWS, RANGE and GROUPS
+
+A frame is written `{ROWS | RANGE | GROUPS} BETWEEN start AND end`, where each end is `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING` or `UNBOUNDED FOLLOWING`. The three units differ in what they count:
+
+- `ROWS` counts physical rows.
+- `RANGE` works on the *values* of the `ORDER BY` key: `RANGE BETWEEN 7 PRECEDING AND CURRENT ROW` over a numeric day number means "the last seven days", however many rows that is. Rows with equal keys, called **peers**, are always inside or outside together.
+- `GROUPS` counts groups of peers (SQLite since 3.28, PostgreSQL since 11; MySQL lacks it).
+
+If you write an `ORDER BY` but no frame, the default is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`: from the start of the partition up to the current row *and all its peers*. Without `ORDER BY`, the default frame is the whole partition. Those defaults cause two classic surprises, both visible here:
+
+```sql check
+.mode column
+CREATE TABLE deposit (day INTEGER NOT NULL, amount INTEGER NOT NULL);
+INSERT INTO deposit VALUES (1, 10), (2, 5), (2, 7), (3, 4);
+
+-- The default frame with ORDER BY is RANGE ... CURRENT ROW, which includes ties
+-- ("peers"); ROWS counts physical rows instead.
+SELECT day, amount,
+       sum(amount) OVER (ORDER BY day)                       AS default_range,
+       sum(amount) OVER (ORDER BY day, amount
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS by_rows,
+       last_value(amount) OVER (ORDER BY day)                AS last_default,
+       last_value(amount) OVER (ORDER BY day
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_whole
+FROM deposit
+ORDER BY day, amount;
+```
+
+```text
+day  amount  default_range  by_rows  last_default  last_whole
+---  ------  -------------  -------  ------------  ----------
+1    10      10             10       10            4
+2    5       22             15       7             4
+2    7       22             22       7             4
+3    4       26             26       4             4
+```
+
+First, the two deposits on day 2 are peers, so with the default frame *both* rows see both deposits and show the same "running total", 22. If you want a total that grows row by row, make the order unique (here by adding `amount`) and say `ROWS`. Second, `last_value(amount) OVER (ORDER BY day)` does not return the last value of the partition: its default frame ends at the current row's last peer, so it mostly returns the current row's own value. To get the true last value, extend the frame to `UNBOUNDED FOLLOWING`, or, more simply, use `first_value` with the order reversed.
+
+</Section>
+
+<Section id="patterns" kind="examples" title="Two classic patterns">
+
+### Top N per group
+
+"The two longest sessions per learner", "the latest order of each customer", "the best-selling product in each category": all are the same pattern. Number the rows within each group with `row_number()` in a CTE, then keep the rows numbered 1 to N. This is the portable replacement for SQLite's bare-column trick from lesson 4 and for PostgreSQL's `LATERAL` from lesson 6, and unlike them it handles ties exactly as you choose: `row_number()` keeps exactly N, `rank()` keeps everyone tied for a place.
+
+### Gaps and islands
+
+Given the days on which each learner practised, find their streaks of consecutive days. The trick: number each learner's days in order with `row_number()`. Within a run of consecutive dates, the date and the row number both go up by one each step, so *date minus row number* is constant; at a gap, the date jumps but the row number does not, so the difference changes. Grouping by that difference groups each streak.
+
+```sql check
+.mode column
+CREATE TABLE practice (learner TEXT NOT NULL, day TEXT NOT NULL, minutes INTEGER NOT NULL,
+                       PRIMARY KEY (learner, day));
+INSERT INTO practice VALUES
+  ('Rahel', '2026-04-01', 20), ('Rahel', '2026-04-02', 35), ('Rahel', '2026-04-03', 15),
+  ('Rahel', '2026-04-06', 40), ('Rahel', '2026-04-07', 25),
+  ('Tariq', '2026-04-02', 30), ('Tariq', '2026-04-03', 10), ('Tariq', '2026-04-04', 45),
+  ('Tariq', '2026-04-05', 20), ('Tariq', '2026-04-09', 50);
+
+-- Top 2 sessions per learner: number the rows in a CTE, then filter.
+WITH ranked AS (
+  SELECT learner, day, minutes,
+         row_number() OVER (PARTITION BY learner ORDER BY minutes DESC, day) AS rn
+  FROM practice
+)
+SELECT learner, day, minutes FROM ranked WHERE rn <= 2 ORDER BY learner, rn;
+
+-- Gaps and islands: consecutive days share the same (day - row_number).
+WITH numbered AS (
+  SELECT learner, day,
+         julianday(day) - row_number() OVER (PARTITION BY learner ORDER BY day) AS grp
+  FROM practice
+)
+SELECT learner, min(day) AS streak_start, max(day) AS streak_end, count(*) AS days
+FROM numbered
+GROUP BY learner, grp
+ORDER BY learner, streak_start;
+```
+
+```text
+learner  day         minutes
+-------  ----------  -------
+Rahel    2026-04-06  40
+Rahel    2026-04-02  35
+Tariq    2026-04-09  50
+Tariq    2026-04-04  45
+learner  streak_start  streak_end  days
+-------  ------------  ----------  ----
+Rahel    2026-04-01    2026-04-03  3
+Rahel    2026-04-06    2026-04-07  2
+Tariq    2026-04-02    2026-04-05  4
+Tariq    2026-04-09    2026-04-09  1
+```
+
+Rahel's first three days give differences that are all equal, then the jump from the 3rd to the 6th changes the difference and starts a new island. The same trick finds runs of anything: consecutive months with growing sales, sequences of identical sensor readings, uninterrupted stretches of a service being up. In PostgreSQL you would subtract an integer from a `DATE` directly (`day - row_number() OVER (…)::int`); in SQLite, `julianday()` turns the text date into a number.
+
+</Section>
+
+<Section id="practice" kind="human" title="Window functions in practice">
+
+Window functions are the everyday tool of data analysts and of engineers who build reports, and a few habits make them reliable:
+
+- **Make orderings deterministic.** Any window `ORDER BY` with possible ties should end in a unique key, or results can change between runs, especially in parallel engines. This matters most for `row_number()`, `lag()` and `lead()`.
+- **State the frame when it matters.** Reviewers who see `sum(…) OVER (ORDER BY …)` will ask whether peers are intended. Writing `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` removes the question.
+- **Mind the cost.** Each distinct window (each different `PARTITION BY` and `ORDER BY`) typically needs its own sort of the data. Several functions over the *same* window share one sort, which is another reason to use named windows. An index that already delivers rows in partition order can remove the sort entirely.
+- **Filter outside.** Remember that a window function cannot go in `WHERE`; the CTE-then-filter shape you saw for top-N is the standard idiom.
+
+Many problems that look like they need a loop in application code, such as sessionising clickstreams (start a new session after 30 minutes of inactivity), computing customer retention, or carrying the last known value forward over gaps, are a `lag()` and a running `sum()` away. The PostgreSQL and SQLite references linked below list every function and frame option; read them once, and you will start seeing windows everywhere.
+
+<Misconception>
+
+"`row_number()` and `rank()` are interchangeable." Only when there are no ties. For "the top three players", `row_number()` returns exactly three rows and silently drops someone tied for third; `rank()` returns everyone tied, which may be four or five. Decide which the question means.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

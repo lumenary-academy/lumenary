@@ -1,0 +1,326 @@
+---
+title: Writing fast Julia
+subtitle: Type stability, global variables, allocation, memory order and compilation latency, and how to measure before you optimise.
+minutes: 65
+objectives:
+  - Measure run time and allocation with @time, @allocated and benchmarking tools, avoiding common measurement traps
+  - Define type stability, detect instability with @code_warntype and fix it
+  - Explain why untyped global variables are slow and use const, typed globals or arguments instead
+  - Reduce allocation with views, in-place broadcasting, preallocation and function barriers
+  - Describe compilation latency and the tools that reduce it, from package images to juliac
+prerequisites: [composite-and-parametric-types]
+related: [math.comp.algorithms-and-efficiency]
+references:
+  - title: Julia manual, Performance Tips
+    url: https://docs.julialang.org/en/v1/manual/performance-tips/
+    note: The official checklist; this lesson explains the reasons behind its most important entries.
+  - title: Julia manual, Profiling
+    url: https://docs.julialang.org/en/v1/manual/profile/
+    note: The sampling profiler in the Profile standard library and how to read its output.
+  - title: BenchmarkTools.jl
+    url: https://github.com/JuliaCI/BenchmarkTools.jl
+    note: The standard package for reliable micro-benchmarks, with @btime and @benchmark.
+  - title: PrecompileTools.jl
+    url: https://github.com/JuliaLang/PrecompileTools.jl
+    note: How package authors cache compiled code to cut time to first X.
+---
+
+<Section id="motivation" kind="motivation" title="Fast by design, not by default">
+
+Julia's reputation for speed is deserved, but it comes with a condition: the compiler must be able to work out the concrete types of the values in your code. When it can, a Julia loop compiles to the same machine code as the equivalent C. When it cannot, Julia falls back to checking types at run time and storing values in generic "boxes", and the same loop can be ten or a hundred times slower, while giving exactly the same answer.
+
+The good news is that the rules are few, they follow from how the compiler works, and you have met most of them already: put code in functions, keep the types of variables predictable, give struct fields concrete types, and avoid needless allocation. This lesson makes those rules precise, shows how to measure their effect, and then turns to the other side of Julia's performance story, the time spent compiling.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Measure first">
+
+Never optimise code you have not measured. Julia gives you several tools, from quick to thorough:
+
+| Tool | Where | What it tells you |
+| --- | --- | --- |
+| `@time expr` | Base | wall time, allocations and the share spent compiling, for one run |
+| `@elapsed expr`, `@allocated expr` | Base | just the seconds, or just the bytes allocated, as numbers |
+| `@btime f($x)`, `@benchmark f($x)` | BenchmarkTools.jl | many runs with statistics; the `$` stops `x` being treated as a slow global |
+| `@profile f(x)` | Profile (standard library) | which lines the time is spent on, by sampling the call stack |
+| `@profview f(x)` | VS Code extension, ProfileView.jl | the same profile as an interactive flame graph |
+| `@code_warntype f(x)` | InteractiveUtils | where type inference failed |
+
+Three measurement traps catch everyone. First, the first call includes compilation, so run the function once before you time it, or use BenchmarkTools, which does so for you. Second, timing code at the top level of a script measures global-variable access, not your algorithm. Third, if a result is never used, the compiler may delete the whole computation: one draft of the timing script below reported 0.0 ms for summing a million numbers, because the sum was thrown away and LLVM removed the loop. BenchmarkTools takes care of this; in hand-written timing, keep the result (Base provides `Base.donotdelete` for exactly this purpose).
+
+In this lesson the checked programs measure **bytes allocated**, which are reproducible from run to run, and timings are shown separately as one run on our test machine, which you should expect to differ from yours.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Type stability">
+
+<Definition term="Type-stable function">
+
+A function is **type-stable** when the type of its result depends only on the types of its arguments, not on their values. More broadly, code is type-stable when the compiler can infer a single concrete type for each variable and expression in it.
+
+</Definition>
+
+```julia check
+# Type stability: can the compiler predict the type of every result?
+
+# Unstable: for a Float64 input, returns a Float64 or an Int64 depending on the value
+relu_unstable(x) = x > 0 ? x : 0
+# Stable: zero(x) has the same type as x
+relu_stable(x) = x > 0 ? x : zero(x)
+
+println("relu_unstable(-2.5) = ", relu_unstable(-2.5), " :: ", typeof(relu_unstable(-2.5)))
+println("relu_stable(-2.5)   = ", relu_stable(-2.5), " :: ", typeof(relu_stable(-2.5)))
+
+# What the compiler infers for a Float64 argument
+println("inferred: ", only(Base.return_types(relu_unstable, (Float64,))),
+        " versus ", only(Base.return_types(relu_stable, (Float64,))))
+
+# An accumulator that changes type inside a loop is the most common instability
+function total_unstable(xs)
+    s = 0                     # an Int64 ...
+    for x in xs
+        s += x                # ... that becomes a Float64 on the first iteration
+    end
+    return s
+end
+
+function total_stable(xs)
+    s = zero(eltype(xs))      # starts with the element type
+    for x in xs
+        s += x
+    end
+    return s
+end
+
+println("inferred: ", only(Base.return_types(total_unstable, (Vector{Float64},))),
+        " versus ", only(Base.return_types(total_stable, (Vector{Float64},))))
+
+xs = [sin(k) for k in 1:1_000_000]
+anys = Vector{Any}(xs)                         # the same numbers, in a container of Any
+total_unstable(xs); total_stable(xs); total_unstable(anys)    # compile first, then measure
+
+println("same answers: ", total_unstable(xs) ≈ total_stable(xs) ≈ total_unstable(anys))
+println("bytes allocated, unstable accumulator: ", @allocated total_unstable(xs))
+println("bytes allocated, stable accumulator:   ", @allocated total_stable(xs))
+println("bytes allocated, Vector{Any} input:    ", @allocated total_unstable(anys))
+```
+
+It prints:
+
+```text
+relu_unstable(-2.5) = 0 :: Int64
+relu_stable(-2.5)   = 0.0 :: Float64
+inferred: Union{Float64, Int64} versus Float64
+inferred: Union{Float64, Int64} versus Float64
+same answers: true
+bytes allocated, unstable accumulator: 0
+bytes allocated, stable accumulator:   0
+bytes allocated, Vector{Any} input:    16000000
+```
+
+`relu_unstable(x)` returns `x` (a `Float64`) for positive inputs and the integer literal `0` otherwise, so for a `Float64` argument the compiler can only promise `Union{Float64, Int64}`. The fix is to return `zero(x)`, a zero of the same type as `x`. The accumulator in `total_unstable` has the same disease: `s` starts as the integer `0` and becomes a `Float64` after the first addition. Again, `zero(eltype(xs))` cures it.
+
+The tool for finding instabilities is `@code_warntype`, which prints the compiler's view of a function with every inferred type. Run on `total_unstable([1.0, 2.0])`, part of its output reads:
+
+```text
+Locals
+  @_3::UNION{NOTHING, TUPLE{FLOAT64, INT64}}
+  s::UNION{FLOAT64, INT64}
+  x::Float64
+Body::UNION{FLOAT64, INT64}
+```
+
+In a terminal, problem types are shown in red (and here in capitals). A `Union{Nothing, Tuple{...}}` from `iterate` is normal, because that is how every `for` loop ends; the `Union` for `s` is the real finding.
+
+### How much does it cost?
+
+Look again at the allocation numbers. The unstable accumulator allocated *nothing*: modern Julia handles a small union of concrete types well, by **union splitting**, generating a branch for each possibility. The real disaster is the third case, where the elements have type `Any`. Each value read from a `Vector{Any}` is a pointer to a boxed number of unknown type, every `+` must be dispatched at run time, and every intermediate sum is boxed again: 16 bytes for each of the million additions.
+
+Here are the timings of the same functions (taking the best of 50 runs each), plus a version that adds `@inbounds` and `@simd`, which permit the compiler to skip bounds checks and to reorder the floating-point additions so they can use the processor's vector instructions:
+
+```julia
+function total_simd(xs)
+    s = zero(eltype(xs))
+    @simd for i in eachindex(xs)
+        @inbounds s += xs[i]
+    end
+    return s
+end
+```
+
+One run on our test machine, an Intel Core i7-12700H shared with other jobs, printed:
+
+```text
+unstable accumulator  0.45 ms
+stable accumulator    0.46 ms
+Vector{Any} input     11.6 ms
+stable with @simd     0.1 ms
+```
+
+The stable and the union-split versions are equally fast; the `Vector{Any}` version is roughly 25 times slower; and `@simd` gave a further factor of about four on this machine. `@simd` changes results slightly, because floating-point addition is not associative, which is why the compiler will not do it without your permission.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Globals, allocation and function barriers">
+
+### Untyped global variables
+
+```julia check
+# Global variables: the compiler cannot assume anything about an untyped global.
+rate = 0.05                      # untyped, non-constant global
+const RATE = 0.05                # a constant: its type and value are fixed
+typed_rate::Float64 = 0.05       # a typed global (Julia 1.8+): the value may change, the type may not
+
+grow_global(xs) = sum(x * (1 + rate) for x in xs)
+grow_const(xs) = sum(x * (1 + RATE) for x in xs)
+grow_typed(xs) = sum(x * (1 + typed_rate) for x in xs)
+grow_arg(xs, r) = sum(x * (1 + r) for x in xs)    # best of all: pass it in
+
+xs = collect(1.0:100_000.0)
+for f in (grow_global, grow_const, grow_typed)
+    f(xs)                                        # compile
+end
+grow_arg(xs, 0.05)
+
+println("all equal: ", grow_global(xs) == grow_const(xs) == grow_typed(xs) == grow_arg(xs, 0.05))
+println("inferred return type with untyped global: ", only(Base.return_types(grow_global, (Vector{Float64},))))
+println("inferred return type with const global:   ", only(Base.return_types(grow_const, (Vector{Float64},))))
+println("bytes allocated, untyped global: ", @allocated grow_global(xs))
+println("bytes allocated, const global:   ", @allocated grow_const(xs))
+println("bytes allocated, typed global:   ", @allocated grow_typed(xs))
+println("bytes allocated, argument:       ", @allocated grow_arg(xs, 0.05))
+```
+
+It prints:
+
+```text
+all equal: true
+inferred return type with untyped global: Any
+inferred return type with const global:   Float64
+bytes allocated, untyped global: 6399984
+bytes allocated, const global:   0
+bytes allocated, typed global:   0
+bytes allocated, argument:       0
+```
+
+A non-constant global variable can be reassigned at any moment, to a value of any type, so a function that reads `rate` cannot assume it is a `Float64`: inference gives up and returns `Any`, and every arithmetic operation involving it is dispatched at run time and boxed. There are three cures. Declaring the global `const` fixes its type and value; annotating it, as in `typed_rate::Float64 = 0.05` (Julia 1.8 and later), fixes only its type; and best of all, passing the value as an argument makes the function self-contained and testable. This is also why "put everything in a function" is the first performance tip: a script's top-level variables are all untyped globals.
+
+### Allocation
+
+```julia check
+# Allocation: slices copy, views don't; .= writes in place; preallocate outputs.
+xs = collect(1.0:1_000_000.0)
+ys = similar(xs)
+
+sum_slice(a) = sum(a[2:end-1])
+sum_view(a) = sum(@view a[2:end-1])
+scale_new(a) = 2 .* a .+ 1             # allocates a new array for the result
+scale_into!(out, a) = (out .= 2 .* a .+ 1; out)   # fills an existing one
+
+sum_slice(xs); sum_view(xs); scale_new(xs); scale_into!(ys, xs)    # compile
+
+println("bytes, slice:           ", @allocated sum_slice(xs))
+println("bytes, view:            ", @allocated sum_view(xs))
+println("bytes, new result:      ", @allocated scale_new(xs))
+println("bytes, in-place result: ", @allocated scale_into!(ys, xs))
+println("same results: ", sum_slice(xs) == sum_view(xs), " ", scale_new(xs) == ys)
+
+# A function barrier: the outer function cannot know the element type, the inner one can.
+function process(data)                # data comes from a file; its type is only known at run time
+    values = data["values"]           # inferred as Any
+    return kernel(values)             # dispatch happens once here ...
+end
+function kernel(v)                    # ... and this is compiled for the concrete type
+    s = zero(eltype(v))
+    for x in v
+        s += x * x
+    end
+    return s
+end
+data = Dict{String, Any}("values" => [1.0, 2.0, 3.0], "name" => "test")
+println("sum of squares: ", process(data))
+```
+
+It prints:
+
+```text
+bytes, slice:           8000072
+bytes, view:            0
+bytes, new result:      8000072
+bytes, in-place result: 0
+same results: true true
+sum of squares: 14.0
+```
+
+Each `Float64` is 8 bytes, so a slice of almost a million of them costs 8 MB. The `@view` costs nothing. Likewise, `2 .* a .+ 1` allocates a new 8 MB result each time, while `out .= 2 .* a .+ 1` writes into an array allocated once, outside the hot loop. In a simulation that updates a large state a million times, the difference is between a program that spends most of its time in the garbage collector and one that never calls it.
+
+The last part shows a **function barrier**. Data read from files, dictionaries of type `Dict{String, Any}` and similar sources have types the compiler cannot know in advance, so `values` inside `process` is inferred as `Any`. Rather than writing the hot loop there, `process` hands `values` to a separate function, `kernel`. Dispatch happens once, at the call, and `kernel` is compiled for the concrete type `Vector{Float64}`, so its loop is fast. Splitting a function at the point where types become known is one of the most effective tricks in Julia.
+
+### Memory order
+
+Lesson 4 noted that matrices are stored column by column. Summing a 4000 × 4000 matrix with the row index in the inner loop walks memory in order; with the column index in the inner loop it jumps 32 000 bytes between consecutive reads and defeats the processor's caches. The two loop orders are written as:
+
+```julia
+for j in axes(A, 2), i in axes(A, 1)    # columns outer, rows inner: in memory order
+for i in axes(A, 1), j in axes(A, 2)    # rows outer, columns inner: strided access
+```
+
+and one run on the same test machine printed:
+
+```text
+column order: 11.1 ms
+row order:    95.2 ms
+```
+
+about a factor of eight for identical arithmetic. In a `for i in ..., j in ...` header the *last* range varies fastest, so put the first index last.
+
+</Section>
+
+<Section id="human" kind="human" title="Compilation latency, and how professionals manage it">
+
+The other half of performance is the time Julia spends compiling. You saw in lesson 1 that the first call of a function can be dominated by compilation. Large packages, such as plotting libraries, compile a great deal of code the first time they are used, and for years "time to first plot" was Julia's most common complaint. Several mechanisms now reduce it:
+
+- **Precompilation and package images.** When you install or update a package, Pkg precompiles it. Since Julia 1.9, this cache includes native machine code, so code that was compiled during precompilation does not need compiling again in your session. Package authors use **PrecompileTools.jl** to run a representative workload during precompilation, so that the methods users actually call are cached.
+- **Invalidations.** Loading a package that adds methods to Base functions can force code that was already compiled to be thrown away and compiled again. Package developers hunt such invalidations with tools like SnoopCompile.jl; as a user, you mostly benefit from their work.
+- **Custom system images.** **PackageCompiler.jl** builds a system image, a snapshot of a Julia session with chosen packages already loaded and compiled, so that Julia starts with them ready. It can also produce standalone applications that bundle Julia.
+- **Ahead-of-time compilation with trimming.** Julia 1.12 added experimental support, driven by a tool called `juliac` and the `--trim` option, for compiling a program ahead of time into a small executable or library that contains only the code reachable from its entry points. It requires code that is fully type-stable, since nothing can be compiled later at run time. As of late 2026 it is still marked experimental; check the documentation for your Julia version before relying on it.
+
+Day to day, experienced Julia programmers do four things. They keep a long-running session with Revise.jl, so compilation happens once per session rather than once per run. They write type-stable code, both because it runs faster and because it compiles better and caches better. They check new code with `@code_warntype` or the JET.jl package, which reports type instabilities and likely errors across a whole call tree. And they profile before optimising, because the slow part is very often not the part they expected.
+
+When a program is too slow, a good order of work is:
+
+1. **Profile** a realistic run and find the function where the time goes. Ignore everything else.
+2. **Check it for type instability** with `@code_warntype`, starting with containers of abstract type, untyped globals and struct fields of abstract type.
+3. **Look at allocation** in the hot loop with `@allocated` or `@time`: slices that could be views, temporary arrays that could be preallocated, broadcasts that could use `.=`.
+4. **Check memory access**: loop order, and whether data that is used together is stored together.
+5. Only then consider **`@inbounds`, `@simd`, threads** (lesson 9) or a better algorithm, which usually beats all of the above.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"Sprinkle `@inbounds` everywhere for speed."** `@inbounds` tells the compiler to skip bounds checks, and if your index is ever wrong the program reads or corrupts arbitrary memory instead of throwing a `BoundsError`. Use it only in small, verified loops where profiling shows it matters, ideally where indices come from `eachindex`. Often the compiler removes the checks itself.
+
+</Misconception>
+
+<Misconception>
+
+**"Type annotations on everything make code type-stable."** Stability comes from the code's logic: whether each variable keeps one type and whether the compiler can see the types of the values flowing in. Annotations on arguments do not change that. The places where type information genuinely helps are struct fields, containers (`Vector{Float64}` rather than `Vector{Any}`) and globals.
+
+</Misconception>
+
+<Misconception>
+
+**"If it allocates, it is slow."** Allocation matters in hot loops. A function called once that allocates a few kilobytes is fine, and clear code that allocates beats unreadable code that does not. Measure, find the hot spot, and fix that.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

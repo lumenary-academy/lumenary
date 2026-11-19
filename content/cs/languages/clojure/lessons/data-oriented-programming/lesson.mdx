@@ -1,0 +1,352 @@
+---
+title: "Maps as data: namespaces, polymorphism and spec"
+subtitle: Model a domain with plain data, organise code in namespaces, dispatch with multimethods and protocols, and describe data with spec.
+minutes: 65
+objectives:
+  - Model domain entities as maps with qualified keywords instead of classes
+  - Organise code into namespaces with ns, require, aliases and private functions
+  - Choose between multimethods, protocols and records for polymorphism
+  - Describe and validate data with clojure.spec, and know where spec stands today
+  - Read and write configuration and data as EDN
+prerequisites: [sequences-and-laziness]
+references:
+  - title: Namespaces
+    url: https://clojure.org/reference/namespaces
+    note: The official reference for ns, require, aliases and vars.
+  - title: Multimethods and hierarchies
+    url: https://clojure.org/reference/multimethods
+    note: Dispatch on any function of the arguments.
+  - title: Protocols
+    url: https://clojure.org/reference/protocols
+    note: Fast, type-based polymorphism.
+  - title: Datatypes, deftype and defrecord
+    url: https://clojure.org/reference/datatypes
+    note: When and why to define a record.
+  - title: spec, rationale and overview
+    url: https://clojure.org/about/spec
+    note: Why spec exists and what it is for.
+  - title: spec guide
+    url: https://clojure.org/guides/spec
+    note: The official tutorial for clojure.spec.
+  - title: Malli
+    url: https://github.com/metosin/malli
+    note: A popular community library for describing data with data, often used instead of spec.
+---
+
+<Section id="motivation" kind="motivation" title="Information is just data">
+
+In many languages the first step in modelling a domain is to write classes: a `Customer` class with fields and getters, an `Order` class with methods, maybe an `OrderService`. Each class has its own interface, and every piece of code that touches customers must learn that interface. Moving data between parts of the system, to a database, across the network, into a test, means writing conversion code for each class.
+
+Clojure encourages a different habit, often called **data-oriented programming**: represent information as plain, immutable data (maps, vectors, sets, keywords, strings, numbers) and write functions that transform it. A customer is a map. An order is a map containing a vector of line maps. There is no `getEmail` method, because `:customer/email` already works with `get`, `select-keys`, `update`, destructuring and every other function you already know.
+
+The benefits compound. Data prints readably, so logs and REPL output are useful. Data can be saved, sent and compared with no extra code. Generic functions work on all of it. Tests are maps in, maps out. The cost is that nothing stops a map from missing a key or holding a string where a number belongs, which is why this lesson ends with spec, a way to describe the shape of data precisely.
+
+Along the way you will meet namespaces, which organise the functions, and Clojure's two main tools for polymorphism, which let one function behave differently for different kinds of data.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Namespaces and qualified keywords">
+
+<Definition term="Namespace">
+
+A named mapping from symbols to vars (and to Java classes), corresponding by convention to one source file. The namespace `shop.pricing` lives in `src/shop/pricing.clj`; hyphens in a namespace name become underscores in the file name, so `my-app.core` lives in `my_app/core.clj`.
+
+</Definition>
+
+<Definition term="Qualified keyword">
+
+A keyword with a namespace part, such as `:cart/id`. The namespace keeps keys from different parts of a system from colliding: `:cart/id` and `:user/id` are different keys. Written with a double colon, `::status`, a keyword is qualified with the current namespace.
+
+</Definition>
+
+The `ns` form at the top of a file names the namespace and declares what it needs. Normally each namespace has its own file, but for this demonstration both live in one file, which works because the first namespace is already loaded when the second requires it:
+
+```clojure check
+(ns shop.pricing
+  (:require [clojure.string :as str]))
+
+(def tax-rates {"KE" 0.16, "BR" 0.17, "JP" 0.10})
+
+(defn- round2 [x]
+  (/ (Math/round (* x 100.0)) 100.0))
+
+(defn line-total [{:keys [price qty]}]
+  (* price qty))
+
+(defn with-tax [country amount]
+  (round2 (* amount (+ 1 (get tax-rates country 0)))))
+
+(defn sku->label [sku]
+  (str/upper-case (str/replace sku "-" " ")))
+
+(ns shop.app
+  (:require [shop.pricing :as pricing]))
+
+(def cart
+  {:cart/id 42
+   :cart/country "KE"
+   :cart/lines [{:sku "tea-500g" :price 6.5 :qty 2}
+                {:sku "mug-blue" :price 9.0 :qty 1}]})
+
+(def subtotal (reduce + (map pricing/line-total (:cart/lines cart))))
+
+(println "subtotal:" subtotal)
+(println "with tax:" (pricing/with-tax (:cart/country cart) subtotal))
+(println (map (comp pricing/sku->label :sku) (:cart/lines cart)))
+(prn ::status (namespace ::status) (name ::status))
+(prn #:cart{:id 7 :country "JP"})
+(prn (= #:cart{:id 7} {:cart/id 7}))
+```
+
+```text
+subtotal: 22.0
+with tax: 25.52
+(TEA 500G MUG BLUE)
+:shop.app/status "shop.app" "status"
+#:cart{:id 7, :country "JP"}
+true
+```
+
+- `(:require [clojure.string :as str])` loads a namespace and gives it a short **alias**. Code then writes `str/upper-case`. Aliases are the norm; `:refer [upper-case]` brings individual names in unqualified, and is used sparingly so readers can always tell where a function comes from.
+- `defn-` defines a **private** function, callable only inside its namespace. `round2` is an implementation detail of pricing.
+- Inside `shop.app`, `::status` expands to `:shop.app/status`.
+- `#:cart{:id 7 :country "JP"}` is **namespaced map syntax**, a shorthand for a map whose keys all share the `cart` namespace. It is the same value as writing the keys out in full.
+- A function named `sku->label` reads "SKU to label", a common naming style for conversions.
+
+Not every key needs a namespace. Inside a small, local map such as a cart line, `:price` is clear. Qualify the keys of entities that travel across your system (users, orders, events), where `:id` alone would be ambiguous.
+
+### How Clojure teams lay out namespaces
+
+A typical service of a few thousand lines might have a namespace tree like this:
+
+```text
+src/shop/
+  domain/cart.clj        pure functions on cart maps: add-line, totals, discounts
+  domain/order.clj       pure functions on orders
+  db.clj                 reading and writing maps to the database
+  http/routes.clj        turning requests (maps) into domain calls and responses (maps)
+  main.clj               configuration, wiring and the -main entry point
+test/shop/
+  domain/cart_test.clj   tests for shop.domain.cart
+```
+
+The important property is the direction of dependencies. The `domain` namespaces are pure and depend on nothing but `clojure.core` and each other; they are where the business rules live and where tests are cheapest. Namespaces with side effects (`db`, `http`) depend on the domain, never the other way round. This arrangement, sometimes called "functional core, imperative shell", is not unique to Clojure, but immutable maps make it the path of least resistance: the shell reads data, hands it to pure functions, and writes back what they return.
+
+Clojure also forbids **circular** requires: if `shop.domain.cart` requires `shop.db`, then `shop.db` cannot require `shop.domain.cart`. Teams sometimes find this annoying at first, but it steadily pushes code into the layered shape above.
+
+</Section>
+
+<Section id="polymorphism" kind="examples" title="Polymorphism: multimethods, protocols and records">
+
+Sometimes one operation must work differently for different kinds of data: the area of a circle is not computed like the area of a rectangle. Clojure offers two mechanisms, and both are **open**: you can add new cases later, from any namespace, without touching the original definition.
+
+```clojure check
+(defmulti area :shape)
+
+(defmethod area :circle [{:keys [r]}]
+  (* Math/PI r r))
+
+(defmethod area :rect [{:keys [w h]}]
+  (* w h))
+
+(defmethod area :default [shape]
+  (throw (ex-info "Unknown shape" {:shape shape})))
+
+(def shapes [{:shape :circle :r 1}
+             {:shape :rect :w 3 :h 4}])
+
+(prn (map area shapes))
+
+(defmethod area :triangle [{:keys [b h]}]
+  (/ (* b h) 2))
+
+(prn (area {:shape :triangle :b 6 :h 5}))
+(prn (try (area {:shape :hexagon})
+          (catch clojure.lang.ExceptionInfo e [(ex-message e) (ex-data e)])))
+
+(defprotocol Describe
+  (describe [x] "A short, human-readable description."))
+
+(defrecord Book [title author year]
+  Describe
+  (describe [b] (str title " by " author " (" year ")")))
+
+(extend-protocol Describe
+  String
+  (describe [s] (str "the text \"" s "\""))
+  Long
+  (describe [n] (str "the number " n))
+  nil
+  (describe [_] "nothing at all"))
+
+(def b (->Book "Half of a Yellow Sun" "Chimamanda Ngozi Adichie" 2006))
+
+(run! (comp println describe) [b "hello" 42 nil])
+(prn (:title b) (assoc b :pages 448) (map? b) (instance? Book b))
+```
+
+```text
+(3.141592653589793 12)
+15
+["Unknown shape" {:shape {:shape :hexagon}}]
+Half of a Yellow Sun by Chimamanda Ngozi Adichie (2006)
+the text "hello"
+the number 42
+nothing at all
+"Half of a Yellow Sun" #user.Book{:title "Half of a Yellow Sun", :author "Chimamanda Ngozi Adichie", :year 2006, :pages 448} true true
+```
+
+### Multimethods
+
+`defmulti` names an operation and a **dispatch function**; here the keyword `:shape`, so the dispatch value is the map's `:shape`. Each `defmethod` handles one dispatch value, and `:default` catches the rest. Dispatch can be on *any* function of the arguments: a key, a pair of types, a computed category such as `(fn [order] (if (> (:total order) 1000) :large :normal))`. The `:triangle` method was added after the first calls, the way another namespace or a plugin would extend the system.
+
+The default method throws with `ex-info`, which creates an exception carrying a map of data. `ex-message` and `ex-data` read it back. This is the idiomatic way to signal errors in Clojure, and lesson 7 returns to it.
+
+### Protocols and records
+
+A **protocol** is a named set of functions that dispatch on the *type* of their first argument, like an interface in Java but one you can extend to types you did not write. `extend-protocol` above teaches `describe` about Java's `String` and `Long` and even about `nil`. Because dispatch uses the JVM's type machinery, protocol calls are fast, which is why the core library uses them internally.
+
+A **record**, defined with `defrecord`, is a named type that behaves like a map: you can read its fields with keywords, `assoc` extra keys onto it, and it is still a record. `->Book` is the positional constructor that `defrecord` generates (there is also `map->Book`, which takes a map). Records exist mainly to implement protocols efficiently. They print with their type name, as `#user.Book{...}` shows.
+
+### Which to choose
+
+| Situation | Reach for |
+| --- | --- |
+| Data with no special behaviour | plain maps and functions |
+| Behaviour that varies by a value in the data (a `:type` key, a status) | a multimethod |
+| Behaviour that varies by type, especially for speed or to extend Java types | a protocol |
+| A protocol implementation on map-like data | a record |
+| Interop that needs a real Java class with mutable fields | `deftype` (rare) |
+
+The usual advice from experienced Clojure developers is to start with maps and functions and add polymorphism only when a `case` or `cond` on a type key starts appearing in several places.
+
+</Section>
+
+<Section id="spec" kind="examples" title="Describing data with spec">
+
+Plain maps are flexible, and flexibility cuts both ways: a typo in a key or a string where a number belongs travels quietly through the system until something far away fails. **clojure.spec** (introduced with Clojure 1.9 in 2017) lets you describe the shape of data with predicates and then validate, explain, parse ("conform") and even generate test data from those descriptions. Spec ships as a separate library, `org.clojure/spec.alpha`, that Clojure itself depends on, so it is always available.
+
+```clojure check
+(require '[clojure.spec.alpha :as s])
+
+(s/def :order/id pos-int?)
+(s/def :order/email (s/and string? #(re-matches #".+@.+\..+" %)))
+(s/def :order/qty (s/int-in 1 100))
+(s/def :order/item (s/keys :req-un [:order/qty] :opt-un [:order/note]))
+(s/def :order/items (s/coll-of :order/item :min-count 1))
+(s/def :order/order (s/keys :req [:order/id :order/email :order/items]))
+
+(def good {:order/id 17
+           :order/email "nia@example.com"
+           :order/items [{:qty 2} {:qty 1 :note "gift"}]})
+
+(def bad {:order/id -5
+          :order/email "nia-at-example"
+          :order/items []})
+
+(println (s/valid? :order/order good))
+(println (s/valid? :order/order bad))
+(print (s/explain-str :order/order bad))
+
+(s/def ::amount (s/or :cents int? :decimal decimal?))
+(prn (s/conform ::amount 250) (s/conform ::amount 2.50M) (s/conform ::amount "2.50"))
+```
+
+```text
+true
+false
+-5 - failed: pos-int? in: [:order/id] at: [:order/id] spec: :order/id
+"nia-at-example" - failed: (re-matches #".+@.+\..+" %) in: [:order/email] at: [:order/email] spec: :order/email
+[] - failed: (<= 1 (count %) MAX_VALUE) in: [:order/items] at: [:order/items] spec: :order/items
+[:cents 250] [:decimal 2.50M] :clojure.spec.alpha/invalid
+```
+
+Here is what each piece does.
+
+- `s/def` registers a spec under a qualified keyword in a global registry. A spec is usually just a predicate (`pos-int?`) or a combination (`s/and`, `s/or`, `s/coll-of`, `s/int-in`).
+- `s/keys` describes a map by the *names* of its keys, not their positions: `:req` lists required qualified keys, `:req-un` and `:opt-un` required and optional unqualified keys (`:qty` checked against `:order/qty`). Every key present in the map that has a registered spec is checked, required or not.
+- `s/valid?` answers yes or no; `s/explain-str` says exactly which value failed which predicate, and where. That message is far more useful than a `NullPointerException` thirty calls later.
+- `s/conform` returns the value *parsed*: an `s/or` tags which branch matched, and invalid input gives the special keyword `:clojure.spec.alpha/invalid`.
+
+</Section>
+
+<Section id="spec-today" kind="human" title="Spec in practice, and its alternatives">
+
+Beyond validation, spec can describe functions with `s/fdef` (argument and return specs), check calls against those specs during development with `instrument`, and generate random valid data for **property-based tests** (that part needs the separate `test.check` library). Teams typically put specs at system boundaries: incoming HTTP requests, messages from queues, configuration files, and the public functions of important namespaces. Inside a namespace, where data has already been checked, they rely on plain functions.
+
+Two honest caveats belong in any account of spec as of 2026. First, it is still officially **alpha**: the namespace is `clojure.spec.alpha`, and a redesign ("spec 2") has been explored for years without replacing it. The alpha library is stable in practice and widely used, but its API is not promised. Second, many teams use the community library **Malli** instead, which describes schemas as plain data (vectors and maps) rather than registered predicates, making schemas easy to store, transform and send over the wire. Both are reasonable; what matters is that important data has a written description that code can check.
+
+### EDN: data as a file format
+
+Clojure's literal syntax doubles as a data format, **EDN** (extensible data notation). Configuration files, `deps.edn`, test fixtures and messages between Clojure services are often EDN. Read it with `clojure.edn/read-string`, which only reads data and never evaluates code:
+
+```clojure check
+(require '[clojure.edn :as edn])
+
+(def config-text
+  "{:server {:port 8080 :host \"0.0.0.0\"}
+    :features #{:search :export}
+    :retries 3}")
+
+(def config (edn/read-string config-text))
+
+(prn (get-in config [:server :port]))
+(prn (contains? (:features config) :export))
+(prn (type config) (type (:features config)))
+(prn (edn/read-string "[1 2.5 \"three\" :four four nil]"))
+(prn (pr-str {:a [1 2] :b #{3}}))
+(prn (= config (edn/read-string (pr-str config))))
+```
+
+```text
+8080
+true
+clojure.lang.PersistentArrayMap clojure.lang.PersistentHashSet
+[1 2.5 "three" :four four nil]
+"{:a [1 2], :b #{3}}"
+true
+```
+
+`pr-str` writes any data as EDN text and `edn/read-string` reads it back to an equal value: a round trip with no serialisation code at all. Never use the general `read-string` from `clojure.core` on untrusted input, since its reader can be told to run code; `clojure.edn` exists precisely to avoid that.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Writing a record for every entity.** Coming from object-oriented languages, it is tempting to `defrecord` a `Customer` and an `Order` on day one. Records add a type, a constructor and a different printed form, and buy you only faster protocol dispatch. Start with plain maps; most Clojure codebases have few records.
+
+</Misconception>
+
+<Misconception>
+
+**Using `:refer :all`.** Bringing every name of another namespace in unqualified makes it impossible to tell where a function comes from and invites collisions. Use an alias such as `[clojure.string :as str]`.
+
+</Misconception>
+
+<Misconception>
+
+**Expecting `s/keys` to reject extra keys.** Spec's maps are open: a map may carry keys the spec does not mention, by design, so that data can grow without breaking its consumers. If a key must not be present, say so with an extra predicate, or use a library that supports closed schemas.
+
+</Misconception>
+
+<Misconception>
+
+**Believing maps cost nothing compared with classes.** The trade-off is real. A misspelled keyword, `(:emial user)`, silently returns `nil` instead of failing to compile, and an IDE cannot always tell you which keys a map has. Clojure teams compensate in several ways: specs or Malli schemas at boundaries, the linter clj-kondo (lesson 8) to flag suspicious code, destructuring with `:keys` so every key a function uses is listed in one place, and qualified keywords that are easy to search for across a codebase. Many find the flexibility worth it; it is still a choice, not a free lunch.
+
+</Misconception>
+
+<Misconception>
+
+**Thinking a multimethod must dispatch on a type.** Its dispatch function can compute anything from the arguments. Dispatching on a value in the data, such as `:shape` or `:event/type`, is the most common use.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

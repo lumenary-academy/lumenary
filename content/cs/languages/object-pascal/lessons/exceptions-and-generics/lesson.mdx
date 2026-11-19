@@ -1,0 +1,560 @@
+---
+title: Exceptions and generics
+subtitle: Raising and handling exceptions with your own exception classes, try … except and try … finally, then generic classes and functions and the Generics.Collections library.
+minutes: 60
+objectives:
+  - Raise exceptions, define exception class hierarchies, and handle them with try … except … on
+  - Combine try … finally and try … except so that cleanup always runs and errors are reported once
+  - Write generic classes and functions in objfpc syntax, and recognise Delphi's syntax
+  - Use TList, TObjectList and TDictionary from Generics.Collections, with ownership and custom comparers
+  - Avoid the common traps of swallowed exceptions, dictionary indexing and for-in over bracketed lists
+prerequisites: [arrays-records-sets-and-strings, classes-properties-and-interfaces]
+references:
+  - title: "Free Pascal Reference Guide: Exceptions and Generics"
+    url: https://www.freepascal.org/docs-html/current/ref/ref.html
+    note: The raise statement, try blocks, and generic types and routines in objfpc and delphi modes.
+  - title: "Free Pascal RTL reference: SysUtils exceptions"
+    url: https://www.freepascal.org/docs-html/current/rtl/index.html
+    note: Exception and its standard descendants such as EConvertError and EArgumentException.
+  - title: Embarcadero DocWiki
+    url: https://docwiki.embarcadero.com/
+    note: Delphi's documentation of exceptions, generics and System.Generics.Collections.
+---
+
+<Section id="motivation" kind="motivation" title="Failing well, and writing code once">
+
+Real programs meet bad input, missing files and broken networks. Standard Pascal had no good way to report such failures: a routine could return an error code, which callers forgot to check, or stop the program. Delphi brought **exceptions** to Object Pascal in 1995, and they are now how every library reports failure: `StrToInt` raises `EConvertError`, a list raises `EListError`, a file routine raises `EFOpenError`. Handling them well means two things: cleaning up correctly as an exception passes through (that is `try … finally`), and catching it only where something useful can be done (that is `try … except`).
+
+The second half of the lesson is about **generics**. Before them, Pascal programmers either rewrote the same list or stack for each element type, or stored untyped pointers and cast them back, losing all type checking. Generics let you write a container or algorithm once, with the element type as a parameter, and have the compiler check every use. Free Pascal has supported generics since version 2.2, and since 3.2 its standard library includes `Generics.Collections`, compatible with Delphi's.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Exceptions in Object Pascal">
+
+<Definition term="Exception">
+
+An exception is an **object** of class `Exception` (from `SysUtils`) or a descendant, created and thrown by `raise`. The run-time system unwinds the call stack, running every `finally` block it passes, until an `except` block with a matching handler catches it. The handler's block frees the exception object automatically when it ends.
+
+</Definition>
+
+The two kinds of `try` block do different jobs:
+
+```pascal
+try
+  { statements }
+finally
+  { always runs: cleanup }
+end;
+
+try
+  { statements }
+except
+  on E: EConvertError do
+    { handle this kind }
+  on E: Exception do
+    { handle anything else }
+end;
+```
+
+A `finally` block does **not** stop the exception; it runs and the exception continues outwards. An `except` block **does** stop it, unless a handler re-raises it with a bare `raise;`. Handlers are tried in order and the first whose class matches (including descendants) runs, so the most specific classes come first. An `else` part in an `except` block catches anything not matched; leaving out `on` altogether catches everything, which is almost always a mistake.
+
+Exception classes form a hierarchy, and defining your own is cheap: `EConfigError = class(Exception);` is a complete declaration. Raise them with `Create('message')` or `CreateFmt('format', [values])`, and add fields when handlers need more than the message.
+
+</Section>
+
+<Section id="examples" kind="examples" title="A configuration parser that fails well">
+
+```pascal check
+program Exceptions;
+{$mode objfpc}{$H+}
+
+uses
+  SysUtils;
+
+type
+  { An exception hierarchy of our own, rooted at SysUtils.Exception. }
+  EConfigError = class(Exception);
+  EMissingValue = class(EConfigError);
+  EOutOfRange = class(EConfigError)
+  private
+    FKey: string;
+  public
+    constructor Create(const AKey: string; AValue, ALow, AHigh: Integer);
+    property Key: string read FKey;
+  end;
+
+constructor EOutOfRange.Create(const AKey: string; AValue, ALow, AHigh: Integer);
+begin
+  inherited CreateFmt('%s = %d is outside %d..%d', [AKey, AValue, ALow, AHigh]);
+  FKey := AKey;
+end;
+
+{ Parse "key=value" where value must be an integer in Low..High. }
+function ParseSetting(const Line: string; Low, High: Integer): Integer;
+var
+  Eq: Integer;
+  Key, Text: string;
+begin
+  Eq := Pos('=', Line);
+  if Eq = 0 then
+    raise EConfigError.CreateFmt('no "=" in "%s"', [Line]);
+  Key := Trim(Copy(Line, 1, Eq - 1));
+  Text := Trim(Copy(Line, Eq + 1, MaxInt));
+  if Text = '' then
+    raise EMissingValue.CreateFmt('%s has no value', [Key]);
+  Result := StrToInt(Text);                     { may raise EConvertError }
+  if (Result < Low) or (Result > High) then
+    raise EOutOfRange.Create(Key, Result, Low, High);
+end;
+
+procedure Check(const Line: string);
+var
+  Value: Integer;
+begin
+  try
+    Value := ParseSetting(Line, 1, 64);
+    WriteLn('ok:      ', Line, ' -> ', Value);
+  except
+    on E: EOutOfRange do                        { most specific first }
+      WriteLn('range:   ', E.Message, ' (key ', E.Key, ')');
+    on E: EConfigError do                       { catches EMissingValue too }
+      WriteLn('config:  ', E.ClassName, ': ', E.Message);
+    on E: EConvertError do
+      WriteLn('convert: ', E.Message);
+  end;
+end;
+
+begin
+  Check('threads = 8');
+  Check('threads = 128');
+  Check('threads =');
+  Check('threads: 8');
+  Check('threads = eight');
+
+  { finally runs on the way out, even when an exception passes through. }
+  try
+    try
+      WriteLn('working...');
+      ParseSetting('retries = 0', 1, 5);
+      WriteLn('not reached');
+    finally
+      WriteLn('cleanup always runs');
+    end;
+  except
+    on E: Exception do
+      WriteLn('caught outside: ', E.Message);
+  end;
+end.
+```
+
+It prints:
+
+```text
+ok:      threads = 8 -> 8
+range:   threads = 128 is outside 1..64 (key threads)
+config:  EMissingValue: threads has no value
+config:  EConfigError: no "=" in "threads: 8"
+convert: "eight" is an invalid integer
+working...
+cleanup always runs
+caught outside: retries = 0 is outside 1..5
+```
+
+- `EConfigError` is the root of the program's own exceptions, with two descendants. `EOutOfRange` carries an extra `Key` property and builds its message in its constructor with `inherited CreateFmt`.
+- `ParseSetting` raises for each kind of problem and lets `StrToInt` raise `EConvertError` for non-numbers. It does not catch anything itself, because it cannot do anything useful about bad input; its callers can.
+- `Check`'s handlers go from specific to general: `EOutOfRange` first, then `EConfigError`, which also catches `EMissingValue` since that is a descendant. If `EConfigError` came first, the `EOutOfRange` handler could never run (an out-of-range value would print `config:  EOutOfRange: …`), and Free Pascal compiles that order without a warning.
+- In the last part, the exception raised by `ParseSetting` passes through the inner `finally` block, which runs its cleanup, and is caught by the outer `except`. Nesting `try … finally` inside `try … except` is the standard shape when a routine both owns resources and reports errors.
+
+Note that `Value := ParseSetting(…)` comes before the `WriteLn`. Inside a single `WriteLn` call, Pascal writes each argument as soon as it is evaluated, so a call that raises halfway through a `WriteLn` would leave half a line on the screen.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Generics">
+
+<Definition term="Generic type">
+
+A type declared with **type parameters**, such as `generic TRing<T> = class … end;`, from which concrete types are produced by **specialisation**: `TIntRing = specialize TRing<Integer>;`. Generic routines work the same way.
+
+</Definition>
+
+Free Pascal's `objfpc` mode marks generics with the words `generic` and `specialize`; `delphi` mode uses Delphi's syntax, without them:
+
+```pascal
+{ objfpc mode }                          { delphi mode }
+generic TRing<T> = class ... end;        TRing<T> = class ... end;
+TIntRing = specialize TRing<Integer>;    TIntRing = TRing<Integer>;
+X := specialize Largest<Integer>(A);     X := Largest<Integer>(A);
+```
+
+Free Pascal accepts standalone generic functions in both modes. Delphi itself allows generic *methods* of classes and records but not standalone generic routines, so code shared with Delphi puts a function such as `Largest` inside a record or class as a class method.
+
+### A generic ring buffer and a generic function
+
+```pascal check
+program Generics;
+{$mode objfpc}{$H+}
+
+uses
+  SysUtils;
+
+type
+  { A generic class: T is a type parameter, filled in by "specialize". }
+  generic TRing<T> = class
+  private
+    FItems: array of T;
+    FNext: Integer;
+    FCount: Integer;
+  public
+    constructor Create(ACapacity: Integer);
+    procedure Add(const Item: T);           { overwrites the oldest when full }
+    function Items: specialize TArray<T>;   { oldest first }
+    property Count: Integer read FCount;
+  end;
+
+constructor TRing.Create(ACapacity: Integer);
+begin
+  inherited Create;
+  SetLength(FItems, ACapacity);
+end;
+
+procedure TRing.Add(const Item: T);
+begin
+  FItems[FNext] := Item;
+  FNext := (FNext + 1) mod Length(FItems);
+  if FCount < Length(FItems) then
+    Inc(FCount);
+end;
+
+function TRing.Items: specialize TArray<T>;
+var
+  I, Start: Integer;
+begin
+  SetLength(Result, FCount);
+  Start := (FNext - FCount + Length(FItems)) mod Length(FItems);
+  for I := 0 to FCount - 1 do
+    Result[I] := FItems[(Start + I) mod Length(FItems)];
+end;
+
+{ A generic function (Free Pascal 3.2 and later). }
+generic function Largest<T>(const Values: array of T): T;
+var
+  V: T;
+begin
+  Result := Values[0];
+  for V in Values do
+    if V > Result then
+      Result := V;
+end;
+
+type
+  TIntRing = specialize TRing<Integer>;
+  TStrRing = specialize TRing<string>;
+
+const
+  Readings: array[1..5] of Integer = (18, 21, 25, 19, 17);
+  Commands: array[1..3] of string = ('open', 'save', 'print');
+  Fruits: array[1..3] of string = ('pear', 'fig', 'plum');
+
+var
+  Temps: TIntRing;
+  Recent: TStrRing;
+  N: Integer;
+  S: string;
+
+begin
+  Temps := TIntRing.Create(3);
+  Recent := TStrRing.Create(2);
+  try
+    for N in Readings do
+      Temps.Add(N);
+    Write('Last 3 temperatures:');
+    for N in Temps.Items do
+      Write(' ', N);
+    WriteLn;
+
+    for S in Commands do
+      Recent.Add(S);
+    WriteLn('Recent commands: ', string.Join(', ', Recent.Items));
+
+    WriteLn('Largest: ', specialize Largest<Integer>(Temps.Items));
+    WriteLn('Largest: ', specialize Largest<string>(Fruits));
+  finally
+    Temps.Free;
+    Recent.Free;
+  end;
+end.
+```
+
+It prints:
+
+```text
+Last 3 temperatures: 25 19 17
+Recent commands: save, print
+Largest: 25
+Largest: plum
+```
+
+`TRing<T>` keeps the last few items added, overwriting the oldest when full, for any element type. `TIntRing` and `TStrRing` are two specialisations, each a complete, type-checked class. `Items` returns `specialize TArray<T>`, the standard generic dynamic array, which works with `for … in` and with `string.Join`. `Largest` is a **generic function**, new in Free Pascal 3.2. It uses `>` on values of type `T`, and the compiler checks that operator when the function is specialised: `Largest<Integer>` and `Largest<string>` compile, while specialising it for a record type `TP` that has no `>` operator fails with `Error: Operator is not overloaded: "TP" > "TP"`. Unlike Ada's generics, Free Pascal's (like C++ templates) are checked for each specialisation; generic constraints such as `<T: class>` can state some requirements up front.
+
+### Generics.Collections
+
+```pascal check
+program Collections;
+{$mode objfpc}{$H+}
+
+uses
+  SysUtils, Generics.Defaults, Generics.Collections;
+
+type
+  TCity = class
+    Name: string;
+    Population: Integer;          { in thousands, approximate }
+    constructor Create(const AName: string; APopulation: Integer);
+    destructor Destroy; override;
+  end;
+
+  TCityList = specialize TObjectList<TCity>;
+  TCityComparer = specialize TComparer<TCity>;
+  TCounts = specialize TDictionary<string, Integer>;
+
+var
+  Freed: Integer = 0;
+
+constructor TCity.Create(const AName: string; APopulation: Integer);
+begin
+  inherited Create;
+  Name := AName;
+  Population := APopulation;
+end;
+
+destructor TCity.Destroy;
+begin
+  Inc(Freed);
+  inherited;
+end;
+
+function ByPopulationDescending(constref A, B: TCity): Integer;
+begin
+  Result := B.Population - A.Population;
+end;
+
+const
+  Words: array[1..8] of string =
+    ('to', 'be', 'or', 'not', 'to', 'be', 'that', 'is');
+
+var
+  Cities: TCityList;
+  C: TCity;
+  Counts: TCounts;
+  W: string;
+  N: Integer;
+
+begin
+  Cities := TCityList.Create(True);              { True: the list owns its objects }
+  try
+    Cities.Add(TCity.Create('Nairobi', 4397));
+    Cities.Add(TCity.Create('Reykjavik', 140));
+    Cities.Add(TCity.Create('Lima', 10151));
+    Cities.Add(TCity.Create('Busan', 3349));
+    Cities.Sort(TCityComparer.Construct(@ByPopulationDescending));
+    for C in Cities do
+      WriteLn(C.Name:10, C.Population:7);
+    Cities.Delete(Cities.Count - 1);             { frees the smallest city object }
+    WriteLn('After Delete: ', Cities.Count, ' cities, ', Freed, ' freed');
+  finally
+    Cities.Free;                                 { frees the rest }
+  end;
+  WriteLn('After Free: ', Freed, ' freed');
+
+  Counts := TCounts.Create;
+  try
+    for W in Words do
+      if Counts.TryGetValue(W, N) then
+        Counts[W] := N + 1                       { the key exists, so this is safe }
+      else
+        Counts.Add(W, 1);
+    WriteLn('"to" appears ', Counts['to'], ' times; "be" ', Counts['be'],
+            '; distinct words: ', Counts.Count);
+    WriteLn('Contains "question"? ', Counts.ContainsKey('question'));
+  finally
+    Counts.Free;
+  end;
+end.
+```
+
+It prints:
+
+```text
+      Lima  10151
+   Nairobi   4397
+     Busan   3349
+ Reykjavik    140
+After Delete: 3 cities, 1 freed
+After Free: 4 freed
+"to" appears 2 times; "be" 2; distinct words: 6
+Contains "question"? FALSE
+```
+
+- **`TObjectList<T>`** created with `True` **owns** its objects: deleting an item, or freeing the list, frees the objects. The counter in `TCity.Destroy` proves it: one freed by `Delete`, all four by the time the list is freed. This is the usual answer to "who frees the objects in a list?".
+- **Sorting** takes a comparer. `TComparer<TCity>.Construct` wraps an ordinary function that returns a negative number, zero or a positive number. (The `constref` parameters are what `Generics.Defaults` expects in Free Pascal; Delphi uses `const`.)
+- **`TDictionary<K, V>`** maps keys to values with hashing. `TryGetValue` looks a key up without raising. Reading `Counts['missing']` raises an exception, and so does *assigning* to a key that does not exist yet with `Counts[Key] := …`: use `Add` for new keys and `AddOrSetValue` when you do not know.
+
+Free Pascal also ships the older **`fgl`** unit (`TFPGList`, `TFPGObjectList`, `TFPGMap`), which you will see in many Lazarus projects. It is simpler and smaller; `Generics.Collections` is more complete and shares its interface with Delphi, which makes it the better default for new code.
+
+</Section>
+
+<Section id="human" kind="human" title="Exceptions and generics in professional code">
+
+Most of what experienced Object Pascal developers know about exceptions is about *where* code deals with them. This program gathers four habits in one place:
+
+```pascal check
+program Safety;
+{$mode objfpc}{$H+}
+{$assertions on}
+
+uses
+  SysUtils, Classes;
+
+type
+  { If a constructor raises, the destructor runs at once on the half-built object. }
+  TReport = class
+  private
+    FLines: TStringList;
+    FLog: TStringList;
+  public
+    constructor Create(const ATitle: string);
+    destructor Destroy; override;
+  end;
+
+constructor TReport.Create(const ATitle: string);
+begin
+  inherited Create;
+  FLines := TStringList.Create;
+  if ATitle = '' then
+    raise EArgumentException.Create('a report needs a title');
+  FLog := TStringList.Create;                 { never reached for an empty title }
+end;
+
+destructor TReport.Destroy;
+begin
+  WriteLn('  destroying: FLines assigned ', Assigned(FLines), ', FLog assigned ', Assigned(FLog));
+  FLog.Free;                                  { Free on nil does nothing }
+  FLines.Free;
+  inherited Destroy;
+end;
+
+function Withdraw(Balance, Amount: Integer): Integer;
+begin
+  Assert(Amount > 0, 'amount must be positive');  { a programmer's assumption }
+  Result := Balance - Amount;
+end;
+
+procedure Step(const Name: string; Work: TProcedure);
+begin
+  try
+    Work();
+    WriteLn(Name, ': ok');
+  except
+    on E: EAbort do
+      WriteLn(Name, ': cancelled quietly');
+    on E: Exception do
+      WriteLn(Name, ': ', E.ClassName, ': ', E.Message);
+  end;
+end;
+
+procedure MakeReport;
+var
+  R: TReport;
+begin
+  R := TReport.Create('');
+  R.Free;
+end;
+
+procedure BadWithdrawal;
+begin
+  Withdraw(100, -5);
+end;
+
+procedure CancelByUser;
+begin
+  Abort;                                      { raises EAbort: "stop, but say nothing" }
+end;
+
+procedure LogAndReraise;
+begin
+  try
+    StrToInt('12x');
+  except
+    on E: EConvertError do
+    begin
+      WriteLn('  log: ', E.Message);
+      raise;                                  { the same exception continues outwards }
+    end;
+  end;
+end;
+
+begin
+  Step('report', @MakeReport);
+  Step('withdraw', @BadWithdrawal);
+  Step('cancel', @CancelByUser);
+  Step('parse', @LogAndReraise);
+end.
+```
+
+It prints:
+
+```text
+  destroying: FLines assigned TRUE, FLog assigned FALSE
+report: EArgumentException: a report needs a title
+withdraw: EAssertionFailed: amount must be positive (main.pas, line 38)
+cancel: cancelled quietly
+  log: "12x" is an invalid integer
+parse: EConvertError: "12x" is an invalid integer
+```
+
+- **Constructors that fail clean up after themselves.** When `TReport.Create` raises, Object Pascal calls the destructor on the half-built object at once, then passes the exception on; `R` is never assigned, and `R.Free` never runs. The destructor must therefore cope with fields that were never created. It does, because `Free` on a `nil` reference does nothing, and the fields of a new object start as `nil`. Write destructors this way and constructors can raise safely.
+- **Assertions state the programmer's assumptions.** `Assert(Amount > 0, …)` raises `EAssertionFailed`, with the file and line, when the assumption is false. Assertions are compiled only with `{$assertions on}` (or the `-Sa` option), which is usual in debug builds; release builds normally leave them out, so they must never be the only check on user input.
+- **`Abort` cancels without complaint.** It raises `EAbort`, the "silent exception". Lazarus and Delphi applications show a message box for unhandled exceptions, except `EAbort`, so a routine deep inside an operation can stop it, after the user has pressed Cancel for example, without an error appearing.
+- **Log, then re-raise.** A handler that only records what happened ends with a bare `raise;`, which sends the *same* exception object on its way. Raising a new exception would lose the original class and, in a debugger, the place where things first went wrong.
+
+Two broader rules complete the picture. **Use exceptions for the exceptional.** When failure is an ordinary outcome, such as a user typing a word where a number belongs or a key missing from a cache, call the `Try…` function (`TryStrToInt`, `TryGetValue`) and test its Boolean result; it is clearer and much faster than raising and catching. And **give every program one last handler**: a GUI application has one built in (`Application.OnException` lets you replace it), while a console program wraps its main work in a `try … except` that writes `E.ClassName` and `E.Message` to `ErrOutput` and sets `ExitCode := 1`, so that scripts calling it can tell that it failed.
+
+For generics, professionals declare each specialisation once, near the top of a unit (`TCityList = specialize TObjectList<TCity>;`), and use that name everywhere, which keeps declarations readable and gives each specialised type one place to change. Every distinct specialisation is compiled separately, much like a C++ template, so a program that specialises dozens of containers for dozens of types grows larger and compiles more slowly; that is the price of type safety without casts, and it is almost always worth paying. For new code, `Generics.Collections` is the default; `fgl` remains common in existing Lazarus projects.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"`try … finally` catches exceptions."** It runs cleanup and lets the exception carry on. To handle an exception you need `except`. Most routines need only `finally`; very few should catch.
+
+</Misconception>
+
+<Misconception>
+
+**"Catching `Exception` everywhere makes a program robust."** An `except` that swallows every exception hides bugs and leaves data in an unknown state. Catch the specific classes you can handle, at the level that can handle them, and let the rest reach a top-level handler that reports them.
+
+</Misconception>
+
+<Misconception>
+
+**"I must free the exception object I caught."** The `except` block frees it when the handler ends. Freeing it yourself causes a double free. (If you need to keep it beyond the handler, `AcquireExceptionObject` exists for that rare case.)
+
+</Misconception>
+
+<Misconception>
+
+**"`for N in [18, 21, 25, 19, 17] do` loops over those numbers in order."** In Free Pascal 3.2.2 a bracketed list of integers in a `for … in` loop is a **set** constructor, so the loop visits 17, 18, 19, 21, 25 in ascending order (and a repeated value is a compile-time error). A list of characters is a set too. A list of strings keeps its order, but in a test every element was cut to the length of the first: `['open', 'save', 'print']` gave `open`, `save` and `prin`. Loop over a typed constant array instead, as the programs in this lesson do.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+All outputs below were checked by compiling and running the code with Free Pascal 3.2.2.
+
+<Exercises/>
+
+</Section>

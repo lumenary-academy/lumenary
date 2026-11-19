@@ -1,0 +1,357 @@
+---
+title: Metatables and objects
+subtitle: Giving tables new behaviour with metamethods, and building classes, inheritance, read-only and strict tables, caches and private state.
+minutes: 65
+objectives:
+  - Attach metatables with setmetatable and define arithmetic, comparison, length, concatenation, call and tostring metamethods
+  - Use __index and __newindex, as tables or functions, for defaults, computed values, read-only and strict tables
+  - Write classes with the colon syntax, constructors and inheritance, and call overridden base methods
+  - Use raw access, weak tables, finalisers and __metatable, and choose between metatable objects and closure objects
+prerequisites: [functions-and-closures]
+references:
+  - title: "Reference Manual: Metatables and Metamethods"
+    url: https://www.lua.org/manual/5.5/manual.html#2.4
+    note: Every metamethod and exactly when Lua calls it.
+  - title: "Reference Manual: Garbage Collection"
+    url: https://www.lua.org/manual/5.5/manual.html#2.5
+    note: Finalisers (__gc) and weak tables (__mode).
+  - title: "Reference Manual: Basic Functions"
+    url: https://www.lua.org/manual/5.5/manual.html#6.1
+    note: setmetatable, getmetatable, rawget, rawset, rawequal, rawlen, pairs and next.
+  - title: Programming in Lua (first edition, online)
+    url: https://www.lua.org/pil/contents.html
+    note: The free first edition (written for Lua 5.0) has chapters on metatables and object-oriented programming whose ideas still apply.
+---
+
+<Section id="motivation" kind="motivation" title="Changing what a table means">
+
+By default, a table does very little. You cannot add two tables, compare them by contents, print them meaningfully or call them, and reading a missing key quietly gives `nil`. That is a deliberate blank slate. A **metatable** lets you fill it in: you attach a second table to the first, and fields in it, named with two underscores such as `__add` or `__index`, tell Lua what to do when the first table meets an operator or a missing key.
+
+With this one mechanism, Lua programs build vectors and complex numbers that support `+`, tables with default values, read-only constants, tables that report typos, proxies that log every access, caches that let their entries be garbage-collected, and the whole of object-oriented programming: classes, methods and inheritance. Almost every substantial Lua code base, from game engines to Neovim plugins, uses metatables, usually for objects.
+
+</Section>
+
+<Section id="operators" kind="examples" title="Metamethods for operators">
+
+<Definition term="Metatable and metamethod">
+
+A **metatable** is an ordinary table attached to a value with `setmetatable(t, mt)` (which returns `t`) and read back with `getmetatable(t)`. When Lua performs an operation it does not know how to do on a value, such as adding a table, it looks in the value's metatable for a field named after the event, like `__add`; the function found there, the **metamethod**, performs the operation. From Lua you can set the metatables of tables only; strings share one metatable (whose `__index` is the `string` library, which is why `s:upper()` works), and C code can give metatables to its own userdata.
+
+</Definition>
+
+```lua check
+-- A metatable gives tables new behaviour for operators and built-ins.
+local Vector = {}
+Vector.__index = Vector                -- methods are looked up in Vector (explained below)
+
+local function new(x, y)
+  return setmetatable({ x = x, y = y }, Vector)
+end
+
+Vector.__add = function(a, b) return new(a.x + b.x, a.y + b.y) end
+Vector.__sub = function(a, b) return new(a.x - b.x, a.y - b.y) end
+Vector.__mul = function(a, b)          -- number * vector or vector * number
+  if type(a) == "number" then return new(a * b.x, a * b.y) end
+  return new(a.x * b, a.y * b)
+end
+Vector.__unm = function(v) return new(-v.x, -v.y) end
+Vector.__eq = function(a, b) return a.x == b.x and a.y == b.y end
+Vector.__lt = function(a, b) return a:length() < b:length() end
+Vector.__len = function(v) return 2 end               -- # gives the dimension
+Vector.__tostring = function(v) return "(" .. v.x .. ", " .. v.y .. ")" end
+Vector.__concat = function(a, b) return tostring(a) .. tostring(b) end
+
+function Vector:length() return math.sqrt(self.x ^ 2 + self.y ^ 2) end
+
+local a, b = new(3, 4), new(1, -2)
+print(a + b, a - b, 2 * a, a * 0.5, -b)
+print(a == new(3, 4), a == b, rawequal(a, new(3, 4)))
+print(b < a, #a, a:length())
+print("a is " .. a, getmetatable(a) == Vector)
+```
+
+It printed:
+
+```text
+(4, 2)	(2, 6)	(6, 8)	(1.5, 2.0)	(-1, 2)
+true	false	false
+true	2	5.0
+a is (3, 4)	true
+```
+
+How Lua chose each metamethod:
+
+- **Arithmetic** (`__add`, `__sub`, `__mul`, `__div`, `__mod`, `__pow`, `__unm`, `__idiv`, and the bitwise ones): Lua looks at the first operand's metatable, then the second's. That is how `2 * a` found `__mul` even though `2` is a number; the metamethod receives the operands in their original order and must handle both cases.
+- **`__eq`** is used only when both operands are tables (or both userdata) and are not the same object; `rawequal` bypasses it and compares identity.
+- **`__lt` and `__le`** define `<` and `<=`; `a > b` is evaluated as `b < a`. Here vectors compare by length.
+- **`__len`** defines `#`, **`__concat`** defines `..`, **`__tostring`** is used by `tostring` and therefore by `print`, and **`__call`** (shown next) makes a value callable.
+
+Operator overloading is a tool for types where the meaning of the operator is obvious, such as vectors, matrices, complex numbers, money or dates. If a reader has to look up what `+` does, a method with a name is better.
+
+</Section>
+
+<Section id="index" kind="examples" title="__index and __newindex">
+
+The two most important metamethods deal with **keys**. `__index` is consulted when you *read* a key that is absent from the table; `__newindex` when you *assign* to a key that is absent. Each can be a table (Lua looks the key up there instead, which can itself have a metatable, forming a chain) or a function (Lua calls it with the table and the key, and for `__newindex` the value).
+
+```lua check
+-- __index: where to look when a key is missing. A table or a function.
+local defaults = { colour = "blue", size = 12 }
+local style = setmetatable({ size = 16 }, { __index = defaults })
+print(style.size, style.colour, rawget(style, "colour"))
+
+local squares = setmetatable({}, {
+  __index = function(t, n)            -- compute on demand, then remember
+    local v = n * n
+    rawset(t, n, v)
+    return v
+  end,
+})
+print(squares[12], rawget(squares, 12), rawget(squares, 13))
+
+-- __newindex: intercept assignments to missing keys. Here, a read-only view.
+local function read_only(t)
+  return setmetatable({}, {
+    __index = t,
+    __newindex = function(_, k) error("attempt to change read-only key '" .. tostring(k) .. "'", 2) end,
+    __len = function() return #t end,
+    __pairs = function() return next, t, nil end,
+  })
+end
+local DAYS = read_only({ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" })
+print(DAYS[1], #DAYS)
+print(pcall(function() DAYS[8] = "Funday" end))
+
+-- A strict table: reading a missing key is an error instead of a silent nil.
+local function strict(t)
+  return setmetatable(t, {
+    __index = function(_, k) error("no field '" .. tostring(k) .. "'", 2) end,
+  })
+end
+local config = strict({ host = "localhost", port = 8080 })
+print(config.port, pcall(function() return config.prot end))
+
+-- __call makes a table callable like a function.
+local greeter = setmetatable({ greeting = "Sawubona" }, {
+  __call = function(self, name) return self.greeting .. ", " .. name end,
+})
+print(greeter("Zanele"))
+```
+
+It printed:
+
+```text
+16	blue	nil
+144	144	nil
+Mon	7
+false	main.lua:26: attempt to change read-only key '8'
+8080	false	main.lua:35: no field 'prot'
+Sawubona, Zanele
+```
+
+The patterns, one by one:
+
+- **Defaults.** `style` has its own `size` but no `colour`, so the read falls through to `defaults`. `rawget` reads without consulting the metatable, proving `colour` is not really in `style`.
+- **Computed values.** An `__index` function can compute a value on demand and store it with `rawset` (which writes without triggering `__newindex`), so the second lookup is an ordinary table read: memoisation through the metatable.
+- **Read-only tables.** The trick is to return an **empty proxy** whose `__index` points to the real data. Every assignment to the proxy is to a missing key, so `__newindex` sees it and refuses. Because the proxy is empty, `#` and `pairs` need their own metamethods (`__len` and `__pairs`) to see the real contents. The error was raised with **level 2**, so the message points at the line that tried the assignment, not at the metamethod.
+- **Strict tables.** An `__index` function that raises an error turns a silent typo (`config.prot`) into a loud one. The same trick on the environment table catches misspelt global variables in Lua versions before 5.5.
+- **Callable tables.** `__call` lets a table act as a function while carrying data: here, a greeter with its own greeting.
+
+</Section>
+
+<Section id="classes" kind="examples" title="Classes, methods and inheritance">
+
+Lua has no classes, but `__index` gives you everything needed to build them. The standard pattern: a **class** is a table holding the methods; each **instance** is a table holding its own data, whose metatable is the class; and the class's `__index` field points to the class itself, so any method missing from the instance is found in the class.
+
+<Definition term="Method call syntax">
+
+`function Class:method(args)` is shorthand for `function Class.method(self, args)`: it adds a hidden first parameter named `self`. `obj:method(args)` is shorthand for `obj.method(obj, args)`: it passes the object as that first argument. The colon is pure syntax; methods are ordinary functions stored in tables.
+
+</Definition>
+
+```lua check
+-- A class is a table of methods that serves as the metatable of its instances.
+local Entity = {}
+Entity.__index = Entity
+
+function Entity.new(name, x, y)
+  local self = setmetatable({}, Entity)
+  self.name, self.x, self.y = name, x or 0, y or 0
+  return self
+end
+
+function Entity:move(dx, dy)                -- the colon adds a hidden 'self' parameter
+  self.x, self.y = self.x + dx, self.y + dy
+  return self
+end
+
+function Entity:describe()
+  return string.format("%s at (%d, %d)", self.name, self.x, self.y)
+end
+
+Entity.__tostring = function(e) return e:describe() end
+
+-- Inheritance: Player's methods fall back to Entity's.
+local Player = setmetatable({}, { __index = Entity })
+Player.__index = Player
+Player.__tostring = Entity.__tostring       -- metamethods are not inherited through __index
+
+function Player.new(name, x, y)
+  local self = Entity.new(name, x, y)       -- build the base part
+  self.health = 100
+  return setmetatable(self, Player)         -- then make it a Player
+end
+
+function Player:hit(damage)
+  self.health = math.max(0, self.health - damage)
+end
+
+function Player:describe()                  -- override, and call the base version
+  return Entity.describe(self) .. ", health " .. self.health
+end
+
+local rock = Entity.new("rock", 2, 2)
+local hero = Player.new("Ayo", 0, 0)
+hero:move(3, 1):move(1, 1)                  -- methods returning self can be chained
+hero:hit(30)
+
+for _, thing in ipairs({ rock, hero }) do
+  print(tostring(thing))                    -- each finds its own describe
+end
+print(hero.move == rock.move, getmetatable(hero) == Player, rawget(hero, "move"))
+
+-- obj:method(...) is just obj.method(obj, ...).
+print(Entity.describe(hero), hero.describe(hero) == hero:describe())
+```
+
+It printed:
+
+```text
+rock at (2, 2)
+Ayo at (4, 2), health 70
+true	true	nil
+Ayo at (4, 2)	true
+```
+
+Read the pieces:
+
+- **The constructor** `Entity.new` creates a table, sets its metatable to `Entity`, and fills in fields. Because `Entity.__index = Entity`, `rock:describe()` finds `describe` in `Entity`. The method is shared, not copied: `rawget(hero, "move")` is `nil`, and `hero.move == rock.move`.
+- **Inheritance.** `Player` is a class whose own metatable has `__index = Entity`. A lookup on a player tries the instance, then `Player`, then `Entity`: an `__index` chain. `Player.new` builds the base part with `Entity.new` and re-blesses the result with `setmetatable(self, Player)`.
+- **Overriding and calling the base method.** `Player:describe` replaces `Entity:describe` for players, and calls the original explicitly as `Entity.describe(self)`. There is no `super` keyword; you name the parent.
+- **Metamethods are not inherited through `__index`.** Lua looks for `__tostring` directly in the metatable with a raw access, so `Player` needs its own copy; the line `Player.__tostring = Entity.__tostring` provides it.
+- **Chaining.** `move` returns `self`, so calls can be chained.
+
+<Misconception>
+
+"`obj.method()` and `obj:method()` are interchangeable." They are not. The dot form passes no object, so inside the method `self` is `nil` (or whatever the first argument happens to be), and the error, often "attempt to index a nil value (local 'self')", appears inside the method rather than at the faulty call. When you see that message, check the call site for a dot that should be a colon.
+
+</Misconception>
+
+Many projects use a small **class library** to remove the boilerplate; middleclass and classic are popular pure-Lua examples. They build on exactly this pattern, so understanding it lets you read any of them.
+
+</Section>
+
+<Section id="memory" kind="examples" title="Weak tables, finalisers and private state">
+
+```lua check
+-- Weak tables: entries that do not keep their keys or values alive.
+local cache = setmetatable({}, { __mode = "k" })    -- weak keys
+local function remember(obj, info) cache[obj] = info end
+
+local kept = {}
+remember(kept, "still referenced")
+remember({}, "garbage soon")                         -- nothing else refers to this key
+
+local function count(t) local n = 0 for _ in pairs(t) do n = n + 1 end return n end
+print("before collection:", count(cache))
+collectgarbage()
+print("after collection:", count(cache), cache[kept])
+
+-- __gc: a finaliser that runs when the garbage collector frees a table.
+do
+  local resource = setmetatable({ name = "temp file" }, {
+    __gc = function(r) print("finalising " .. r.name) end,
+  })
+end
+collectgarbage()
+
+-- Private state with closures instead of metatables.
+local function new_counter()
+  local count = 0                                    -- invisible from outside
+  return {
+    increment = function() count = count + 1 end,
+    value = function() return count end,
+  }
+end
+local c = new_counter()
+c.increment(); c.increment()
+print("counter:", c.value(), c.count)
+
+-- __metatable hides and protects a metatable.
+local locked = setmetatable({}, { __metatable = "locked" })
+print(getmetatable(locked), pcall(setmetatable, locked, {}))
+```
+
+It printed:
+
+```text
+before collection:	2
+after collection:	1	still referenced
+finalising temp file
+counter:	2	nil
+locked	false	cannot change a protected metatable
+```
+
+- **Weak tables.** A metatable field `__mode = "k"` makes the table's keys **weak**: an entry does not by itself keep its key alive. After `collectgarbage()` the entry for the temporary table vanished, while the entry for `kept`, still referenced by a local, remained. `"v"` makes values weak, and `"kv"` both. Weak tables are how Lua code attaches extra data to objects, or caches results, without causing memory leaks.
+- **Finalisers.** A `__gc` metamethod runs when the collector frees the table. Do not rely on finalisers for anything that must happen promptly, such as closing files: when the collector runs is not under your control. Lesson 6's to-be-closed variables release resources at a precise point.
+- **Private state with closures.** A table of functions that close over local variables gives truly private fields: `c.count` is `nil` because `count` is not in the table at all. Closure objects are simple and fully private; metatable objects use less memory per instance (methods are shared rather than created per object) and support inheritance and operators. Large programs mostly use metatable classes, and closures for small one-off objects.
+- **`__metatable`.** Setting this field makes `getmetatable` return its value instead of the real metatable, and makes `setmetatable` fail, protecting objects from tampering by other code.
+
+</Section>
+
+<Section id="history" kind="history" title="From fallbacks to metatables">
+
+Metatables were not part of Lua from the start, and their history shows the "mechanisms, not policies" principle being refined. Lua 2.1 (1995) introduced **fallbacks**: global functions Lua called when an operation failed, such as indexing a non-table. They were enough to build objects with inheritance, which users promptly did, but a fallback was global, so two libraries that each wanted their own could not coexist. Lua 3.0 (1997) replaced them with **tag methods**, attached to numeric tags that values carried, which allowed different behaviours for different kinds of value but was awkward to use. **Lua 5.0** (2003) replaced tags with **metatables**: an ordinary table attached to a value, its fields naming the events. Because a metatable is a table, it can be shared, built at run time, inspected and inherited from, all with the tools you already have.
+
+Each step kept the mechanism small and moved more of the policy into libraries. The language never gained a `class` keyword; the class pattern in this lesson is a convention, which is why you will meet slightly different versions of it in different code bases.
+
+</Section>
+
+<Section id="traps" kind="misconceptions" title="Common metatable mistakes">
+
+<Misconception>
+
+"`__index` runs on every read." It runs only when the key is **absent** from the table itself. If an instance stores its own `name`, reading `obj.name` never consults the class. This is why a field can shadow a method of the same name: setting `obj.describe = "x"` hides the class's `describe` for that one object, and a later `obj:describe()` fails with "attempt to call a string value".
+
+</Misconception>
+
+<Misconception>
+
+"`setmetatable` copies the metatable into the object." It stores a reference. All instances of a class share one metatable, so adding a method to the class later makes it available to every existing instance at once. That is handy for live reloading in games and editors, and a surprise if you expected objects to be independent.
+
+</Misconception>
+
+<Misconception>
+
+"I can give numbers or strings their own metatables to add methods." From Lua code you can set the metatables of tables only. All strings share one metatable, which the standard library set up with `__index = string`; adding a function to the `string` table therefore gives every string a new method, which is legal but a change that every library in the program will see. Prefer plain functions.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="human" title="Metatables in practice">
+
+- **Keep the class pattern boring.** One file per class, `Class.__index = Class`, a `new` function, methods with the colon. Readers recognise it immediately.
+- **Use `__index` tables, not functions, for method lookup.** A table lookup is fast; an `__index` function runs Lua code on every missing key.
+- **Avoid deep inheritance chains.** Each level is another lookup on every inherited method call, and deep hierarchies are as hard to understand in Lua as anywhere else. Prefer composition: an object that holds another object and forwards a few calls.
+- **Use `rawget` and `rawset` inside metamethods** to avoid triggering them recursively.
+- **Make typos loud.** A strict `__index` on configuration tables, or Lua 5.5's `global` declarations for global variables, catches whole classes of bugs before users see them.
+- **Do not overload operators to be clever.** `..` on two buttons is not obviously "group them"; a method called `group` is.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,289 @@
+---
+title: Arrays, hash maps and the standard library
+subtitle: Fast data structures in a pure language. Arrays updated in place thanks to reference counting, strings, hash maps, hash sets and tree maps from Std, and how to choose between them.
+minutes: 55
+objectives:
+  - Choose between List and Array, and use Array's indexing, push, set, map, filter, fold and sort
+  - Explain how reference counting lets Lean update a pure array in place, and avoid accidentally sharing it
+  - Work with String and Char, and know that the string API was redesigned recently
+  - Use Std.HashMap, Std.HashSet and Std.TreeMap, with the right instances for your keys
+  - Write a complete program, a breadth-first search, with arrays, hash maps and loops
+prerequisites: [monads-and-io]
+related: [math.discrete.graph-theory]
+references:
+  - title: "Counting Immutable Beans: Reference Counting Optimized for Purely Functional Programming"
+    author: Sebastian Ullrich and Leonardo de Moura
+    year: 2019
+    note: The paper describing how Lean reuses memory that is no longer shared, which makes pure arrays fast (IFL 2019).
+  - title: Lean API reference
+    url: https://lean-lang.org/doc/api/
+    note: Generated documentation for every function in the core library and Std, searchable by name.
+  - title: Loogle
+    url: https://loogle.lean-lang.org/
+    note: Search Lean libraries by name, by type or by pattern, for example every function from Array α to List α.
+  - title: Hash tables (Lumenary CS)
+    url: https://lumenary.academy/en/cs/hash-tables/
+    note: How hash tables work inside, independent of any language.
+---
+
+<Section id="motivation" kind="motivation" title="Lists are not enough">
+
+The `List` type of lesson 3 is a **linked list**: each element sits in its own cell with a pointer to the rest. That makes lists ideal for recursion and for proofs (a list is either empty or a head and a tail, and every function can follow that shape), and adding to the front is instant. But reaching the millionth element means following a million pointers, and every cell is a separate allocation scattered through memory, which modern processors handle badly.
+
+Real programs need contiguous arrays with constant-time indexing, and dictionaries that find a key without scanning. Here a pure language seems to face a dilemma. If values never change, then "setting element 5 of an array" must produce a new array, and copying a million elements to change one would make arrays useless.
+
+Lean's way out is one of its most distinctive engineering ideas. Every value on the heap carries a **reference count**: how many places currently point to it. When you update an array that nothing else refers to (its count is 1), no one could ever observe the old version, so Lean simply changes it in place. Only when the array is genuinely shared does Lean copy it. The program keeps its pure meaning, which proofs rely on, and runs with the speed of mutation. Leonardo de Moura and Sebastian Ullrich described the technique in a 2019 paper with the memorable title *Counting Immutable Beans*, and it is why this lesson can run a sieve over a million booleans in a pure function.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Arrays">
+
+<Definition term="Array">
+
+`Array α` is a contiguous, growable sequence of values of type `α`, written `#[1, 2, 3]`. Reading `a[i]` takes constant time, and so does `a.push x` (on average; the array occasionally grows its storage). Updates such as `a.set! i x` or `a.modify i f` take constant time when `a` is not shared, and copy the array when it is.
+
+</Definition>
+
+```lean check
+/-- All primes below `n`, by the sieve of Eratosthenes. -/
+def primesBelow (n : Nat) : Array Nat := Id.run do
+  let mut isPrime := Array.replicate n true
+  let mut primes := #[]
+  for p in [2:n] do
+    if isPrime[p]! then
+      primes := primes.push p
+      let mut multiple := p * p
+      while multiple < n do
+        isPrime := isPrime.set! multiple false
+        multiple := multiple + p
+  return primes
+
+def main : IO Unit := do
+  let small := #[5, 3, 8, 1]
+  IO.println s!"{small}, size {small.size}, first {small[0]!}, at 9: {small[9]?}"
+  IO.println s!"pushed: {small.push 13}, sorted: {small.qsort (· < ·)}"
+  IO.println s!"mapped: {small.map (· * 2)}, kept: {small.filter (· > 2)}"
+  IO.println s!"sum: {small.foldl (· + ·) 0}, as a list: {small.toList}"
+  let primes := primesBelow 1000000
+  IO.println s!"{primes.size} primes below one million; the last is {primes.back!}"
+  IO.println s!"the first ten: {primes.extract 0 10}"
+```
+
+```text
+#[5, 3, 8, 1], size 4, first 5, at 9: none
+pushed: #[5, 3, 8, 1, 13], sorted: #[1, 3, 5, 8]
+mapped: #[10, 6, 16, 2], kept: #[5, 3, 8]
+sum: 17, as a list: [5, 3, 8, 1]
+78498 primes below one million; the last is 999983
+the first ten: #[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+```
+
+The first four lines show the everyday operations, all of which return *new* arrays and leave `small` as it was: `push` adds at the end, `qsort` sorts with a comparison, `map`, `filter` and `foldl` work as on lists, and `extract i j` takes the elements from index `i` up to, not including, `j`. The indexing forms are the ones from lesson 5: `a[i]!` panics if `i` is out of range (it prints an error, returns a default value such as `0`, and lets the program continue, which is rarely what you want in production), `a[i]?` returns an `Option`, and `a[i]` with a proof is checked at compile time.
+
+The sieve is the interesting part. `isPrime` holds a million booleans, and the inner loop sets entries to `false` more than two million times. Each `isPrime.set! multiple false` *means* "a new array, equal to the old one except at `multiple`". But the old array is referenced only by the variable we are about to rebind, so its count is 1, and Lean overwrites the entry in place. If every `set!` copied the array, the program would copy a million booleans more than two million times, moving trillions of values; instead each update touches one entry, and the whole program runs in a few seconds even in `lean --run`'s interpreter.
+
+### How to lose the speed
+
+In-place update depends on the array being unshared at the moment of the update. Two patterns break that:
+
+```lean
+let backup := isPrime              -- now two references to the same array
+isPrime := isPrime.set! 4 false    -- must copy: `backup` still needs the old contents
+```
+
+and, less obviously, holding onto an array inside a structure or closure while updating it elsewhere. The cost is not wrong answers (purity guarantees that `backup` really does keep the old contents) but a silent copy, which inside a loop turns linear code quadratic. When performance matters, keep one reference to a large array, update it with `let mut` or by passing it along, and do not stash copies. For hunting down an unexpected copy, Lean provides a debugging function, `dbgTraceIfShared`, that prints a message whenever the value passed to it is shared.
+
+Two further structures are worth knowing: `ByteArray` and `FloatArray` store raw bytes and floats without the per-element boxing that a general `Array` needs, and `Subarray` (written `a[i:j]`) is a view of part of an array without copying it.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Strings, hash maps, hash sets and tree maps">
+
+### Strings
+
+A `String` is UTF-8 text, and `Char` is a Unicode character. The operations you will use most have appeared already: `++`, interpolation with `s!`, `length` (in characters), `splitOn`, `toList`, `toNat?`, `toInt?`, `isEmpty`, `push`, `intercalate`, and `foldl` over the characters. Lean's string library was substantially redesigned in 2025 around byte positions and *slices*, views of part of a string that avoid copying; if you read older Lean code, you will meet functions that are now deprecated or renamed: `String.get` is deprecated, with a warning that names its replacement, and `String.trim` has become `String.trimAscii`, which returns a slice (call `.toString` on it for a `String`). The API reference for the version you use is the authority.
+
+### Std: hash maps, hash sets and tree maps
+
+The **core library**, which every Lean file can use without imports, contains `Nat`, `List`, `Array`, `String`, `Option` and the other basic types. **Std** ships with Lean too and adds data structures and system facilities: hash maps and sets, tree maps and sets, iterators, a date and time library, asynchronous input and output, and more. Its modules must be imported by name, at the very top of the file:
+
+```lean check
+import Std.Data.HashMap
+import Std.Data.HashSet
+import Std.Data.TreeMap
+open Std
+
+def text : String :=
+  "the sun rose over the hills and the river ran down from the hills to the sea " ++
+  "and the sea took the river in"
+
+/-- How many times each word occurs. -/
+def frequencies (words : List String) : HashMap String Nat :=
+  words.foldl (fun counts w => counts.alter w fun
+    | none => some 1
+    | some n => some (n + 1)) {}
+
+def main : IO Unit := do
+  let words := (text.splitOn " ").filter (· ≠ "")
+  let counts := frequencies words
+  IO.println s!"{words.length} words, {counts.size} different"
+  IO.println s!"'the': {counts.getD "the" 0}, 'moon': {counts.getD "moon" 0}"
+  IO.println s!"'river' present: {counts.contains "river"}, lookup 'sea': {counts.get? "sea"}"
+  -- Most frequent first; ties in alphabetical order.
+  let ranked := counts.toArray.qsort fun (w₁, n₁) (w₂, n₂) => n₁ > n₂ || (n₁ == n₂ && w₁ < w₂)
+  IO.println s!"top three: {ranked.extract 0 3}"
+  -- A tree map keeps its keys sorted.
+  let sorted : TreeMap String Nat := counts.fold (fun m k v => m.insert k v) {}
+  IO.println s!"first keys alphabetically: {sorted.keys.take 4}"
+  let seen : HashSet Char := text.foldl (fun s c => if c.isAlpha then s.insert c else s) {}
+  IO.println s!"{seen.size} different letters"
+```
+
+```text
+24 words, 14 different
+'the': 7, 'moon': 0
+'river' present: true, lookup 'sea': (some 2)
+top three: #[(the, 7), (and, 2), (hills, 2)]
+first keys alphabetically: [and, down, from, hills]
+17 different letters
+```
+
+`open Std` lets us write `HashMap` instead of `Std.HashMap`. `{}` is the empty map or set. The operations are the familiar ones: `insert`, `get?` (an `Option`), `getD` (with a default), `contains`, `erase`, `size`, `fold`, `toList` and `toArray`. `alter` updates the entry for a key with a function from the old `Option` value to the new one, which handles "first time" and "seen before" in one step. Like arrays, hash maps are pure values updated in place when unshared, so the `foldl` builds the table without copying it.
+
+A **`HashMap`** needs its keys to have `BEq` and `Hashable` instances; for your own key types, `deriving BEq, Hashable` provides both. Iteration order is unspecified, so never rely on it: here we sorted explicitly before printing a ranking. A **`TreeMap`**, a balanced binary search tree, needs an `Ord` instance instead, keeps its keys in order, and does each operation in logarithmic rather than (expected) constant time; use it when you need sorted output or range queries. **`HashSet`** and **`TreeSet`** are the corresponding sets.
+
+These containers come with large libraries of *proved lemmas* about their operations (for instance, that looking up a key you have just inserted returns the value you inserted), which is what makes it practical to verify programs that use them.
+
+</Section>
+
+<Section id="computation" kind="computation" title="A complete program: shortest path through a maze">
+
+Here is a program that puts the lesson together: arrays for the grid, a hash map for distances, loops in `Id.run`, and an early exit from `main` when the input is malformed. It finds the length of the shortest path through a maze by **breadth-first search**: explore every square one step from the start, then every square two steps away, and so on, so that the first time a square is reached is by a shortest route.
+
+```lean check
+import Std.Data.HashMap
+open Std
+
+/-- A maze: '#' is a wall, 'S' the start, 'E' the exit. -/
+def maze : Array String := #[
+  "##########",
+  "#S   #   #",
+  "# ## # # #",
+  "#  #   # #",
+  "## ##### #",
+  "#      # #",
+  "# #### #E#",
+  "##########"]
+
+abbrev Pos := Nat × Nat   -- (row, column)
+
+def cell (grid : Array (Array Char)) (p : Pos) : Char :=
+  (grid[p.1]?.bind (·[p.2]?)).getD '#'
+
+def find (grid : Array (Array Char)) (c : Char) : Option Pos := Id.run do
+  for r in [0:grid.size] do
+    for col in [0:grid[r]!.size] do
+      if grid[r]![col]! == c then return some (r, col)
+  return none
+
+def neighbours (p : Pos) : List Pos :=
+  [(p.1 + 1, p.2), (p.1, p.2 + 1)] ++
+  (if p.1 > 0 then [(p.1 - 1, p.2)] else []) ++
+  (if p.2 > 0 then [(p.1, p.2 - 1)] else [])
+
+/-- Breadth-first search: the distance from `start` to every reachable square. -/
+def distances (grid : Array (Array Char)) (start : Pos) (limit : Nat) : HashMap Pos Nat := Id.run do
+  let mut dist : HashMap Pos Nat := {}
+  dist := dist.insert start 0
+  let mut frontier := #[start]
+  -- Each round moves one step further; `limit` bounds the number of rounds.
+  for _ in [0:limit] do
+    let mut next := #[]
+    for p in frontier do
+      for q in neighbours p do
+        if cell grid q != '#' && !dist.contains q then
+          dist := dist.insert q (dist.getD p 0 + 1)
+          next := next.push q
+    if next.isEmpty then break
+    frontier := next
+  return dist
+
+def main : IO Unit := do
+  let grid := maze.map (·.toList.toArray)
+  let some start := find grid 'S' | IO.println "no start"
+  let some exit := find grid 'E' | IO.println "no exit"
+  let dist := distances grid start (grid.size * grid[0]!.size)
+  match dist.get? exit with
+  | some d => IO.println s!"The exit at {exit} is {d} steps from the start at {start}."
+  | none => IO.println "The exit cannot be reached."
+  IO.println s!"{dist.size} open squares are reachable."
+```
+
+```text
+The exit at (6, 8) is 16 steps from the start at (1, 1).
+29 open squares are reachable.
+```
+
+Some details worth studying:
+
+- `Pos` is an `abbrev` for a pair, so it automatically has the `BEq` and `Hashable` instances of pairs of numbers and can be a hash-map key.
+- `cell` treats anything outside the grid as a wall, using `Option.bind` to chain the two lookups that might fail. Combined with the `if p.1 > 0` checks in `neighbours`, which avoid the truncated `0 - 1 = 0` of `Nat`, the search can never step off the board.
+- `distances` processes the maze in rounds, one per step of distance, keeping the squares reached in the last round as the `frontier`. The `for _ in [0:limit]` loop with a `break` is deliberate: a loop over a range always ends, so `distances` is an ordinary total function. The number of squares is a safe limit, since a shortest path never visits a square twice. A `while` loop would also work, but `while` is implemented with `partial` (lesson 4), which would put the function beyond the reach of proofs.
+- `let some start := find grid 'S' | IO.println "no start"` handles the failure case first and returns from `main`, so the rest of the function can use `start` directly.
+
+</Section>
+
+<Section id="human" kind="human" title="Choosing data structures in Lean">
+
+| Need | Use | Cost |
+| --- | --- | --- |
+| recursion, pattern matching, proofs | `List` | prepend O(1); index and append O(n) |
+| indexed access, large collections | `Array` | index, push, unshared update O(1) |
+| key lookup, no order needed | `Std.HashMap`, `Std.HashSet` | O(1) expected |
+| keys in order, ranges, min and max | `Std.TreeMap`, `Std.TreeSet` | O(log n) |
+| a fixed length checked by types | `Vector` | as `Array` |
+| bytes and floats in bulk | `ByteArray`, `FloatArray` | as `Array`, unboxed |
+
+Experienced Lean programmers write the specification and the proofs about a function in terms of lists, and the fast implementation in terms of arrays, and then connect the two with a lemma; the standard library itself works this way. For ordinary programs without proofs, use `Array` by default and `List` when you are building results by consing to the front or matching on head and tail.
+
+**Measure compiled code.** `lean --run` and `#eval` interpret your program, which is convenient but much slower than the native executable that `lake build` produces; never judge performance from them. Inside a program, `timeit "label" action` runs an `IO` action and prints how long it took, and `IO.monoMsNow` reads a millisecond clock for your own measurements. As in any language, find the slow part before rewriting anything: in Lean it is very often an accidental copy of a shared array, a `List` used where an `Array` was needed, or a non-tail-recursive function over long input.
+
+Two community resources help you find your way around a library this large. The **API reference** at [lean-lang.org/doc/api](https://lean-lang.org/doc/api/) documents every function in core and Std. **[Loogle](https://loogle.lean-lang.org/)** searches by type: ask for `Array ?a → List ?a` and it lists the functions with that shape. And there is **Batteries**, a community library of extra data structures and lemmas that many projects depend on (lesson 10 shows how to add dependencies).
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Immutable arrays must be slow."** Not in Lean. An unshared array is updated in place, so pure array code runs like imperative code. The real risk is the opposite: an innocent extra reference that forces a copy on every update.
+
+</Misconception>
+
+<Misconception>
+
+**"`a[i]!` is the normal way to index."** It is the convenient way, and fine where an index has just been checked. But it hides failures: an out-of-range `a[i]!` prints an error and continues with a default value. In code that matters, prefer `a[i]?`, or a proof that the index is valid.
+
+</Misconception>
+
+<Misconception>
+
+**"A hash map remembers insertion order."** It does not, and its iteration order may change between versions of the library. Sort explicitly, or use a `TreeMap`, when order matters.
+
+</Misconception>
+
+<Misconception>
+
+**"Std is a third-party package."** Std is distributed with Lean itself and needs no dependency in your project, only an `import`. Batteries and Mathlib are separate packages that Lake downloads.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Use the definitions from the lesson; remember the imports when you try the hash-map examples yourself.
+
+<Exercises/>
+
+</Section>

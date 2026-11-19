@@ -1,0 +1,409 @@
+---
+title: Metaprogramming and macros
+subtitle: Julia code as data, expressions you can build and transform, macros that rewrite code before it runs, and when not to use any of it.
+minutes: 60
+objectives:
+  - Quote, inspect, build and evaluate Julia expressions, and explain what eval does and where it runs
+  - Transform expressions with ordinary functions and multiple dispatch
+  - Write macros, inspect them with @macroexpand, and use esc correctly to respect hygiene
+  - Generate repetitive definitions with @eval in a loop
+  - Judge when a macro is the right tool and when a function is better
+prerequisites: [modules-packages-and-testing]
+related: [math.comp.lambda-calculus]
+references:
+  - title: Julia manual, Metaprogramming
+    url: https://docs.julialang.org/en/v1/manual/metaprogramming/
+    note: Expressions, quoting, interpolation, eval, macros, hygiene and generated functions.
+  - title: Julia ASTs (developer documentation)
+    url: https://docs.julialang.org/en/v1/devdocs/ast/
+    note: The full list of expression heads and how surface syntax maps to them.
+  - title: JuMP.jl
+    url: https://jump.dev/
+    note: A modelling language for mathematical optimisation built with macros, a good example of a well-designed DSL.
+---
+
+<Section id="motivation" kind="motivation" title="Programs that write programs">
+
+You have been using macros since the first lesson: `@show`, `@time`, `@test`, `@view`, `@.`. Each of them does something an ordinary function cannot. `@show x + y` prints the *text* `x + y` as well as its value, yet a function would only ever see the value. `@.` rewrites a whole expression, putting a dot on every operation. `@test` captures the expression so that, when a test fails, it can tell you which comparison failed and what the operands were.
+
+What makes this possible is that Julia, like Lisp before it, represents its own code as ordinary data: trees of `Expr` objects that a program can build, inspect and transform. **Metaprogramming** is writing code that works on code. It is powerful, it is the basis of some of Julia's best packages, and it is also the easiest way to write code nobody else can read. This lesson teaches the mechanics and, just as importantly, the judgement.
+
+</Section>
+
+<Section id="history" kind="history" title="A Lisp in disguise">
+
+Julia's creators listed Lisp-style macros among their wishes in the 2012 announcement, and the influence runs deep. In Lisp, programs are written as nested lists, the same data structure the programs manipulate, a property called **homoiconicity**. Julia's surface syntax looks nothing like Lisp, but under it every program is parsed into a tree of `Expr` objects, and that tree is ordinary data available to Julia code, so Julia gets most of the benefits of homoiconicity without the parentheses.
+
+For most of Julia's history the parser was itself written in Lisp: a small Scheme dialect called femtolisp, embedded in the Julia runtime. Since Julia 1.10, the default parser is JuliaSyntax.jl, written in Julia, which produces much better error messages and keeps precise source positions for tools. Either way the result is the same `Expr` tree, which is why macros written a decade ago still work.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Expressions">
+
+<Definition term="Expression, symbol, quoting">
+
+An **expression** (`Expr`) is a node in Julia's syntax tree, with a `head` saying what kind of node it is (`:call`, `:(=)`, `:if`, `:block` and so on) and a vector of `args`, which may be other expressions, **symbols** (names, such as `:width`) or literal values. **Quoting**, with `:( ... )` or `quote ... end`, turns code into an expression instead of running it.
+
+</Definition>
+
+```julia check
+# Code is data: Julia programs can build and inspect Julia expressions.
+ex = :(area = width * height + 2)       # a quoted expression; nothing is evaluated
+println(typeof(ex), " with head ", repr(ex.head), " and args ", ex.args)
+
+rhs = ex.args[2]
+println("right-hand side: ", rhs, ", which is a call to ", rhs.args[1])
+dump(:(width * height))                  # the full tree
+
+# Parsing a string gives the same kind of object
+parsed = Meta.parse("width * height + 2")
+println(parsed == rhs)
+
+# Expressions can be built and changed like any other data
+rhs.args[1] = :-                          # replace + by -
+println(ex)
+built = Expr(:call, :max, :width, :height, 10)
+println(built)
+
+# Interpolation splices values (or other expressions) into a quote
+n = 3
+println(:(x^$n + $(built)))
+
+# eval runs an expression at the top level of the current module
+width, height = 4, 5
+eval(ex)
+println("area = ", area)
+println(eval(built))
+```
+
+It prints:
+
+```text
+Expr with head :(=) and args Any[:area, :(width * height + 2)]
+right-hand side: width * height + 2, which is a call to +
+Expr
+  head: Symbol call
+  args: Array{Any}((3,))
+    1: Symbol *
+    2: Symbol width
+    3: Symbol height
+true
+area = width * height - 2
+max(width, height, 10)
+x ^ 3 + max(width, height, 10)
+area = 18
+10
+```
+
+Walk through it:
+
+- `:(area = width * height + 2)` produced an `Expr` whose head is `:(=)` (assignment) and whose arguments are the symbol `:area` and another expression, the right-hand side. That in turn is a `:call` whose first argument is the function, `:+`. Every operator is a function call in the tree; `width * height` is `Expr(:call, :*, :width, :height)`, as `dump` shows.
+- `Meta.parse` turns a string into the same kind of tree: parsing is how the REPL gets from text to code.
+- Because an expression is mutable data, you can change it. Replacing `:+` by `:-` changed the expression to `area = width * height - 2`, and `Expr(:call, :max, ...)` built a call from scratch.
+- Inside a quote, **`$`** interpolates, just as in strings: `:(x^$n + $(built))` spliced in the *value* 3 and the *expression* `built`.
+- **`eval`** runs an expression, always at the **top level of the current module**, as if you had typed it there. That is why `eval(ex)` created a global variable `area`. It cannot see a function's local variables, and code that calls `eval` inside a function to compute something is almost always a mistake; its proper use is defining things, as you will see below.
+
+### A map of the tree
+
+You do not need to memorise the heads, because `dump` and `Meta.parse` will always tell you, but a handful appear constantly. Each row below was checked by parsing the code with `Meta.parse` and reading its `head`:
+
+| Code | Head | Arguments |
+| --- | --- | --- |
+| `f(x, y)`, `x + y` | `:call` | the function, then the arguments |
+| `x = 1` | `:(=)` | the target and the value |
+| `a[i]` | `:ref` | the collection, then the indices |
+| `[1, 2]` / `(1, 2)` | `:vect` / `:tuple` | the elements |
+| `obj.field` | `:.` | the object and the quoted field name |
+| `x -> x + 1` | `:->` | the arguments and the body |
+| `if`, `for`, `function` | `:if`, `:for`, `:function` | the condition or header, then the body |
+| `begin ... end` | `:block` | the statements, with line-number nodes between them |
+| `a && b` | `:&&` | the two operands (short-circuiting is not a function call) |
+| `@time f(x)` | `:macrocall` | the macro name, a source location, then the arguments |
+
+The developer documentation page on Julia ASTs, linked below, lists all of them.
+
+### Transforming expressions: symbolic differentiation
+
+Since expressions are data, functions can transform them, and multiple dispatch is a natural fit: a derivative rule for a number, one for a symbol, one for a compound expression. The following program differentiates simple expressions symbolically, tidies the result, and then turns it into a real, compiled function.
+
+```julia check
+# Symbolic differentiation of Julia expressions, by multiple dispatch on Symbol, Number and Expr.
+d(c::Number, x::Symbol) = 0
+d(s::Symbol, x::Symbol) = s == x ? 1 : 0
+
+function d(ex::Expr, x::Symbol)
+    ex.head == :call || error("cannot differentiate $(ex)")
+    op, args = ex.args[1], ex.args[2:end]
+    if op == :+
+        return Expr(:call, :+, (d(a, x) for a in args)...)
+    elseif op == :- && length(args) == 2
+        return :($(d(args[1], x)) - $(d(args[2], x)))
+    elseif op == :* && length(args) == 2          # product rule
+        u, v = args
+        return :($(d(u, x)) * $v + $u * $(d(v, x)))
+    elseif op == :^ && args[2] isa Number         # power rule, constant exponent
+        u, n = args
+        return :($n * $u ^ $(n - 1) * $(d(u, x)))
+    elseif op == :sin
+        return :(cos($(args[1])) * $(d(args[1], x)))
+    elseif op == :cos
+        return :(-(sin($(args[1]))) * $(d(args[1], x)))
+    elseif op == :exp
+        return :(exp($(args[1])) * $(d(args[1], x)))
+    end
+    error("no rule for $op")
+end
+
+# A few simplifications so the results stay readable
+simplify(e) = e
+function simplify(ex::Expr)
+    ex.head == :call || return ex
+    args = map(simplify, ex.args[2:end])
+    op = ex.args[1]
+    if op == :*
+        any(==(0), args) && return 0
+        args = filter(!=(1), args)
+        isempty(args) && return 1
+        length(args) == 1 && return args[1]
+    elseif op == :+
+        args = filter(!=(0), args)
+        isempty(args) && return 0
+        length(args) == 1 && return args[1]
+    elseif op == :^ && args[2] == 1
+        return args[1]
+    end
+    all(a -> a isa Number, args) && return eval(Expr(:call, op, args...))
+    return Expr(:call, op, args...)
+end
+
+for f in (:(x^3 + 2x), :(sin(x) * x), :(exp(3x)), :(cos(x^2)))
+    println("d/dx ", f, " = ", simplify(d(f, :x)))
+end
+
+# Turn a derivative into a real, compiled function and compare with a finite difference
+f_expr = :(sin(x) * x)
+@eval fprime(x) = $(simplify(d(f_expr, :x)))
+@eval f(x) = $f_expr
+h = 1e-6
+println(fprime(2.0), " ≈ ", (f(2.0 + h) - f(2.0 - h)) / 2h)
+```
+
+It prints:
+
+```text
+d/dx x ^ 3 + 2x = 3 * x ^ 2 + 2
+d/dx sin(x) * x = cos(x) * x + sin(x)
+d/dx exp(3x) = exp(3x) * 3
+d/dx cos(x ^ 2) = -(sin(x ^ 2)) * (2x)
+0.0770037537313969 ≈ 0.07700375370678358
+```
+
+The core is about thirty lines: the sum, difference, product and power rules, and three elementary functions. The `simplify` pass removes multiplications by 0 and 1 and additions of 0, which is why `d/dx (x^3 + 2x)` comes out as `3 * x ^ 2 + 2` rather than a tangle of `1`s and `0`s. Then `@eval fprime(x) = $(...)` splices the derivative into a function definition and evaluates it at the top level, so `fprime` is an ordinary Julia function, compiled to machine code, and its value at 2 agrees with a central finite difference to about eight digits, which is what a step of $10^{-6}$ allows. Real computer-algebra packages such as Symbolics.jl are built on the same foundations, with far more rules and a serious simplifier.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Macros">
+
+<Definition term="Macro">
+
+A **macro** is a function that runs when code is *parsed*, before it is compiled. It receives its arguments as unevaluated expressions (symbols, literals and `Expr`s) and returns a new expression, which replaces the macro call in the program. This replacement is called **macro expansion**.
+
+</Definition>
+
+```julia check
+# Macros: functions from expressions to expressions, run before the code is compiled.
+
+# 1. A new control-flow construct
+macro unless(condition, body)
+    return :(if !$(esc(condition)); $(esc(body)); end)
+end
+
+stock = 0
+@unless stock > 0 println("out of stock: reorder")
+
+# 2. Seeing the code a macro produces
+expanded = @macroexpand @unless stock > 0 println("reorder")
+println(Base.remove_linenums!(expanded))
+
+# 3. A macro gets the *expression*, so it can print the source text as well as the value
+macro inspect(exprs...)
+    blocks = [:(println($(string(e)), " → ", repr($(esc(e))))) for e in exprs]
+    return Expr(:block, blocks...)
+end
+
+r = 2.5
+@inspect r π * r^2 round(Int, π * r^2) uppercase("lumen")
+
+# 4. Hygiene: variables a macro introduces cannot clash with the caller's
+macro logged(label, ex)
+    return quote
+        println("starting ", $label)
+        value = $(esc(ex))           # hygiene renames this `value` behind the scenes
+        println("finished ", $label)
+        value
+    end
+end
+
+value = "the caller's own value"
+result = @logged "summing squares" sum(k^2 for k in 1:1000)
+println(result, ", and value is still ", repr(value))
+
+# 5. Macros you already know are ordinary macros too
+println(@macroexpand(@assert r > 0) |> Base.remove_linenums!)
+```
+
+It prints:
+
+```text
+out of stock: reorder
+if !(stock > 0)
+    println("reorder")
+end
+r → 2.5
+π * r ^ 2 → 19.634954084936208
+round(Int, π * r ^ 2) → 20
+uppercase("lumen") → "LUMEN"
+starting summing squares
+finished summing squares
+333833500, and value is still "the caller's own value"
+if r > 0
+    nothing
+else
+    Base.throw(Base.AssertionError("r > 0"))
+end
+```
+
+Five lessons in one program:
+
+1. **`@unless`** adds a control-flow construct that Julia does not have. The macro receives `stock > 0` and `println(...)` as expressions and returns an `if` built around them. Nothing is evaluated until the resulting code runs.
+2. **`@macroexpand`** shows the code a macro generates. It is the first tool to reach for when a macro misbehaves. (`Base.remove_linenums!` strips the source-location comments that would otherwise clutter the output.)
+3. **`@inspect`** shows why macros exist at all: it receives `π * r^2` as an expression, so it can print the source text with `string(e)` *and* insert code that evaluates it. A function would see only `19.63...`. This is exactly how `@show` works.
+4. **Hygiene.** The `@logged` macro uses a variable called `value`. If the macro's generated code simply contained the name `value`, it would overwrite the caller's variable of the same name. Julia's macro system prevents this automatically by renaming variables that a macro introduces, which is called **hygiene**: the caller's `value` survived untouched.
+5. **`@assert`** is an ordinary macro from Base; expanding it shows the `if` and the `AssertionError` it generates, including the source text `"r > 0"` for the message.
+
+### esc: whose variables are these?
+
+Hygiene works in both directions, and this is the part people get wrong. By default, names in a macro's output refer to the module **where the macro was defined**, not to the code where it is used. To make an expression from the caller mean what the caller meant, the macro must wrap it in **`esc`**, as `@unless` did. Here is the same macro written carelessly, without `esc`:
+
+```text
+julia> macro careless_unless(condition, body)
+           return :(if !$condition; $body; end)
+       end
+@careless_unless (macro with 1 method)
+
+julia> function restock(level)
+           @careless_unless level > 0 println("reorder now")
+       end
+restock (generic function with 1 method)
+
+julia> restock(0)
+ERROR: UndefVarError: `level` not defined in `Main`
+Suggestion: check for spelling errors or missing imports.
+(the rest of the message is omitted here)
+
+julia> @macroexpand @careless_unless level > 0 println("reorder now")
+:(if !(Main.level > 0)
+      #= REPL:2 =#
+      Main.println("reorder now")
+  end)
+```
+
+The expansion says it all: `level` became `Main.level`, a global in the macro's module, instead of the function's argument. The rule is simple to state: **escape every expression that came from the user**, and leave unescaped only the names your macro introduces for itself.
+
+### Generating code with @eval
+
+The most common use of `eval` in real packages is to generate many similar definitions at the top level of a module:
+
+```julia check
+# Generating many similar definitions with @eval in a loop
+const FACTORS = Dict(:km => 1000.0, :mi => 1609.344, :nmi => 1852.0, :ft => 0.3048)
+
+for (from, f1) in FACTORS, (to, f2) in FACTORS
+    from == to && continue
+    name = Symbol(from, "_to_", to)
+    @eval $name(x) = x * $(f1 / f2)
+end
+
+println(round(km_to_mi(42.195); digits = 3), " miles in a marathon")
+println(round(nmi_to_km(1); digits = 3), " km in a nautical mile")
+println(round(Int, mi_to_ft(1)), " feet in a mile")
+println(length(FACTORS) * (length(FACTORS) - 1), " functions defined, e.g. ", ft_to_km)
+
+# The same idea defines operators on a type without repetitive code
+struct Celsius
+    t::Float64
+end
+for op in (:+, :-)
+    @eval Base.$op(a::Celsius, b::Celsius) = Celsius($op(a.t, b.t))
+end
+for op in (:<, :(==))
+    @eval Base.$op(a::Celsius, b::Celsius) = $op(a.t, b.t)
+end
+println(Celsius(21.5) + Celsius(3.0), " ", Celsius(10) < Celsius(12), " ", Celsius(5) == Celsius(5.0))
+```
+
+It prints:
+
+```text
+26.219 miles in a marathon
+1.852 km in a nautical mile
+5280 feet in a mile
+12 functions defined, e.g. ft_to_km
+Celsius(24.5) true true
+```
+
+The loop wrote twelve conversion functions and then the arithmetic and comparison methods for a small `Celsius` type. Each `@eval` interpolates a *symbol*, such as `$name` or `$op`, into a definition. Notice that `$(f1 / f2)` is computed while the loop runs, so each generated function contains its conversion factor as a constant. Base uses this pattern extensively, for example to define arithmetic for all the integer types at once.
+
+</Section>
+
+<Section id="human" kind="human" title="Macros as professionals use them">
+
+**Prefer functions.** A macro is justified only when you need something a function cannot do: access to the unevaluated expression (`@show`, `@test`, `@assert`), new syntax or control flow (`@unless`, `@threads`), changing how code is compiled (`@inbounds`, `@simd`, `@fastmath`), or definitions generated at the top level (`@kwdef`, `@enum`). If a function would do the job, write a function. It is easier to read, to test, to document and to compose, and others can pass it to `map`.
+
+**Keep the generated code small.** A good macro does a little syntactic rewriting and then calls an ordinary function that does the real work. That function can be tested and debugged normally, and the macro stays short enough to read in its `@macroexpand` output.
+
+**Domain-specific languages.** The most impressive macro-based packages define small languages inside Julia. In JuMP, an optimisation model reads almost like the mathematics:
+
+```julia
+using JuMP, HiGHS
+model = Model(HiGHS.Optimizer)
+@variable(model, 0 <= wheat <= 40)
+@variable(model, 0 <= maize <= 30)
+@constraint(model, wheat + maize <= 50)
+@objective(model, Max, 3wheat + 2maize)
+optimize!(model)
+```
+
+The macros receive expressions such as `wheat + maize <= 50`, analyse their structure, and build efficient data structures for a solver, instead of evaluating them as ordinary arithmetic. ModelingToolkit.jl and Turing.jl do similar things for differential equations and probabilistic models. (This example needs the JuMP and HiGHS packages, so it is shown as plain code.)
+
+**Know the related tools.** **Generated functions** (`@generated`) produce a function body from the argument *types* at compile time; they are an expert tool for unrolling loops over tuple lengths and similar tricks. **String macros** such as `r"[0-9]+"` (a regular expression), `big"1.5"` and `raw"C:\path"` are macros whose name ends in `_str`, and you can define your own. And Julia 1.13 began moving macro expansion to a more principled scoping implementation: `macroexpand` gained a `legacyscope` keyword, and the old behaviour will eventually stop being the default. Macros that use `esc` correctly are not affected.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"A macro runs every time the line runs."** A macro runs *once*, when the code containing it is parsed and expanded. The code it returns is what runs every time. That is why a macro cannot see the values of the caller's variables, only their names.
+
+</Misconception>
+
+<Misconception>
+
+**"`eval` evaluates in the current scope, like Python's `eval`."** Julia's `eval` always evaluates in the global scope of a module and cannot see local variables. If you find yourself building an expression from local values just to `eval` it, you almost certainly want a closure or a higher-order function instead.
+
+</Misconception>
+
+<Misconception>
+
+**"Macros make code faster."** Some macros change how code is compiled (`@inbounds`, `@simd`), but a macro as such adds no speed: it only produces code that you could have written by hand. Julia's speed comes from type specialisation, which works the same with or without macros.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

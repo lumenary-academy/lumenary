@@ -1,0 +1,447 @@
+---
+title: Coroutines and structured concurrency
+subtitle: Suspend functions and how the compiler implements them, a hand-built scheduler, and the kotlinx.coroutines library's builders, scopes, cancellation, dispatchers and flows.
+minutes: 70
+objectives:
+  - Explain what a suspend function is and how suspension differs from blocking a thread
+  - Describe how the compiler turns suspend functions into continuation-passing code, and observe it
+  - Build sequences and a tiny scheduler from the standard library's coroutine primitives
+  - Use launch, async, runBlocking and coroutineScope from kotlinx.coroutines
+  - Explain structured concurrency, including how failures and cancellation propagate
+  - Use dispatchers, withContext, timeouts and flows, and avoid the common mistakes
+prerequisites: [generics-and-variance]
+references:
+  - title: "Coroutines guide (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/coroutines-guide.html
+    note: The official guide to kotlinx.coroutines, from basics to flows and channels.
+  - title: kotlinx.coroutines on GitHub
+    author: JetBrains
+    url: https://github.com/Kotlin/kotlinx.coroutines
+    note: The library's source, releases and the dependency coordinates to add it to a project.
+  - title: "Asynchronous Flow (Kotlin documentation)"
+    author: JetBrains
+    url: https://kotlinlang.org/docs/flow.html
+    note: Cold streams of values built on coroutines.
+  - title: "Kotlin coroutines on Android"
+    author: Google
+    url: https://developer.android.com/kotlin/coroutines
+    note: How Android apps use coroutines with lifecycle-aware scopes.
+  - title: "KEEP: Kotlin coroutines design document"
+    author: JetBrains
+    url: https://github.com/Kotlin/KEEP/blob/master/proposals/coroutines.md
+    note: The original design of suspend functions and continuations in the language.
+---
+
+<Section id="motivation" kind="motivation" title="Waiting without wasting">
+
+An Android app must fetch a user's profile from a server and then show it. The network takes half a second. If the app simply calls a blocking function on the main thread, the screen freezes for half a second, and Android may decide the app is not responding. A server handling ten thousand simultaneous requests, each waiting on a database, has the same problem at scale: a thread per waiting request is expensive.
+
+The traditional fixes are callbacks ("call this function when the data arrives") and futures. Both work, and both turn straightforward code ("get the user, then get their orders, then show them") into nests of callbacks or chains of `thenApply` that are hard to read, hard to debug, and very hard to cancel correctly.
+
+Kotlin's answer is the **coroutine**: code that is written sequentially, like blocking code, but that can **suspend** at certain points, giving its thread back to do other work, and **resume** later where it left off. The language provides one small feature, the `suspend` modifier, and the compiler machinery behind it. Everything else (launching coroutines, running them on thread pools, cancelling them, combining their results) lives in a library, **kotlinx.coroutines**, maintained by JetBrains. That split shapes this lesson. The checked programs use only the standard library, to show what suspension really is; the library examples are shown in plain code blocks, and their output comes from running them with kotlinx.coroutines on the class path.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="A cook, not a crowd of cooks">
+
+<Analogy>
+
+A single cook makes rice, stew and fried plantain for dinner. She does not stand watching the rice for eighteen minutes. She starts it, turns to the stew, and comes back when a timer rings. At any moment she is doing one thing, but three dishes are in progress. A **blocking** program is a kitchen that needs one cook per pot, each standing idle while their pot simmers. A program with coroutines is the single cook with timers: each dish is a coroutine, each "wait for the timer" is a suspension, and the cook is a thread that is never idle while there is work to do.
+
+</Analogy>
+
+When a coroutine suspends, the information needed to continue it later (which line it was on, the values of its local variables) is saved in an object called a **continuation**. The thread is then free. When the awaited thing happens (a timer fires, a network reply arrives), someone calls the continuation's `resume`, and the coroutine carries on from where it stopped, possibly on a different thread. Nothing is blocked while it waits; it simply is not running.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="Suspend function">
+
+A function declared with `suspend`. It may call other suspend functions, which are its possible **suspension points**, and it may only be called from another suspend function or from a coroutine. Calls look exactly like ordinary calls.
+
+</Definition>
+
+<Definition term="Continuation">
+
+An object representing "the rest of the computation" after a suspension point, with a `resume` method. The compiler passes one as a hidden extra parameter to every suspend function and turns the function's body into a state machine that can stop and restart at each suspension point.
+
+</Definition>
+
+<Definition term="Coroutine builder and scope (kotlinx.coroutines)">
+
+Functions that start coroutines: `launch` (start, no result, returns a `Job`), `async` (start, returns a `Deferred` whose `await()` gives the result), `runBlocking` (bridge from ordinary code; blocks the current thread until done), and `coroutineScope` (a suspend function that opens a scope and waits for everything started in it). Every coroutine runs in a **CoroutineScope**.
+
+</Definition>
+
+<Definition term="Structured concurrency">
+
+The rule that every coroutine has a parent scope, a scope does not finish until all its children have finished, a failure in a child cancels its siblings and the parent, and cancelling a parent cancels its children. Concurrent work is therefore bounded by a block of code, just like a function call.
+
+</Definition>
+
+<Definition term="Dispatcher">
+
+Decides which thread or threads a coroutine runs on: `Dispatchers.Default` (a pool sized to the CPU cores, for computation), `Dispatchers.IO` (a larger pool for blocking I/O), and `Dispatchers.Main` (the UI thread on Android and desktop).
+
+</Definition>
+
+</Section>
+
+<Section id="inside" kind="computation" title="Suspension, seen from the inside">
+
+You have already used a coroutine. The `sequence { ... }` builder from <LessonLink slug="collections-and-sequences">Collections, sequences and scope functions</LessonLink> runs its block as a coroutine that suspends at each `yield`. Printing from inside it shows the hand-offs:
+
+```kotlin check
+fun main() {
+    val numbers = sequence {
+        println("  generator: start")
+        yield(1)
+        println("  generator: resumed after 1")
+        yield(2)
+        println("  generator: resumed after 2, finishing")
+    }
+
+    val iterator = numbers.iterator()
+    println("asking for the first value")
+    println("got ${iterator.next()}")
+    println("asking for the second value")
+    println("got ${iterator.next()}")
+    println("more? ${iterator.hasNext()}")
+}
+```
+
+```text
+asking for the first value
+  generator: start
+got 1
+asking for the second value
+  generator: resumed after 1
+got 2
+  generator: resumed after 2, finishing
+more? false
+```
+
+Nothing in the generator runs until the first `next()`. It then runs up to `yield(1)` and *suspends*, with its position saved, and `next()` returns 1. The second `next()` resumes it right after the first `yield`. Two pieces of code take turns on one thread, each picking up exactly where it stopped.
+
+How does a function stop in the middle and continue later on the JVM, which has no such feature? The compiler rewrites it. Compare the bytecode signatures of an ordinary function and a suspend function:
+
+```kotlin check
+suspend fun fetchPrice(productId: Int): Long = productId * 100L
+
+fun regularPrice(productId: Int): Long = productId * 100L
+
+fun main() {
+    for (name in listOf("regularPrice", "fetchPrice")) {
+        val method = Class.forName("MainKt").declaredMethods.first { it.name == name }
+        val params = method.parameterTypes.joinToString { it.name }
+        println("$name($params): ${method.returnType.name}")
+    }
+}
+```
+
+```text
+regularPrice(int): long
+fetchPrice(int, kotlin.coroutines.Continuation): java.lang.Object
+```
+
+The suspend function has gained a hidden `Continuation` parameter, and its return type has become `Object`. This is **continuation-passing style**: the caller hands over "what to do next", and the function either returns its result directly or returns a special marker meaning "I have suspended; I will call your continuation when I am done". Inside, the body becomes a state machine whose state records which suspension point it reached, with local variables saved in fields. That is why suspend functions can only be called from other suspend functions: someone has to supply the continuation.
+
+</Section>
+
+<Section id="scheduler" kind="computation" title="A scheduler in about sixty lines">
+
+The standard library provides the primitives a coroutine library is built from: `startCoroutine` to start a suspend block, `suspendCoroutine` to capture the current continuation, and `resume` to continue one. With them, here is a complete single-threaded scheduler with a virtual clock, running the cook's dinner from the analogy:
+
+```kotlin check
+import java.util.PriorityQueue
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.EmptyCoroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.startCoroutine
+import kotlin.coroutines.suspendCoroutine
+
+/** A toy single-threaded scheduler with a virtual clock, built only from the standard library. */
+class Kitchen {
+    private class Wakeup(val at: Long, val order: Long, val continuation: Continuation<Unit>)
+
+    private val queue = PriorityQueue<Wakeup>(compareBy<Wakeup> { it.at }.thenBy { it.order })
+    private var order = 0L
+    var now = 0L
+        private set
+
+    /** Starts a task; it runs until its first suspension, then waits in the queue. */
+    fun start(task: suspend () -> Unit) {
+        task.startCoroutine(Continuation(EmptyCoroutineContext) { result -> result.getOrThrow() })
+    }
+
+    /** Suspends the calling task: store its continuation, to be resumed when the clock reaches it. */
+    suspend fun wait(minutes: Long) = suspendCoroutine { continuation ->
+        queue += Wakeup(now + minutes, order++, continuation)
+    }
+
+    fun log(message: String) = println("[minute ${now.toString().padStart(2)}] $message")
+
+    /** The event loop: repeatedly wake the task whose time has come. */
+    fun run() {
+        while (queue.isNotEmpty()) {
+            val next = queue.poll()
+            now = next.at
+            next.continuation.resume(Unit)
+        }
+    }
+}
+
+fun main() {
+    val kitchen = Kitchen()
+
+    kitchen.start {
+        kitchen.log("rice: rinse and start simmering")
+        kitchen.wait(18)
+        kitchen.log("rice: done")
+    }
+    kitchen.start {
+        kitchen.log("stew: start browning onions")
+        kitchen.wait(5)
+        kitchen.log("stew: add tomatoes and spices")
+        kitchen.wait(20)
+        kitchen.log("stew: done")
+    }
+    kitchen.start {
+        kitchen.log("plantain: wait until near the end")
+        kitchen.wait(15)
+        kitchen.log("plantain: start frying")
+        kitchen.wait(6)
+        kitchen.log("plantain: done")
+    }
+
+    kitchen.run()
+    println("dinner ready after ${kitchen.now} minutes, cooked by one cook (one thread)")
+}
+```
+
+```text
+[minute  0] rice: rinse and start simmering
+[minute  0] stew: start browning onions
+[minute  0] plantain: wait until near the end
+[minute  5] stew: add tomatoes and spices
+[minute 15] plantain: start frying
+[minute 18] rice: done
+[minute 21] plantain: done
+[minute 25] stew: done
+dinner ready after 25 minutes, cooked by one cook (one thread)
+```
+
+Each task is written as straight-line code with waits in it. `kitchen.wait(18)` calls `suspendCoroutine`, which hands the task's continuation to the lambda; the lambda files it in a priority queue under its wake-up time and returns, and the task is now suspended, so `start` returns to `main`. After all three tasks are parked, `run` is the **event loop**: take the earliest wake-up, advance the clock, and `resume` that continuation, which runs the task until its next `wait` (or its end). The dishes interleave by minute, the total is 25 virtual minutes rather than 18 + 25 + 21, and everything happened on one thread.
+
+This toy has the essential structure of real coroutine libraries: continuations saved at suspension points, and a dispatcher that decides when and where to resume them. kotlinx.coroutines adds real timers, thread pools, cancellation, error propagation and structured scopes on top. You will never need to write this yourself, but having seen it, nothing about `delay` or `await` should feel like magic.
+
+</Section>
+
+<Section id="library" kind="examples" title="kotlinx.coroutines: launch, async and runBlocking">
+
+Real projects add the library as a dependency (in Gradle, `implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:VERSION")`, with the current version from the [project's GitHub page](https://github.com/Kotlin/kotlinx.coroutines)). The examples in the rest of this lesson need it, so they are plain blocks; each output shown is from running the program with the library on the class path.
+
+```kotlin
+import kotlinx.coroutines.*
+
+suspend fun fetchUser(id: Int): String {
+    delay(100)                          // suspends the coroutine, does not block the thread
+    return "user-$id"
+}
+
+suspend fun fetchOrders(id: Int): List<String> {
+    delay(150)
+    return listOf("order-${id}a", "order-${id}b")
+}
+
+fun main() = runBlocking {
+    val start = System.currentTimeMillis()
+
+    // Sequential by default: one call after the other
+    val user = fetchUser(7)
+    val orders = fetchOrders(7)
+    println("$user has ${orders.size} orders (sequential)")
+
+    // Concurrent when you ask for it: async starts both, await waits for each result
+    val u = async { fetchUser(8) }
+    val o = async { fetchOrders(8) }
+    println("${u.await()} has ${o.await().size} orders (concurrent)")
+
+    // launch starts a coroutine that returns no result; join waits for it
+    val jobs = List(3) { i -> launch { delay(50L * (3 - i)); println("job $i done") } }
+    jobs.joinAll()
+
+    val elapsed = System.currentTimeMillis() - start
+    println("elapsed under 600 ms: ${elapsed < 600}")
+}
+```
+
+```text
+user-7 has 2 orders (sequential)
+user-8 has 2 orders (concurrent)
+job 2 done
+job 1 done
+job 0 done
+elapsed under 600 ms: true
+```
+
+Three things to take from it. First, **code is sequential by default**: two suspend calls in a row run one after the other, exactly as they read (250 ms). Concurrency is explicit: wrap work in `async` to start it, and `await` to get its result; the two concurrent fetches take about 150 ms together. Second, `delay` **suspends** rather than blocks: all of this runs on the single thread that `runBlocking` occupies, and the three `launch`ed jobs finish in order of their delays, not of their creation. Third, `runBlocking` is a bridge for `main` functions and tests; production code inside a framework is given a scope instead and never calls it.
+
+</Section>
+
+<Section id="structured" kind="examples" title="Structured concurrency: failure, timeouts and cancellation">
+
+```kotlin
+import kotlinx.coroutines.*
+
+suspend fun loadDashboard(failPrices: Boolean): String = coroutineScope {
+    val news = async {
+        delay(200)
+        println("  news finished")
+        "3 headlines"
+    }
+    val prices = async {
+        delay(50)
+        if (failPrices) throw IllegalStateException("price service down")
+        "12 prices"
+    }
+    "${news.await()}, ${prices.await()}"
+}
+
+fun main() = runBlocking {
+    println(loadDashboard(failPrices = false))
+    try {
+        println(loadDashboard(failPrices = true))
+    } catch (e: IllegalStateException) {
+        println("dashboard failed: ${e.message}")      // and the news request was cancelled
+    }
+
+    val result = withTimeoutOrNull(100) {
+        delay(1_000)
+        "too slow"
+    }
+    println("timeout result: $result")
+
+    val job = launch {
+        try {
+            repeat(10) { i ->
+                println("  working $i")
+                delay(100)                              // a suspension point: cancellation is checked here
+            }
+        } finally {
+            println("  cleaning up")
+        }
+    }
+    delay(250)
+    job.cancelAndJoin()
+    println("cancelled: ${job.isCancelled}")
+}
+```
+
+```text
+  news finished
+3 headlines, 12 prices
+dashboard failed: price service down
+timeout result: null
+  working 0
+  working 1
+  working 2
+  cleaning up
+cancelled: true
+```
+
+This is the heart of the library's design. `coroutineScope` opens a scope for the two `async` children and does not return until both are finished. In the second call, the price request fails after 50 ms; the scope immediately **cancels its other child**, which is why "news finished" is printed only once, and rethrows the failure to the caller, who handles it like any exception from a function call. No request is left running in the background, no result arrives after nobody is listening, and no failure is silently lost.
+
+**Cancellation is cooperative.** Cancelling a job does not kill a thread; it makes the job's next suspension point (here, `delay`) throw a `CancellationException`. The `finally` block runs, so resources are released. A loop that computes without ever suspending will not notice cancellation unless it checks, with `ensureActive()` or `yield()`. `withTimeoutOrNull` uses the same mechanism to give up after a deadline and return `null`.
+
+</Section>
+
+<Section id="dispatchers-flows" kind="examples" title="Dispatchers, withContext and flows">
+
+```kotlin
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+// A cold flow: the block runs again for every collector
+fun temperatures(): Flow<Int> = flow {
+    for (t in listOf(21, 23, 26, 30, 27)) {
+        delay(10)
+        emit(t)
+    }
+}
+
+suspend fun readReport(): String = withContext(Dispatchers.IO) {   // move blocking work off the caller's thread
+    Thread.sleep(20)                                                 // stands in for blocking file or network I/O
+    "report from ${Thread.currentThread().name.substringBefore("-worker")}"
+}
+
+fun main() = runBlocking {
+    temperatures()
+        .filter { it >= 25 }
+        .map { "$it C" }
+        .collect { println("hot: $it") }
+    println("max: ${temperatures().toList().max()}")
+
+    println(readReport())
+}
+```
+
+```text
+hot: 26 C
+hot: 30 C
+hot: 27 C
+max: 30
+report from DefaultDispatcher
+```
+
+**`withContext(Dispatchers.IO)`** runs a block on another dispatcher and suspends the caller until it finishes. It is how you call blocking APIs (old JDBC drivers, file I/O, legacy libraries) without blocking the thread a coroutine was running on: on Android, never block the main thread; on a server, never block the threads of `Dispatchers.Default`. The thread name shows the block ran on one of the library's worker threads.
+
+A **`Flow`** is an asynchronous sequence: values arrive over time, and operators such as `filter` and `map` transform them as they pass. Flows are **cold**: the `flow { ... }` block runs anew for each collector, which is why `temperatures()` produced values twice. Flows are the standard way to model streams of updates: database query results that change, user-interface state, messages from a server. The library also offers hot variants (`StateFlow`, `SharedFlow`) for state that many observers watch, and `Channel`s for passing values between coroutines.
+
+</Section>
+
+<Section id="practice" kind="human" title="Coroutines in professional code">
+
+- **Use the scope your platform gives you.** On Android, `viewModelScope` and `lifecycleScope` cancel their coroutines automatically when the screen goes away. Server frameworks (Ktor, Spring with Kotlin) run request handlers as coroutines in a scope tied to the request. Avoid `GlobalScope`: coroutines launched there belong to no one, are cancelled by no one, and leak.
+- **Make suspend functions main-safe.** A well-behaved suspend function can be called from any thread, including the UI thread: if it does blocking work, it switches to `Dispatchers.IO` internally with `withContext`. Callers should not need to know.
+- **Never swallow `CancellationException`.** A `catch (e: Exception)` around suspending code also catches cancellation and can keep a cancelled coroutine running. Rethrow it, or catch narrower exception types.
+- **Test with virtual time.** The `kotlinx-coroutines-test` library's `runTest` skips `delay`s instantly with a virtual clock, much like the toy kitchen, so a test of a 30-second timeout runs in milliseconds.
+- **Coroutines and Java's virtual threads.** JDK 21's virtual threads also make waiting cheap, by making blocking calls cheap instead of by suspending. They are complementary: coroutines bring structured concurrency, cancellation and flows to Kotlin code on every platform (including Android, Kotlin/Native and the browser), while virtual threads help blocking Java libraries. Coroutines can even be dispatched onto virtual threads.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A coroutine is a lightweight thread."** It is a computation that can suspend and resume. Coroutines *run on* threads, possibly hopping between them; many coroutines share a few threads, which is what makes them cheap.
+
+</Misconception>
+
+<Misconception>
+
+**"Marking a function `suspend` makes it run in the background."** `suspend` only means the function *may* suspend. A suspend function that calls `Thread.sleep` or does heavy computation still blocks whatever thread it is on. Use `delay`, suspending APIs, or `withContext` to move work.
+
+</Misconception>
+
+<Misconception>
+
+**"`async` is how you call a suspend function."** Call suspend functions directly; they run sequentially, which is usually what you want. Use `async` only to run things *concurrently* and combine their results.
+
+</Misconception>
+
+<Misconception>
+
+**"Cancelling a job stops it immediately."** Cancellation is cooperative: it takes effect at the next suspension point or explicit check. CPU-bound loops must call `ensureActive()` or `yield()`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

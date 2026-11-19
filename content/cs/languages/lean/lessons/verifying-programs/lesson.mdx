@@ -1,0 +1,318 @@
+---
+title: Proving properties of your programs
+subtitle: Specifications, tests that run at compile time, proofs by induction that follow your code, fast implementations proved equal to simple ones, and values that carry their own proofs.
+minutes: 65
+objectives:
+  - Write a specification for a function as Lean theorems, and recognise a specification that is too weak
+  - Use #guard for tests and theorems for guarantees, and say what each one establishes
+  - Prove properties of recursive functions by induction, including helper lemmas and generalising an accumulator
+  - Prove a fast implementation equal to a simple one, and use functional induction to follow a function's own branches
+  - Return values that carry proofs with subtypes, so that callers get guarantees for free
+prerequisites: [propositions-and-proofs]
+related: [math.comp.intro-lean, math.found.proof-techniques, math.comp.formal-proof-lean]
+references:
+  - title: Functional Programming in Lean
+    author: David Thrane Christiansen
+    url: https://lean-lang.org/functional_programming_in_lean/
+    note: Its later chapters on programming with dependent types and on proving programs equal show the same techniques at greater length.
+  - title: "The Lean Language Reference: functional induction"
+    url: https://lean-lang.org/doc/reference/latest/
+    note: How Lean derives induction principles from recursive definitions, and how fun_induction uses them.
+  - title: CSLib
+    url: https://www.cslib.io/
+    note: An open-source Lean library of verified algorithms, data structures and tools for reasoning about programs.
+  - title: Testing (Lumenary CS)
+    url: https://lumenary.academy/en/cs/testing/
+    note: Testing as practised in industry, the complement to the proofs in this lesson.
+---
+
+<Section id="motivation" kind="motivation" title="What does it mean for a program to be correct?">
+
+"Correct" is not a property of a program on its own. It is a relation between a program and a **specification**: a precise statement of what the program should do. A sorting function is correct if, for every input list, its output is sorted *and* contains the same elements as its input. Leave out the second half and a function that always returns the empty list is "correct". Specifications are where many real bugs live, and writing them down precisely is often more valuable than any single proof.
+
+In most languages, specifications live in comments and test suites, and the tests check them on the examples you chose. In Lean, a specification can be a theorem, stated in the same file as the code, and proved for every input. This lesson takes functions like the ones you wrote in lessons 3 to 7 and proves things about them: that `rev` reverses, that the fast Fibonacci function of lesson 4 agrees with the slow one, that an accumulator loop computes the same sum as plain recursion, that a search tree contains what you inserted. Along the way you will meet the techniques that working Lean programmers use every day: helper lemmas, generalising induction hypotheses, functional induction, and types that carry proofs.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Tests and theorems">
+
+<Definition term="#guard">
+
+`#guard e` evaluates a Boolean expression `e` while the file is being checked, and reports an error if it is not `true`. It is a unit test that runs every time the file is compiled, with no separate test runner.
+
+</Definition>
+
+<Definition term="Specification">
+
+A **specification** of a function `f` is a set of theorems that together say what `f` must do. A specification is **sound** if the intended function satisfies it, and **complete enough** if every function that satisfies it is acceptable. Proving that `f` meets a specification shows it behaves correctly on *every* input, but only in the sense the specification captures.
+
+</Definition>
+
+Here are both, for a list-reversing function of our own:
+
+```lean check
+def rev : List α → List α
+  | [] => []
+  | x :: xs => rev xs ++ [x]
+
+-- Tests: checked every time the file is checked.
+#guard rev [1, 2, 3] == [3, 2, 1]
+#guard rev ([] : List Nat) == []
+#guard rev (rev ["a", "b", "c"]) == ["a", "b", "c"]
+
+-- Proofs: true for every list, of every element type.
+theorem rev_length (xs : List α) : (rev xs).length = xs.length := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [rev, ih]
+
+theorem rev_append (xs ys : List α) : rev (xs ++ ys) = rev ys ++ rev xs := by
+  induction xs with
+  | nil => simp [rev]
+  | cons x xs ih => simp [rev, ih]
+
+theorem rev_rev (xs : List α) : rev (rev xs) = xs := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [rev, rev_append, ih]
+
+-- Our function agrees with the library's.
+theorem rev_eq_reverse (xs : List α) : rev xs = xs.reverse := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [rev, ih]
+
+#check @rev_rev
+```
+
+```text
+@rev_rev : ∀ {α : Type u_1} (xs : List α), rev (rev xs) = xs
+```
+
+The program prints only the last line, because tests that pass and proofs that check are silent; any failure would be an error and the file would be rejected.
+
+Each proof follows the same pattern. `induction xs` gives a case for `[]` and a case for `x :: xs` with the induction hypothesis `ih` about `xs`. In each case `simp [rev, ih]` unfolds one step of `rev`, uses `ih`, and lets the library's simplification lemmas about `++` and `length` finish the job.
+
+The interesting one is `rev_rev`. Try proving it directly and the induction step gets stuck at `rev (rev xs ++ [x]) = x :: xs`: the induction hypothesis talks about `rev (rev xs)`, but the goal has `rev` applied to an append. The fix, typical of real proofs, is a **helper lemma** that says how `rev` interacts with `++`. `rev_append` is that lemma, and with it in hand, `simp [rev, rev_append, ih]` goes through. Finding the right helper lemma is the main creative step in most proofs about programs, and a sign of a good one is that it is more general than the goal: `rev_append` is about any two lists, not just about `rev xs` and `[x]`.
+
+Finally, `rev_eq_reverse` connects our function to `List.reverse` from the standard library. Once that is proved, every theorem the library has about `reverse` applies to `rev` too. Proving that your implementation equals a library function or a simple reference version is one of the most useful things a proof can do, and the next section is about exactly that.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Fast and simple: proving two implementations equal">
+
+Lesson 4 had a slow Fibonacci function and a fast one, and a naive sum and an accumulator version. They are good examples of a common situation: the obvious implementation is clearly right but too slow, and the efficient one is not obviously right. Prove them equal, and you get the best of both.
+
+```lean check
+def fibSlow : Nat → Nat
+  | 0 => 0
+  | 1 => 1
+  | n + 2 => fibSlow n + fibSlow (n + 1)
+
+def fibPair : Nat → Nat × Nat
+  | 0 => (0, 1)
+  | n + 1 => let (a, b) := fibPair n; (b, a + b)
+
+def fib (n : Nat) : Nat := (fibPair n).1
+
+/-- The invariant: `fibPair n` holds two consecutive Fibonacci numbers. -/
+theorem fibPair_eq (n : Nat) : fibPair n = (fibSlow n, fibSlow (n + 1)) := by
+  induction n with
+  | zero => rfl
+  | succ k ih => simp [fibPair, ih, fibSlow]
+
+theorem fib_eq_fibSlow (n : Nat) : fib n = fibSlow n := by
+  simp [fib, fibPair_eq]
+
+def sumNaive : List Nat → Nat
+  | [] => 0
+  | x :: xs => x + sumNaive xs
+
+def sumAcc (acc : Nat) : List Nat → Nat
+  | [] => acc
+  | x :: xs => sumAcc (acc + x) xs
+
+theorem sumAcc_eq (acc : Nat) (xs : List Nat) : sumAcc acc xs = acc + sumNaive xs := by
+  induction xs generalizing acc with
+  | nil => simp [sumAcc, sumNaive]
+  | cons x xs ih => simp [sumAcc, sumNaive, ih]; omega
+
+theorem sumAcc_zero (xs : List Nat) : sumAcc 0 xs = sumNaive xs := by
+  simp [sumAcc_eq]
+
+#eval fib 50
+```
+
+```text
+12586269025
+```
+
+**Prove the invariant, not the goal.** `fib n = fibSlow n` cannot be proved by induction directly: `fib` is the first component of `fibPair`, and knowing only the first component for `n` tells you nothing about the pair for `n + 1`. The statement that *can* be proved by induction is the invariant `fibPair_eq`: the pair holds *both* `fibSlow n` and `fibSlow (n + 1)`. With that, the induction step is pure computation, and `fib_eq_fibSlow` follows in one line. This is the same move as finding a loop invariant in an imperative program, and it is the most important technique in this lesson.
+
+**Generalise the accumulator.** For `sumAcc`, the statement `sumAcc 0 xs = sumNaive xs` is what we want, but it is too specific to prove by induction, because the recursive call uses a different accumulator, `acc + x`, not `0`. We prove the general statement `sumAcc acc xs = acc + sumNaive xs` for *every* `acc`, and `induction xs generalizing acc` makes the induction hypothesis hold for every accumulator too. Without `generalizing`, here is the goal Lean shows in the `cons` case (captured with `trace_state`):
+
+```text
+case cons
+acc x : Nat
+xs : List Nat
+ih : sumAcc acc xs = acc + sumNaive xs
+⊢ sumAcc (acc + x) xs = acc + (x + sumNaive xs)
+```
+
+The hypothesis `ih` speaks about `sumAcc acc xs`, but the goal needs `sumAcc (acc + x) xs`, so `ih` is useless and the proof is stuck. With `generalizing acc`, `ih` becomes `∀ acc, sumAcc acc xs = acc + sumNaive xs`, which `simp` can use with `acc + x`, and `omega` rearranges the sums. Whenever a recursive call changes an argument, that argument must be generalised.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Specifications that say enough">
+
+Here is a function that finds the largest element of a list, with a specification in two parts:
+
+```lean check
+def maximum : List Nat → Nat
+  | [] => 0
+  | x :: xs => max x (maximum xs)
+
+/-- Part 1 of the specification: the result is at least every element. -/
+theorem le_maximum (xs : List Nat) : ∀ y ∈ xs, y ≤ maximum xs := by
+  induction xs with
+  | nil => simp
+  | cons x xs ih =>
+    intro y hy
+    simp only [List.mem_cons] at hy
+    simp only [maximum]
+    cases hy with
+    | inl h => omega
+    | inr h => have := ih y h; omega
+
+/-- Part 2: for a non-empty list, the result is one of the elements. -/
+theorem maximum_mem (xs : List Nat) (h : xs ≠ []) : maximum xs ∈ xs := by
+  induction xs <;> grind [maximum]
+
+/-- Why part 2 matters: the sum also satisfies part 1. -/
+theorem le_sum (xs : List Nat) : ∀ y ∈ xs, y ≤ xs.sum := by
+  induction xs <;> grind
+
+#eval maximum [3, 9, 4]
+#eval [3, 9, 4].sum
+```
+
+```text
+9
+16
+```
+
+The proof of `le_maximum` is written out step by step: introduce `y` and the hypothesis `hy : y ∈ x :: xs`, rewrite membership in a cons as "`y = x` or `y ∈ xs`", and handle each side, using the induction hypothesis in the second. `maximum_mem` is left to `grind`, which does the same kind of case analysis on its own. `induction xs <;> grind [maximum]` means "do induction, then run `grind`, told to unfold `maximum`, on every resulting goal"; the combinator `<;>` applies a tactic to all the goals the previous one produced.
+
+Now look at `le_sum`. For natural numbers, every element of a list is at most the list's sum, so `List.sum` satisfies part 1 of our specification perfectly. If part 1 were the whole specification, a "maximum" function that returned the sum would be proved correct. Part 2, that the result is an element of the list, rules it out. This is the most common way that verified software goes wrong: not a mistake in a proof, which Lean would catch, but a specification that is too weak to say what was meant. Two habits help. Ask, for each specification, "what wrong function would satisfy this?". And state the property you actually rely on downstream, since that is the one that has to be true.
+
+Notice also what the specification says about the empty list: `maximum []` is `0`, but part 2 assumes `xs ≠ []`, so the specification deliberately says nothing about which value an empty list gets. Making those choices visible is part of a specification's job.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Following the code: functional induction and proof-carrying values">
+
+Some functions do not recurse in the shape of their argument's type. `Tree.insert` from lesson 3 compares the key with the node and goes left, right or stops: three behaviours for a `node`, which a plain `induction t` would lump together. **Functional induction** generates one case for each branch of the function's own definition, with the branch's conditions and an induction hypothesis for each recursive call. The tactic `fun_induction` uses it:
+
+```lean check
+inductive Tree where
+  | leaf
+  | node (left : Tree) (key : Nat) (right : Tree)
+
+namespace Tree
+
+def insert (t : Tree) (k : Nat) : Tree :=
+  match t with
+  | leaf => node leaf k leaf
+  | node l x r =>
+    if k < x then node (l.insert k) x r
+    else if x < k then node l x (r.insert k)
+    else t
+
+def contains (t : Tree) (k : Nat) : Bool :=
+  match t with
+  | leaf => false
+  | node l x r => if k < x then l.contains k else if x < k then r.contains k else true
+
+/-- After inserting a key, the tree contains it. -/
+theorem contains_insert (t : Tree) (k : Nat) : (t.insert k).contains k = true := by
+  fun_induction insert t k <;> simp_all [contains] <;> omega
+
+end Tree
+
+/-- Clamp `x` into the interval from `lo` to `hi`; the result carries its own proof. -/
+def clamp (lo hi x : Int) (h : lo ≤ hi) : { y : Int // lo ≤ y ∧ y ≤ hi } :=
+  if h₁ : x < lo then ⟨lo, by omega⟩
+  else if h₂ : hi < x then ⟨hi, by omega⟩
+  else ⟨x, by omega⟩
+
+#guard (clamp 0 10 15 (by decide)).val == 10
+#guard (clamp 0 10 (-3) (by decide)).val == 0
+#eval (clamp (-5) 5 2 (by decide)).val
+```
+
+```text
+2
+```
+
+`fun_induction insert t k` produces four goals, one per branch of `insert`. The second, for the branch that goes left, looks like this in the infoview (the `✝` marks names Lean invented, which you cannot refer to):
+
+```text
+case case2
+k : Nat
+l✝ : Tree
+x✝ : Nat
+r✝ : Tree
+h✝ : k < x✝
+ih1✝ : (l✝.insert k).contains k = true
+⊢ ((l✝.insert k).node x✝ r✝).contains k = true
+```
+
+The branch condition `k < x` is a hypothesis, and the induction hypothesis is about exactly the recursive call that branch makes. `simp_all [contains]` unfolds `contains` on the new node, sees that it goes left because `k < x`, and uses the hypothesis; in the last branch, where `k` equals the node's key, a little arithmetic remains, which `omega` supplies. Functional induction is the reason to prefer proofs that follow the code: the cases you must consider are the cases the code considers.
+
+**Values that carry proofs.** `clamp` takes a different approach: instead of proving a theorem about it afterwards, its result type is a *subtype* that includes the guarantee. Every value it returns is a pair of a number and a proof that the number lies between `lo` and `hi`, and each branch must supply that proof (`by omega`, using the branch condition, which `if h₁ : …` names). Callers get the guarantee with no further work: anyone holding a `clamp` result can use `.property` as a proof. This style suits invariants that many callers rely on; theorems after the fact suit properties that only some callers need. Experienced Lean programmers use both.
+
+</Section>
+
+<Section id="human" kind="human" title="Verification in practice">
+
+Where is this worth the effort? The honest answer from industry is: where bugs are very expensive and the core logic is small enough to specify. Authorisation and access-control languages, cryptographic code, parsers for security-critical formats, compilers, consensus protocols and smart contracts have all been verified in proof assistants, and Lean is increasingly one of them. For most application code, tests remain the main tool, and a few well-chosen theorems about the trickiest functions give much of the benefit.
+
+Some working habits:
+
+- **Keep the reference implementation simple**, even slow, and prove the fast one equal to it. Then every further theorem can be proved about the simple version.
+- **Write `#guard` tests first.** They are cheap, they catch most mistakes, and a theorem you cannot prove is often a theorem that is false, which a test would have shown in seconds.
+- **Mark your own equational lemmas `@[simp]`** when the right-hand side is always simpler than the left (`rev_rev` is a good candidate), so that `simp` uses them automatically in later proofs.
+- **Prefer structural recursion** when you intend to prove things: definitions compute in proofs, and `induction` lines up with them.
+- **Reach for libraries.** Std's data structures come with lemmas, CSLib collects verified algorithms, and recent versions of Std include tools for verifying imperative-style monadic code (the `Std.Do` framework and its `mvcgen` tactic, imported with `import Std.Tactic.Do`), which go beyond this course.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A verified program cannot have bugs."** It cannot violate the theorems you proved. It can still have a specification that is too weak (as the sum shows), run out of memory, be slow, or misbehave at a boundary that the specification ignores, such as the empty list. Verification moves the question from "is the code right?" to "is the specification right?", which is a smaller and better question, but still a question.
+
+</Misconception>
+
+<Misconception>
+
+**"If the induction step is stuck, the theorem is false."** More often, the statement is too specific for induction. Generalise an accumulator, strengthen the claim into an invariant (as `fibPair_eq` did), or prove a helper lemma about how the function interacts with another (as `rev_append` did).
+
+</Misconception>
+
+<Misconception>
+
+**"`#guard` and `theorem` do the same thing."** `#guard` checks one input; a theorem covers all of them. But `#guard` is also more honest about what it checks, and it costs nothing. Use both.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Use the definitions from the lesson. For the proof questions, try them in the editor and watch the goals.
+
+<Exercises/>
+
+</Section>

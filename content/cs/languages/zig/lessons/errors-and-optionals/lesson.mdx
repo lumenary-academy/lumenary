@@ -1,0 +1,404 @@
+---
+title: Errors and optionals
+subtitle: Error unions with try, catch and errdefer, error return traces, and optional values with orelse and if captures.
+minutes: 60
+objectives:
+  - Declare error sets and functions that return error unions, with explicit or inferred error sets
+  - Propagate errors with try and handle them with catch, if-else captures and switch over errors
+  - Release resources correctly on every path with defer and errdefer
+  - Read an error return trace
+  - Use optionals for values that may be absent, with orelse, .?, if and while captures and optional pointers
+prerequisites: [structs-enums-unions]
+references:
+  - title: "Zig language reference: Errors"
+    url: https://ziglang.org/documentation/0.17.0/
+    note: Error sets, try, catch, errdefer, merging error sets and error return traces.
+  - title: "Zig language reference: Optionals and defer"
+    url: https://ziglang.org/documentation/0.17.0/
+---
+
+<Section id="motivation" kind="motivation" title="Failure is part of the type">
+
+Every interesting program can fail: files are missing, input is malformed, memory runs out, the network disappears. Languages differ mainly in how visible they make this. C returns `-1` and sets `errno`, and nothing forces the caller to look. Java, Python and C++ throw exceptions, which keep the normal path clean but mean any call might jump somewhere else, invisibly. Go returns an error as a second value that the caller is supposed to check.
+
+Zig's answer is the **error union**: a function that can fail has a return type like `PortError!u16`, "an error from this set, or a `u16`". You cannot use the `u16` without dealing with the possibility of an error first, and the ways of dealing with it are short keywords (`try`, `catch`) that make every exit from a function visible. There are no exceptions and no hidden control flow. Absence is handled the same way: a value that might not exist has an **optional** type `?T`, and you must check it before use, which removes the null-pointer crashes that Tony Hoare, who introduced null references in 1965, later called his "billion-dollar mistake".
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="error set">
+
+A set of error names, like an enum: `const PortError = error{ Empty, NotANumber, OutOfRange };`. An error value is written `error.Empty`. Error sets can be combined with `||`, and `anyerror` is the set of all errors in the program. Because each error name means the same thing everywhere, `error.OutOfMemory` from one library and from another are the same value, and merging sets never needs conversion code.
+
+</Definition>
+
+<Definition term="error union">
+
+`E!T` holds either an error from set `E` or a value of type `T`. Writing just `!T` in a function's return type asks the compiler to **infer** the error set from the function body. `main` may return `!void`; an error escaping `main` is printed and the program exits with status 1.
+
+</Definition>
+
+<Definition term="try, catch and errdefer">
+
+`try x` means "if `x` is an error, return it from this function; otherwise give me the value". `x catch default` replaces an error with a value, and `x catch |err| ...` runs code with the error captured. `defer` schedules a statement to run when the current block exits; `errdefer` schedules one that runs only if the block exits by returning an error.
+
+</Definition>
+
+<Definition term="optional">
+
+`?T` holds either a `T` or `null`. `x orelse default` supplies a value for `null`, `x.?` asserts that it is not `null` (illegal behaviour otherwise), and `if (x) |v|` and `while (x) |v|` run only when there is a value, binding it to `v`. Optional pointers `?*T` are the same size as plain pointers, because `null` is represented by address zero, which a valid `*T` can never be.
+
+</Definition>
+
+</Section>
+
+<Section id="errors" kind="computation" title="Returning, propagating and handling errors">
+
+```zig check
+const std = @import("std");
+
+const PortError = error{ Empty, NotANumber, OutOfRange };
+
+fn parsePort(text: []const u8) PortError!u16 {
+    if (text.len == 0) return error.Empty;
+    const n = std.fmt.parseInt(u32, text, 10) catch |err| switch (err) {
+        error.InvalidCharacter => return error.NotANumber,
+        error.Overflow => return error.OutOfRange,
+    };
+    if (n == 0 or n > 65535) return error.OutOfRange;
+    return @intCast(n);
+}
+
+// The ! with no error set before it lets the compiler infer the set.
+fn parseAddress(text: []const u8) !struct { host: []const u8, port: u16 } {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.MissingColon;
+    const port = try parsePort(text[colon + 1 ..]); // try: return the error if there is one
+    return .{ .host = text[0..colon], .port = port };
+}
+
+pub fn main() void {
+    const inputs = [_][]const u8{ "localhost:8080", "example.org:", "db:70000", "db:http", "no-port-here" };
+    for (inputs) |in| {
+        if (parseAddress(in)) |addr| {
+            std.debug.print("{s:<15} host={s} port={d}\n", .{ in, addr.host, addr.port });
+        } else |err| {
+            std.debug.print("{s:<15} error.{t}\n", .{ in, err });
+        }
+    }
+
+    // catch with a default value, for when an error simply means "use the fallback".
+    const port = parsePort("eighty") catch 80;
+    std.debug.print("fallback port {d}\n", .{port});
+}
+```
+
+```text
+localhost:8080  host=localhost port=8080
+example.org:    error.Empty
+db:70000        error.OutOfRange
+db:http         error.NotANumber
+no-port-here    error.MissingColon
+fallback port 80
+```
+
+Each line of output takes a different path:
+
+- `parsePort` declares its error set explicitly. It calls `std.fmt.parseInt`, which can fail with `InvalidCharacter` or `Overflow`, and translates those into its own errors with `catch |err| switch (err)`. The `switch` must handle every error in `parseInt`'s set, so if a future version of `parseInt` adds a new error, this code stops compiling instead of mishandling it.
+- `parseAddress` uses `!` alone, so its error set is inferred: everything `parsePort` can return, plus `MissingColon`, which it creates on the spot with `return error.MissingColon`. The line `orelse return error.MissingColon` turns an optional (`indexOfScalar` returns `?usize`) into an error.
+- `try parsePort(...)` passes any error straight up. Most Zig code is mostly `try`: errors travel up to the level that knows what to do about them.
+- `main` uses `if (...) |addr| ... else |err| ...` to handle both outcomes, and `{t}` to print an error's name.
+- `catch 80` is the shortest form: on any error, use 80.
+
+Errors in Zig are just names: they carry no message and no extra data. When a caller needs details (which line of a file was bad, which field was missing), the convention is to pass an optional "diagnostics" struct that the function fills in before returning the error, as the standard library's JSON parser does. This keeps errors cheap (an error value is a small integer) and keeps the common path free of allocation.
+
+### When an error reaches main
+
+If `main` returns an error, the startup code prints its name and, in debug and safe builds, an **error return trace**: the path the error took, not just where it was noticed. For a program whose `main` calls `loadConfig`, which calls `parsePort("80a")`:
+
+```text
+error: InvalidCharacter
+.../lib/std/fmt.zig:583:24: 0x10fa42a in charToDigit (std.zig)
+    if (value >= base) return error.InvalidCharacter;
+                       ^
+...
+/tmp/tmpgjw8nqyi/main.zig:4:5: 0x11e9969 in parsePort (main.zig)
+    return std.fmt.parseInt(u16, text, 10);
+    ^
+/tmp/tmpgjw8nqyi/main.zig:8:18: 0x11e99f0 in loadConfig (main.zig)
+    const port = try parsePort("80a");
+                 ^
+/tmp/tmpgjw8nqyi/main.zig:13:18: 0x11e9ac3 in main (main.zig)
+    const port = try loadConfig();
+                 ^
+```
+
+(The standard library's path is shortened here, and three frames inside `fmt.zig` are left out.) Every `try` the error passed through is listed, from the place it was created to `main`. This is one of the most useful debugging features in the language, and it costs nothing in the fast build modes, where it is turned off.
+
+</Section>
+
+<Section id="cleanup" kind="examples" title="defer and errdefer">
+
+Resources acquired step by step must be released correctly whichever step fails. Zig's tools are `defer` and `errdefer`.
+
+```zig check
+const std = @import("std");
+
+const Resource = struct {
+    name: []const u8,
+    fn open(name: []const u8, should_fail: bool) error{Unavailable}!Resource {
+        if (should_fail) {
+            std.debug.print("  open {s}: failed\n", .{name});
+            return error.Unavailable;
+        }
+        std.debug.print("  open {s}\n", .{name});
+        return .{ .name = name };
+    }
+    fn close(r: Resource) void {
+        std.debug.print("  close {s}\n", .{r.name});
+    }
+};
+
+const Session = struct { db: Resource, cache: Resource };
+
+// If the second open fails, the first resource must be closed before returning the error.
+// errdefer runs only when the function returns an error.
+fn startSession(cache_fails: bool) !Session {
+    const db = try Resource.open("database", false);
+    errdefer db.close();
+    const cache = try Resource.open("cache", cache_fails);
+    return .{ .db = db, .cache = cache };
+}
+
+pub fn main() void {
+    std.debug.print("success:\n", .{});
+    if (startSession(false)) |s| {
+        defer s.db.close(); // defer runs when the enclosing block ends, in reverse order
+        defer s.cache.close();
+        std.debug.print("  working with {s} and {s}\n", .{ s.db.name, s.cache.name });
+    } else |err| {
+        std.debug.print("  {t}\n", .{err});
+    }
+
+    std.debug.print("failure:\n", .{});
+    if (startSession(true)) |s| {
+        _ = s;
+    } else |err| {
+        std.debug.print("  gave up: {t}\n", .{err});
+    }
+}
+```
+
+```text
+success:
+  open database
+  open cache
+  working with database and cache
+  close cache
+  close database
+failure:
+  open database
+  open cache: failed
+  close database
+  gave up: Unavailable
+```
+
+In `startSession`, `errdefer db.close();` is registered right after the database opens. If the function later returns an error (here, the cache failing), the `errdefer` runs and closes the database. If it succeeds, ownership of both resources passes to the caller, and the `errdefer` does not run. In `main`, the caller uses two `defer`s to close both when its block ends; deferred statements run in reverse order, so the cache closes before the database.
+
+The habit to build is: **acquire, then immediately write the matching `defer` or `errdefer` on the next line.** Use `defer` when this function will release the resource itself, and `errdefer` when it is handing the resource to its caller on success. Code reviewers in Zig projects look for that pairing. A `defer` may run a whole block (`defer { ... }`), but it cannot `return` or `try`: cleanup must not change how the function exits, which is also why a function used for cleanup, like `close` here, should not be able to fail.
+
+</Section>
+
+<Section id="optionals" kind="examples" title="Optionals">
+
+```zig check
+const std = @import("std");
+
+const Student = struct { name: []const u8, mentor: ?*const Student = null };
+
+fn indexOf(names: []const []const u8, wanted: []const u8) ?usize {
+    for (names, 0..) |n, i| {
+        if (std.mem.eql(u8, n, wanted)) return i;
+    }
+    return null;
+}
+
+pub fn main() void {
+    const names = [_][]const u8{ "Aroha", "Bilal", "Chidi", "Dana" };
+
+    // if with a capture: runs only when there is a value.
+    if (indexOf(&names, "Chidi")) |i| std.debug.print("Chidi is at {d}\n", .{i});
+
+    // orelse supplies a default for null.
+    const pos = indexOf(&names, "Zoe") orelse names.len;
+    std.debug.print("Zoe would go at {d}\n", .{pos});
+
+    // .? unwraps, and panics in safe modes if the value is null.
+    std.debug.print("Dana is at {d}\n", .{indexOf(&names, "Dana").?});
+
+    // Optional pointers: null instead of a dangling or zero address, at no extra cost.
+    const teacher: Student = .{ .name = "Ms Okafor" };
+    const pupil: Student = .{ .name = "Bilal", .mentor = &teacher };
+    for ([_]Student{ teacher, pupil }) |s| {
+        if (s.mentor) |m| {
+            std.debug.print("{s} is mentored by {s}\n", .{ s.name, m.name });
+        } else {
+            std.debug.print("{s} has no mentor\n", .{s.name});
+        }
+    }
+    std.debug.print("size of *Student {d}, of ?*Student {d}\n", .{ @sizeOf(*Student), @sizeOf(?*Student) });
+
+    // while with an optional: the standard iterator pattern.
+    var it = std.mem.splitScalar(u8, "3,1,4", ',');
+    var sum: u32 = 0;
+    while (it.next()) |piece| sum += std.fmt.parseInt(u32, piece, 10) catch 0;
+    std.debug.print("sum {d}\n", .{sum});
+}
+```
+
+```text
+Chidi is at 2
+Zoe would go at 4
+Dana is at 3
+Ms Okafor has no mentor
+Bilal is mentored by Ms Okafor
+size of *Student 8, of ?*Student 8
+sum 8
+```
+
+`indexOf` returns `?usize`: an index, or `null` if the name is absent. That is clearer and safer than the C convention of returning `-1`, because the caller cannot accidentally use `null` as an index. The program shows the main ways to consume an optional: `if` with a capture, `orelse` with a default, and `.?` when you know the value is there (if you are wrong, safe builds panic with "attempt to use null value").
+
+`mentor: ?*const Student = null` is an optional pointer. The size line confirms that `?*Student` takes no more space than `*Student`: no flag is needed, because `null` is the zero address. Finally, `while (it.next()) |piece|` is the standard iteration pattern in Zig: an iterator's `next` returns an optional, and the loop ends at the first `null`. The `catch 0` inside it shows errors and optionals working together.
+
+</Section>
+
+<Section id="diagnostics" kind="examples" title="Errors with details: the diagnostics pattern">
+
+Here is the diagnostics convention in full. A configuration parser reports *which* line was wrong without making its errors any bigger:
+
+```zig check
+const std = @import("std");
+
+const Diagnostics = struct {
+    line: usize = 0,
+    key: []const u8 = "",
+};
+
+const Config = struct { width: u32 = 80, height: u32 = 24 };
+
+const ParseError = error{ MissingEquals, UnknownKey, BadNumber };
+
+// Errors stay small; details go into the caller's optional Diagnostics.
+fn parseConfig(text: []const u8, diag: ?*Diagnostics) ParseError!Config {
+    var config: Config = .{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |raw| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw, " ");
+        if (line.len == 0 or line[0] == '#') continue;
+        errdefer if (diag) |d| {
+            d.line = line_no;
+            d.key = line;
+        };
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.MissingEquals;
+        const key = std.mem.trim(u8, line[0..eq], " ");
+        const value = std.fmt.parseInt(u32, std.mem.trim(u8, line[eq + 1 ..], " "), 10) catch
+            return error.BadNumber;
+        if (std.mem.eql(u8, key, "width")) {
+            config.width = value;
+        } else if (std.mem.eql(u8, key, "height")) {
+            config.height = value;
+        } else return error.UnknownKey;
+    }
+    return config;
+}
+
+pub fn main() void {
+    const good = "# terminal size\nwidth = 120\nheight = 40\n";
+    const bad = "width = 100\nheigth = 30\n";
+    for ([_][]const u8{ good, bad }) |text| {
+        var diag: Diagnostics = .{};
+        if (parseConfig(text, &diag)) |c| {
+            std.debug.print("ok: {d}x{d}\n", .{ c.width, c.height });
+        } else |err| {
+            std.debug.print("error.{t} on line {d}: \"{s}\"\n", .{ err, diag.line, diag.key });
+        }
+    }
+}
+```
+
+```text
+ok: 120x40
+error.UnknownKey on line 2: "heigth = 30"
+```
+
+The caller passes a pointer to a `Diagnostics` struct, or `null` if it does not care. Inside the loop, an `errdefer` registered for each line fills in the line number and text if any error escapes while that line is being processed, so none of the three `return error...` statements needs its own bookkeeping. (`errdefer` works at block level, so it fires when the error leaves the loop body on its way out of the function.) The typo `heigth` becomes `error.UnknownKey on line 2`, which is a message a user can act on. Because the parameter is optional, callers that only want to know whether parsing worked pass `null` and pay nothing.
+
+</Section>
+
+<Section id="comparison" kind="human" title="Zig's approach next to other languages">
+
+| Language | Failure is signalled by | Must the caller deal with it? | Visible at the call site? |
+| --- | --- | --- | --- |
+| C | return codes, `errno` | no | only by convention |
+| C++, Java, Python | exceptions | no (except Java's checked exceptions) | no |
+| Go | a second return value `err` | not enforced (linters help) | yes |
+| Rust | `Result` type and `?` | yes | yes |
+| Zig | error unions, `try`, `catch` | yes | yes |
+
+Zig and Rust land in a similar place: failure is in the type, and propagation is one short operator. The differences are that Zig's errors are plain names in a global set rather than arbitrary values, that error sets can be inferred and merged automatically, and that error return traces come built in. Rust's richer error values carry more information; Zig's lighter ones need diagnostics structs when information matters, but cost almost nothing.
+
+</Section>
+
+<Section id="explanation" kind="human" title="How experienced Zig programmers use errors">
+
+**Return errors for conditions, panic for bugs.** A missing file, bad input or a full disk is a condition the program should handle: return an error. A violated invariant, such as an index your own code computed being out of range, is a bug: use `unreachable`, `std.debug.assert` or `@panic`. Mixing the two up leads either to programs that crash on bad input or to error handling for things that cannot happen.
+
+**Keep error sets meaningful at boundaries.** Inferred error sets are convenient inside a module. At the public boundary of a library, an explicit error set documents exactly what callers must handle and stops internal changes from leaking out.
+
+**`catch unreachable` is a claim, not a convenience.** It says "this cannot fail". It is right for, say, formatting a small number into a buffer you know is big enough, and wrong for anything involving input. When in doubt, use `try` and let the caller decide.
+
+**Out-of-memory is an error like any other.** Functions that allocate return `error.OutOfMemory` rather than crashing, so libraries written in Zig can be used in places where running out of memory must be survivable, such as embedded systems and servers that shed load. The next lesson is about where that memory comes from.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`try` is like a `try` block in Java."** There is no block and nothing is caught: `try expr` returns the error from the current function immediately. It is closer to Rust's `?` operator than to exceptions.
+
+</Misconception>
+
+<Misconception>
+
+**"`defer` runs when the function returns."** It runs when the enclosing *block* exits. A `defer` inside a loop body runs at the end of each iteration, and one inside an `if` block runs when that block ends.
+
+</Misconception>
+
+<Misconception>
+
+**"An error union and an optional are interchangeable."** `?T` says "there may be no value, and that is normal" (a search that finds nothing). `E!T` says "something went wrong, and here is what" (a parse that failed). Use `orelse return error.X` and `catch null` to convert between them when a layer of the program sees the situation differently.
+
+</Misconception>
+
+<Misconception>
+
+**"`catch {}` is a quick way to get rid of an error I don't care about."** It compiles, and it silently throws away information. If an error truly does not matter, say why in a comment; if it might, log it (`catch |err| std.log.warn("cache write failed: {t}", .{err})`) or pass it on with `try`. Swallowed errors are one of the hardest kinds of bug to find later.
+
+</Misconception>
+
+<Misconception>
+
+**"Errors can carry messages, like exceptions."** They cannot; an error is just a name. Put details in a diagnostics struct supplied by the caller, or log them where the error is detected.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

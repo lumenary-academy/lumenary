@@ -1,0 +1,333 @@
+---
+title: "State and concurrency: atoms, refs and agents"
+subtitle: Values never change, but the world does. How Clojure models changing state safely, even across many threads.
+minutes: 65
+objectives:
+  - Explain Clojure's separation of identity, state and value
+  - Manage independent state with atoms, using swap!, reset!, validators and watches
+  - Coordinate changes to several references at once with refs and software transactional memory
+  - Run asynchronous, ordered updates with agents and handle their errors
+  - Use futures, promises and delays, and avoid the common pitfalls of concurrent Clojure code
+prerequisites: [data-oriented-programming]
+references:
+  - title: Values and change, Clojure's approach to identity and state
+    url: https://clojure.org/about/state
+    note: The essay that explains the model behind this lesson.
+  - title: Atoms
+    url: https://clojure.org/reference/atoms
+    note: The official reference.
+  - title: Refs and transactions
+    url: https://clojure.org/reference/refs
+    note: How Clojure's software transactional memory works.
+  - title: Agents and asynchronous actions
+    url: https://clojure.org/reference/agents
+    note: The official reference, including error modes.
+  - title: Concurrent programming
+    url: https://clojure.org/about/concurrent_programming
+    note: An overview of all of Clojure's concurrency tools.
+---
+
+<Section id="motivation" kind="motivation" title="If nothing changes, how does anything happen?">
+
+After two lessons of immutable data, a fair question is how a Clojure program does anything that involves change: count website visits, track stock levels, hold the current state of a game. The world changes; a program that models it must too.
+
+Clojure's answer is one of its most distinctive ideas. It separates three things that most languages fuse into a single mutable object:
+
+- A **value** is an immutable fact: the map `{:apples 7 :pears 4}`.
+- An **identity** is a stable thing we refer to over time: "the shop's inventory".
+- A **state** is the value an identity has at a particular moment.
+
+The inventory *is* not a mutable map; it is an identity whose state is one immutable map now and a different immutable map after the next sale. Clojure represents identities with a small set of **reference types**: boxes that hold a value and can be pointed at a new one, under well-defined rules. Anyone who reads the box gets a complete, consistent value that will never change under them, even while another thread is busy pointing the box at a newer value.
+
+This lesson covers the three main reference types (atoms, refs and agents), plus futures, promises and delays for running work in parallel. Together they make Clojure one of the more pleasant languages for concurrent programs on the JVM.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The reference types">
+
+<Definition term="Atom">
+
+A reference for **independent, synchronous** change. `swap!` applies a pure function to the current value and installs the result atomically, using a compare-and-swap loop: if another thread changed the atom in the meantime, the function is run again on the newer value. `reset!` sets a value outright. `@a` (or `(deref a)`) reads it.
+
+</Definition>
+
+<Definition term="Ref">
+
+A reference for **coordinated, synchronous** change. Refs are changed only inside a transaction (`dosync`), and all changes in a transaction become visible together or not at all, Clojure's **software transactional memory** (STM).
+
+</Definition>
+
+<Definition term="Agent">
+
+A reference for **independent, asynchronous** change. `send` queues a function to be applied to the agent's value on a thread pool, later. Actions sent to one agent run one at a time, in the order they were sent.
+
+</Definition>
+
+| | Synchronous (caller waits) | Asynchronous (caller continues) |
+| --- | --- | --- |
+| **One identity at a time** | atom | agent |
+| **Several identities together** | ref | |
+
+There is a fourth reference type, the **var**, which `def` creates. Vars hold the functions and constants of your namespaces; a var declared `^:dynamic` can also be rebound per thread with `binding`, which some libraries use for settings like the current output stream. Application state should not live in vars.
+
+</Section>
+
+<Section id="atoms" kind="examples" title="Atoms: the everyday tool">
+
+Atoms cover most of the state in real Clojure programs. A typical application has a handful of them, often just one holding a map of everything that changes.
+
+```clojure check
+(def inventory (atom {:apples 10 :pears 4}))
+
+(println @inventory)
+(swap! inventory update :apples - 3)
+(swap! inventory assoc :figs 12)
+(println @inventory)
+
+(println (swap-vals! inventory update :pears inc))
+(reset! inventory {:apples 0})
+(println (deref inventory))
+
+(def temperature (atom 20 :validator #(<= -50 % 60)))
+(add-watch temperature :logger
+           (fn [_key _ref old new]
+             (println "temperature changed from" old "to" new)))
+(swap! temperature + 5)
+(println (try (reset! temperature 500)
+              (catch IllegalStateException e (str "rejected: " (ex-message e)))))
+(println @temperature)
+```
+
+```text
+{:apples 10, :pears 4}
+{:apples 7, :pears 4, :figs 12}
+[{:apples 7, :pears 4, :figs 12} {:apples 7, :pears 5, :figs 12}]
+{:apples 0}
+temperature changed from 20 to 25
+rejected: Invalid reference state
+25
+```
+
+`swap!` takes the atom, a function, and extra arguments: `(swap! inventory update :apples - 3)` computes `(update current :apples - 3)` and installs the result. Notice that the update functions are the same `update` and `assoc` you used on plain maps. The atom adds only the "change over time" part; all the logic is ordinary pure functions, which you can test without any atom at all.
+
+`swap-vals!` returns both the old and the new value, which is useful when you need to know what you replaced. A **validator** rejects any new value that fails a predicate, so the atom can never hold an invalid state. A **watch** is called after every change with the old and new values, handy for logging or for updating a user interface.
+
+### Atoms under contention
+
+Atoms are safe to share between threads. Here eight threads each increment a counter a thousand times, and another hundred add to a set:
+
+```clojure check
+(def hits (atom 0))
+
+(def workers
+  (doall
+    (for [_ (range 8)]
+      (future
+        (dotimes [_ 1000]
+          (swap! hits inc))))))
+
+(run! deref workers)
+(println "hits:" @hits)
+
+(def seen (atom #{}))
+(def adders
+  (mapv (fn [n] (future (swap! seen conj (mod n 5)))) (range 100)))
+(run! deref adders)
+(println "distinct remainders:" (sort @seen))
+
+(shutdown-agents)
+```
+
+```text
+hits: 8000
+distinct remainders: (0 1 2 3 4)
+```
+
+No update is lost, and no lock appears in the code. `future` runs its body on another thread and returns immediately; dereferencing a future waits for its result, so `(run! deref workers)` waits for all eight. The `doall` forces the lazy `for` to start every future before we wait on them. `(shutdown-agents)` at the end lets the JVM exit promptly: futures and agents use a thread pool whose idle threads would otherwise keep the program alive for about a minute after the last task.
+
+<Misconception>
+
+**Doing side effects inside `swap!`.** Under contention, `swap!` may call your function *more than once*, discarding results computed from a stale value. If the function sends an email or writes a log line, it may do so twice. Keep functions passed to `swap!` pure, and perform side effects after the swap, using the value it returns.
+
+</Misconception>
+
+</Section>
+
+<Section id="refs" kind="examples" title="Refs: changing several things together">
+
+An atom guarantees that *its own* updates are atomic. It cannot guarantee anything about two atoms: if money moves from one account atom to another, some other thread might read the books between the withdrawal and the deposit and see money missing. When several identities must change together, use **refs** and a transaction.
+
+```clojure check
+(def accounts
+  {:amina (ref 1000)
+   :bruno (ref 1000)
+   :chen  (ref 1000)})
+
+(defn transfer! [from to amount]
+  (dosync
+    (when (< @(accounts from) amount)
+      (throw (ex-info "Insufficient funds" {:from from :amount amount})))
+    (alter (accounts from) - amount)
+    (alter (accounts to) + amount)))
+
+(defn total []
+  (dosync (reduce + (map deref (vals accounts)))))
+
+(def plan
+  [[:amina :bruno 7] [:bruno :chen 5] [:chen :amina 3] [:amina :chen 2]])
+
+(def tasks
+  (mapv (fn [[from to amount]]
+          (future (dotimes [_ 50] (transfer! from to amount))))
+        plan))
+
+(run! deref tasks)
+
+(println "balances:" (into (sorted-map) (map (fn [[k r]] [k @r]) accounts)))
+(println "total:" (total))
+(println (try (transfer! :bruno :amina 5000)
+              (catch clojure.lang.ExceptionInfo e (ex-data e))))
+
+(shutdown-agents)
+```
+
+```text
+balances: {:amina 700, :bruno 1100, :chen 1200}
+total: 3000
+{:from :bruno, :amount 5000}
+```
+
+Two hundred transfers ran on four threads at once, and the total is exactly 3000, as it must be. Inside `dosync`, `alter` applies a function to a ref's value; reading a ref with `@` sees a consistent snapshot of all refs as of the transaction's start. If two transactions conflict, one of them is **retried** automatically from the beginning, so (just as with `swap!`) the body of a transaction must be free of side effects. Throwing an exception aborts the transaction, and none of its changes are applied: the failed 5000 transfer left every balance untouched.
+
+Clojure's STM uses **multiversion concurrency control**, the same family of techniques databases use: readers never block writers and writers never block readers. Two other functions are worth knowing. `commute` is like `alter` for operations whose order does not matter (such as incrementing a counter) and lets more transactions proceed in parallel; `ensure` protects a ref you only read from being changed by others before you commit.
+
+<Note>
+
+Refs are elegant, and they are also the least-used reference type in practice. Most programs that seem to need coordination can keep all the related state in **one atom** holding a map, and update it with a single `swap!`: moving money between two keys of one map is automatically atomic. Reach for refs when the identities are genuinely separate and must still change together.
+
+</Note>
+
+<Example title="The same bank with one atom">
+
+Here is the transfer rewritten for a single atom holding every balance. The business rule is a pure function from balances to balances:
+
+```clojure
+(def bank (atom {:amina 1000 :bruno 1000}))
+
+(defn transfer [balances from to amount]
+  (if (< (balances from) amount)
+    balances
+    (-> balances
+        (update from - amount)
+        (update to + amount))))
+
+(swap! bank transfer :amina :bruno 300)
+;; => {:amina 700, :bruno 1300}
+
+(transfer {:a 10 :b 0} :a :b 20)
+;; => {:a 10, :b 0}
+```
+
+`swap!` calls `(transfer current-balances :amina :bruno 300)` and installs the result in one atomic step, so no reader can ever see the money in flight. The last line tests the rule with no atom and no threads at all: a transfer larger than the balance returns the balances unchanged. Whether that is the right behaviour (silently doing nothing) or whether the caller should be told is a design decision; a common answer is to compare the old and new values that `swap-vals!` returns, or to keep a `:rejected` entry in the state for the caller to inspect. Notice how far the concurrency concerns have receded: the only line that knows about threads is the `swap!`.
+
+</Example>
+
+</Section>
+
+<Section id="agents-futures" kind="examples" title="Agents, futures, promises and delays">
+
+```clojure check
+(def log (agent []))
+
+(doseq [i (range 5)]
+  (send log conj (str "event " i)))
+
+(await log)
+(println @log)
+
+(def problems (promise))
+(def meter
+  (agent 10 :error-handler (fn [_agent ex] (deliver problems (ex-message ex)))))
+
+(send meter / 0)
+(println "error:" @problems)
+(send meter + 32)
+(await meter)
+(println "still running:" @meter)
+
+(def gate (promise))
+(def answer (future @gate (* 6 7)))
+(println "future done?" (future-done? answer))
+(deliver gate :go)
+(println "future value:" @answer)
+
+(def expensive (delay (println "computing once...") 99))
+(println @expensive @expensive)
+
+(println (pmap #(* % %) [1 2 3 4]))
+(shutdown-agents)
+```
+
+```text
+[event 0 event 1 event 2 event 3 event 4]
+error: Divide by zero
+still running: 42
+future done? false
+future value: 42
+computing once...
+99 99
+(1 4 9 16)
+```
+
+**Agents.** `send` returns immediately; the function runs later on a pool thread, and actions sent to one agent never overlap and run in order. `await` blocks until everything sent so far has run. Use `send` for CPU-bound work and `send-off` for actions that block on I/O (they use different thread pools). By default an agent whose action throws becomes *failed* and refuses further actions until `restart-agent` is called; giving it an `:error-handler`, as `meter` does, switches it to *continue* mode, so the error is reported and the agent carries on with its last good value (10, to which 32 was then added). A neat property: if you `send` to an agent inside a ref transaction, the send happens only if the transaction commits, which makes agents the right place for side effects that should follow a successful transaction.
+
+**Futures** run a body on another thread; dereferencing waits for the result (and re-throws any exception the body threw). **Promises** are empty boxes that some thread will fill exactly once with `deliver`; dereferencing waits until then, and `(deref p timeout-ms default)` waits at most a given time. Here a promise works as a gate, so the future cannot finish before we check on it. **Delays** compute their body at most once, the first time they are dereferenced, and cache the result. `pmap` is a parallel `map`, worth it only when each call does substantial work.
+
+</Section>
+
+<Section id="ecosystem" kind="human" title="Concurrency in real Clojure systems">
+
+The tools above live in `clojure.core`. Professional code adds a few more, and an honest picture includes what experienced teams actually reach for.
+
+- **One atom for application state.** Web servers and user interfaces often keep a single atom holding a map, updated with `swap!` and pure functions. It is simple to inspect at the REPL (`@app-state`) and easy to reason about.
+- **core.async**, an official library (not part of core, so not used in this course's programs), adds channels and lightweight processes in the style of Go and CSP. It is popular for pipelines, event processing and in ClojureScript, where there is only one thread.
+- **Java's concurrency library** is always available through interop: thread pools from `java.util.concurrent`, concurrent queues, and, since Java 21, **virtual threads**, which make it cheap to run a blocking task per request. Clojure functions are Java `Runnable`s and `Callable`s, so they can be handed directly to Java executors.
+- **Databases for durable state.** Atoms live in memory and vanish when the process stops. Anything that must survive a restart belongs in a database; Clojure's emphasis on immutable facts carries over to Datomic and similar databases, which keep history rather than overwriting it.
+
+Underneath all of these is the same discipline: keep most code pure, confine change to a few clearly named references, and let readers always see a complete value.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Reading an atom and then writing it in two steps.** `(reset! counter (inc @counter))` is a race: another thread can change the atom between the read and the reset, and its update is lost. Always use `(swap! counter inc)`, which reads and writes atomically.
+
+</Misconception>
+
+<Misconception>
+
+**Using many atoms for state that must stay consistent.** Two atoms for "cart items" and "cart total" can disagree for a moment, and a reader can see that moment. Put related state in one atom (or use refs), so that every observer sees a consistent whole.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting `shutdown-agents` in scripts.** A script that uses futures, agents or `pmap` will finish its work and then appear to hang for about a minute before exiting, because the thread pool's threads are still alive. Call `(shutdown-agents)` at the end of `-main`, or call `System/exit`.
+
+</Misconception>
+
+<Misconception>
+
+**Expecting `deref` of a future to swallow errors.** If a future's body throws, dereferencing it throws an `ExecutionException` wrapping the original. Errors in futures you never dereference are silently lost, so always deref, or catch and log inside the future.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

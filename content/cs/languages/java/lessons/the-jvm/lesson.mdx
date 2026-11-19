@@ -1,0 +1,367 @@
+---
+title: "Inside the JVM: memory, garbage collection and the JIT"
+subtitle: Where objects live, how the garbage collector finds the ones you no longer need, and how hot code becomes fast machine code while the program runs.
+minutes: 60
+objectives:
+  - Describe the JVM's main memory areas (heap, thread stacks, metaspace, code cache)
+  - Explain reachability, generational collection and the trade-off between throughput and pause times
+  - Name the collectors in JDK 25 and say when each fits
+  - Read a garbage-collection log and a JIT compilation log
+  - Explain tiered compilation, inlining, escape analysis, deoptimization and warm-up
+  - Avoid the classic mistakes of hand-written benchmarks, and know the tools professionals use
+prerequisites: [concurrency]
+related: [math.comp.algorithms-and-efficiency]
+references:
+  - title: "HotSpot Virtual Machine Garbage Collection Tuning Guide (Java SE 25)"
+    author: Oracle
+    url: https://docs.oracle.com/en/java/javase/25/gctuning/
+    note: The official guide to the collectors, their goals and their options.
+  - title: "The java command (Java SE 25)"
+    author: Oracle
+    url: https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html
+    note: Every standard and advanced JVM option, including -Xmx, -Xlog and the collector switches.
+  - title: "The Java Virtual Machine Specification"
+    author: Oracle
+    url: https://docs.oracle.com/javase/specs/
+    note: Run-time data areas, class loading and the bytecode instruction set.
+  - title: "JEP 439: Generational ZGC"
+    url: https://openjdk.org/jeps/439
+    note: Generational mode for ZGC (JDK 21); since JDK 24 it is ZGC's only mode.
+  - title: "JEP 519: Compact Object Headers"
+    url: https://openjdk.org/jeps/519
+    note: Smaller object headers as a product option in JDK 25.
+  - title: "JEP 483: Ahead-of-Time Class Loading & Linking"
+    url: https://openjdk.org/jeps/483
+    note: The AOT cache for faster startup (JDK 24), simplified by JEP 514 in JDK 25.
+  - title: JMH (Java Microbenchmark Harness)
+    url: https://openjdk.org/projects/code-tools/jmh/
+    note: The OpenJDK tool for writing benchmarks that the JIT cannot fool.
+---
+
+<Section id="motivation" kind="motivation" title="The machine inside the machine">
+
+Every Java program runs inside another program, the JVM, which makes two large decisions on your behalf. It decides **when memory can be reused**, so you never call `free` and never use memory after freeing it. And it decides **which code to compile to machine code, and how**, while your program runs, using what it observes about your program's actual behaviour.
+
+Most of the time you can ignore both, and that is the point. But professional Java developers meet the JVM sooner or later, usually at an inconvenient moment: a service whose response times spike every few minutes, a container killed for using too much memory, a batch job that runs slowly for its first thirty seconds, a benchmark that claims a change made code a hundred times faster. Each of these makes sense once you know how the heap, the garbage collector and the JIT compiler work. This lesson gives you that working knowledge, with real logs from real runs, and points you to the tools that professionals use to look inside a running JVM.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Where things live">
+
+<Figure caption="A simplified map of a running JVM. Each thread has its own stack of frames; every object lives on the shared heap; class metadata and compiled code have areas of their own.">
+<svg viewBox="0 0 640 220" role="img" aria-label="Two thread stacks on the left, each with frames holding local variables that point to objects on a shared heap in the middle. The heap is divided into a young generation and an old generation. On the right, metaspace holds class metadata and the code cache holds JIT-compiled machine code.">
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="10" y="30" width="110" height="170" rx="6"/>
+    <rect x="20" y="60" width="90" height="30" rx="3"/>
+    <rect x="20" y="95" width="90" height="30" rx="3"/>
+    <rect x="20" y="150" width="90" height="30" rx="3"/>
+    <rect x="160" y="30" width="300" height="170" rx="6"/>
+    <rect x="170" y="55" width="130" height="135" rx="4" stroke-dasharray="4 3"/>
+    <rect x="315" y="55" width="135" height="135" rx="4" stroke-dasharray="4 3"/>
+    <circle cx="205" cy="90" r="9"/>
+    <circle cx="255" cy="130" r="9"/>
+    <circle cx="225" cy="165" r="9"/>
+    <circle cx="370" cy="100" r="9"/>
+    <circle cx="410" cy="150" r="9"/>
+    <rect x="500" y="30" width="130" height="75" rx="6"/>
+    <rect x="500" y="125" width="130" height="75" rx="6"/>
+    <path d="M110 75 C150 75 170 90 195 90 M110 110 C160 110 200 130 245 130 M110 165 C150 165 190 165 215 165 M264 130 C300 130 330 100 360 100"/>
+  </g>
+  <g fill="currentColor" font-family="sans-serif" font-size="12" text-anchor="middle">
+    <text x="65" y="22">thread stacks</text>
+    <text x="65" y="79" font-size="10">frame: main</text>
+    <text x="65" y="114" font-size="10">frame: load</text>
+    <text x="65" y="169" font-size="10">another thread</text>
+    <text x="310" y="22">heap (shared by all threads)</text>
+    <text x="235" y="72" font-size="11">young generation</text>
+    <text x="382" y="72" font-size="11">old generation</text>
+    <text x="565" y="22">metaspace</text>
+    <text x="565" y="70" font-size="10">class metadata</text>
+    <text x="565" y="118">code cache</text>
+    <text x="565" y="165" font-size="10">JIT-compiled code</text>
+  </g>
+</svg>
+</Figure>
+
+- **Thread stacks.** Each thread has a stack of **frames**, one per method call in progress, holding that call's local variables and partial results. Primitive locals live right in the frame; reference locals hold pointers to objects. A stack is small (typically around a megabyte for a platform thread) and is reclaimed automatically as methods return. Infinite recursion fills it and throws `StackOverflowError`.
+- **The heap.** Every object and array lives here, shared by all threads. Allocation is extremely fast: each thread gets a private buffer (a TLAB, thread-local allocation buffer) and allocating usually means bumping a pointer. The heap is where the garbage collector works.
+- **Metaspace** holds the metadata of loaded classes, outside the heap.
+- **The code cache** holds machine code produced by the JIT compilers.
+
+The garbage collector's job is to find objects that the program can no longer reach and reuse their memory. An object is **reachable** if a chain of references leads to it from a **root**: a local variable in some live frame, a static field, a running thread, and a few JVM internals. Everything else is garbage, no matter how recently it was created, and no matter whether it refers to other objects (a cycle of objects that nothing reaches is garbage too).
+
+Most collectors exploit an empirical observation, the **generational hypothesis**: most objects die young. A request handler creates thousands of temporary strings, lists and records, and almost all are unreachable before the request finishes. So the heap is divided into a **young generation**, collected often and cheaply by copying the few survivors elsewhere, and an **old generation** for long-lived objects, collected rarely. The cost of a young collection is proportional to what *survives*, not to what was allocated, which is why allocating short-lived objects in Java is cheap.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="Stop-the-world pause">
+
+A period in which the collector halts all application threads, for example to find roots or move objects safely. Pauses add directly to response times.
+
+</Definition>
+
+<Definition term="Throughput and latency">
+
+**Throughput** is the share of time the application spends doing its own work rather than collecting garbage. **Latency** here means how long individual pauses last. Collectors trade one against the other, and against memory overhead.
+
+</Definition>
+
+<Definition term="JIT compilation and tiers">
+
+HotSpot starts by **interpreting** bytecode while counting how often methods and loops run. Hot methods are compiled by **C1**, a fast compiler that also inserts profiling, and the hottest are recompiled by **C2**, an optimising compiler that uses the profile. This scheme is called **tiered compilation**; `-XX:+PrintCompilation` labels the levels 0 (interpreter) to 4 (C2).
+
+</Definition>
+
+<Definition term="Inlining, escape analysis and deoptimization">
+
+**Inlining** replaces a method call with the method's body, which removes call overhead and, more importantly, lets other optimisations see across the call. **Escape analysis** detects objects that never leave a method and can avoid allocating them on the heap at all. C2 makes **speculative** optimisations based on the profile ("this call site has only ever seen one class"); if the assumption is later violated, the JVM **deoptimizes**: it discards the compiled code and returns to the interpreter until it can recompile.
+
+</Definition>
+
+</Section>
+
+<Section id="which-jvm" kind="examples" title="Which JVM, which collector?">
+
+```java check
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+
+void main() {
+    IO.println("JVM: " + System.getProperty("java.vm.name") + ", Java " + Runtime.version().feature());
+    for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+        IO.println("collector: " + gc.getName());
+    }
+    IO.println("processors: " + Runtime.getRuntime().availableProcessors());
+    IO.println("max heap MB: " + Runtime.getRuntime().maxMemory() / (1024 * 1024));
+    IO.println(ManagementFactory.getRuntimeMXBean().getInputArguments());
+}
+```
+
+On the course's test machine (20 hardware threads, 16 GB of memory, no options) this printed:
+
+```text
+JVM: OpenJDK 64-Bit Server VM, Java 25
+collector: G1 Young Generation
+collector: G1 Concurrent GC
+collector: G1 Old Generation
+processors: 20
+max heap MB: 3922
+[--add-modules=ALL-DEFAULT]
+```
+
+Your numbers will differ, and that is the lesson. With no options, the JVM chooses for itself, using **ergonomics**: it picks the **G1** collector on any machine with at least two processors and about 2 GB of memory (otherwise the simpler Serial collector), and sets the maximum heap to a quarter of physical memory. Inside a container, modern JVMs read the container's CPU and memory limits rather than the host's. In production you usually set the heap explicitly, either as a size (`-Xmx4g`) or, in containers, as a share of the container's memory (`-XX:MaxRAMPercentage=75`). The `--add-modules` argument is added by the source launcher.
+
+</Section>
+
+<Section id="garbage" kind="examples" title="Reachability and garbage, observed">
+
+```java check
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Main {
+    record Photo(String name, byte[] pixels) {}
+
+    static int depth = 0;
+
+    static void descend() {
+        depth++;
+        descend();                         // no base case: each call adds a stack frame
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        // An object stays alive while it is reachable from a root (a local variable, a static field...)
+        List<Photo> album = new ArrayList<>();
+        album.add(new Photo("sunrise", new byte[1_000_000]));
+        WeakReference<Photo> watcher = new WeakReference<>(album.getFirst());   // does not keep it alive
+
+        System.out.println("while reachable, cleared? " + (watcher.get() == null));
+
+        album.clear();                     // the last strong reference is gone
+        for (int i = 0; i < 10 && watcher.get() != null; i++) {
+            System.gc();                   // only a request; we ask until the collector has run
+            Thread.sleep(10);
+        }
+        System.out.println("after the album let go, cleared? " + (watcher.get() == null));
+
+        // Short-lived garbage is cheap: allocate far more than we ever keep
+        long kept = 0;
+        for (int i = 0; i < 2_000; i++) {
+            byte[] scratch = new byte[1_000_000];      // about 2 GB allocated in total
+            scratch[i % scratch.length] = 1;
+            kept += scratch[i % scratch.length];
+        }
+        System.out.println("allocated about 2000 MB, kept " + kept + " bytes of results");
+
+        // Each thread's stack is small and fixed; heap objects are not on it
+        try {
+            descend();
+        } catch (StackOverflowError e) {
+            System.out.println("StackOverflowError after many thousands of frames: " + (depth > 1_000));
+        }
+    }
+}
+```
+
+```text
+while reachable, cleared? false
+after the album let go, cleared? true
+allocated about 2000 MB, kept 2000 bytes of results
+StackOverflowError after many thousands of frames: true
+```
+
+A `WeakReference` lets you watch an object without keeping it alive; it is cleared when the object is no longer strongly reachable and the collector has run. While the album held the photo, it survived; once `album.clear()` removed the last strong reference, the next collection reclaimed it. `System.gc()` is only a request, which is why the program asks in a loop; production code should almost never call it.
+
+To see the collector at work, run the program with **unified logging**: `java -Xlog:gc Main.java`. The beginning of the log on the test machine:
+
+```text
+[0.003s][info][gc] Using G1
+while reachable, cleared? false
+[0.575s][info][gc] GC(0) Pause Full (System.gc()) 40M->3M(34M) 13.364ms
+after the album let go, cleared? true
+[0.596s][info][gc] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 15M->3M(34M) 1.032ms
+[0.598s][info][gc] GC(2) Pause Young (Normal) (G1 Evacuation Pause) 13M->3M(34M) 0.466ms
+[0.600s][info][gc] GC(3) Pause Young (Normal) (G1 Evacuation Pause) 15M->3M(34M) 0.318ms
+[0.601s][info][gc] GC(4) Pause Young (Normal) (G1 Evacuation Pause) 17M->3M(140M) 0.536ms
+[0.645s][info][gc] GC(5) Pause Young (Normal) (G1 Evacuation Pause) 85M->3M(140M) 0.756ms
+```
+
+Each line gives the time since startup, the collection number, its kind and cause, the heap occupancy before and after (`85M->3M`), the current heap size in parentheses, and the pause length. Read it with the generational hypothesis in mind: young collections found 85 MB of scratch arrays, kept 3 MB, and finished in under a millisecond, because the cost depends on survivors. The explicit `System.gc()` triggered a *full* collection, much slower (13 ms here). Notice too that G1 grew the heap (34M, then 140M) as allocation pressure rose. In production, GC logs go to a file (`-Xlog:gc*:file=gc.log`) and are the first thing to read when latency misbehaves.
+
+The final test shows the other memory area: a method that calls itself without end adds frames until the thread's stack is exhausted. `StackOverflowError` is an `Error`, not an `Exception`; catching it here is a demonstration, not a practice to copy.
+
+</Section>
+
+<Section id="collectors" kind="human" title="Choosing a collector">
+
+JDK 25 ships several collectors, each a different answer to the throughput–latency–memory trade-off:
+
+| Collector | Option | Character |
+| --- | --- | --- |
+| **G1** | `-XX:+UseG1GC` (default) | Divides the heap into regions, collects the ones with most garbage first, and aims for a pause-time goal (200 ms by default, `-XX:MaxGCPauseMillis`). A balanced default for most services. |
+| **ZGC** | `-XX:+UseZGC` | Does almost all its work concurrently with the application; pauses stay well under a millisecond even on very large heaps. Generational since JDK 21 and only generational since JDK 24. Costs some throughput and memory. |
+| **Parallel** | `-XX:+UseParallelGC` | Stops the world but uses all cores to collect fast. Best raw throughput for batch jobs that do not care about pauses. |
+| **Serial** | `-XX:+UseSerialGC` | One thread, small footprint. Fine for small heaps, command-line tools and tiny containers. |
+| **Shenandoah** | `-XX:+UseShenandoahGC` | Another low-pause concurrent collector, included in most OpenJDK builds. |
+
+The professional approach is undramatic: start with the default, set the heap size deliberately, turn on GC logging, measure the pause times and throughput your service actually experiences, and change collector only when the measurements say so. If the requirement is "p99 latency under 10 ms with a 64 GB heap", try ZGC; if it is "finish this nightly job as fast as possible", try Parallel. Most of the old folklore about tuning dozens of flags dates from collectors that no longer exist.
+
+Memory footprint has also improved in recent releases. Every object carries a header (traditionally 12 bytes on a 64-bit JVM with compressed pointers); JDK 25 makes **compact object headers** a supported option (`-XX:+UseCompactObjectHeaders`, [JEP 519](https://openjdk.org/jeps/519)), shrinking it to 8 bytes, which matters for programs with many small objects.
+
+</Section>
+
+<Section id="jit" kind="computation" title="The JIT at work">
+
+This program searches for the starting number below three million with the longest Collatz sequence, about 300 million loop iterations in all:
+
+```java check
+public class Main {
+    static long collatzSteps(long n) {
+        long steps = 0;
+        while (n != 1) {
+            n = (n % 2 == 0) ? n / 2 : 3 * n + 1;
+            steps++;
+        }
+        return steps;
+    }
+
+    public static void main(String[] args) {
+        long best = 0, arg = 0;
+        for (long n = 1; n < 3_000_000; n++) {
+            long s = collatzSteps(n);
+            if (s > best) { best = s; arg = n; }
+        }
+        System.out.println(arg + " takes " + best + " steps");
+    }
+}
+```
+
+```text
+2298025 takes 559 steps
+```
+
+On the test machine, compiled with `javac` and run three times with `java`, it took 0.79, 0.80 and 0.79 seconds. With `java -Xint`, which disables the JIT and interprets every bytecode, the same program took 15.07 seconds: about nineteen times slower. That is the JIT's contribution. Running with `-XX:+PrintCompilation` shows it happening; here are the lines about this program's own methods (the JVM compiles hundreds of its library methods too):
+
+```text
+12    8       3       Main::collatzSteps (43 bytes)
+14    9 %     4       Main::collatzSteps @ 2 (43 bytes)
+15   10       4       Main::collatzSteps (43 bytes)
+15    8       3       Main::collatzSteps (43 bytes)   made not entrant: not used
+29   11 %     3       Main::main @ 7 (59 bytes)
+31   12       3       Main::main (59 bytes)
+39   13 %     4       Main::main @ 7 (59 bytes)
+40   11 %     3       Main::main @ 7 (59 bytes)   made not entrant: OSR invalidation of lower level
+786   13 %     4       Main::main @ 7 (59 bytes)   made not entrant: uncommon trap
+```
+
+The columns are milliseconds since startup, a compilation ID, flags, the tier, and the method. Twelve milliseconds in, `collatzSteps` had run often enough to be compiled at tier 3 (C1 with profiling); by 15 ms the C2 version (tier 4) was ready and the C1 version was retired ("made not entrant"). The `%` marks **on-stack replacement** (OSR): `main` never returns while the loop runs, so the JVM compiled the *loop* and switched the running frame over to the compiled code mid-execution. The last line is a **deoptimization**: at 786 ms, just as the loop ended, compiled code hit a path it had speculated would never be taken (an "uncommon trap"), and the JVM threw that code away. All of this is invisible to the program, which just gets faster.
+
+#### Why hand-written benchmarks lie
+
+The JIT makes naive timing measurements misleading in several ways:
+
+- **Warm-up.** The first iterations run interpreted or with C1 code. Timing them measures the compiler, not your code.
+- **Dead-code elimination.** If a benchmark computes a result and never uses it, C2 may delete the computation, and the "benchmark" measures an empty loop.
+- **Constant folding and unrealistic profiles.** A benchmark that always passes the same input, or only one class, lets C2 specialise in ways production code never sees.
+- **Noise.** GC pauses, CPU frequency scaling and other processes all perturb single runs.
+
+Professionals use **JMH**, the Java Microbenchmark Harness from the OpenJDK project, which handles warm-up, forking fresh JVMs, consuming results so they cannot be eliminated, and reporting statistics. For whole applications, they use profilers: **Java Flight Recorder** (built into the JDK; start it with `-XX:StartFlightRecording` or `jcmd <pid> JFR.start`) and JDK Mission Control to read its recordings, or sampling profilers such as async-profiler.
+
+</Section>
+
+<Section id="startup" kind="human" title="Startup, footprint and the tools of the trade">
+
+The JIT's weakness is the beginning: until hot code is compiled, a Java program runs slowly, and loading and linking thousands of classes takes time too. That matters for command-line tools, serverless functions and services that scale up and down. Recent JDKs address it directly. Class data sharing has long let the JVM map pre-parsed JDK classes from an archive. JDK 24 added an **ahead-of-time cache** ([JEP 483](https://openjdk.org/jeps/483)) that also stores your application's classes, already loaded and linked, from a training run; JDK 25 simplified creating it to one option and added method profiles to it. On the test machine:
+
+```bash
+jar --create --file app.jar --main-class Main -C out .
+java -XX:AOTCacheOutput=app.aot -jar app.jar   # training run: writes the cache
+java -XX:AOTCache=app.aot -jar app.jar         # later runs: start from the cache
+```
+
+The training run ended with `AOTCache creation is complete: app.aot 10018816 bytes`, and later runs loaded it. (The cache needs the application on a JAR class path, not a directory of class files.) Separately, the GraalVM project's **native image** compiles a Java application ahead of time into a standalone executable with very fast startup, at the cost of a closed-world build and some restrictions on dynamic features.
+
+The everyday diagnostic tools ship with every JDK:
+
+- `jcmd <pid> help` lists commands for a running JVM: thread dumps, heap summaries, GC triggers, JFR recordings, VM flags.
+- `jstat -gc <pid> 1s` prints heap and GC statistics every second.
+- A **heap dump** (`jcmd <pid> GC.heap_dump file.hprof`) can be opened in a tool such as Eclipse MAT to find what is keeping memory alive; add `-XX:+HeapDumpOnOutOfMemoryError` in production so you get one when it matters.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Garbage collection means Java cannot have memory leaks."** The collector frees *unreachable* objects. A static map that keeps growing, a cache with no eviction, or listeners that are never removed keep objects reachable forever. Those are leaks, and heap dumps find them.
+
+</Misconception>
+
+<Misconception>
+
+**"Creating objects in Java is expensive, so reuse them in pools."** Allocation is a pointer bump, and short-lived objects cost almost nothing to collect. Object pools of ordinary objects usually make things slower and keep objects alive longer. Pool only genuinely expensive resources, such as database connections.
+
+</Misconception>
+
+<Misconception>
+
+**"Calling `System.gc()` helps performance."** It usually triggers a full, stop-the-world collection, exactly the expensive kind, and the collector already knows better than your code when to run.
+
+</Misconception>
+
+<Misconception>
+
+**"I timed the old and new versions in a loop, and the new one is faster."** Without warm-up, repeated forks, and protection against dead-code elimination, such timings often measure the JIT rather than the code. Use JMH.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

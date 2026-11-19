@@ -1,0 +1,397 @@
+---
+title: Tooling, testing and a complete project
+subtitle: The F# toolchain as professionals use it, example-based and property-based tests, and a small language implementation in idiomatic F#.
+minutes: 70
+objectives:
+  - Use scripts, projects, NuGet references and F# Interactive together in a day-to-day workflow
+  - Format code with Fantomas and keep a codebase consistent
+  - Write example-based tests with xUnit or Expecto and property-based tests in the style of FsCheck
+  - Read and extend a complete program built from unions, recursion, results and folds
+  - Know the main F# libraries and communities, and where to go next
+prerequisites: [computation-expressions-and-interop]
+references:
+  - title: Fantomas
+    url: https://fsprojects.github.io/fantomas/
+    note: The F# code formatter, and the configuration options it reads from .editorconfig.
+  - title: FsCheck
+    url: https://fscheck.github.io/FsCheck/
+    note: Property-based testing for .NET, written in F#.
+  - title: Expecto
+    url: https://github.com/haf/expecto
+    note: An F#-first test framework in which tests are ordinary values.
+  - title: Ionide
+    url: https://ionide.io/
+    note: The F# extension for Visual Studio Code.
+  - title: Learning F#
+    author: F# Software Foundation
+    url: https://fsharp.org/learn/
+    note: A curated list of books, courses and exercises, including the F# track on Exercism.
+---
+
+<Section id="motivation" kind="motivation" title="From scripts to a codebase">
+
+The previous lessons ran every program as a script. Scripts are where much F# work begins, but production code lives in projects, is formatted consistently, is tested automatically, and depends on libraries from NuGet. This lesson covers that toolchain, then puts the whole course together in a complete program: a small calculator language with variables, the kind of program (a tokeniser, a parser, an evaluator) for which F# is especially well suited. It finishes with how to test such code thoroughly, including **property-based testing**, a technique the F# community has done much to popularise.
+
+</Section>
+
+<Section id="tooling" kind="human" title="The F# toolchain">
+
+**The SDK.** Everything starts with the `dotnet` command from the .NET SDK. `dotnet new console -lang F#`, `dotnet new classlib -lang F#` and `dotnet new xunit -lang F#` create projects; `dotnet build`, `dotnet run` and `dotnet test` work exactly as in C#. Remember that an F# project lists its files in compilation order, so adding a file means placing it in the list (editors do this for you).
+
+**Scripts as a workbench.** An `.fsx` script can pull in NuGet packages and other source files directly, which makes it ideal for exploring a library, prototyping, data analysis and automation:
+
+```fsharp
+#r "nuget: FSharp.Data"          // download and reference a package
+#load "Domain.fs" "Parsing.fs"   // compile project files into the script
+
+open Parsing
+parseLine "let rate = 0.16"      // try project code interactively
+```
+
+Many teams keep a `scripts/` folder of such files next to their projects, for one-off data fixes, reports and experiments.
+
+**Editors.** Ionide (Visual Studio Code), JetBrains Rider and Visual Studio all provide inline type hints, error highlighting, navigation and refactoring. Ionide and several other editors are built on **FsAutoComplete**, an open-source language server for F#.
+
+**Formatting with Fantomas.** Fantomas is the community's standard formatter, following the official F# style guide. Install it as a local tool and run it over the repository:
+
+```bash
+dotnet tool install fantomas --create-manifest-if-needed
+dotnet fantomas .            # format every F# file
+dotnet fantomas --check .    # in CI: fail if anything is not formatted
+```
+
+Its settings (line length, and a few style choices) live in `.editorconfig`, so every developer and every CI run formats identically. Teams that adopt it stop discussing layout in code review entirely.
+
+**Packages.** Most F# projects use NuGet like any .NET project, often with central package management. Some use **Paket**, an alternative dependency manager created in the F# community, which locks the exact version of every transitive dependency; you will meet it in older and larger F# repositories.
+
+**A typical repository.** A small F# service might be laid out like this, with the project file's `Compile` list mirroring the order of the files: domain types first, then logic, then the edges.
+
+```text
+Calculator.sln
+src/Calculator/Calculator.fsproj     Compile: Syntax.fs, Tokeniser.fs, Parser.fs, Eval.fs, Program.fs
+tests/Calculator.Tests/...fsproj     Compile: TokeniserTests.fs, ParserTests.fs, Properties.fs, Main.fs
+scripts/explore.fsx                  #load the source files and experiment
+.editorconfig                        Fantomas and compiler settings
+.config/dotnet-tools.json            local tools, such as fantomas, at pinned versions
+```
+
+**Analyzers and warnings.** Treat warnings as errors in CI, at least FS0025 (incomplete matches). The F# compiler also has optional warnings worth enabling, and community analyzers can check rules specific to your codebase.
+
+</Section>
+
+<Section id="project" kind="computation" title="Project: a calculator language">
+
+The program reads lines such as `let price = 250` and `price * (1 + vat)`, keeps a set of named variables, and prints each result, or an error message for a line it cannot handle. It is written in three stages, each a pure function, and a small driver:
+
+1. **Tokenise**: turn the text into a list of tokens (numbers, names, operators, parentheses).
+2. **Parse**: turn the tokens into an expression tree, respecting operator precedence.
+3. **Evaluate**: compute the value of a tree, given the variables defined so far.
+
+Every stage returns a `Result`, so an error at any stage flows to the output as a message instead of crashing the program.
+
+```fsharp check
+// A small calculator with variables: tokenise, parse, evaluate, report errors as values.
+open System
+
+type Token =
+    | Number of float
+    | Ident of string
+    | Op of char
+    | LParen
+    | RParen
+
+type Expr =
+    | Num of float
+    | Var of string
+    | Neg of Expr
+    | Binary of char * Expr * Expr
+
+type Statement =
+    | Assign of name: string * Expr
+    | Print of Expr
+
+// ---- Tokeniser ---------------------------------------------------------------
+let tokenise (text: string) : Result<Token list, string> =
+    let rec go i acc =
+        if i >= text.Length then Ok(List.rev acc)
+        else
+            let c = text[i]
+            if Char.IsWhiteSpace c then go (i + 1) acc
+            elif Char.IsDigit c || c = '.' then
+                let j = Seq.initInfinite ((+) i) |> Seq.find (fun j -> j >= text.Length || not (Char.IsDigit text[j] || text[j] = '.'))
+                match Double.TryParse(text[i .. j - 1], Globalization.CultureInfo.InvariantCulture) with
+                | true, n -> go j (Number n :: acc)
+                | false, _ -> Error $"bad number '{text[i .. j - 1]}'"
+            elif Char.IsLetter c then
+                let j = Seq.initInfinite ((+) i) |> Seq.find (fun j -> j >= text.Length || not (Char.IsLetterOrDigit text[j]))
+                go j (Ident text[i .. j - 1] :: acc)
+            elif "+-*/=".Contains c then go (i + 1) (Op c :: acc)
+            elif c = '(' then go (i + 1) (LParen :: acc)
+            elif c = ')' then go (i + 1) (RParen :: acc)
+            else Error $"unexpected character '{c}'"
+    go 0 []
+
+// ---- Parser: recursive descent, one function per precedence level --------------
+// expr   = term (('+' | '-') term)*
+// term   = factor (('*' | '/') factor)*
+// factor = number | name | '-' factor | '(' expr ')'
+let rec parseExpr tokens =
+    parseTerm tokens |> Result.bind (fun (left, rest) -> exprTail left rest)
+
+and exprTail left tokens =
+    match tokens with
+    | Op ('+' | '-' as op) :: rest ->
+        parseTerm rest |> Result.bind (fun (right, rest') -> exprTail (Binary(op, left, right)) rest')
+    | _ -> Ok(left, tokens)
+
+and parseTerm tokens =
+    parseFactor tokens |> Result.bind (fun (left, rest) -> termTail left rest)
+
+and termTail left tokens =
+    match tokens with
+    | Op ('*' | '/' as op) :: rest ->
+        parseFactor rest |> Result.bind (fun (right, rest') -> termTail (Binary(op, left, right)) rest')
+    | _ -> Ok(left, tokens)
+
+and parseFactor tokens =
+    match tokens with
+    | Number n :: rest -> Ok(Num n, rest)
+    | Ident name :: rest -> Ok(Var name, rest)
+    | Op '-' :: rest -> parseFactor rest |> Result.map (fun (e, rest') -> Neg e, rest')
+    | LParen :: rest ->
+        match parseExpr rest with
+        | Ok(e, RParen :: rest') -> Ok(e, rest')
+        | Ok _ -> Error "missing ')'"
+        | Error e -> Error e
+    | [] -> Error "unexpected end of input"
+    | t :: _ -> Error $"unexpected {t}"
+
+let parseStatement tokens =
+    let complete parsed =
+        match parsed with
+        | Ok(e, []) -> Ok e
+        | Ok(_, t :: _) -> Error $"unexpected {t} after the expression"
+        | Error e -> Error e
+    match tokens with
+    | Ident "let" :: Ident name :: Op '=' :: rest -> parseExpr rest |> complete |> Result.map (fun e -> Assign(name, e))
+    | _ -> parseExpr tokens |> complete |> Result.map Print
+
+// ---- Evaluator -----------------------------------------------------------------
+let rec eval (env: Map<string, float>) expr : Result<float, string> =
+    let both a b f = eval env a |> Result.bind (fun x -> eval env b |> Result.bind (f x))
+    match expr with
+    | Num n -> Ok n
+    | Var name ->
+        match Map.tryFind name env with
+        | Some value -> Ok value
+        | None -> Error $"unknown variable '{name}'"
+    | Neg e -> eval env e |> Result.map (fun x -> -x)
+    | Binary ('+', a, b) -> both a b (fun x y -> Ok(x + y))
+    | Binary ('-', a, b) -> both a b (fun x y -> Ok(x - y))
+    | Binary ('*', a, b) -> both a b (fun x y -> Ok(x * y))
+    | Binary ('/', a, b) -> both a b (fun x y -> if y = 0.0 then Error "division by zero" else Ok(x / y))
+    | Binary (op, _, _) -> Error $"unknown operator {op}"
+
+// ---- Running a session: each line updates the environment or prints a result ---
+let run (env: Map<string, float>) (line: string) =
+    let outcome =
+        tokenise line
+        |> Result.bind parseStatement
+        |> Result.bind (fun statement ->
+            match statement with
+            | Assign (name, e) -> eval env e |> Result.map (fun v -> Map.add name v env, $"{name} = {v}")
+            | Print e -> eval env e |> Result.map (fun v -> env, $"{v}"))
+    match outcome with
+    | Ok (env', message) ->
+        printfn "> %-28s %s" line message
+        env'
+    | Error message ->
+        printfn "> %-28s error: %s" line message
+        env
+
+let session =
+    [ "let price = 250"
+      "let vat = 0.16"
+      "price * (1 + vat)"
+      "let total = price * 3 - -10"
+      "total / 4"
+      "total / (vat - 0.16)"
+      "discount * price"
+      "2 * (3 + 4"
+      "7 % 2" ]
+
+session |> List.fold run Map.empty |> ignore
+```
+
+It prints:
+
+```text
+> let price = 250              price = 250
+> let vat = 0.16               vat = 0.16
+> price * (1 + vat)            290
+> let total = price * 3 - -10  total = 760
+> total / 4                    190
+> total / (vat - 0.16)         error: division by zero
+> discount * price             error: unknown variable 'discount'
+> 2 * (3 + 4                   error: missing ')'
+> 7 % 2                        error: unexpected character '%'
+```
+
+How it uses the course:
+
+- **Unions model the language.** `Token`, `Expr` and `Statement` are each a few lines and describe the whole language. `Binary of char * Expr * Expr` covers all four operators; a compiler for a bigger language would have one case per kind of node, but the shape is the same.
+- **The tokeniser** is a tail-recursive loop over positions, accumulating tokens in reverse and reversing once at the end. Slices such as `text[i .. j - 1]` extract the characters of a number or a name, and `Double.TryParse` with the invariant culture means "0.16" parses the same everywhere.
+- **The parser is recursive descent**: one function per level of precedence, mutually recursive with `and`, each returning the parsed expression and the remaining tokens. The comment above them is the grammar they implement. Because `term` is parsed inside `expr`, multiplication binds more tightly than addition, and because `exprTail` builds `Binary(op, left, right)` with the result so far on the left, `10 - 3 - 2` is read as `(10 - 3) - 2`, as it should be. Or-patterns such as `Op ('+' | '-' as op)` match either operator and name it.
+- **The evaluator** is a direct recursive function over the tree. The helper `both` evaluates two subexpressions on the railway, and division by zero becomes an `Error` rather than an infinity.
+- **The driver is a fold.** `List.fold run Map.empty` threads the environment of variables through the session: each line receives the variables so far and returns the possibly updated set. There is no mutable state anywhere in the program.
+
+Errors carry useful messages: the unknown variable is named, the missing parenthesis is reported, and an unsupported character is quoted. Each comes from the stage that understands it.
+
+Why `Result` rather than exceptions in the parser? Because bad input is the normal case for a parser: users mistype. Each stage reports what it found in its own terms, and the driver decides how to present it. Exceptions would be appropriate only for bugs, such as an operator the evaluator does not know, which the parser can never produce. (The final `Binary (op, _, _)` rule exists only to keep the match complete.)
+
+How would you test this program? Example tests for each stage (`tokenise "2*x"` gives three tokens), plus one powerful property: **printing an expression and parsing the result gives back the same expression**. Write a `show` function like the one in the unions lesson, generate random trees, and check the round trip. Properties like this have found real bugs in real compilers.
+
+Natural extensions, each a small change: add `^` for powers (one more precedence level), functions such as `sqrt(x)` (a new `Expr` case and a new parser rule), or units of measure for typed quantities. Each change starts with the union, and the compiler's exhaustiveness checks lead you to every function that must follow.
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing: examples and properties">
+
+There are two complementary ways to test a function. **Example-based tests** check particular inputs against expected outputs: `encode "aaab"` should be `[('a', 3); ('b', 1)]`. **Property-based tests** state rules that must hold for *every* input, then check them against hundreds of generated inputs: decoding an encoding gives back the original text; no run is empty; neighbouring runs have different characters; the run lengths add up to the text's length. A good property often catches an edge case nobody thought to write an example for.
+
+This script tests a run-length encoder both ways. A real project would use a test framework; here a tiny `check` function stands in for one, and a seeded random generator stands in for a property-testing library, so that the run is reproducible:
+
+```fsharp check
+// Run-length encoding, and the two kinds of test professionals write for it.
+let encode (text: string) =
+    text
+    |> Seq.fold (fun runs c ->
+        match runs with
+        | (last, n) :: rest when last = c -> (c, n + 1) :: rest
+        | _ -> (c, 1) :: runs) []
+    |> List.rev
+
+let decode runs =
+    runs |> List.map (fun (c, n) -> System.String(c, n)) |> String.concat ""
+
+let mutable passed = 0
+let mutable failed = 0
+let check name condition =
+    if condition then passed <- passed + 1
+    else
+        failed <- failed + 1
+        printfn "FAIL: %s" name
+
+// 1. Example-based tests: specific inputs, specific expected outputs.
+check "empty" (encode "" = [])
+check "single" (encode "a" = [ ('a', 1) ])
+check "runs" (encode "aaabccdddd" = [ ('a', 3); ('b', 1); ('c', 2); ('d', 4) ])
+check "no merging across gaps" (encode "abab" |> List.length = 4)
+
+// 2. Property-based tests: rules that must hold for every input, tried on many random inputs.
+let random = System.Random 2026                       // fixed seed: the same inputs every run
+let randomText () =
+    let length = random.Next(0, 30)
+    System.String(Array.init length (fun _ -> "aabbbcz"[random.Next 7]))
+
+for _ in 1..500 do
+    let text = randomText ()
+    let runs = encode text
+    check $"round trip: {text}" (decode runs = text)
+    check $"no empty runs: {text}" (runs |> List.forall (fun (_, n) -> n > 0))
+    check $"neighbours differ: {text}" (runs |> List.pairwise |> List.forall (fun ((a, _), (b, _)) -> a <> b))
+    check $"lengths add up: {text}" (runs |> List.sumBy snd = text.Length)
+
+printfn "%d checks passed, %d failed" passed failed
+printfn "%A" (encode "Mississippi")
+exit (if failed = 0 then 0 else 1)
+```
+
+It prints:
+
+```text
+2004 checks passed, 0 failed
+[('M', 1); ('i', 1); ('s', 2); ('i', 1); ('s', 2); ('i', 1); ('p', 2); ('i', 1)]
+```
+
+`exit` sets the process's exit code, which is how a CI system notices failing tests. In a real repository, the same tests would live in a test project. With **xUnit**, F#'s double-backtick names make readable test names:
+
+```fsharp
+open Xunit
+
+[<Fact>]
+let ``encode groups repeated characters`` () =
+    Assert.Equal<(char * int) list>([ ('a', 3); ('b', 1) ], encode "aaab")
+```
+
+With **Expecto**, an F#-first framework, tests are ordinary values that you compose into lists, and its FsCheck integration turns a property into a test that runs against generated inputs:
+
+```fsharp
+open Expecto
+
+let tests =
+    testList "run-length encoding" [
+        test "groups repeated characters" {
+            Expect.equal (encode "aaab") [ ('a', 3); ('b', 1) ] "runs"
+        }
+        testProperty "decode reverses encode" (fun (chars: char list) ->
+            let text = System.String(List.toArray chars)
+            decode (encode text) = text)
+    ]
+```
+
+**FsCheck** generates the inputs and, when a property fails, *shrinks* the failing input to a minimal example, which is often the most useful debugging information you will ever get. Generating a list of characters, rather than a string directly, avoids FsCheck's generated `null` strings, a reminder that properties make you think precisely about what "every input" means.
+
+</Section>
+
+<Section id="ecosystem" kind="reading" title="The ecosystem, and where to go next">
+
+The F# community is smaller than C#'s, and correspondingly close-knit. Much of its tooling (Ionide, Fantomas, Paket, Fable, FsAutoComplete) is built and maintained by volunteers, coordinated through the F# Software Foundation and GitHub organisations such as fsprojects. The language itself evolves in the open: anyone can propose a feature, discussions are public, and accepted designs are written up as RFCs before they are implemented. Contributing a fix to a tool you use is a realistic and welcome way to learn. Libraries and tools you are likely to meet:
+
+- **Web**: Giraffe and Saturn build web applications on ASP.NET Core in a functional style; plain ASP.NET Core minimal APIs work from F# too.
+- **Front end**: **Fable** compiles F# to JavaScript (and, increasingly, to other languages), so that a whole web application can be written in F#; the SAFE Stack combines it with a server.
+- **Data**: FSharp.Data provides type providers for CSV, JSON and HTML that infer types from sample data at compile time; Plotly.NET draws charts; Deedle handles data frames.
+- **Testing**: xUnit, NUnit, Expecto, FsCheck, and Unquote for readable assertions.
+
+Where to go next:
+
+- **Practise.** The F# track on Exercism offers small problems with mentoring; Advent of Code puzzles each December suit F# beautifully.
+- **Read about design.** Scott Wlaschin's site *F# for Fun and Profit*, and his book *Domain Modeling Made Functional*, show how to design whole applications with the types from this course.
+- **Read real code.** The F# compiler, FSharp.Core, Fantomas and many community libraries are open source on GitHub, and the F# language design repository shows how new features are proposed, debated and specified.
+- **Look sideways.** OCaml, F#'s closest relative, Haskell, Elm and Rust all share its core ideas; knowing F# makes each of them easier to learn.
+
+<Reflection title="Saying exactly what is true">
+
+Much of this course has been about types that tell the truth: an option that admits a value may be missing, a union that lists every state an order can be in, a result that names every way a transfer can fail. There is something worth noticing in that discipline. Scripture often praises the plain, true word — "let your yea be yea; and your nay, nay" (James 5:12, King James Version) — and warns against speech that hides what it means. A program cannot be honest in the human sense, but its authors can be: by refusing to let `null` pretend to be a customer, or an empty string pretend to be an email address. Clarity is a kindness to everyone who reads the code after you.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Property-based tests replace example-based tests."** They complement each other. Examples document specific, important behaviour and are easy to read; properties explore the space of inputs and find the cases nobody imagined. Most well-tested F# code has both.
+
+</Misconception>
+
+<Misconception>
+
+**"F# needs its own build servers and special CI."** An F# project builds, tests and publishes with the same `dotnet` commands and the same CI templates as any .NET project, and can live in the same solution as C# projects.
+
+</Misconception>
+
+<Misconception>
+
+**"Writing a parser is a job for experts and generator tools."** For small languages, configuration formats and command syntaxes, a hand-written recursive-descent parser like the one above is short, fast and easy to give good error messages. Parser-combinator libraries such as FParsec help when the grammar grows.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

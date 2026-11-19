@@ -1,0 +1,380 @@
+---
+title: Computation expressions, async and interop
+subtitle: The syntax behind seq, async and task, writing your own builder, concurrent code, and working hand in hand with C#.
+minutes: 65
+objectives:
+  - Explain what a computation expression is and how let!, return and return! map onto builder methods
+  - Write a small custom builder, such as one for Result
+  - Write asynchronous code with task and async, run work concurrently with and! and Async.Parallel, and cancel it
+  - Call .NET libraries idiomatically from F#, including tuple-style methods, out parameters, named arguments and delegates
+  - Predict how F# records, unions and modules look to C# code, and design F# APIs that C# can use comfortably
+prerequisites: [types-and-units]
+related: [math.cat.monads]
+references:
+  - title: Computation expressions
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/fsharp/language-reference/computation-expressions
+    note: The full list of builder methods and how each piece of syntax translates.
+  - title: Task expressions
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/fsharp/language-reference/task-expressions
+    note: "task { }, its relationship to .NET tasks, and how it differs from async { }."
+  - title: Async expressions
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/fsharp/language-reference/async-expressions
+    note: F#'s original asynchronous workflows, with cancellation built in.
+  - title: Component design guidelines
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/fsharp/style-guide/component-design-guidelines
+    note: How to design F# libraries that are pleasant to use from F# and from C#.
+---
+
+<Section id="motivation" kind="motivation" title="One syntax, many kinds of computation">
+
+You have already used three things that look like special syntax: sequence expressions (`seq { ... yield ... }`), list comprehensions, and, in the last lesson, `Result.bind` chains that you might have wished were easier to read. F# has a single general mechanism behind all of them, the **computation expression**. It lets a library define what `let!`, `return`, `yield` and `for` *mean* inside a block, so that code which is really about optional values, results, sequences or asynchronous waiting can be written in the same plain, top-to-bottom style.
+
+Computation expressions are how F# does asynchronous programming, and asynchronous code is where F# meets the wider .NET world most often: web servers, databases, cloud services, all written mostly in C#. The second half of this lesson is about that meeting, in both directions.
+
+</Section>
+
+<Section id="builders" kind="definitions" title="What a computation expression is">
+
+<Definition term="Computation expression">
+
+A block written `builder { ... }`, where `builder` is an object with specially named methods (`Bind`, `Return`, `ReturnFrom`, `Zero`, `Yield`, `For`, `Combine` and others). The compiler translates the block's syntax into calls to those methods: `let! x = e` becomes a call to `Bind`, `return v` to `Return`, `return! e` to `ReturnFrom`, and so on. What those methods do defines the meaning of the block.
+
+</Definition>
+
+The clearest way to understand this is to build one. Here is a builder for `Result`, with a bank transfer written in it:
+
+```fsharp check
+// A computation expression builder for Result: let! binds on success and short-circuits on Error.
+type ResultBuilder() =
+    member _.Bind(result, next) = Result.bind next result
+    member _.Return(value) = Ok value
+    member _.ReturnFrom(result: Result<_, _>) = result
+    member _.Zero() = Ok()
+
+let result = ResultBuilder()
+
+type Account = { Owner: string; Balance: decimal; Frozen: bool }
+
+let accounts =
+    Map [ "A-1", { Owner = "Thandiwe"; Balance = 500m; Frozen = false }
+          "A-2", { Owner = "Kenji"; Balance = 40m; Frozen = false }
+          "A-3", { Owner = "Ruth"; Balance = 900m; Frozen = true } ]
+
+let find id =
+    match Map.tryFind id accounts with
+    | Some a -> Ok a
+    | None -> Error $"no account {id}"
+
+let ensureActive account =
+    if account.Frozen then Error $"{account.Owner}'s account is frozen" else Ok account
+
+let parseAmount (text: string) =
+    match System.Decimal.TryParse(text, System.Globalization.CultureInfo.InvariantCulture) with
+    | true, a when a > 0m -> Ok a
+    | _ -> Error $"'{text}' is not a positive amount"
+
+// Reads like straight-line code; every let! is a Result.bind underneath.
+let transfer fromId toId amountText =
+    result {
+        let! source = find fromId
+        let! target = find toId
+        let! _ = ensureActive source
+        let! _ = ensureActive target
+        let! amount = parseAmount amountText
+        if amount > source.Balance then
+            return! Error $"{source.Owner} has only {source.Balance}"
+        else
+            return $"{amount} from {source.Owner} to {target.Owner}"
+    }
+
+for fromId, toId, amount in [ "A-1", "A-2", "120"; "A-2", "A-1", "75"; "A-1", "A-9", "5"; "A-1", "A-3", "5"; "A-1", "A-2", "ten" ] do
+    match transfer fromId toId amount with
+    | Ok description -> printfn "ok:      %s" description
+    | Error reason -> printfn "refused: %s" reason
+```
+
+It prints:
+
+```text
+ok:      120 from Thandiwe to Kenji
+refused: Kenji has only 40
+refused: no account A-9
+refused: Ruth's account is frozen
+refused: 'ten' is not a positive amount
+```
+
+The builder has four one-line methods. `Bind` is literally `Result.bind`, with its arguments in the order the compiler supplies them; `Return` wraps a value in `Ok`; `ReturnFrom` passes a ready-made result through; `Zero` handles branches that produce no value. With those in place, the compiler rewrites
+
+```fsharp
+result {
+    let! source = find fromId
+    let! target = find toId
+    return ...
+}
+```
+
+into roughly `result.Bind(find fromId, fun source -> result.Bind(find toId, fun target -> result.Return(...)))`: the same railway as the previous lesson, but written as straight-line code. Each `let!` means "unwrap this if it is `Ok`, otherwise stop here with its `Error`". Ordinary `let`, `if` and `match` still work inside, and `return!` returns an existing `Result`, such as the `Error` for insufficient funds.
+
+Builders can define much more than `Bind` and `Return`. A builder with `Yield`, `YieldFrom`, `For`, `Combine` and `Delay` supports `yield`, `yield!`, loops and sequencing, which is how `seq { }` and list comprehensions work; `Using` supports `use`; `TryWith` and `TryFinally` support exception handling inside the block. A builder implements only the methods its kind of computation needs, and the compiler reports an error if a block uses syntax its builder does not support.
+
+You will rarely need to write builders yourself. FSharp.Core provides `seq`, `async` and `task`, list and array comprehensions use the same machinery, and libraries supply the rest: FsToolkit.ErrorHandling has `result`, `option`, `validation` and asynchronous versions of each. But knowing that a builder is just an object with a few methods takes the mystery out of all of them. In the vocabulary of functional programming, a builder with `Bind` and `Return` describes a *monad*, the same structure that LINQ's `SelectMany` captures in C#.
+
+</Section>
+
+<Section id="async" kind="examples" title="task and async">
+
+F# has two asynchronous computation expressions:
+
+- **`task { }`** (built in since F# 6) produces a .NET `Task`, exactly what C# `async` methods return. It starts running as soon as it is created (a *hot* task), and it is the right default when working with .NET libraries such as ASP.NET Core, Entity Framework or `HttpClient`.
+- **`async { }`** is F#'s original design (2007), which inspired C#'s `async`/`await`. An `Async` value is a *recipe*: nothing happens until it is started, it can be started more than once, and a cancellation token flows through it automatically. It remains useful for composing and cancelling workflows, and in older F# code.
+
+```fsharp check
+open System.Threading
+open System.Threading.Tasks
+
+// task { } produces a .NET Task: the same type C# async methods return.
+// (A script may block on .Result at the very top; inside an application, keep awaiting.)
+let fetchPrice (item: string) (delayMs: int) =
+    task {
+        do! Task.Delay delayMs            // stands in for a web or database call
+        printfn "  got %s" item
+        return item.Length * 10
+    }
+
+let sequential () =
+    task {
+        let! a = fetchPrice "tea" 100
+        let! b = fetchPrice "coffee" 100
+        return a + b
+    }
+
+// F# 10: and! awaits several tasks concurrently.
+let concurrent () =
+    task {
+        let! a = fetchPrice "maize" 300
+        and! b = fetchPrice "sorghum" 100
+        and! c = fetchPrice "millet" 200
+        return a + b + c
+    }
+
+printfn "sequential:"
+printfn "  total %d" (sequential().Result)
+printfn "concurrent:"
+printfn "  total %d" (concurrent().Result)
+
+// async { } is F#'s older, cold workflow: it runs only when started, and carries cancellation.
+let countdown name =
+    async {
+        for _ in 1..3 do
+            do! Async.Sleep 30
+        return $"{name} done"
+    }
+
+let results = [ countdown "x"; countdown "y" ] |> Async.Parallel |> Async.RunSynchronously
+printfn "%A" results
+
+let runCancelled () =
+    use cts = new CancellationTokenSource()
+    cts.Cancel()
+    try
+        Async.RunSynchronously(countdown "z", cancellationToken = cts.Token)
+    with :? System.OperationCanceledException ->
+        "z was cancelled before it finished"
+
+printfn "%s" (runCancelled ())
+```
+
+It prints:
+
+```text
+sequential:
+  got tea
+  got coffee
+  total 90
+concurrent:
+  got sorghum
+  got millet
+  got maize
+  total 180
+[|"x done"; "y done"|]
+z was cancelled before it finished
+```
+
+Inside `task { }`, `let!` awaits a task and `do!` awaits one that returns nothing. In `sequential`, the second fetch starts only after the first finishes. In `concurrent`, the F# 10 **`and!`** keyword starts all three at once and waits for all of them; they finish in order of their delays (sorghum, millet, maize), and the total time is about the longest delay rather than the sum. Before F# 10 you would write `Task.WhenAll` by hand.
+
+The `async` part runs two workflows in parallel with `Async.Parallel`, which returns their results in order, and shows built-in cancellation: the token was cancelled before the workflow started, so it stopped at its first opportunity with `OperationCanceledException`, which the `try ... with` turned into a message. In `runCancelled`, `use` binds the `CancellationTokenSource` so it is disposed when the function ends; at the top level of a script, `use` would act like `let`, which is why it is inside a function.
+
+The script calls `.Result` to wait at the very top. In an application you would not block like that: the entry point of an ASP.NET Core app, a test or an Azure Function is itself asynchronous, and tasks are awaited all the way up, exactly as in C#. To convert between the two styles, `Async.StartAsTask` turns an `Async` into a `Task`, and `Async.AwaitTask` goes the other way.
+
+</Section>
+
+<Section id="agents" kind="examples" title="Agents: concurrency without locks">
+
+Asynchronous code waits efficiently; concurrent code must also stay correct when many things happen at once. F#'s first line of defence is immutability: data that never changes can be shared between threads freely. For state that must change, FSharp.Core includes a small, powerful tool, the **`MailboxProcessor`**, often called an *agent*. An agent owns its state privately and processes messages from a queue one at a time, so no other code ever touches the state and no locks are needed. The idea comes from the actor model, which Erlang made famous.
+
+```fsharp check
+// MailboxProcessor: an agent that owns its state and handles one message at a time.
+type Message =
+    | Deposit of amount: decimal
+    | Withdraw of amount: decimal * reply: AsyncReplyChannel<Result<decimal, string>>
+    | GetBalance of reply: AsyncReplyChannel<decimal>
+
+let account =
+    MailboxProcessor.Start(fun inbox ->
+        let rec loop balance =
+            async {
+                match! inbox.Receive() with
+                | Deposit amount -> return! loop (balance + amount)
+                | Withdraw (amount, reply) when amount <= balance ->
+                    reply.Reply(Ok(balance - amount))
+                    return! loop (balance - amount)
+                | Withdraw (amount, reply) ->
+                    reply.Reply(Error $"cannot withdraw {amount} from {balance}")
+                    return! loop balance
+                | GetBalance reply ->
+                    reply.Reply balance
+                    return! loop balance
+            }
+        loop 0m)
+
+// A hundred deposits from many threads at once: no locks, no lost updates,
+// because only the agent ever touches the balance.
+[ 1..100 ] |> List.toArray |> Array.Parallel.iter (fun _ -> account.Post(Deposit 1m))
+
+printfn "balance: %M" (account.PostAndReply GetBalance)
+printfn "%A" (account.PostAndReply(fun ch -> Withdraw(30m, ch)))
+printfn "%A" (account.PostAndReply(fun ch -> Withdraw(500m, ch)))
+printfn "balance: %M" (account.PostAndReply GetBalance)
+```
+
+It prints:
+
+```text
+balance: 100
+Ok 70M
+Error "cannot withdraw 500 from 70"
+balance: 70
+```
+
+The agent's behaviour is a recursive `async` loop whose parameter is the current balance: each message produces the next call of `loop` with the new state, so even the agent's own state is never mutated. Messages are a union, which makes the agent's protocol explicit and checked. `Post` sends a message without waiting; `PostAndReply` sends one carrying an `AsyncReplyChannel` and waits for the answer. `match!` is `let!` followed by `match`, a small convenience that computation expressions provide. A hundred deposits arrive from parallel threads, yet the balance is exactly 100, because the agent handles them one after another.
+
+Agents suit components with a little private state and many concurrent clients: a cache, a rate limiter, an in-memory session store, a coordinator for background jobs. For high-throughput pipelines, .NET's `System.Threading.Channels` offer a similar model with more control.
+
+</Section>
+
+<Section id="interop" kind="examples" title="F# and C#, side by side">
+
+F# and C# compile to the same IL, share the same runtime and the same base class library, and can reference each other's projects and packages. Calling .NET from F# is routine; a few conventions make it smooth.
+
+```fsharp check
+open System
+open System.Collections.Generic
+open System.Text
+
+// Calling .NET: methods take tuples, out parameters come back as extra results,
+// optional and named arguments work, and IDisposable values are bound with use.
+let ok, date = DateOnly.TryParseExact("2026-11-19", "yyyy-MM-dd")
+printfn "%b %s %A" ok (date.ToString("dddd d MMMM yyyy", Globalization.CultureInfo.InvariantCulture)) date.DayOfWeek
+
+let counts = Dictionary<string, int>()
+for w in "rain in the hills and rain in the valley".Split ' ' do
+    counts[w] <- (match counts.TryGetValue w with | true, n -> n + 1 | _ -> 1)
+printfn "%d distinct words, 'rain' x%d" counts.Count counts["rain"]
+
+let builder = StringBuilder()
+builder.Append("Habari").Append(", ").Append("dunia") |> ignore
+printfn "%s" (builder.ToString())
+
+// F# functions convert to .NET delegates where a method expects one.
+let evens = Linq.Enumerable.Where([ 1..10 ], fun n -> n % 2 = 0) |> List.ofSeq
+printfn "%A" evens
+let padded = "7".PadLeft(totalWidth = 3, paddingChar = '0')
+printfn "%s" padded
+
+// How F# types look from C#: records and unions compile to ordinary .NET classes.
+type Point = { X: float; Y: float }
+type Shape =
+    | Circle of radius: float
+    | Square of side: float
+
+let names (t: Type) =
+    t.GetProperties() |> Array.map (fun p -> p.Name) |> Array.sort |> String.concat ", "
+
+printfn "Point properties: %s" (names typeof<Point>)
+printfn "Shape properties: %s" (names typeof<Shape>)
+let c = Circle 2.0
+printfn "IsCircle=%b, run-time class %s with properties %s" c.IsCircle (c.GetType().Name) (names (c.GetType()))
+```
+
+It prints:
+
+```text
+true Thursday 19 November 2026 Thursday
+6 distinct words, 'rain' x2
+Habari, dunia
+[2; 4; 6; 8; 10]
+007
+Point properties: X, Y
+Shape properties: IsCircle, IsSquare, Tag
+IsCircle=true, run-time class Circle with properties IsCircle, IsSquare, Tag, radius
+```
+
+**Calling .NET from F#:**
+
+- .NET methods take their arguments as a **tuple**, so you call them with parentheses and commas: `date.ToString("dddd d MMMM yyyy", CultureInfo.InvariantCulture)`. A method with a single argument can be called with a space, as in `Task.Delay delayMs` earlier.
+- **`out` parameters** become extra return values: `DateOnly.TryParseExact(...)` returns a pair `(bool, DateOnly)`, matched with `let ok, date = ...`, and `counts.TryGetValue w` returns `(bool, int)`.
+- **Named and optional arguments** work as in C#: `"7".PadLeft(totalWidth = 3, paddingChar = '0')`.
+- **Fluent APIs** such as `StringBuilder.Append` return a value at each step; F# warns if you silently discard a non-unit result, so the chain ends with `|> ignore`.
+- **Delegates**: where a .NET method expects a `Func` or `Action`, you can pass an F# lambda directly, as in the call to `Linq.Enumerable.Where`. (F# rarely calls LINQ like that, because the `Seq` module does the same job, but libraries designed for C# often take delegates.)
+- **Generic .NET collections** such as `Dictionary<string, int>` work with indexers and properties as in C#.
+
+**How F# looks from C#.** The reflection at the end shows what C# sees. A record becomes a class with read-only properties (`X`, `Y`), a constructor, and equality and comparison methods. A union becomes a base class with `Is...` properties for each case and a `Tag` number, plus a nested subclass for each case (`Circle`, with its `radius` field as a property); C# code can use `switch` on the type or the tag. A module becomes a static class, and a curried function `let add x y = ...` in a module becomes a static method `add(x, y)`.
+
+**Designing F# APIs for C# callers.** If a library will be used from C#, the F# component design guidelines suggest a few adaptations at the public surface: use .NET method syntax (members with tuple parameters) rather than curried functions; return `Task` rather than `Async`; avoid exposing F# options to C# (use null for missing reference values, `Nullable` for value types, or overloads); and accept `IEnumerable` and `Func` rather than F# lists and function types. Inside, the code stays as idiomatic F# as you like. Many teams mix the two languages this way: domain logic and data processing in F#, user interfaces and framework glue in C#.
+
+</Section>
+
+<Section id="mixed" kind="human" title="Mixed F# and C# codebases in practice">
+
+A .NET *project* is written in one language, but a *solution* can contain both. The usual arrangement is an F# class library (domain types, business rules, calculations, parsers) referenced by a C# application (a web API, a desktop app, a game), or the other way round, with F# at the top and C# libraries underneath. Both build with `dotnet build` and test with `dotnet test`, and editors navigate between them.
+
+A few practical points come up in every mixed codebase:
+
+- **FSharp.Core travels with the F# library.** C# projects that reference an F# project receive it as a dependency automatically; keep its version consistent across the solution.
+- **Serialisation.** `System.Text.Json` handles records well but not unions or options out of the box. The widely used FSharp.SystemTextJson library adds support for them; alternatively, map domain types to plain data-transfer records at the boundary.
+- **Frameworks that expect mutable classes**, such as Entity Framework Core or some UI frameworks, may need a parameterless constructor and settable properties. F#'s `CLIMutable` attribute generates them for a record, so the F# code still treats it as immutable.
+- **Nulls at the edge.** Values from C# may be null whatever their type says; convert them to options as they enter (`Option.ofObj`), or turn on F# 9's nullness checking, which makes such values visible in the types.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`async { }` and `task { }` are interchangeable."** A task starts immediately and can be awaited many times for the same result; an `Async` does nothing until started, runs again each time it is started, and carries a cancellation token implicitly. Use `task` at .NET boundaries and in performance-sensitive code; use `async` when you want its composition and cancellation model. Exercise 2 shows the difference in starting.
+
+</Misconception>
+
+<Misconception>
+
+**"Computation expressions are only for asynchronous code."** Sequences, comprehensions, optional values, results, validation, parsers, test frameworks and build scripts all use them. They are a general way to give a block of code a custom meaning.
+
+</Misconception>
+
+<Misconception>
+
+**"C# can't use F# libraries."** It can use all of them, but some F#-specific types (curried functions, `option`, `Async`, units of measure, which are erased) are awkward or invisible from C#. A thin, C#-friendly surface fixes that.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

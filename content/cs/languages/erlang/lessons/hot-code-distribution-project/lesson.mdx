@@ -1,0 +1,407 @@
+---
+title: Hot code loading, distribution and a complete project
+subtitle: Replacing code in a running system, connecting nodes into a cluster, the rebar3 toolchain with EUnit, Common Test and Dialyzer, and a supervised rate-limiting service with tests.
+minutes: 70
+objectives:
+  - Explain how the BEAM keeps two versions of a module, when a process switches to new code, and what purging does
+  - Describe how OTP release upgrades, appups and code_change/3 build on hot code loading, and when teams use them
+  - Describe Erlang distribution, including node names, cookies, epmd, location-transparent messaging, erpc, global and pg, and its security and network caveats
+  - Use rebar3 to create, build, test, analyse and release a project, and know the roles of EUnit, Common Test and Dialyzer
+  - Structure a small service as a pure core inside a gen_server, with EUnit tests
+prerequisites: [otp-behaviours]
+references:
+  - title: Compilation and code loading
+    url: https://www.erlang.org/doc/system/code_loading.html
+    note: Old and current code, fully qualified calls and purging.
+  - title: Release handling
+    url: https://www.erlang.org/doc/system/release_handling.html
+    note: Upgrading a running release with appup and relup files.
+  - title: Distributed Erlang
+    url: https://www.erlang.org/doc/system/distributed.html
+    note: Nodes, cookies, hidden nodes and the distribution BIFs.
+  - title: Using TLS for Erlang distribution
+    url: https://www.erlang.org/doc/apps/ssl/ssl_distribution.html
+    note: How to encrypt and authenticate traffic between nodes.
+  - title: rebar3 documentation
+    url: https://rebar3.org/docs/
+    note: Creating projects, dependencies, testing, releases and plugins.
+  - title: EUnit
+    url: https://www.erlang.org/doc/apps/eunit/chapter.html
+    note: The unit-testing framework used in this lesson's project.
+  - title: Common Test
+    url: https://www.erlang.org/doc/apps/common_test/introduction.html
+    note: OTP's framework for integration and system tests.
+  - title: Dialyzer
+    url: https://www.erlang.org/doc/apps/dialyzer/dialyzer_chapter.html
+    note: Static analysis that finds type errors and unreachable code using success typings.
+  - title: Erlang Ecosystem Foundation
+    url: https://erlef.org/
+    note: The non-profit supporting the community, tooling and security of BEAM languages.
+---
+
+<Section id="motivation" kind="motivation" title="Systems that run for years, on many machines">
+
+Two of Erlang's original requirements remain to be explored. A telephone exchange could not be switched off to install a bug fix, so Erlang can **replace code in a running system**. And a system that must survive the failure of a whole computer must run on several, so Erlang processes can **send messages across machines** exactly as they do within one.
+
+This final lesson covers both, honestly: what they do, how they work, and how much professional teams actually use them today. Then it turns to the everyday toolchain (rebar3, EUnit, Common Test and Dialyzer) and ends with a complete small service, written the way an experienced Erlang developer would write it, with its tests.
+
+</Section>
+
+<Section id="hot-code" kind="computation" title="Hot code loading">
+
+<Definition term="Current and old code">
+
+The BEAM can hold **two versions** of each module at once: the *current* version and the *old* one. Loading a new version makes the current one old and discards any previous old version. A **fully qualified call**, `Module:function(...)`, always goes to the current version; a **local call**, `function(...)`, stays within the version the caller is already running.
+
+</Definition>
+
+That rule is all you need to understand hot code loading. A server loop that ends with `?MODULE:loop(State)` (fully qualified) moves to new code on its next iteration; one that ends with `loop(State)` never does. The following program shows it happening, by compiling modules from source text in memory and loading them into the running system:
+
+```erlang check
+#!/usr/bin/env escript
+%% Hot code loading, live: we compile versions of two modules from
+%% source text and load them into the running system.
+main(_) ->
+    load(source(greeter, "Hello", 1, qualified)),
+    Server = spawn(greeter, loop, []),
+    io:format("~s~n", [ask(Server, "Ada")]),
+
+    load(source(greeter, "Hola", 2, qualified)),
+    io:format("~s~n", [ask(Server, "Ada")]),
+    io:format("~s~n", [ask(Server, "Ada")]),
+
+    %% Only two versions can exist, so version 1 must go before version 3.
+    io:format("old greeter unused, purged: ~p~n", [code:soft_purge(greeter)]),
+    load(source(greeter, "Jambo", 3, qualified)),
+    io:format("~s~n", [ask(Server, "Ada")]),
+    io:format("~s~n", [ask(Server, "Ada")]),
+
+    %% A loop that calls itself locally never leaves its old version.
+    load(source(stubborn, "Hi", 1, local)),
+    Stuck = spawn(stubborn, loop, []),
+    Ref = erlang:monitor(process, Stuck),
+    load(source(stubborn, "Hey", 2, local)),
+    io:format("~s~n", [ask(Stuck, "Ada")]),
+    io:format("old stubborn unused, purged: ~p~n", [code:soft_purge(stubborn)]),
+    code:purge(stubborn),
+    receive
+        {'DOWN', Ref, process, Stuck, Reason} -> io:format("stuck process ended: ~p~n", [Reason])
+    end.
+
+ask(Pid, Name) ->
+    Pid ! {greet, self(), Name},
+    receive {reply, Text} -> Text after 1000 -> "no reply" end.
+
+source(Module, Word, Version, CallStyle) ->
+    Next = case CallStyle of
+               qualified -> atom_to_list(Module) ++ ":loop()";
+               local -> "loop()"
+           end,
+    lists:flatten(io_lib:format(
+      "-module(~s).~n"
+      "-export([loop/0]).~n"
+      "loop() ->~n"
+      "    receive~n"
+      "        {greet, From, Name} ->~n"
+      "            From ! {reply, \"~s, \" ++ Name ++ \" (version ~p)\"},~n"
+      "            ~s~n"
+      "    end.~n", [Module, Word, Version, Next])).
+
+%% Compile Erlang source text in memory and load the result.
+load(Source) ->
+    {ok, Tokens, _} = erl_scan:string(Source),
+    Forms = [Form || FormTokens <- split_at_dots(Tokens, []),
+                     {ok, Form} <- [erl_parse:parse_form(FormTokens)]],
+    {ok, Module, Binary} = compile:forms(Forms),
+    {module, Module} = code:load_binary(Module, atom_to_list(Module) ++ ".erl", Binary).
+
+split_at_dots([], []) -> [];
+split_at_dots([{dot, _} = Dot | Rest], Acc) -> [lists:reverse([Dot | Acc]) | split_at_dots(Rest, [])];
+split_at_dots([Token | Rest], Acc) -> split_at_dots(Rest, [Token | Acc]).
+```
+
+It prints:
+
+```text
+Hello, Ada (version 1)
+Hello, Ada (version 1)
+Hola, Ada (version 2)
+old greeter unused, purged: true
+Hola, Ada (version 2)
+Jambo, Ada (version 3)
+Hi, Ada (version 1)
+old stubborn unused, purged: false
+stuck process ended: killed
+```
+
+Follow the greeter process. It was spawned running version 1 and waits in its `receive`. When version 2 is loaded, the process is still inside version 1's `receive`, so the next request is answered by version 1; then the fully qualified call `greeter:loop()` jumps into version 2, and from then on it says "Hola". Only two versions can exist, so version 1 has to go before version 3 can arrive. `code:soft_purge/1` removes old code only if no process is still running it, and here it succeeds, because the greeter has already moved on. Had we skipped that step, `code:load_binary/3` would have purged version 1 by force, killing any process still inside it; the lower-level built-in `erlang:load_module/2` is more cautious and refuses with `{error, not_purged}`.
+
+The `stubborn` module loops with a local call, so its process never leaves version 1, even after version 2 is loaded. A soft purge therefore refuses (`false`), and `code:purge/1`, the hard version, removes the old code by **killing** the processes still running it. This is why OTP code always loops through fully qualified calls, and why a process stuck in old code is a real risk during upgrades.
+
+In everyday development, you use hot loading constantly without thinking about it: `c(Module)` or `l(Module)` in the shell replaces a module in your running system, and rebar3's shell can reload changed modules for you.
+
+**In production**, OTP offers full **release upgrades**. An *appup* file describes, per application, how to move from one version to the next (which modules to load, which processes to suspend, which state to transform); a *relup* combines these for a whole release; and `release_handler` executes the plan. Each `gen_server` gets a callback, `code_change(OldVsn, State, Extra)`, that converts its state to the new format while the process is suspended. This machinery is powerful and is used where long-lived connections must never drop, in telecom and some messaging systems. But it requires careful testing of every upgrade path, and many teams today prefer **rolling deployments**: start new nodes running the new release, move traffic over, stop the old ones. Both are legitimate; the BEAM's abilities mean you can choose.
+
+</Section>
+
+<Section id="distribution" kind="definitions" title="Distribution">
+
+<Definition term="Node">
+
+A **node** is a running Erlang system (a BEAM) that has been given a name, such as `orders@db1` or `orders@db1.example.org`, which makes it able to connect to other nodes. Connected nodes form a **cluster** in which a pid on any node can be sent messages from any other node, with the same `!` operator.
+
+</Definition>
+
+You start a node with a short name (`-sname`, host name without domain) or a long name (`-name`, fully qualified), and a **cookie**, a shared secret that nodes must agree on to connect:
+
+```text
+$ erl -sname orders -setcookie choose-a-long-random-secret
+$ erl -sname billing -setcookie choose-a-long-random-secret
+```
+
+From a shell on `billing`, the commands below would connect and talk to `orders` (replace `host` with the machine's short host name). We describe them rather than show output, because the sandbox that runs this course's programs has no network:
+
+```erlang
+net_adm:ping('orders@host').                      % pong if connected, pang if not
+nodes().                                          % the nodes this one is connected to
+{ledger, 'orders@host'} ! {charge, 42, 1999}.     % send to a process registered on orders
+erpc:call('orders@host', erlang, system_info, [otp_release]).   % run a function there
+spawn('orders@host', fun() -> io:format("hello from ~p~n", [node()]) end).
+```
+
+The key idea is **location transparency**: a pid looks and behaves the same wherever its process lives, and links and monitors work across nodes too, so a supervisor-like process can watch a process on another machine. `erlang:monitor_node/2` reports when a whole node disconnects. On top of this, OTP provides `erpc` for remote procedure calls, `global` for cluster-wide registered names, `pg` for named process groups spread across nodes, and **Mnesia**, a distributed database built into OTP.
+
+Some practical facts every Erlang engineer learns:
+
+- A small daemon called **epmd** (Erlang Port Mapper Daemon), listening on port 4369, tells nodes on a machine where to find each other. Distribution traffic then uses other ports.
+- **The cookie is not a security mechanism.** A connected node has full control over the other, able to run any code, and traffic is unencrypted by default. Never expose distribution ports to an untrusted network. For anything beyond a private network, use distribution over TLS, which the `ssl` application provides.
+- **Networks fail in ways machines do not.** Nodes can lose contact while both keep running (a *partition*). Distributed Erlang gives you the tools to notice, through monitors, but deciding what each side should do, and keeping data consistent, is your design problem, the same one every distributed system faces.
+- By default every node connects to every other (a full mesh), which works well for clusters of tens of nodes. Larger systems partition into groups or use other communication between clusters.
+
+In practice, distribution is used to cluster a handful of nodes in one data centre: to share load, keep presence information (who is online), broadcast events, or fail over. Erlang and Elixir libraries such as Phoenix.PubSub rely on it.
+
+</Section>
+
+<Section id="toolchain" kind="human" title="The professional toolchain">
+
+Real Erlang projects are built with **rebar3**. `rebar3 new app limiter` printed this on the toolchain used for this course:
+
+```text
+===> Writing limiter/src/limiter_app.erl
+===> Writing limiter/src/limiter_sup.erl
+===> Writing limiter/src/limiter.app.src
+===> Writing limiter/rebar.config
+===> Writing limiter/.gitignore
+===> Writing limiter/LICENSE.md
+===> Writing limiter/README.md
+```
+
+`limiter_app.erl` is the application callback, `limiter_sup.erl` the top supervisor, and `limiter.app.src` the resource file from the last lesson. One thing to change at once: the generated supervisor uses `strategy => one_for_all` with `intensity => 0`, which means any crash stops the whole application; pick the strategy and limits your design needs. `rebar.config` lists compiler options and dependencies from [Hex](https://hex.pm/), for example `{deps, [{cowboy, "2.12.0"}]}` for the widely used HTTP server.
+
+| Command | What it does |
+| --- | --- |
+| `rebar3 compile` | fetch dependencies, lock their versions in `rebar.lock`, compile |
+| `rebar3 shell` | a shell with the application and its dependencies running |
+| `rebar3 eunit` | run EUnit tests |
+| `rebar3 ct` | run Common Test suites |
+| `rebar3 dialyzer` | run Dialyzer |
+| `rebar3 xref` | check for calls to undefined or deprecated functions |
+| `rebar3 release` / `rebar3 as prod tar` | build a release, or a tarball of one, for deployment |
+
+**EUnit** is for unit tests: functions whose names end in `_test` (or `_test_` for test generators), using macros such as `?assertEqual`, `?assertMatch` and `?assertError`. **Common Test** is for larger integration and system tests: suites with setup and teardown per group, logs in HTML, and support for testing across several nodes; OTP itself is tested with it, and OTP 29 added `ct_doctest` for checking the examples in documentation. **Dialyzer** analyses compiled code for type errors using *success typings*: it reports only code it can prove will fail, so it produces few false alarms, and it uses the `-spec` and `-type` declarations you write to make its analysis sharper. WhatsApp's open-source **eqWAlizer** offers a stricter, more conventional type checker for Erlang, and **erlfmt** (also from WhatsApp) formats code automatically.
+
+Since OTP 27, documentation is written in the code with `-moduledoc` and `-doc` attributes in Markdown, and the OTP documentation itself is generated with ExDoc, the same tool Elixir uses. And for diagnosing live systems, the community library recon, together with `observer` and the `sys` functions from the last lesson, are the standard toolkit.
+
+</Section>
+
+<Section id="project" kind="examples" title="Project: a rate-limiting service">
+
+Here is a complete small service: a **rate limiter** that gives each client a *token bucket*. A bucket holds up to `Capacity` tokens and refills at `Rate` tokens per second; each request takes a token; when the bucket is empty, the request is refused with the number of milliseconds to wait. Services put such a limiter in front of expensive operations (logins, searches, outgoing messages) so that one client cannot overwhelm them. In a rebar3 project the code would be split into `limiter_bucket.erl` (the pure core), `limiter_server.erl` (the gen_server), the application and supervisor modules, and `test/limiter_bucket_tests.erl`; here it is as one runnable escript, tests included:
+
+```erlang check
+#!/usr/bin/env escript
+%% A rate limiter service: every client gets a token bucket that holds up
+%% to Capacity tokens and refills at Rate tokens per second. Each request
+%% takes one token; with none left, the request is refused with a hint of
+%% how long to wait.
+-module(limiter).
+-behaviour(gen_server).
+-include_lib("eunit/include/eunit.hrl").
+
+-export([main/1]).
+-export([new_bucket/3, take/2]).                        % the pure core
+-export([start_link/1, check/1, stats/0]).              % the service API
+-export([init/1, handle_call/3, handle_cast/2]).        % gen_server callbacks
+
+-type bucket() :: #{capacity := pos_integer(), rate := pos_integer(),
+                    tokens := float(), updated := integer()}.
+
+%%% The pure core: no processes, no clock, just values.
+
+-spec new_bucket(pos_integer(), pos_integer(), integer()) -> bucket().
+new_bucket(Capacity, Rate, Now) ->
+    #{capacity => Capacity, rate => Rate, tokens => float(Capacity), updated => Now}.
+
+-spec take(bucket(), integer()) -> {ok, bucket()} | {wait, pos_integer(), bucket()}.
+take(Bucket, Now) ->
+    #{tokens := Tokens} = Refilled = refill(Bucket, Now),
+    if
+        Tokens >= 1 -> {ok, Refilled#{tokens := Tokens - 1}};
+        true -> {wait, ms_until_one_token(Refilled), Refilled}
+    end.
+
+refill(#{capacity := Cap, rate := Rate, tokens := Tokens, updated := Then} = B, Now) ->
+    Earned = (Now - Then) * Rate / 1000,
+    B#{tokens := min(float(Cap), Tokens + Earned), updated := Now}.
+
+ms_until_one_token(#{rate := Rate, tokens := Tokens}) ->
+    ceil((1 - Tokens) * 1000 / Rate).
+
+%%% The service: one gen_server owns every client's bucket.
+
+start_link(Opts) -> gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
+
+-spec check(term()) -> allow | {deny, RetryAfterMs :: pos_integer()}.
+check(Client) -> gen_server:call(?MODULE, {check, Client}).
+
+stats() -> gen_server:call(?MODULE, stats).
+
+init(#{capacity := Cap, rate := Rate, clock := Clock}) ->
+    {ok, #{capacity => Cap, rate => Rate, clock => Clock, buckets => #{},
+           allowed => 0, denied => 0}}.
+
+handle_call({check, Client}, _From, #{clock := Clock, buckets := Buckets} = S) ->
+    Now = Clock(),
+    Bucket = maps:get(Client, Buckets, new_bucket(maps:get(capacity, S), maps:get(rate, S), Now)),
+    case take(Bucket, Now) of
+        {ok, B} ->
+            {reply, allow, S#{buckets := Buckets#{Client => B}, allowed := maps:get(allowed, S) + 1}};
+        {wait, Ms, B} ->
+            {reply, {deny, Ms}, S#{buckets := Buckets#{Client => B}, denied := maps:get(denied, S) + 1}}
+    end;
+handle_call(stats, _From, #{allowed := A, denied := D, buckets := Bs} = S) ->
+    {reply, #{allowed => A, denied => D, clients => map_size(Bs)}, S}.
+
+handle_cast(_Msg, S) -> {noreply, S}.
+
+%%% A fake clock for the demonstration and the tests, kept in an ETS table.
+
+clock_start() ->
+    ets:new(fake_clock, [named_table, public]),
+    ets:insert(fake_clock, {now, 0}),
+    fun() -> ets:lookup_element(fake_clock, now, 2) end.
+
+advance(Ms) -> ets:update_counter(fake_clock, now, Ms).
+
+%%% Tests (EUnit runs every function whose name ends in _test).
+
+full_bucket_allows_up_to_capacity_test() ->
+    B0 = new_bucket(3, 1, 0),
+    {ok, B1} = take(B0, 0),
+    {ok, B2} = take(B1, 0),
+    {ok, B3} = take(B2, 0),
+    ?assertMatch({wait, 1000, _}, take(B3, 0)).
+
+tokens_refill_over_time_test() ->
+    {ok, Empty} = take(new_bucket(1, 2, 0), 0),
+    ?assertMatch({wait, 500, _}, take(Empty, 0)),
+    ?assertMatch({wait, 250, _}, take(Empty, 250)),
+    ?assertMatch({ok, _}, take(Empty, 500)).
+
+refill_never_exceeds_capacity_test() ->
+    {ok, B} = take(new_bucket(2, 10, 0), 0),
+    {ok, #{tokens := T}} = take(B, 60000),
+    ?assertEqual(1.0, T).
+
+%%% Demonstration
+
+main(_) ->
+    Clock = clock_start(),
+    {ok, _} = start_link(#{capacity => 3, rate => 2, clock => Clock}),
+    Burst = [check(<<"amara">>) || _ <- lists:seq(1, 5)],
+    io:format("burst of 5 from amara: ~p~n", [Burst]),
+    io:format("kofi is unaffected: ~p~n", [check(<<"kofi">>)]),
+    advance(600),
+    io:format("600 ms later, amara: ~p~n", [[check(<<"amara">>) || _ <- lists:seq(1, 2)]]),
+    advance(5000),
+    io:format("5 s later, amara: ~p~n", [[check(<<"amara">>) || _ <- lists:seq(1, 4)]]),
+    io:format("~p~n", [stats()]),
+    ok = eunit:test(?MODULE).
+```
+
+It prints:
+
+```text
+burst of 5 from amara: [allow,allow,allow,{deny,500},{deny,500}]
+kofi is unaffected: allow
+600 ms later, amara: [allow,{deny,400}]
+5 s later, amara: [allow,allow,allow,{deny,500}]
+#{denied => 4,allowed => 8,clients => 2}
+  All 3 tests passed.
+```
+
+The design choices are the lesson.
+
+**A pure core with explicit time.** `new_bucket/3` and `take/2` are plain functions from values to values, and the current time is a *parameter*, never read from a clock inside them. That makes them trivially testable (the tests construct buckets at time 0 and ask what happens at 250 or 500 milliseconds) and deterministic. All the arithmetic of refilling, capping at capacity and computing the wait lives there.
+
+**A thin process shell.** The gen_server only owns the map of buckets, reads the clock once per request, delegates to the core, and keeps two counters. Because it handles one request at a time, two simultaneous requests from the same client can never both take the last token. The clock is injected as a fun: the demonstration uses a fake clock stored in an ETS table, so its output is reproducible; production code would pass `fun() -> erlang:monotonic_time(millisecond) end`, the clock that never jumps backwards.
+
+**Types as documentation and as input to Dialyzer.** The `-type` and `-spec` declarations document the shapes of buckets and results, and `rebar3 dialyzer` would check every caller against them.
+
+**Tests next to the code.** Including `eunit.hrl` makes every function ending in `_test` a test, and `eunit:test(?MODULE)` runs them. Matching with `ok = ...` makes the script exit with an error if any test fails. The tests target the core, where the logic is; the service's behaviour is demonstrated in `main/1`. In a rebar3 project, the tests would live in their own module and run with `rebar3 eunit` on every change.
+
+**What production would add.** Buckets for clients who have gone quiet should be removed (a periodic `handle_info` sweep); a single server would become a bottleneck at high volume, so buckets would be sharded across several processes or kept in ETS with atomic updates; and in a cluster you would decide whether limits are per node or global. Each of those is a small, local change, because the core and the shell are separate.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"With hot code loading, an Erlang system never needs restarting."** The BEAM can swap modules, but a real upgrade also changes state formats, message protocols between versions and dependencies. Each upgrade path needs its own appup instructions and its own tests, which is why many teams restart nodes one at a time instead and keep hot loading for development and emergencies.
+
+</Misconception>
+
+<Misconception>
+
+**"Loading a new version can't hurt the processes that are running."** Loading a third version purges the oldest one, and the code server does that by killing every process still executing it. A server that loops with a local call, or one blocked for a long time in old code, is exactly such a process.
+
+</Misconception>
+
+<Misconception>
+
+**"The cookie keeps my cluster secure."** It only stops nodes from connecting by accident. Anyone who learns it, or who can watch unencrypted traffic, controls every node. Keep distribution on a private network and use TLS distribution when the network is not fully trusted.
+
+</Misconception>
+
+<Misconception>
+
+**"A message to a remote process is as reliable as a local one."** The syntax is the same and ordering between a pair of processes still holds, but a remote node can become unreachable at any moment. Use monitors and timeouts on every remote interaction, and decide in advance what each side does during a partition.
+
+</Misconception>
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the Erlang language, its processes and failure model, and the OTP behaviours that structure real systems. Some good next steps:
+
+- **Read the official guides.** [OTP Design Principles](https://www.erlang.org/doc/system/design_principles.html) covers behaviours, supervision, applications and releases in more depth than any tutorial, and the [Efficiency Guide](https://www.erlang.org/doc/system/efficiency_guide.html) explains the cost of everything.
+- **Read a book.** [Learn You Some Erlang for Great Good!](https://learnyousomeerlang.com/) by Fred Hébert is free online and covers everything in this course and much more, including releases and distribution in practice.
+- **Build something with rebar3.** A chat server over TCP with `gen_tcp`, one process per connection and a `pg` group per room, exercises nearly every idea in this course.
+- **Explore the other BEAM languages.** The [Elixir course](/en/cs/languages/elixir/) on this site uses the same runtime and OTP with a different syntax and tooling; Gleam adds static types to the BEAM.
+- **Join the community.** The [Erlang Ecosystem Foundation](https://erlef.org/) runs working groups on tooling, security and documentation, and [erlang.org](https://www.erlang.org/) links to the forums and mailing lists.
+
+<Reflection title="Built to keep going, built to rest">
+
+Erlang was designed for systems that never stop: code replaced while it runs, failures absorbed and repaired without a pause. It is a remarkable achievement, and it is worth noticing that the people who build and run such systems cannot work that way themselves. Even the most resilient system depends on engineers who sleep, take days off and come back with clearer minds; teams that try to run their people like their servers burn out. The biblical rhythm of work and Sabbath rest suggests that rest is not a failure to be engineered away but part of how good work is sustained. A system that can run forever is a gift precisely because it lets the people who care for it stop.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

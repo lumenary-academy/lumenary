@@ -1,0 +1,411 @@
+---
+title: Joins of every kind
+subtitle: Inner, outer, cross and self joins, semi- and anti-joins, set operations, and the row-multiplying mistake that every SQL programmer makes once.
+minutes: 65
+objectives:
+  - Explain a join as a filtered Cartesian product, and write inner joins across several tables with aliases
+  - Use LEFT, RIGHT and FULL OUTER joins, and emulate the last two in older SQLite
+  - Find rows with no match (anti-joins), and put conditions in ON or WHERE deliberately
+  - Write self joins and cross joins, and combine results with UNION, UNION ALL, INTERSECT and EXCEPT
+  - Recognise and fix fan-out, where joining two one-to-many relationships inflates aggregates
+  - Describe how databases execute joins with nested loops, hash joins and merge joins
+prerequisites: [aggregation-and-grouping]
+related: [math.found.sets, math.found.functions]
+references:
+  - title: "SQLite: The SELECT statement (join operators)"
+    url: https://www.sqlite.org/lang_select.html
+  - title: "PostgreSQL: Joins Between Tables (tutorial)"
+    url: https://www.postgresql.org/docs/current/tutorial-join.html
+  - title: "PostgreSQL: Table Expressions (joined tables)"
+    url: https://www.postgresql.org/docs/current/queries-table-expressions.html
+    note: The precise rules for every join type, USING and NATURAL.
+  - title: "PostgreSQL: Combining Queries (UNION, INTERSECT, EXCEPT)"
+    url: https://www.postgresql.org/docs/current/queries-union.html
+  - title: "SQLite: The SQLite Query Optimizer Overview"
+    url: https://www.sqlite.org/optoverview.html
+    note: How SQLite chooses a join order and which loops to nest.
+---
+
+<Section id="motivation" kind="motivation" title="Facts in many tables">
+
+A well-designed database stores each fact once. A student's name lives in the `student` table, a club's name in `club`, and the fact that a student belongs to a club in a third table, `membership`, which holds nothing but pairs of keys. This avoids the problems of storing the same name in a hundred places (lesson 10 on design makes this precise), but it means most interesting questions need data from several tables at once. Which clubs is Chen in? Which clubs have no members? Who mentors whom?
+
+A **join** combines rows of two tables into wider rows, pairing them according to a condition. It is the operation that makes the relational model work, and it is where the declarative style pays off most: you state which rows belong together, and the database chooses among several clever algorithms to find them. This lesson covers every kind of join you will meet, the set operations that combine whole results, and the mistakes that produce wrong numbers without any error.
+
+All the examples share one small school database. Students may have a mentor, who is another student; clubs have members; one club (Astronomy) has none, and two students (Dara and Femi) belong to no club.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="What a join is">
+
+<Definition term="Cartesian product and join">
+
+The **Cartesian product** of tables A and B, written `A CROSS JOIN B`, pairs every row of A with every row of B: if A has 6 rows and B has 4, it has 24. An **inner join** `A JOIN B ON condition` is the Cartesian product filtered to the pairs for which the condition is true.
+
+</Definition>
+
+That definition is the meaning, not the method: no sensible database builds all 24 pairs and then filters them. But it tells you exactly what any join returns, and from it follow the **outer joins**, which add back rows that found no partner:
+
+| Join | Returns |
+| --- | --- |
+| `A [INNER] JOIN B ON c` | the pairs where `c` is true |
+| `A LEFT [OUTER] JOIN B ON c` | the inner join, plus each row of A that matched nothing, with `NULL`s for B's columns |
+| `A RIGHT [OUTER] JOIN B ON c` | the inner join, plus each unmatched row of B, with `NULL`s for A's columns |
+| `A FULL [OUTER] JOIN B ON c` | the inner join, plus the unmatched rows of both sides |
+| `A CROSS JOIN B` | every pair |
+
+A few spellings are worth knowing. **Table aliases** (`FROM student AS s`) give tables short names, and once a query has more than one table, every column should be qualified with one (`s.name`, not `name`). `JOIN … USING (id)` is shorthand for `ON a.id = b.id` when both columns have the same name. `NATURAL JOIN` joins on *every* pair of same-named columns, which sounds convenient until someone adds a `created_at` column to both tables and the join silently changes meaning; professionals avoid it. Older code writes inner joins as `FROM a, b WHERE a.id = b.a_id`: a Cartesian product filtered in `WHERE`. It means the same, but forgetting one condition produces a huge accidental product, so modern style uses explicit `JOIN … ON`.
+
+**Version note.** `RIGHT JOIN` and `FULL OUTER JOIN` arrived in SQLite only in version 3.39 (2022). The SQLite used for this course, 3.37, rejects them, so the examples show how to write the same queries without them. PostgreSQL, MySQL (`RIGHT` only; MySQL has no `FULL JOIN`), SQL Server and Oracle support them.
+
+</Section>
+
+<Section id="inner-and-left" kind="examples" title="Inner and left joins">
+
+```sql check
+.mode column
+CREATE TABLE student (
+  id        INTEGER PRIMARY KEY,
+  name      TEXT NOT NULL,
+  mentor_id INTEGER REFERENCES student (id)    -- another student, or NULL
+);
+CREATE TABLE club (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE membership (
+  student_id INTEGER NOT NULL REFERENCES student (id),
+  club_id    INTEGER NOT NULL REFERENCES club (id),
+  PRIMARY KEY (student_id, club_id)
+);
+INSERT INTO student VALUES
+  (1, 'Ana', NULL), (2, 'Bilal', 1), (3, 'Chen', 1),
+  (4, 'Dara', NULL), (5, 'Esi', 4), (6, 'Femi', NULL);
+INSERT INTO club VALUES (1, 'Chess'), (2, 'Robotics'), (3, 'Choir'), (4, 'Astronomy');
+INSERT INTO membership VALUES (1, 1), (1, 3), (2, 2), (3, 1), (3, 2), (5, 3);
+
+-- INNER JOIN: only students and clubs that match.
+SELECT s.name AS student, c.name AS club
+FROM student AS s
+JOIN membership AS m ON m.student_id = s.id
+JOIN club AS c       ON c.id = m.club_id
+ORDER BY s.name, c.name;
+
+-- LEFT JOIN keeps every club, matched or not; count(m.student_id) counts matches.
+SELECT c.name AS club, count(m.student_id) AS members
+FROM club AS c
+LEFT JOIN membership AS m ON m.club_id = c.id
+GROUP BY c.id, c.name
+ORDER BY members DESC, club;
+```
+
+```text
+student  club
+-------  --------
+Ana      Chess
+Ana      Choir
+Bilal    Robotics
+Chen     Chess
+Chen     Robotics
+Esi      Choir
+club       members
+---------  -------
+Chess      2
+Choir      2
+Robotics   2
+Astronomy  0
+```
+
+The three-table inner join reads naturally from left to right: start with students, attach their memberships, attach each membership's club. Dara and Femi have no memberships and Astronomy has no members, so none of them appear: an inner join keeps only rows that found a partner.
+
+The second query needed Astronomy's zero, so it starts from `club` and uses a `LEFT JOIN`. Astronomy matched nothing, so it appears once with `NULL`s in the membership columns. Then the choice of aggregate matters: `count(m.student_id)` counts non-`NULL` values and gives 0, while `count(*)` would have counted Astronomy's single row and reported 1 member. This pattern, a left join from the table that defines the groups plus a count of a column from the other side, is how you report zeros, the problem the previous lesson left open.
+
+</Section>
+
+<Section id="anti-joins" kind="examples" title="Missing matches, and ON versus WHERE">
+
+Finding rows *without* a partner is so common that it has a name, the **anti-join**. One way to write it is a left join that keeps only the rows where the right side came back `NULL`. The column tested must be one that is never `NULL` in a real match, such as the join key.
+
+An outer join also forces you to decide where each condition belongs. A condition in `ON` decides which rows *match*; a row that fails it is still kept (with `NULL`s), because that is what an outer join does. A condition in `WHERE` is applied *after* the join and removes rows. The two queries at the end of this program differ only in that placement.
+
+```sql check
+.mode column
+CREATE TABLE student (id INTEGER PRIMARY KEY, name TEXT NOT NULL, mentor_id INTEGER);
+CREATE TABLE club (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE membership (
+  student_id INTEGER NOT NULL, club_id INTEGER NOT NULL, PRIMARY KEY (student_id, club_id)
+);
+INSERT INTO student VALUES
+  (1, 'Ana', NULL), (2, 'Bilal', 1), (3, 'Chen', 1),
+  (4, 'Dara', NULL), (5, 'Esi', 4), (6, 'Femi', NULL);
+INSERT INTO club VALUES (1, 'Chess'), (2, 'Robotics'), (3, 'Choir'), (4, 'Astronomy');
+INSERT INTO membership VALUES (1, 1), (1, 3), (2, 2), (3, 1), (3, 2), (5, 3);
+
+-- Students in no club: LEFT JOIN, then keep the rows with no match.
+SELECT s.name
+FROM student AS s
+LEFT JOIN membership AS m ON m.student_id = s.id
+WHERE m.student_id IS NULL
+ORDER BY s.name;
+
+-- The ON-versus-WHERE trap: a condition on the right table.
+SELECT s.name, c.name AS chess
+FROM student AS s
+LEFT JOIN membership AS m ON m.student_id = s.id AND m.club_id = 1
+LEFT JOIN club AS c ON c.id = m.club_id
+ORDER BY s.id;
+
+SELECT s.name, m.club_id
+FROM student AS s
+LEFT JOIN membership AS m ON m.student_id = s.id
+WHERE m.club_id = 1
+ORDER BY s.id;
+```
+
+```text
+name
+----
+Dara
+Femi
+name   chess
+-----  -----
+Ana    Chess
+Bilal
+Chen   Chess
+Dara
+Esi
+Femi
+name  club_id
+----  -------
+Ana   1
+Chen  1
+```
+
+With `m.club_id = 1` in `ON`, every student is listed and the chess column says who plays chess: that is "all students, with their chess membership if any". With the same condition in `WHERE`, the rows of students without a chess membership have `NULL` in `m.club_id`, the condition is unknown, and `WHERE` drops them: the outer join has quietly become an inner join. When a `LEFT JOIN` returns suspiciously few rows, look for a condition on the right-hand table in `WHERE`.
+
+The other common way to write an anti-join is `NOT EXISTS`, which you will see in the next program and study properly in the next lesson. Both forms are correct even when `NULL`s are around, unlike `NOT IN`, and good optimisers turn both into the same plan.
+
+</Section>
+
+<Section id="self-cross-sets" kind="computation" title="Self joins, cross joins and set operations">
+
+A **self join** joins a table to itself, using two aliases so that each copy has its own name. It is how you follow a reference from a table into the same table: an employee's manager, a student's mentor, a flight's return flight. A **cross join** is rarer but useful when you really want every combination: every student with every club, every product with every month in a report, every pair of players in a round-robin tournament.
+
+**Set operations** combine two whole query results that have the same number of columns with compatible types: `UNION` (rows in either, duplicates removed), `UNION ALL` (rows in either, duplicates kept), `INTERSECT` (rows in both) and `EXCEPT` (rows in the first but not the second; Oracle traditionally calls it `MINUS`). They are the <TopicLink id="math.found.sets">set operations</TopicLink> of mathematics applied to query results. An `ORDER BY` at the end sorts the combined result.
+
+```sql check
+.mode column
+CREATE TABLE student (id INTEGER PRIMARY KEY, name TEXT NOT NULL, mentor_id INTEGER);
+CREATE TABLE club (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE membership (
+  student_id INTEGER NOT NULL, club_id INTEGER NOT NULL, PRIMARY KEY (student_id, club_id)
+);
+INSERT INTO student VALUES
+  (1, 'Ana', NULL), (2, 'Bilal', 1), (3, 'Chen', 1),
+  (4, 'Dara', NULL), (5, 'Esi', 4), (6, 'Femi', NULL);
+INSERT INTO club VALUES (1, 'Chess'), (2, 'Robotics'), (3, 'Choir'), (4, 'Astronomy');
+INSERT INTO membership VALUES (1, 1), (1, 3), (2, 2), (3, 1), (3, 2), (5, 3);
+
+-- Self join: the same table twice, under two aliases.
+SELECT s.name AS student, coalesce(t.name, '-') AS mentor
+FROM student AS s
+LEFT JOIN student AS t ON t.id = s.mentor_id
+ORDER BY s.id;
+
+-- CROSS JOIN: every pairing. Which clubs could each mentee still join?
+SELECT s.name AS student, c.name AS club
+FROM student AS s
+CROSS JOIN club AS c
+WHERE s.mentor_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM membership AS m
+                  WHERE m.student_id = s.id AND m.club_id = c.id)
+ORDER BY s.name, c.name;
+
+-- Set operations combine whole result sets with the same columns.
+-- Students in Chess or Choir (UNION removes duplicates):
+SELECT student_id FROM membership WHERE club_id = 1
+UNION
+SELECT student_id FROM membership WHERE club_id = 3
+ORDER BY student_id;
+
+-- In Chess and also in Robotics:
+SELECT student_id FROM membership WHERE club_id = 1
+INTERSECT
+SELECT student_id FROM membership WHERE club_id = 2;
+
+-- Students who are not in any club:
+SELECT id FROM student
+EXCEPT
+SELECT student_id FROM membership
+ORDER BY 1;
+```
+
+```text
+student  mentor
+-------  ------
+Ana      -
+Bilal    Ana
+Chen     Ana
+Dara     -
+Esi      Dara
+Femi     -
+student  club
+-------  ---------
+Bilal    Astronomy
+Bilal    Chess
+Bilal    Choir
+Chen     Astronomy
+Chen     Choir
+Esi      Astronomy
+Esi      Chess
+Esi      Robotics
+student_id
+----------
+1
+3
+5
+student_id
+----------
+3
+id
+--
+4
+6
+```
+
+The mentor query uses a `LEFT JOIN` so that students without a mentor stay in the list. The cross-join query lists each mentee with each club they have not joined: three mentees times four clubs is twelve pairs, minus their four existing memberships, leaves eight. And `EXCEPT` gave a third way to write the anti-join from the previous section.
+
+`UNION` removes duplicates, which costs a sort or a hash; `UNION ALL` does not. When you know the parts cannot overlap, or you want the duplicates, write `UNION ALL`. It is faster and it says what you mean.
+
+### Full outer joins, with and without FULL JOIN
+
+A full outer join answers "compare two lists": who signed up for a workshop but did not come, who came without signing up, and who did both. In SQLite before 3.39, you build it from a left join plus the right-hand rows that matched nothing:
+
+```sql check
+.mode column
+-- Who signed up for the workshop, and who actually came?
+CREATE TABLE signup     (name TEXT PRIMARY KEY, signed_on TEXT NOT NULL);
+CREATE TABLE attendance (name TEXT PRIMARY KEY, arrived TEXT NOT NULL);
+INSERT INTO signup VALUES ('Aroha', '05-02'), ('Bongani', '05-03'), ('Carmen', '05-03'), ('Dmitri', '05-04');
+INSERT INTO attendance VALUES ('Aroha', '09:58'), ('Carmen', '10:05'), ('Eitan', '10:12');
+
+-- FULL OUTER JOIN, emulated for SQLite before 3.39:
+-- the LEFT JOIN, plus the right-hand rows that matched nothing.
+SELECT s.name AS signed_up, a.name AS attended, a.arrived
+FROM signup AS s
+LEFT JOIN attendance AS a ON a.name = s.name
+UNION ALL
+SELECT NULL, a.name, a.arrived
+FROM attendance AS a
+WHERE NOT EXISTS (SELECT 1 FROM signup AS s WHERE s.name = a.name)
+ORDER BY signed_up;
+```
+
+```text
+signed_up  attended  arrived
+---------  --------  -------
+           Eitan     10:12
+Aroha      Aroha     09:58
+Bongani
+Carmen     Carmen    10:05
+Dmitri
+```
+
+In PostgreSQL (and SQLite 3.39 or later) the same query is one join. PostgreSQL 16 printed:
+
+```sql
+SELECT s.name AS signed_up, a.name AS attended, a.arrived
+FROM signup AS s
+FULL JOIN attendance AS a ON a.name = s.name
+ORDER BY coalesce(s.name, a.name);
+```
+
+```text
+ signed_up | attended | arrived
+-----------+----------+---------
+ Aroha     | Aroha    | 09:58
+ Bongani   |          |
+ Carmen    | Carmen   | 10:05
+ Dmitri    |          |
+           | Eitan    | 10:12
+(5 rows)
+```
+
+A `RIGHT JOIN` never needs emulating: `A RIGHT JOIN B` is `B LEFT JOIN A` with the tables swapped, and many teams write only left joins for consistency.
+
+</Section>
+
+<Section id="fan-out" kind="misconceptions" title="Fan-out: when joins multiply">
+
+<Misconception>
+
+"Joining more tables only adds columns." A join can also multiply *rows*. If a student has 3 club memberships and 2 fee payments, joining the student to both tables produces 3 × 2 = 6 rows for that student, and every sum and count over them is inflated.
+
+</Misconception>
+
+```sql check
+.mode column
+CREATE TABLE student    (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE membership (student_id INTEGER NOT NULL, club TEXT NOT NULL);
+CREATE TABLE fee        (student_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+INSERT INTO student VALUES (1, 'Ana'), (2, 'Bilal');
+INSERT INTO membership VALUES (1, 'Chess'), (1, 'Choir'), (1, 'Drama'), (2, 'Robotics');
+INSERT INTO fee VALUES (1, 30), (1, 20), (2, 25);
+
+-- Wrong: two one-to-many joins multiply each other's rows.
+SELECT s.name, count(m.club) AS clubs, sum(f.amount) AS fees
+FROM student AS s
+JOIN membership AS m ON m.student_id = s.id
+JOIN fee AS f        ON f.student_id = s.id
+GROUP BY s.id, s.name;
+
+-- Right: aggregate each child table first, then join one row to one row.
+SELECT s.name, m.clubs, f.fees
+FROM student AS s
+JOIN (SELECT student_id, count(*) AS clubs FROM membership GROUP BY student_id) AS m
+  ON m.student_id = s.id
+JOIN (SELECT student_id, sum(amount) AS fees FROM fee GROUP BY student_id) AS f
+  ON f.student_id = s.id
+ORDER BY s.id;
+```
+
+```text
+name   clubs  fees
+-----  -----  ----
+Ana    6      150
+Bilal  1      25
+name   clubs  fees
+-----  -----  ----
+Ana    3      50
+Bilal  1      25
+```
+
+Ana really has 3 clubs and has paid 50, but the first query reports 6 clubs and 150. Bilal's figures happen to be right because he has one row in each table, which is exactly why this bug survives testing on small data. The fix aggregates each child table separately (in subqueries, which the next lesson covers) so that each joins as one row per student. Before you trust a total computed over a join, ask of each join: can one row on this side match *several* rows on that side? If so, and you are summing something from the other side, you have fan-out. Note that `count(DISTINCT m.club)` would have rescued the club count, but no `DISTINCT` can rescue the sum.
+
+<Misconception>
+
+"Joins are Venn diagrams." Venn diagrams are a popular picture of inner and outer joins, and they help you remember which side keeps its unmatched rows. But a join is not an intersection of two sets of the same things: it pairs rows, its result has the columns of both tables, and one row can appear many times. The fan-out above has no place in a Venn diagram, which is why it surprises people who learned joins that way.
+
+</Misconception>
+
+</Section>
+
+<Section id="execution" kind="human" title="How a database executes a join">
+
+Declarative SQL leaves the method to the database, and there are three classic methods, each best in different circumstances:
+
+- **Nested loop join.** For each row of the outer table, find the matching rows of the inner table. With an index on the inner table's join column, each lookup is a quick B-tree search, so this is excellent when the outer side is small. Without an index it is a full scan per outer row, which is quadratic.
+- **Hash join.** Read the smaller table and build a hash table on its join key, then stream the larger table past it, probing for matches. Linear time, but it needs memory for the hash table and works only for equality conditions.
+- **Merge join.** Sort both inputs on the join key (or read them in that order from indexes) and walk through them together, like merging two sorted lists.
+
+PostgreSQL, MySQL (since 8.0.18 for hash joins) and SQL Server choose among these with a cost model. SQLite uses nested loops only, relying on indexes, and builds a temporary "automatic index" when a join would otherwise scan repeatedly. The database also chooses the **join order**, which for many tables is a hard search problem; this is why the textual order of your joins usually does not matter for speed, and why the lesson on indexes teaches you to read the plan rather than guess.
+
+Two practical consequences. First, **index your foreign keys**: the column `membership.club_id` is what joins search, and PostgreSQL, unlike MySQL's InnoDB, does not create such indexes automatically. Second, beware the **N+1 query** pattern in application code, often produced by object-relational mappers: one query fetches 100 students, then the program runs 100 more queries to fetch each student's clubs. A single join returns the same data in one round trip.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

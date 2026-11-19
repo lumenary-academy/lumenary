@@ -1,0 +1,422 @@
+---
+title: Embedding, LuaJIT and a project
+subtitle: How applications embed Lua through its C API, where LuaJIT fits, the tools Lua programmers use, and a complete sandboxed rule engine.
+minutes: 75
+objectives:
+  - Describe the Lua C API's virtual stack and use it to run scripts and register C functions from a host program
+  - Explain what LuaJIT is, what its FFI offers, and how its Lua 5.1 base affects portable code
+  - Write code that detects features rather than versions, with shims for older Luas
+  - Use LuaRocks, busted, luacheck, StyLua and the Lua language server in a project
+  - Build a sandboxed plugin system with load, environments, read-only tables, error isolation and an instruction budget
+prerequisites: [coroutines]
+references:
+  - title: "Reference Manual: The Application Program Interface"
+    url: https://www.lua.org/manual/5.5/manual.html#4
+    note: The C API, its stack, error handling in C, and every function, followed by the auxiliary library in section 5.
+  - title: LuaJIT
+    url: https://luajit.org/
+    note: The official site of LuaJIT, with its documentation, including the FFI library.
+  - title: LuaRocks
+    url: https://luarocks.org/
+    note: The package manager for Lua modules and the repository of rocks.
+  - title: busted
+    url: https://lunarmodules.github.io/busted/
+    note: The most widely used unit-testing framework for Lua.
+  - title: Lua Language Server
+    url: https://luals.github.io/
+    note: Editor support for Lua with completion, diagnostics and type annotations.
+---
+
+<Section id="motivation" kind="motivation" title="The other side of the boundary">
+
+Everything so far has been Lua seen from inside: values, tables, functions, metatables, coroutines. But Lua was designed to be one half of a program. The other half is the **host**, an application written in C or C++ (or Rust, Go, Java or C# through bindings) that creates a Lua interpreter, decides what scripts may see and do, and calls into them. Game engines, Neovim, Redis, nginx and Wireshark all have such a host.
+
+This lesson looks at that boundary from both sides. First, the C API, at the level of understanding rather than mastery: what the host does to run a script and give it new functions. Then **LuaJIT**, the high-performance implementation that many hosts embed. Then the tools working Lua programmers use. Finally, a project that puts the host's point of view into practice in pure Lua: a log monitor whose alert rules are user scripts, run in a sandbox that keeps them from damaging the host, hanging it, or crashing it.
+
+</Section>
+
+<Section id="c-api" kind="definitions" title="The C API in one example">
+
+<Definition term="Lua state and virtual stack">
+
+A host creates an independent Lua interpreter, a **state** of type `lua_State *`, with `luaL_newstate()`. Every value passed between C and Lua goes through a **virtual stack** that belongs to the state: C pushes values onto it (`lua_pushnumber`, `lua_pushstring`, `lua_newtable`), calls Lua functions, which take their arguments from the stack and leave their results there, and reads values back by stack index (1 is the bottom, -1 the top). C functions callable from Lua have the type `int f(lua_State *L)`: they read arguments from the stack, push results, and return how many results they pushed.
+
+</Definition>
+
+Here is a complete host. It opens a state, gives scripts a C function `area` and a table `rooms`, runs a script in protected mode, and reads the script's result:
+
+```c
+/* host.c: a C program that embeds Lua, gives scripts one function, and runs a script. */
+#include <stdio.h>
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
+
+/* A C function callable from Lua: area(width, height) -> number */
+static int area(lua_State *L) {
+  lua_Number w = luaL_checknumber(L, 1);   /* argument 1, or a clear error */
+  lua_Number h = luaL_checknumber(L, 2);
+  lua_pushnumber(L, w * h);                /* push the result on the stack */
+  return 1;                                /* number of results */
+}
+
+static const char *script =
+  "local total = 0\n"
+  "for _, room in ipairs(rooms) do\n"
+  "  total = total + area(room.w, room.h)\n"
+  "end\n"
+  "print(('%d rooms, %.1f square metres'):format(#rooms, total))\n"
+  "return total\n";
+
+int main(void) {
+  lua_State *L = luaL_newstate();          /* a fresh, independent Lua world */
+  luaL_openlibs(L);                        /* load the standard libraries */
+
+  lua_pushcfunction(L, area);              /* expose area() as a global */
+  lua_setglobal(L, "area");
+
+  lua_newtable(L);                         /* rooms = { {w=4,h=3}, {w=2.5,h=2} } */
+  double sizes[2][2] = { {4, 3}, {2.5, 2} };
+  for (int i = 0; i < 2; i++) {
+    lua_newtable(L);
+    lua_pushnumber(L, sizes[i][0]); lua_setfield(L, -2, "w");
+    lua_pushnumber(L, sizes[i][1]); lua_setfield(L, -2, "h");
+    lua_rawseti(L, -2, i + 1);
+  }
+  lua_setglobal(L, "rooms");
+
+  if (luaL_loadstring(L, script) != LUA_OK || lua_pcall(L, 0, 1, 0) != LUA_OK) {
+    fprintf(stderr, "script failed: %s\n", lua_tostring(L, -1));
+    lua_close(L);
+    return 1;
+  }
+  printf("C received %.1f from the script\n", lua_tonumber(L, -1));
+
+  (void)luaL_dostring(L, "print(pcall(area, 'wide', 2))");   /* a bad argument is a Lua error */
+  lua_close(L);
+  return 0;
+}
+```
+
+Compiled against Lua 5.5 (for example `cc host.c -I lua-5.5.1/src lua-5.5.1/src/liblua.a -lm -o host`), it printed:
+
+```text
+2 rooms, 17.0 square metres
+C received 17.0 from the script
+false	bad argument #1 to 'area' (number expected, got string)
+```
+
+What to notice:
+
+- **The stack discipline.** Building `rooms` pushes a table, then for each room pushes another table, pushes a number and moves it into a field with `lua_setfield(L, -2, "w")` (-2 is the room table just below the number), and finally stores the room in the outer table with `lua_rawseti`. Every push is matched by something that pops. Getting this bookkeeping right is most of the work of writing bindings, and `lua_gettop` and careful comments are your friends.
+- **Protected calls.** `lua_pcall` runs the chunk and, on error, leaves the message on the stack instead of aborting the program. A host should run all user code this way. Errors raised in C with `luaL_checknumber` or `luaL_error` become ordinary Lua errors that a script can catch with `pcall`, as the last line shows.
+- **Independent states.** Each `lua_State` is a separate world with its own globals and garbage collector. A host can run several, for example one per plugin or one per thread, and none can see the others.
+- **Libraries are opt-in.** `luaL_openlibs` loads all standard libraries. A host that does not want scripts to touch files leaves out `io` and `os`; Lua 5.5's `luaL_openselectedlibs` makes that choice explicit, and `luaL_openlibs` is now defined in terms of it.
+
+**C modules** work the same way in reverse: a shared library exporting a function `luaopen_name` is found by `require("name")` through `package.cpath`, and returns a table of C functions, usually built with `luaL_newlib`. **Userdata** lets C hand Lua a block of memory (a file, a texture, a database connection) with a metatable giving it methods and a `__gc` or `__close` to release it.
+
+Lua 5.5 changed a few C functions (for example, `lua_newstate` now takes a seed for string hashing), and, as always, binary modules must be recompiled for each new minor version. Writing bindings by hand is instructive; for large C++ APIs, teams often use binding generators or libraries such as sol2.
+
+</Section>
+
+<Section id="luajit" kind="human" title="LuaJIT">
+
+**LuaJIT** is an independent implementation of Lua written by Mike Pall, first released in 2005. It combines a very fast interpreter written in assembly with a **tracing just-in-time compiler** that records the hot paths a program actually takes and compiles them to machine code. On numeric and table-heavy code it is often many times faster than the standard interpreter, and that speed is why it powers OpenResty, Neovim, the LÖVE game framework and many games.
+
+Two things shape working with it:
+
+- **It implements Lua 5.1**, plus a handful of later features such as `goto` and some 5.2 library functions. It has no integer subtype (numbers are doubles, with 64-bit integers available through the FFI), no `//` or bitwise operators (a `bit` library instead), no `<const>` or `<close>`, no `utf8` library and no `global`. Code written for Lua 5.5 often needs adjusting to run there.
+- **The FFI library** lets Lua code declare C types and functions with ordinary C declarations and call them directly, without writing any C binding code, and the JIT compiles those calls efficiently:
+
+```lua
+local ffi = require("ffi")          -- LuaJIT only
+ffi.cdef[[ int printf(const char *fmt, ...); ]]
+ffi.C.printf("Hello from %s\n", "C")
+```
+
+LuaJIT is maintained as a rolling release from its source repository rather than through numbered releases, and it tracks Lua 5.1's language rather than later versions. Whether your code targets LuaJIT or Lua 5.4/5.5 is one of the first decisions of a Lua project, and usually the host makes it for you.
+
+Libraries meant to run everywhere test for **features**, not version numbers, and use small shims:
+
+```lua check
+-- Code shared between Lua versions tests for features, not version numbers.
+local load_string = loadstring or load           -- Lua 5.1's load takes only functions
+local function compiles(source) return load_string(source) ~= nil end
+
+local features = {
+  { "integer subtype (5.3)",        math.type ~= nil },
+  { "utf8 library (5.3)",           utf8 ~= nil },
+  { "goto (5.2)",                   compiles("goto done ::done::") },
+  { "<close> variables (5.4)",      compiles("local x <close> = nil") },
+  { "global declarations (5.5)",    compiles("global x") },
+  { "LuaJIT",                       type(jit) == "table" },
+}
+print(_VERSION)
+for _, f in ipairs(features) do
+  print(string.format("  %-28s %s", f[1], f[2] and "yes" or "no"))
+end
+
+-- Common shims for code that must also run on Lua 5.1 and LuaJIT:
+local unpack = table.unpack or unpack            -- a global in 5.1
+local pack = table.pack or function(...) return { n = select("#", ...), ... } end
+local args = pack("a", nil, "c")
+print(args.n, unpack({ 10, 20, 30 }))
+```
+
+It printed:
+
+```text
+Lua 5.5
+  integer subtype (5.3)        yes
+  utf8 library (5.3)           yes
+  goto (5.2)                   yes
+  <close> variables (5.4)      yes
+  global declarations (5.5)    yes
+  LuaJIT                       no
+3	10	20	30
+```
+
+</Section>
+
+<Section id="tools" kind="human" title="The tools of the trade">
+
+- **LuaRocks** is the package manager. `luarocks install luasocket` installs a module (compiling its C parts if needed), `luarocks install --local` installs under your home directory, and a project describes itself and its dependencies in a **rockspec** file. Hosts such as Neovim and game engines usually have their own plugin systems instead, so check what your host expects.
+- **busted** is the common test framework, with a readable specification style:
+
+```lua
+-- spec/parse_spec.lua, run with: busted
+local parse = require("watchtower.parse")
+
+describe("parse", function()
+  it("reads the level and the source", function()
+    local e = parse("2026-03-14T10:05:09 WARN  payments: card declined (code=51)")
+    assert.are.equal("WARN", e.level)
+    assert.are.equal("payments", e.source)
+    assert.are.equal("51", e.fields.code)
+  end)
+
+  it("rejects lines that are not log entries", function()
+    assert.is_nil(parse("this line is not a log entry"))
+  end)
+end)
+```
+
+- **luacheck** is the linter: it reports undefined and unused variables, accidental globals, shadowing and unreachable code, and is configured with a `.luacheckrc` file that lists the globals your host provides.
+- **StyLua** is the widely used formatter; run it on save or in CI and stop arguing about layout.
+- **The Lua Language Server** (LuaLS) gives editors completion, go-to-definition and diagnostics, and understands type annotations written in comments, such as `---@param name string` and `---@return integer`, which document code and catch type mistakes without changing the language. Neovim plugin authors use it heavily.
+- **Typed and alternative languages.** Roblox's **Luau** adds gradual typing and its own tooling; **Teal** is a typed dialect that compiles to Lua; **Fennel** is a Lisp that compiles to Lua. All of them run on, or descend from, the same small virtual machine idea.
+
+</Section>
+
+<Section id="project" kind="computation" title="Project: watchtower, a sandboxed rule engine">
+
+The project is a log monitor in the style of a real embedded system. The host part parses log lines with patterns and turns each into an event table. The **rules** are written by users as Lua source code, the way a game's mods or an editor's plugins are, and loaded at run time. Each rule calls `on(level, handler)` to subscribe to events and `alert(text)` to report something.
+
+Users' code must not be able to break the host, so the engine:
+
+1. runs each rule in its **own environment**, containing only the functions it is meant to use, with `load(source, name, "t", env)`; `"t"` refuses precompiled bytecode, which could otherwise be crafted to crash the interpreter;
+2. hands rules **read-only** views of shared libraries and of each event, using a proxy with `__index`, a refusing `__newindex` and a locked `__metatable`;
+3. runs every handler with **`pcall`**, so a failing rule is disabled and reported while the others carry on;
+4. gives each handler an **instruction budget** with `debug.sethook`, so an infinite loop is stopped instead of hanging the program.
+
+```lua check
+-- watchtower: a log monitor whose alerting rules are small Lua scripts
+-- written by its users and run in a sandbox.
+
+---------------------------------------------------------------- parsing
+-- "2026-03-14T10:05:09 WARN  payments: card declined (code=51)"
+local function parse(line)
+  local time, level, source, message =
+    line:match("^(%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d)%s+(%u+)%s+([%w_]+):%s*(.*)$")
+  if not time then return nil end
+  local fields = {}
+  for key, value in message:gmatch("(%w+)=([^%s,%)]+)") do fields[key] = value end
+  return { time = time, hour = tonumber(time:sub(12, 13)), level = level,
+           source = source, message = message, fields = fields }
+end
+
+---------------------------------------------------------------- rules
+local Rule = {}
+Rule.__index = Rule
+
+function Rule.new(name)
+  return setmetatable({ name = name, handlers = {}, alerts = 0, broken = nil }, Rule)
+end
+
+-- A read-only view of a table, so rules cannot change shared libraries.
+local function frozen(t)
+  return setmetatable({}, {
+    __index = t,
+    __newindex = function() error("this table is read-only", 2) end,
+    __metatable = false,
+  })
+end
+local SAFE = { string = frozen(string), math = frozen(math), table = frozen(table),
+               tonumber = tonumber, tostring = tostring, pairs = pairs, ipairs = ipairs }
+
+local MAX_STEPS = 100000          -- instructions a rule may run per event
+
+local function load_rule(name, source, alerts)
+  local rule = Rule.new(name)
+  local env = setmetatable({}, { __index = SAFE })      -- the rule's own globals
+  env.on = function(level, handler)                     -- the API rules use
+    rule.handlers[#rule.handlers + 1] = { level = level, fn = handler }
+  end
+  env.alert = function(text)
+    rule.alerts = rule.alerts + 1
+    alerts[#alerts + 1] = string.format("[%s] %s", name, text)
+  end
+  local chunk, err = load(source, "=" .. name, "t", env)
+  if not chunk then rule.broken = err; return rule end
+  local ok, run_err = pcall(chunk)
+  if not ok then rule.broken = run_err end
+  return rule
+end
+
+-- Run one handler with an instruction budget, so a buggy rule cannot hang us.
+local function guarded_call(fn, event)
+  debug.sethook(function() error("step limit exceeded", 2) end, "", MAX_STEPS)
+  local ok, err = pcall(fn, frozen(event))
+  debug.sethook()
+  return ok, err
+end
+
+function Rule:dispatch(event)
+  if self.broken then return end
+  for _, h in ipairs(self.handlers) do
+    if h.level == "*" or h.level == event.level then
+      local ok, err = guarded_call(h.fn, event)
+      if not ok then self.broken = err; return end
+    end
+  end
+end
+
+---------------------------------------------------------------- the run
+local rule_sources = {
+  declines = [[
+    local count = 0
+    on("WARN", function(e)
+      if e.source == "payments" and e.fields.code then
+        count = count + 1
+        if count == 2 then alert("2 card declines, last code " .. e.fields.code) end
+      end
+    end)
+  ]],
+  night_errors = [[
+    on("ERROR", function(e)
+      if e.hour < 6 then alert("night-time error in " .. e.source .. ": " .. e.message) end
+    end)
+  ]],
+  slow = [[
+    on("*", function(e)
+      local ms = tonumber(e.fields.ms)
+      if ms and ms > 1000 then
+        alert(string.format("%s took %.1f s", e.source, ms / 1000))
+      end
+    end)
+  ]],
+  vandal = [[
+    on("INFO", function(e) string.upper = nil end)
+  ]],
+  spinner = [[
+    on("ERROR", function(e) while true do end end)
+  ]],
+  typo = [[
+    on("WARN", function(e) alert("oops" end)
+  ]],
+}
+
+local log = [[
+2026-03-14T02:14:55 ERROR db: connection reset (retry=3)
+2026-03-14T09:58:01 INFO  web: GET /index.html (ms=120)
+2026-03-14T10:05:09 WARN  payments: card declined (code=51)
+2026-03-14T10:05:40 WARN  payments: card declined (code=05)
+this line is not a log entry
+2026-03-14T10:12:44 INFO  web: GET /report (ms=2350)
+2026-03-14T11:30:00 ERROR web: template missing (ms=15)
+]]
+
+local alerts = {}
+local names = {}
+for name in pairs(rule_sources) do names[#names + 1] = name end
+table.sort(names)                                    -- a stable order for the report
+local rules = {}
+for _, name in ipairs(names) do rules[#rules + 1] = load_rule(name, rule_sources[name], alerts) end
+
+local seen, skipped = 0, 0
+for line in log:gmatch("[^\n]+") do
+  local event = parse(line)
+  if event then
+    seen = seen + 1
+    for _, rule in ipairs(rules) do rule:dispatch(event) end
+  else
+    skipped = skipped + 1
+  end
+end
+
+print(string.format("%d events, %d unparsed lines, %d alerts", seen, skipped, #alerts))
+for _, a in ipairs(alerts) do print("  " .. a) end
+print("rules:")
+for _, rule in ipairs(rules) do
+  local status = rule.broken and ("disabled: " .. rule.broken)
+                 or (rule.alerts .. (rule.alerts == 1 and " alert" or " alerts"))
+  print(string.format("  %-13s %s", rule.name, status))
+end
+print("string.upper still works: " .. string.upper("yes"))
+```
+
+It printed:
+
+```text
+6 events, 1 unparsed lines, 3 alerts
+  [night_errors] night-time error in db: connection reset (retry=3)
+  [declines] 2 card declines, last code 05
+  [slow] web took 2.4 s
+rules:
+  declines      1 alert
+  night_errors  1 alert
+  slow          1 alert
+  spinner       disabled: spinner:1: step limit exceeded
+  typo          disabled: typo:1: ')' expected near 'end'
+  vandal        disabled: vandal:1: this table is read-only
+string.upper still works: YES
+```
+
+### How it fits together
+
+- **Parsing with patterns.** One `match` with captures splits a line into time, level, source and message: `%d` digits, `%u` upper-case letters, `[%w_]+` a name, `%s+` spaces, and `%-` a literal hyphen (hyphens are special in patterns, so they are escaped with `%`). `gmatch("(%w+)=([^%s,%)]+)")` then collects `key=value` pairs from the message. Lines that do not match are counted, not fatal.
+- **A small class.** `Rule` holds a rule's handlers, its alert count and, if it has failed, the reason. `dispatch` sends an event to the matching handlers; `"*"` subscribes to every level.
+- **Closures as the API.** `on` and `alert` are closures created per rule in `load_rule`, so each rule's calls land in its own `Rule` object without the rule knowing anything about it. The `declines` rule keeps its own counter in a local of its chunk, which persists between events because its handler is a closure too.
+- **The sandbox.** The environment's `__index` points to `SAFE`, so a rule can read `string`, `math` and `table`, but only through frozen proxies. The `vandal` rule tried to replace `string.upper` for everyone; it got an error, was disabled, and the last line of output shows the host's `string.upper` intact.
+- **Three kinds of failure, three outcomes.** The `typo` rule did not compile, so `load` returned the syntax error and the rule never ran. The `vandal` rule failed at run time and was disabled by `pcall`. The `spinner` rule never returned; after 100,000 instructions the count hook raised an error inside it, and it too was disabled. In each case the message names the rule, because the chunk name given to `load` (`"=" .. name`) appears in error positions.
+- **Deterministic output.** Rules are loaded in sorted order, and alerts are kept in a list, so the report is the same on every run, which makes it testable.
+
+### Where to take it
+
+Natural next steps: read rules from files in a directory with `io.lines` and the log from standard input, so it can sit in a shell pipeline; move `parse`, `Rule` and the sandbox into modules under `watchtower/` and test them with busted, as in the spec above; add `every(seconds, fn)` timers driven by event times, written with coroutines from lesson 7; and, if you know C, turn the host side into a C program that embeds Lua as in this lesson's first example, which is how a production system would do it. A sandbox in pure Lua is a good line of defence but not a complete security boundary: memory use, for example, is not limited here, and a host that runs untrusted code at scale should also limit memory with a custom allocator and run scripts in separate states or processes.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the whole of Lua: its values and tables, functions and closures, metatables and objects, modules and errors, coroutines, and how it meets its host. Some directions from here:
+
+- **Read the reference manual** from start to finish. It is short, precise and the final word on every question; the [Lua 5.5 manual](https://www.lua.org/manual/5.5/) is on lua.org.
+- **Read *Programming in Lua*** by Roberto Ierusalimschy for deeper treatments of everything in this course, with exercises; see its [official site](https://www.lua.org/pil/).
+- **Pick a host and build something.** Configure and extend [Neovim](https://neovim.io/), make a small game with [LÖVE](https://love2d.org/) (which uses LuaJIT), script Redis, or write a Pandoc filter.
+- **Read real Lua code.** Small, well-written libraries such as Penlight or LPeg's Lua examples show idioms that tutorials cannot.
+- **Look inside.** The Lua source code, about 30,000 lines of ISO C, is famously readable. Start with `lvm.c`, the virtual machine, and `ltable.c`, the table implementation.
+
+<Reflection title="Light that is reflected">
+
+*Lua* means "moon", and the moon gives no light of its own: it shines by reflecting the sun. Early Christian writers loved this image and used it of the Church, which they said has no light of its own but reflects Christ's. A good embedded language has something of the same humility. It is rarely the star of a product; it serves the host and the people who write scripts for it, and its success is measured by what others are able to build with it. Much good work in the world looks like that.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

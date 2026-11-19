@@ -1,0 +1,423 @@
+---
+title: Tests, the build system and C
+subtitle: Test blocks and leak-checked tests, build.zig and packages, and Zig's two-way relationship with C, from zig cc to exported functions.
+minutes: 70
+objectives:
+  - Write test blocks with std.testing, run them with zig test and zig build test, and read a failure
+  - Use std.testing.allocator so that every test also checks for leaks
+  - Read and modify a build.zig, use build options, cross-compile, and add a package dependency in build.zig.zon
+  - Call C code from Zig using a hand-written extern declaration or a header translated by the build system
+  - Export Zig functions with the C ABI, use C-compatible types and callbacks, and compile C with zig cc
+prerequisites: [comptime-and-generics]
+references:
+  - title: "Zig language reference: Zig Test and C"
+    url: https://ziglang.org/documentation/0.17.0/
+    note: Test declarations, the testing namespace, C type primitives, C pointers and exporting a C library.
+  - title: Zig build system guide
+    url: https://ziglang.org/learn/build-system/
+    note: The official walk-through of build.zig, from a single executable to dependencies and generated files.
+  - title: translate-c
+    url: https://codeberg.org/ziglang/translate-c/
+    note: The project that turns C headers into Zig declarations.
+---
+
+<Section id="motivation" kind="motivation" title="A toolchain in one download">
+
+In C and C++, the compiler is only the start: you also choose a build system, a test framework, a formatter, a package manager, and a cross-compiler for each target platform. The Zig download contains all of these. `zig test` runs tests written in the same file as the code. `zig build` runs a build script that is itself Zig code. `zig fmt` formats code one canonical way. `zig fetch` adds dependencies. `zig cc` compiles C and C++ for dozens of targets, with their C libraries included.
+
+The C toolchain arrived early in Zig's life. Because the compiler already contained Clang to translate C headers, exposing it as `zig cc` (around 2020) was a small step, and bundling the headers and sources of several C libraries made it something unusual: a C compiler that cross-compiles to Linux, macOS and Windows out of the box. This lesson covers the tools professionals use every day, and the feature that made many companies adopt Zig before they wrote a line of it: its relationship with C. Zig can call C libraries directly, compile C source alongside Zig, export functions that C can call, and cross-compile all of it. That makes it possible to introduce Zig into an existing C codebase one file at a time.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="test block">
+
+`test "name" { ... }` declares a test in any Zig file. Test blocks are compiled only by `zig test` (or a build step that runs tests); `zig run` and `zig build-exe` ignore them. A test passes if it returns without an error. `std.testing` provides `expect`, `expectEqual`, `expectEqualSlices`, `expectEqualStrings`, `expectError` and a leak-checking `allocator`.
+
+</Definition>
+
+<Definition term="build.zig and build.zig.zon">
+
+`build.zig` is a Zig program with a `pub fn build(b: *std.Build) void` function that declares what to build: modules, executables, libraries, tests, and named **steps** such as `run` and `test`. `build.zig.zon` (Zig Object Notation) describes the package: its name, version, minimum Zig version, files and **dependencies**, each pinned by a content hash.
+
+</Definition>
+
+<Definition term="module">
+
+A unit of Zig source with a root file and its own imports, target and optimisation mode. Executables, libraries and tests are built from modules, and a module can import other modules by name.
+
+</Definition>
+
+<Definition term="C ABI types">
+
+Types guaranteed to match C: `c_int`, `c_long`, `c_char` and the rest; `extern struct` and `extern union` with C layout; `[*:0]const u8` for C strings; `?*anyopaque` for `void *`; and functions with `callconv(.c)`. `extern fn` declares a function defined elsewhere (for example, in C); `export fn` defines a function with the C calling convention and an unmangled name, callable from C.
+
+</Definition>
+
+</Section>
+
+<Section id="testing" kind="computation" title="Tests live next to the code">
+
+This file converts Roman numerals. It has a `main` and five tests.
+
+```zig check
+const std = @import("std");
+
+/// Converts a Roman numeral such as "MCMXCIV" to an integer.
+/// Returns error.InvalidNumeral for any character that is not a Roman digit.
+pub fn fromRoman(text: []const u8) error{ InvalidNumeral, Empty }!u32 {
+    if (text.len == 0) return error.Empty;
+    var total: u32 = 0;
+    var previous: u32 = 0;
+    var i = text.len;
+    while (i > 0) { // walk from right to left
+        i -= 1;
+        const value: u32 = switch (text[i]) {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            else => return error.InvalidNumeral,
+        };
+        if (value < previous) total -= value else total += value;
+        previous = @max(previous, value);
+    }
+    return total;
+}
+
+pub fn main() void {
+    for ([_][]const u8{ "XIV", "MCMXCIV", "MMXXVI", "IIX?" }) |r| {
+        if (fromRoman(r)) |n| {
+            std.debug.print("{s} = {d}\n", .{ r, n });
+        } else |err| {
+            std.debug.print("{s}: {t}\n", .{ r, err });
+        }
+    }
+}
+
+// `zig run` ignores test blocks; `zig test main.zig` compiles and runs only them.
+test "simple numerals" {
+    try std.testing.expectEqual(@as(u32, 3), try fromRoman("III"));
+    try std.testing.expectEqual(@as(u32, 1666), try fromRoman("MDCLXVI"));
+}
+
+test "subtractive forms" {
+    try std.testing.expectEqual(@as(u32, 4), try fromRoman("IV"));
+    try std.testing.expectEqual(@as(u32, 1994), try fromRoman("MCMXCIV"));
+}
+
+test "bad input is an error, not a crash" {
+    try std.testing.expectError(error.InvalidNumeral, fromRoman("XIZ"));
+    try std.testing.expectError(error.Empty, fromRoman(""));
+}
+
+test "every value from 1 to 3999 round-trips through a reference encoder" {
+    const numerals = [_][]const u8{ "M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I" };
+    const values = [_]u32{ 1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1 };
+    var buf: [32]u8 = undefined;
+    for (1..4000) |n| {
+        var rest: u32 = @intCast(n);
+        var len: usize = 0;
+        for (numerals, values) |sym, v| {
+            while (rest >= v) : (rest -= v) {
+                @memcpy(buf[len..][0..sym.len], sym);
+                len += sym.len;
+            }
+        }
+        try std.testing.expectEqual(@as(u32, @intCast(n)), try fromRoman(buf[0..len]));
+    }
+}
+
+test "allocations in tests are checked for leaks" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(gpa);
+    for ([_][]const u8{ "X", "L", "C" }) |r| try list.append(gpa, try fromRoman(r));
+    try std.testing.expectEqualSlices(u32, &.{ 10, 50, 100 }, list.items);
+}
+```
+
+`zig run` ignores the tests and prints:
+
+```text
+XIV = 14
+MCMXCIV = 1994
+MMXXVI = 2026
+IIX?: InvalidNumeral
+```
+
+`zig test roman.zig` compiles and runs only the tests:
+
+```text
+1/5 roman.test.simple numerals...OK
+2/5 roman.test.subtractive forms...OK
+3/5 roman.test.bad input is an error, not a crash...OK
+4/5 roman.test.every value from 1 to 3999 round-trips through a reference encoder...OK
+5/5 roman.test.allocations in tests are checked for leaks...OK
+All 5 tests passed.
+```
+
+A few habits are visible here. Tests are named by the behaviour they check, so a failure reads like a sentence. Tests run one after another in the order written, and an error returned from any `try` inside one fails that test only; the others still run. `expectError` tests the failure paths, which are as much part of a function's contract as its results. The fourth test is a small **property test**: it encodes every number from 1 to 3999 with a simple reference encoder and checks that `fromRoman` recovers it, which covers far more cases than examples could. And the last test allocates with `std.testing.allocator`, so if `list.deinit` were missing, the test would fail with a leak report.
+
+When a test fails, `zig test` shows the expected and actual values, a stack trace into the test, and a summary. From another run, with one deliberately wrong expectation and one deliberate leak (abridged):
+
+```text
+3/4 t1.test.this one fails...expected 5, found 1.5
+FAIL (TestExpectedEqual)
+...
+3 passed; 0 skipped; 1 failed.
+1 errors were logged.
+1 tests leaked memory.
+```
+
+The exit status is non-zero, which is what continuous-integration systems check. One trap catches every Zig newcomer once: the compiler only analyses code that something references. A function that no `main` and no test calls is not even type-checked, so it can contain errors that surface months later. Tests that call every public function are the cure, and many projects add a test containing `std.testing.refAllDecls(@This());`, which references every declaration in the file so that all of it is compiled during testing. For slices, use `expectEqualSlices` or, for text, `expectEqualStrings`, which prints both strings and marks where they differ; `expectEqual` on two slices would compare pointers and lengths, not contents. `expectEqual` takes the *expected* value first; when it is a literal you often need `@as` to give it the right type, as in `@as(u32, 3)`.
+
+</Section>
+
+<Section id="build" kind="examples" title="The build system">
+
+`zig init` creates a project with this layout:
+
+```text
+build.zig        the build script
+build.zig.zon    package description and dependencies
+src/main.zig     the executable's root file
+src/root.zig     a library module that main.zig imports, with its own tests
+```
+
+The generated `build.zig`, with its explanatory comments removed, is about forty lines. Its core:
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{}); // -Dtarget=...
+    const optimize = b.standardOptimizeOption(.{}); // -Doptimize=...
+
+    const mod = b.addModule("initdemo", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+    });
+    const exe = b.addExecutable(.{
+        .name = "initdemo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "initdemo", .module = mod }},
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    b.step("run", "Run the app").dependOn(&run_cmd.step);
+
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+}
+```
+
+The script does not build anything itself. It declares a graph of steps, and `zig build <step>` runs the parts of the graph that step needs, in parallel and with caching. The everyday commands:
+
+```bash
+zig build                       # build and install into zig-out/bin
+zig build run                   # build and run
+zig build test --summary all    # run every test step and summarise
+zig build -Doptimize=fast       # an optimised build
+zig build -Dtarget=aarch64-linux-musl   # cross-compile for 64-bit ARM Linux
+```
+
+`zig build test --summary all` on the generated project printed:
+
+```text
+Build Summary: 5/5 steps succeeded; 3/3 tests passed
+test success
++- run test 1 pass (1 total) 6ms MaxRSS:4M
+|  +- compile test debug native success 423ms MaxRSS:149M
++- run test 2 pass (2 total) 5ms MaxRSS:4M
+   +- compile test debug native success 447ms MaxRSS:150M
+```
+
+Builds leave two directories behind: `.zig-cache`, the local cache of compiled artifacts, and `zig-out`, where installed executables and libraries go. Neither belongs in version control; add both to `.gitignore`. Deleting them is always safe, and the next build recreates whatever it needs (more slowly, the first time).
+
+**Packages.** `zig fetch --save <url>` downloads a package (a git repository or a tarball), computes its hash, and records both in `build.zig.zon`'s `.dependencies`. In `build.zig`, `b.dependency("name", .{ .target = target, .optimize = optimize }).module("name")` gets one of its modules, which you add to `.imports`. There is no central registry: a dependency is a URL plus a hash, and the hash guarantees you get exactly the bytes you pinned. Packages can contain C code too, which is how many C libraries are now packaged to build with `zig build` alone.
+
+</Section>
+
+<Section id="c" kind="examples" title="Zig and C">
+
+**Calling C.** The simplest way is to declare the C function yourself. With a C file `stats.c` defining `int summarise(const double *values, size_t n, summary *out)` and a three-field `summary` struct of doubles, this Zig code calls it:
+
+```zig
+const Summary = extern struct { min: f64, max: f64, mean: f64 };
+extern fn summarise(values: [*]const f64, n: usize, out: *Summary) c_int;
+```
+
+and `zig run src/manual.zig src/stats.c` compiles both languages into one program, which printed `min 0.5 max 48.5 mean 20.50`. For real libraries with large headers, let the build system translate the header instead:
+
+```zig
+const translated = b.addTranslateC(.{
+    .root_source_file = b.path("src/stats.h"),
+    .target = target,
+    .optimize = optimize,
+});
+// ... then, in the executable's module:
+//   .imports = &.{.{ .name = "stats", .module = translated.createModule() }},
+exe_mod.addCSourceFile(.{ .file = b.path("src/stats.c"), .flags = &.{ "-std=c17", "-Wall" } });
+```
+
+Now `const stats = @import("stats");` gives the Zig code every declaration in the header, generated as Zig source:
+
+```zig
+pub const summary = extern struct {
+    min: f64 = 0,
+    max: f64 = 0,
+    mean: f64 = 0,
+};
+pub extern fn summarise(values: [*c]const f64, n: usize, out: [*c]summary) c_int;
+```
+
+`[*c]` is a **C pointer**, a deliberately loose pointer type that translation uses because a C header cannot say whether `double *` means one value or many. Wrap translated functions in small Zig functions that take slices, so the rest of your code never sees `[*c]`. (In Zig 0.17, `@cImport`, the old way to translate headers from inside Zig source, has been removed in favour of this build step; the `zig translate-c` command remains for experiments, and its C front end is now Aro, a C compiler written in Zig.)
+
+A wrapper of that kind is only a few lines. This one turns the C function's pointer, length and return code into a slice and an error union:
+
+```zig
+/// A Zig-friendly wrapper: a slice in, an error union out.
+pub fn summarise(values: []const f64) error{Empty}!stats.summary {
+    var out: stats.summary = undefined;
+    if (stats.summarise(values.ptr, values.len, &out) != 0) return error.Empty;
+    return out;
+}
+```
+
+Called with the four rainfall values it returns the same summary as before, and called with an empty slice it returns `error.Empty`, which a Zig caller must handle like any other error.
+
+**Being called from C.** The other direction is just as direct. This program defines functions that a C program could link against:
+
+```zig check
+const std = @import("std");
+
+// A struct with C's layout, matching this C declaration:
+//   struct reading { int32_t station_id; double celsius; };
+const Reading = extern struct {
+    station_id: i32,
+    celsius: f64,
+};
+
+// The C type of a callback: void (*)(const struct reading *, void *ctx)
+const Visitor = *const fn (r: *const Reading, ctx: ?*anyopaque) callconv(.c) void;
+
+// `export` gives this function the C calling convention and an unmangled symbol name,
+// so a C program linked with this code could declare and call it:
+//   void visit_readings(const struct reading *items, size_t n, visitor_fn f, void *ctx);
+export fn visit_readings(items: [*]const Reading, n: usize, f: Visitor, ctx: ?*anyopaque) void {
+    for (items[0..n]) |*r| f(r, ctx);
+}
+
+// C strings are zero-terminated: [*:0]const u8 in Zig.
+export fn count_vowels(text: [*:0]const u8) c_int {
+    var n: c_int = 0;
+    for (std.mem.span(text)) |ch| {
+        if (std.mem.indexOfScalar(u8, "aeiouAEIOU", ch) != null) n += 1;
+    }
+    return n;
+}
+
+// A callback written in Zig with the C calling convention. The context pointer
+// carries our own state through the C-style API, as C libraries expect.
+const Stats = struct { count: u32 = 0, sum: f64 = 0 };
+
+fn accumulate(r: *const Reading, ctx: ?*anyopaque) callconv(.c) void {
+    const stats: *Stats = @ptrCast(@alignCast(ctx.?));
+    stats.count += 1;
+    stats.sum += r.celsius;
+}
+
+pub fn main() void {
+    const readings = [_]Reading{
+        .{ .station_id = 101, .celsius = 18.5 },
+        .{ .station_id = 102, .celsius = 22.0 },
+        .{ .station_id = 103, .celsius = 20.5 },
+    };
+    var stats: Stats = .{};
+    visit_readings(&readings, readings.len, accumulate, &stats);
+    std.debug.print("{d} readings, mean {d:.2}\n", .{ stats.count, stats.sum / @as(f64, @floatFromInt(stats.count)) });
+    std.debug.print("@sizeOf(Reading) = {d}, offset of celsius = {d}\n", .{ @sizeOf(Reading), @offsetOf(Reading, "celsius") });
+    std.debug.print("vowels in \"Ouagadougou\": {d}\n", .{count_vowels("Ouagadougou")});
+}
+```
+
+```text
+3 readings, mean 20.33
+@sizeOf(Reading) = 16, offset of celsius = 8
+vowels in "Ouagadougou": 8
+```
+
+`export fn visit_readings` has the C calling convention and the plain symbol name `visit_readings`. Its parameters are C-compatible: a many-item pointer and a length, a C function pointer type, and an untyped `?*anyopaque` context, the standard C idiom for passing state to a callback. `accumulate` is a Zig function with `callconv(.c)`, so it can be handed to C code as a callback, and it casts the context back to its real type with `@ptrCast(@alignCast(...))`. `Reading` is an `extern struct`, so its layout (16 bytes, `celsius` at offset 8 after four bytes of padding) is exactly what a C compiler produces for the same declaration. Building this file with `zig build-lib` (add `-dynamic` for a shared library) gives a library that C code can link, declaring the functions in its own header. (Zig has an option to generate that header automatically, `-femit-h`, but in 0.17 it reports that it is currently broken, so write the header by hand.)
+
+**Compiling C with zig cc.** Zig includes Clang and the C library headers for many platforms, so `zig cc` is a drop-in C compiler and cross-compiler. On an x86-64 Linux machine, these three commands built the same `hello.c`:
+
+```bash
+zig cc hello.c -o hello
+zig cc -target aarch64-linux-musl hello.c -o hello-arm64
+zig cc -target x86_64-windows-gnu hello.c -o hello.exe
+```
+
+and `file` described the results as:
+
+```text
+hello:       ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, with debug_info, not stripped
+hello-arm64: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
+hello.exe:   PE32+ executable (console) x86-64, for MS Windows
+```
+
+No ARM toolchain, Windows SDK or virtual machine was installed. This is why projects in other languages use `zig cc` as their cross-compiler.
+
+</Section>
+
+<Section id="practice" kind="human" title="How Zig projects work day to day">
+
+Professional Zig projects pin their compiler version (often in `build.zig.zon`'s `minimum_zig_version` and in continuous integration), because upgrades can break the build. They run `zig fmt --check` in CI, so formatting is never discussed in review; `zig fmt` has no configuration options at all. Editors use ZLS, the Zig language server, built for the same Zig version. Tests live next to the code they test, use `std.testing.allocator`, and run in CI with `zig build test` in at least one safe mode; many projects also test with `-Doptimize=safe`, since some bugs appear only with optimisation. Large projects add **fuzz tests** (the template from `zig init` includes one, run with `zig build test --fuzz`) to search for inputs that break invariants.
+
+When a Zig upgrade breaks the build, the usual routine is: read the release notes (linked from the [download page](https://ziglang.org/download/), they list the breaking changes of each version with examples of the new style), let the compiler's errors guide you, and search the new standard library source for the replacement of anything that disappeared. Each release so far has been worth it, but it is work, and it is the main cost of adopting a pre-1.0 language.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Tests need a separate test directory and framework."** In Zig, tests are part of the language and usually sit in the same file as the code, where they can also test private functions. Larger projects add separate test files for integration tests, imported from the build script.
+
+</Misconception>
+
+<Misconception>
+
+**"`build.zig` is a configuration file."** It is a program, with the full language available: loops, conditionals, functions, and access to the target and options. That power is useful, and it is also a reason to keep build scripts simple and readable.
+
+</Misconception>
+
+<Misconception>
+
+**"Using a C library from Zig needs bindings written by hand."** For most C headers, translation produces usable declarations automatically. Hand-written wrappers are still good practice, to give Zig callers slices, errors and optionals instead of raw C pointers and return codes, but they are thin.
+
+</Misconception>
+
+<Misconception>
+
+**"`zig cc` is only for Zig programmers."** Many projects with no Zig code use it, because it cross-compiles C and C++ to other operating systems and architectures with a single download.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

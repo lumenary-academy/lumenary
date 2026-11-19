@@ -1,0 +1,480 @@
+---
+title: Subqueries, CTEs and views
+subtitle: Queries inside queries, named steps with WITH, recursion over hierarchies and graphs, and views that give a query a permanent name.
+minutes: 65
+objectives:
+  - Use scalar, IN, EXISTS and correlated subqueries, and subqueries in FROM
+  - Prefer NOT EXISTS to NOT IN, and express "for all" questions with a double NOT EXISTS
+  - Break a long query into named steps with common table expressions
+  - Write recursive CTEs that generate sequences, walk hierarchies in both directions and explore graphs without looping forever
+  - Create and use views, and explain when a materialized view is worth its cost
+prerequisites: [joins]
+related: [math.discrete.graph-basics, math.found.first-order-logic, math.discrete.recurrences-generating-functions]
+references:
+  - title: "SQLite: The WITH Clause"
+    url: https://www.sqlite.org/lang_with.html
+    note: Ordinary and recursive CTEs, with several worked examples including a Mandelbrot set drawn in SQL.
+  - title: "PostgreSQL: WITH Queries (Common Table Expressions)"
+    url: https://www.postgresql.org/docs/current/queries-with.html
+    note: Including search order and the CYCLE clause for recursive queries.
+  - title: "PostgreSQL: Subquery Expressions"
+    url: https://www.postgresql.org/docs/current/functions-subquery.html
+  - title: "SQLite: CREATE VIEW"
+    url: https://www.sqlite.org/lang_createview.html
+  - title: "PostgreSQL: Materialized Views"
+    url: https://www.postgresql.org/docs/current/rules-materializedviews.html
+---
+
+<Section id="motivation" kind="motivation" title="Queries are made of queries">
+
+The result of a query is a table. That simple fact has a powerful consequence: anywhere SQL expects a table, or a list of values, or even a single value, you can put another query. "Runners faster than the average for their race" needs an average inside a comparison. "Customers who have never ordered" needs a set of customers who have. "Total sales per month, then the best month" needs a grouped result that is itself grouped again.
+
+SQL offers three ways to nest queries, which grew up in this order. **Subqueries** are queries written inline, in parentheses. **Common table expressions** (CTEs), added in SQL:1999, let you name a subquery with `WITH` and refer to it below, so a complex query reads top to bottom as a series of steps; their **recursive** form lets SQL walk trees and graphs, which plain SQL cannot do at all. **Views** store a query permanently in the database under a name, so that other queries and other people can use it like a table.
+
+The first examples use a small running club: runners, races, and each runner's time in each race. One runner, Grace, has not raced yet.
+
+</Section>
+
+<Section id="subqueries" kind="examples" title="Subqueries">
+
+A subquery can appear in three kinds of place:
+
+- **Where a single value is expected** (a *scalar subquery*): it must return at most one row and one column. No rows gives `NULL`.
+- **After `IN`, `EXISTS` or a comparison with `ANY`/`ALL`**: a set of values or rows to test against. `EXISTS (subquery)` is true when the subquery returns at least one row; what it selects does not matter, so people write `SELECT 1`.
+- **In `FROM`** (a *derived table*): the result is used as a table and must have an alias. You used this in the last lesson to fix fan-out.
+
+A subquery is **correlated** when it refers to a column of the outer query. Conceptually it is re-evaluated for each outer row, like a function called with that row's values; the optimiser is free to do something cleverer.
+
+```sql check
+.mode column
+CREATE TABLE runner (id INTEGER PRIMARY KEY, name TEXT NOT NULL, country TEXT NOT NULL);
+CREATE TABLE race   (id INTEGER PRIMARY KEY, name TEXT NOT NULL, km REAL NOT NULL);
+CREATE TABLE result (
+  runner_id INTEGER NOT NULL REFERENCES runner (id),
+  race_id   INTEGER NOT NULL REFERENCES race (id),
+  minutes   REAL    NOT NULL,
+  PRIMARY KEY (runner_id, race_id)
+);
+INSERT INTO runner VALUES
+  (1, 'Wanjiru', 'Kenya'), (2, 'Ibrahim', 'Morocco'), (3, 'Sofia', 'Portugal'),
+  (4, 'Haruto', 'Japan'), (5, 'Grace', 'Kenya');
+INSERT INTO race VALUES (1, 'River 10K', 10), (2, 'Hill Half', 21.1), (3, 'Park 5K', 5);
+INSERT INTO result VALUES
+  (1, 1, 31.5), (1, 2, 70.2), (1, 3, 15.1),
+  (2, 1, 33.0), (2, 2, 69.8),
+  (3, 1, 36.4), (3, 3, 17.9),
+  (4, 1, 34.2), (4, 2, 75.5), (4, 3, 16.0);
+
+-- A scalar subquery returns one value and can be used like a constant.
+SELECT name, km FROM race
+WHERE km > (SELECT avg(km) FROM race);
+
+-- IN with a subquery: runners who ran the Hill Half.
+SELECT name FROM runner
+WHERE id IN (SELECT runner_id FROM result WHERE race_id = 2)
+ORDER BY name;
+
+-- A correlated subquery refers to the outer row: results faster than
+-- the average for the same race.
+SELECT ru.name, ra.name AS race, r.minutes
+FROM result AS r
+JOIN runner AS ru ON ru.id = r.runner_id
+JOIN race   AS ra ON ra.id = r.race_id
+WHERE r.minutes < (SELECT avg(r2.minutes) FROM result AS r2 WHERE r2.race_id = r.race_id)
+ORDER BY ra.id, r.minutes;
+
+-- NOT EXISTS twice: runners for whom no race exists that they did not run.
+SELECT ru.name FROM runner AS ru
+WHERE NOT EXISTS (
+  SELECT 1 FROM race AS ra
+  WHERE NOT EXISTS (
+    SELECT 1 FROM result AS r WHERE r.runner_id = ru.id AND r.race_id = ra.id))
+ORDER BY ru.name;
+```
+
+```text
+name       km
+---------  ----
+Hill Half  21.1
+name
+-------
+Haruto
+Ibrahim
+Wanjiru
+name     race       minutes
+-------  ---------  -------
+Wanjiru  River 10K  31.5
+Ibrahim  River 10K  33.0
+Ibrahim  Hill Half  69.8
+Wanjiru  Hill Half  70.2
+Wanjiru  Park 5K    15.1
+Haruto   Park 5K    16.0
+name
+-------
+Haruto
+Wanjiru
+```
+
+The correlated subquery computes, for each result, the average time of *that result's* race (`r2.race_id = r.race_id`), so a 10 km time is never compared with a half-marathon average. The same question can be answered by joining to a derived table of per-race averages, or, more elegantly, with the window functions of the next lesson.
+
+The last query answers a "for all" question: which runners ran *every* race? SQL has no "for all" quantifier, but <TopicLink id="math.found.first-order-logic">first-order logic</TopicLink> supplies one: "for every race, the runner ran it" is equivalent to "there is no race the runner did not run". Hence two nested `NOT EXISTS`. This pattern is called **relational division**. Grace, who has no results, is correctly excluded; so are Ibrahim and Sofia, who each missed one race.
+
+### NOT EXISTS, not NOT IN
+
+The previous lessons warned that `x NOT IN (subquery)` returns no rows at all if the subquery produces a single `NULL`. `NOT EXISTS` has no such problem, because `EXISTS` is always true or false, never unknown. Write anti-joins with `NOT EXISTS` (or the `LEFT JOIN … IS NULL` pattern) and reserve `NOT IN` for literal lists or columns declared `NOT NULL`. Modern optimisers turn `IN` and `EXISTS` into efficient semi-joins, so this is a choice for correctness, not speed.
+
+### Beyond SQLite: ANY, ALL and LATERAL
+
+PostgreSQL and MySQL also support `x > ALL (subquery)` (greater than every value) and `x = ANY (subquery)` (equal to at least one, the same as `IN`); SQLite does not. They also support **lateral** subqueries in `FROM`, which may refer to tables listed before them. That makes "the top two results in each race" a natural query. PostgreSQL 16 printed:
+
+```sql
+SELECT ra.name AS race, best.runner_id, best.minutes
+FROM race AS ra
+CROSS JOIN LATERAL (
+  SELECT r.runner_id, r.minutes
+  FROM result AS r
+  WHERE r.race_id = ra.id
+  ORDER BY r.minutes
+  LIMIT 2
+) AS best
+ORDER BY ra.id, best.minutes;
+```
+
+```text
+   race    | runner_id | minutes
+-----------+-----------+---------
+ River 10K |         1 |    31.5
+ River 10K |         2 |    33.0
+ Hill Half |         2 |    69.8
+ Hill Half |         1 |    70.2
+ Park 5K   |         1 |    15.1
+ Park 5K   |         4 |    16.0
+(6 rows)
+```
+
+(MySQL has `LATERAL` since 8.0.14; SQL Server spells it `CROSS APPLY`.) In SQLite the same question is answered with a window function, as the next lesson shows.
+
+</Section>
+
+<Section id="ctes" kind="computation" title="Common table expressions">
+
+<Definition term="Common table expression">
+
+A **common table expression** (CTE) is a named subquery introduced with `WITH name AS (query)` before the main statement. Several can be listed, separated by commas, and each may refer to the ones before it. They exist only for the duration of that one statement.
+
+</Definition>
+
+CTEs do not let you say anything a nested subquery could not, but they change how a query reads. Instead of a query turned inside out, with the first step buried in the deepest parentheses, you write the steps in order and give each a name that explains it. A CTE can also be referenced several times, where a subquery would have to be repeated.
+
+```sql check
+.mode column
+CREATE TABLE runner (id INTEGER PRIMARY KEY, name TEXT NOT NULL, country TEXT NOT NULL);
+CREATE TABLE race   (id INTEGER PRIMARY KEY, name TEXT NOT NULL, km REAL NOT NULL);
+CREATE TABLE result (
+  runner_id INTEGER NOT NULL, race_id INTEGER NOT NULL, minutes REAL NOT NULL,
+  PRIMARY KEY (runner_id, race_id)
+);
+INSERT INTO runner VALUES
+  (1, 'Wanjiru', 'Kenya'), (2, 'Ibrahim', 'Morocco'), (3, 'Sofia', 'Portugal'),
+  (4, 'Haruto', 'Japan'), (5, 'Grace', 'Kenya');
+INSERT INTO race VALUES (1, 'River 10K', 10), (2, 'Hill Half', 21.1), (3, 'Park 5K', 5);
+INSERT INTO result VALUES
+  (1, 1, 31.5), (1, 2, 70.2), (1, 3, 15.1),
+  (2, 1, 33.0), (2, 2, 69.8),
+  (3, 1, 36.4), (3, 3, 17.9),
+  (4, 1, 34.2), (4, 2, 75.5), (4, 3, 16.0);
+
+-- Each CTE is a named query that later parts of the statement can use.
+WITH pace AS (               -- minutes per kilometre, for every result
+  SELECT r.runner_id, r.race_id, r.minutes / ra.km AS min_per_km
+  FROM result AS r JOIN race AS ra ON ra.id = r.race_id
+),
+per_runner AS (              -- each runner's average pace
+  SELECT runner_id, avg(min_per_km) AS avg_pace, count(*) AS races
+  FROM pace
+  GROUP BY runner_id
+)
+SELECT ru.name, ru.country, p.races, round(p.avg_pace, 2) AS avg_pace,
+       round(p.avg_pace - (SELECT avg(min_per_km) FROM pace), 2) AS vs_field
+FROM per_runner AS p
+JOIN runner AS ru ON ru.id = p.runner_id
+ORDER BY p.avg_pace;
+
+-- The simplest recursive CTE: count from 1 to 5.
+WITH RECURSIVE n(i) AS (
+  SELECT 1                          -- anchor: the starting row(s)
+  UNION ALL
+  SELECT i + 1 FROM n WHERE i < 5   -- recursive step: new rows from the last ones
+)
+SELECT i, i * i AS square FROM n;
+
+-- Generate a calendar: every day of a week, with its weekday (0 = Sunday).
+WITH RECURSIVE day(d) AS (
+  SELECT '2026-06-01'
+  UNION ALL
+  SELECT date(d, '+1 day') FROM day WHERE d < '2026-06-07'
+)
+SELECT d, strftime('%w', d) AS weekday FROM day;
+```
+
+```text
+name     country   races  avg_pace  vs_field
+-------  --------  -----  --------  --------
+Wanjiru  Kenya     3      3.17      -0.19
+Ibrahim  Morocco   2      3.3       -0.05
+Haruto   Japan     3      3.4       0.05
+Sofia    Portugal  2      3.61      0.26
+i  square
+-  ------
+1  1
+2  4
+3  9
+4  16
+5  25
+d           weekday
+----------  -------
+2026-06-01  1
+2026-06-02  2
+2026-06-03  3
+2026-06-04  4
+2026-06-05  5
+2026-06-06  6
+2026-06-07  0
+```
+
+The first statement reads as a recipe: compute each result's pace; average it per runner; list runners with their average and its difference from the field's average. The `pace` CTE was used twice, once by `per_runner` and once in the scalar subquery.
+
+Does a CTE run once and store its result, or is it pasted into the query like a macro? It depends on the database and version. PostgreSQL before version 12 always computed CTEs separately, which made them an "optimisation fence"; since version 12 it inlines a CTE that is used once and lets you choose with `WITH x AS MATERIALIZED (…)` or `NOT MATERIALIZED`. SQLite and MySQL decide for themselves. You rarely need to care, but if a query becomes slower when rewritten with CTEs, this is the first thing to check.
+
+### Recursive CTEs
+
+<Definition term="Recursive CTE">
+
+A **recursive CTE**, written `WITH RECURSIVE name(columns) AS (anchor UNION ALL step)`, starts with the rows of the *anchor* query, then repeatedly runs the *step* query on the rows produced in the previous round, adding its output to the result, until a round produces no new rows.
+
+</Definition>
+
+The counter above makes the mechanism visible: the anchor produces 1; each step reads the latest row and produces the next; when `i < 5` fails, the step returns nothing and the recursion stops. The calendar uses the same idea with dates, a common trick for filling gaps in reports (a day with no sales should still appear, with a zero, which a left join from the generated calendar provides). Despite the name, this is iteration, like a `while` loop or a <TopicLink id="math.discrete.recurrences-generating-functions">recurrence</TopicLink>, not a function calling itself.
+
+Two rules keep you safe. The step must eventually produce no rows, or the query runs until it exhausts memory; while experimenting, a `LIMIT` on the final `SELECT` is a cheap safety net in SQLite and PostgreSQL. And use `UNION ALL` unless you need `UNION`'s removal of duplicates (which can itself stop some cycles, at a cost).
+
+</Section>
+
+<Section id="hierarchies" kind="examples" title="Walking trees and graphs">
+
+Recursive CTEs earn their place with hierarchical data: organisation charts, folders, product categories, comment threads, bills of materials. Such data is usually stored as an **adjacency list**, where each row points to its parent, exactly like the `mentor_id` of the last lesson. A plain self join goes up or down one level; recursion goes any number of levels.
+
+```sql check
+.mode column
+-- A hierarchy: who reports to whom in a small charity.
+CREATE TABLE staff (
+  id         INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  role       TEXT NOT NULL,
+  manager_id INTEGER REFERENCES staff (id)
+);
+INSERT INTO staff VALUES
+  (1, 'Nomvula', 'director',     NULL),
+  (2, 'Arjun',   'programmes',   1),
+  (3, 'Beatriz', 'finance',      1),
+  (4, 'Kofi',    'field lead',   2),
+  (5, 'Lin',     'field lead',   2),
+  (6, 'Mariam',  'volunteer',    4),
+  (7, 'Pablo',   'accountant',   3);
+
+-- Walk down the tree from the director, keeping depth and path.
+WITH RECURSIVE chart(id, name, depth, path) AS (
+  SELECT id, name, 0, name FROM staff WHERE manager_id IS NULL
+  UNION ALL
+  SELECT s.id, s.name, c.depth + 1, c.path || ' > ' || s.name
+  FROM staff AS s JOIN chart AS c ON s.manager_id = c.id
+)
+SELECT substr('        ', 1, depth * 2) || name AS tree, depth, path
+FROM chart
+ORDER BY path;
+
+-- Walk up: everyone above Mariam.
+WITH RECURSIVE up(id, name, manager_id) AS (
+  SELECT id, name, manager_id FROM staff WHERE name = 'Mariam'
+  UNION ALL
+  SELECT s.id, s.name, s.manager_id FROM staff AS s JOIN up ON s.id = up.manager_id
+)
+SELECT name FROM up WHERE name <> 'Mariam';
+```
+
+```text
+tree          depth  path
+------------  -----  -------------------------------
+Nomvula       0      Nomvula
+  Arjun       1      Nomvula > Arjun
+    Kofi      2      Nomvula > Arjun > Kofi
+      Mariam  3      Nomvula > Arjun > Kofi > Mariam
+    Lin       2      Nomvula > Arjun > Lin
+  Beatriz     1      Nomvula > Beatriz
+    Pablo     2      Nomvula > Beatriz > Pablo
+name
+-------
+Kofi
+Arjun
+Nomvula
+```
+
+Going down, the anchor is the root (the person with no manager), and each step joins staff whose manager is someone already found. Carrying `depth` and `path` along costs nothing and makes the result easy to display: sorting by the path string puts every person directly under their manager, and the indentation is just spaces repeated by depth. Going up is the same idea in the other direction: start from Mariam and repeatedly join to the current person's manager.
+
+### Graphs and cycles
+
+A tree has no cycles, so the recursion always ends. A general <TopicLink id="math.discrete.graph-basics">graph</TopicLink> may have them: a train network where you can travel from Lyon to Turin to Milan and back to Lyon. A naive recursive query would go round that loop forever. The fix is to carry the path and refuse to revisit a city already on it. (The journey times below are invented for the example.)
+
+```sql check
+.mode column
+-- A graph with a cycle: one-way train links between cities.
+CREATE TABLE link (src TEXT NOT NULL, dst TEXT NOT NULL, minutes INTEGER NOT NULL);
+INSERT INTO link VALUES
+  ('Lyon', 'Geneva', 110), ('Geneva', 'Zurich', 165), ('Zurich', 'Milan', 200),
+  ('Lyon', 'Turin', 240), ('Turin', 'Milan', 60), ('Milan', 'Lyon', 300);
+
+-- Every route from Lyon, never visiting a city twice.
+WITH RECURSIVE route(city, path, total, hops) AS (
+  SELECT 'Lyon', 'Lyon', 0, 0
+  UNION ALL
+  SELECT l.dst, r.path || ' > ' || l.dst, r.total + l.minutes, r.hops + 1
+  FROM route AS r JOIN link AS l ON l.src = r.city
+  WHERE instr(r.path, l.dst) = 0          -- skip cities already on the path
+)
+SELECT city, min(total) AS fastest, path
+FROM route
+WHERE hops > 0
+GROUP BY city
+ORDER BY fastest;
+```
+
+```text
+city    fastest  path
+------  -------  ----------------------
+Geneva  110      Lyon > Geneva
+Turin   240      Lyon > Turin
+Zurich  275      Lyon > Geneva > Zurich
+Milan   300      Lyon > Turin > Milan
+```
+
+The recursion found both routes to Milan (300 minutes via Turin, 475 via Geneva and Zurich) and kept the faster. Two honest caveats. The final `SELECT` relies on SQLite's bare-column rule from lesson 4 to show the path of the minimum row; portable SQL would use a window function. And testing membership with `instr` on a string is a shortcut that fails when one city's name contains another's. In PostgreSQL you would carry an array of visited cities, or use the standard `CYCLE` clause (PostgreSQL 14+), which does the bookkeeping for you:
+
+```sql
+WITH RECURSIVE route(city, total) AS (
+  SELECT 'Lyon', 0
+  UNION ALL
+  SELECT l.dst, r.total + l.minutes
+  FROM route AS r JOIN link AS l ON l.src = r.city
+) CYCLE city SET is_cycle USING visited
+SELECT city, min(total) AS fastest
+FROM route
+WHERE NOT is_cycle AND city <> 'Lyon'
+GROUP BY city
+ORDER BY fastest;
+```
+
+Recursive SQL explores *every* path, which grows exponentially in dense graphs. For shortest paths in large networks, use a graph algorithm in application code or a graph database; SQL:2023's property-graph queries (SQL/PGQ) are beginning to bring graph pattern matching into SQL itself.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Subquery myths">
+
+<Misconception>
+
+"`WHERE id IN (SELECT …)` and a `JOIN` are the same thing." They differ when the inner table has several matching rows. `SELECT name FROM runner WHERE id IN (SELECT runner_id FROM result)` lists each runner once, however many races they ran: it is a **semi-join**, which only asks whether a match exists. `SELECT ru.name FROM runner AS ru JOIN result AS r ON r.runner_id = ru.id` lists Wanjiru three times, once per result. People then add `DISTINCT` to hide the duplicates, which works but makes the database do extra work and hides the real intent. If you are asking "is there a match?", say so with `IN` or `EXISTS`.
+
+</Misconception>
+
+<Misconception>
+
+"Correlated subqueries are always slow, because they run once per row." That is the *meaning*, not necessarily the execution. Optimisers routinely rewrite `EXISTS` and `IN` subqueries as semi-joins and anti-joins, and with an index on the inner table's correlated column each evaluation is a quick lookup rather than a scan. Scalar correlated subqueries in the `SELECT` list are the ones most likely to really run per row; on a large table, check the plan (lesson 8) and, if needed, rewrite them as a join to a grouped derived table or as a window function.
+
+</Misconception>
+
+<Misconception>
+
+"A scalar subquery that returns two rows takes the first one." Standard SQL, PostgreSQL and MySQL raise an error ("more than one row returned by a subquery used as an expression", in PostgreSQL's words). SQLite silently uses the first row it finds, which hides bugs. If you mean "one of them", say which with `ORDER BY … LIMIT 1`.
+
+</Misconception>
+
+</Section>
+
+<Section id="views" kind="human" title="Views">
+
+A **view** is a query stored in the database under a name: `CREATE VIEW name AS SELECT …`. Querying the view runs the stored query, so a view holds no data of its own and always reflects the current contents of its tables.
+
+```sql check
+.mode column
+CREATE TABLE runner (id INTEGER PRIMARY KEY, name TEXT NOT NULL, country TEXT NOT NULL);
+CREATE TABLE race   (id INTEGER PRIMARY KEY, name TEXT NOT NULL, km REAL NOT NULL);
+CREATE TABLE result (
+  runner_id INTEGER NOT NULL, race_id INTEGER NOT NULL, minutes REAL NOT NULL,
+  PRIMARY KEY (runner_id, race_id)
+);
+INSERT INTO runner VALUES
+  (1, 'Wanjiru', 'Kenya'), (2, 'Ibrahim', 'Morocco'), (3, 'Sofia', 'Portugal'),
+  (4, 'Haruto', 'Japan'), (5, 'Grace', 'Kenya');
+INSERT INTO race VALUES (1, 'River 10K', 10), (2, 'Hill Half', 21.1), (3, 'Park 5K', 5);
+INSERT INTO result VALUES
+  (1, 1, 31.5), (1, 2, 70.2), (1, 3, 15.1),
+  (2, 1, 33.0), (2, 2, 69.8),
+  (3, 1, 36.4), (3, 3, 17.9),
+  (4, 1, 34.2), (4, 2, 75.5), (4, 3, 16.0);
+
+-- A view is a named, stored query. It holds no data of its own.
+CREATE VIEW result_detail AS
+SELECT ru.name AS runner, ru.country, ra.name AS race, ra.km, r.minutes,
+       round(r.minutes / ra.km, 2) AS min_per_km
+FROM result AS r
+JOIN runner AS ru ON ru.id = r.runner_id
+JOIN race   AS ra ON ra.id = r.race_id;
+
+-- Query it like a table.
+SELECT country, count(*) AS results, min(min_per_km) AS best_pace
+FROM result_detail
+GROUP BY country
+ORDER BY best_pace;
+
+-- New data shows up immediately, because the view is re-evaluated each time.
+INSERT INTO result VALUES (5, 3, 14.8);
+SELECT runner, race, min_per_km FROM result_detail WHERE race = 'Park 5K' ORDER BY min_per_km;
+```
+
+```text
+country   results  best_pace
+--------  -------  ---------
+Kenya     3        3.02
+Japan     3        3.2
+Morocco   2        3.3
+Portugal  2        3.58
+runner   race     min_per_km
+-------  -------  ----------
+Grace    Park 5K  2.96
+Wanjiru  Park 5K  3.02
+Haruto   Park 5K  3.2
+Sofia    Park 5K  3.58
+```
+
+Teams use views for three main reasons:
+
+- **Reuse and naming.** A join that every report repeats is written once, correctly, and given a name that people understand.
+- **A stable interface.** Applications can read from a view while the tables underneath are reorganised; only the view's definition changes.
+- **Security.** In server databases you can grant a user access to a view that exposes some columns or rows of a table (say, everything except salaries) without granting access to the table itself.
+
+Simple views (one table, no aggregates) are **updatable** in PostgreSQL and MySQL: an `INSERT` or `UPDATE` on the view changes the underlying table. SQLite views are read-only unless you write `INSTEAD OF` triggers.
+
+A **materialized view**, available in PostgreSQL and Oracle (and as "indexed views" in SQL Server), *does* store its result, like a cached table, and must be refreshed explicitly with `REFRESH MATERIALIZED VIEW name`. It trades freshness for speed: perfect for a dashboard summarising millions of rows that can be an hour out of date, wrong for anything that must be current. SQLite and MySQL lack them; people emulate them with an ordinary table rebuilt on a schedule.
+
+<Misconception>
+
+"Views make queries faster." An ordinary view is just a stored query; the database expands it into your query and optimises the whole. It costs almost nothing, but it saves nothing either. The danger is the opposite: views built on views built on views hide how much work a simple-looking `SELECT` really does, and are a classic cause of slow reporting systems. Keep view hierarchies shallow.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

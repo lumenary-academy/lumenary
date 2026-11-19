@@ -1,0 +1,339 @@
+---
+title: Macros, the Lean ecosystem, and a verified compiler
+subtitle: How Lean lets you extend its own syntax, how professionals build and share Lean projects, and a complete project to finish the course, a small compiler with a proof that it is correct.
+minutes: 70
+objectives:
+  - Describe Lean's layers of metaprogramming (notation, macros, syntax with macro_rules, elaborators) and write a simple example of each
+  - Add dependencies to a Lake project, and find your way around Reservoir, Mathlib, Batteries and the community
+  - Build a complete verified program, a compiler from arithmetic expressions to a stack machine, with an optimiser, and prove both correct
+  - Explain the proof technique behind compiler correctness, generalising over the rest of the program and the stack
+  - Plan what to learn next, as a programmer or as a mathematician
+prerequisites: [verifying-programs]
+related: [math.comp.formal-proof-lean, math.comp.intro-lean]
+references:
+  - title: Metaprogramming in Lean 4
+    url: https://leanprover-community.github.io/lean4-metaprogramming-book/
+    note: The community book on syntax, macros, elaborators and writing tactics.
+  - title: Reservoir
+    url: https://reservoir.lean-lang.org/
+    note: The registry of Lean packages that Lake can depend on.
+  - title: Mathlib and the Lean community
+    url: https://leanprover-community.github.io/
+    note: The community's site, with Mathlib's documentation, installation help and contribution guides.
+  - title: Mathematics in Lean
+    url: https://leanprover-community.github.io/mathematics_in_lean/
+    note: The standard introduction to formalising mathematics with Mathlib.
+  - title: Lean Zulip chat
+    url: https://leanprover.zulipchat.com/
+    note: The community's forum; beginners' questions are welcome in its new-members channel.
+  - title: Compilers and interpreters (Lumenary CS)
+    url: https://lumenary.academy/en/cs/compilers-and-interpreters/
+    note: How real compilers are structured, from parsing to code generation.
+---
+
+<Section id="motivation" kind="motivation" title="Where the course has been, and where it ends">
+
+You have now seen both of Lean's faces. As a programming language: expressions and types, structures and inductive types, recursion that provably ends, type classes and dependent types, monads and `IO`, arrays and hash maps. As a proof assistant: propositions as types, tactics, and proofs that your own functions meet their specifications. This last lesson adds the one major part of the language not yet covered, **metaprogramming**, the way Lean lets you extend Lean itself, then shows how Lean projects are built and shared, and ends with a project that uses everything: a small compiler, with a machine-checked proof that it compiles correctly.
+
+Compilers are the classic target of program verification, because a bug in a compiler can silently break every program it compiles. The best-known example, CompCert, is an optimising C compiler verified in the Rocq proof assistant (formerly Coq), and it is used in industries where a miscompiled program could be dangerous. Ours is a few dozen lines rather than many thousands, but the structure of its proof is the structure of theirs.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Metaprogramming: Lean extending Lean">
+
+Because Lean 4 is written in Lean, the parser, the elaborator that turns syntax into terms, and the tactic framework are all Lean programs, and your files can add to them. Much of what you have used in this course is built this way: `s!"…"` interpolation, `do`-notation, `deriving` handlers, and many tactics, `omega` and `grind` among them. There are four layers, from simplest to most powerful:
+
+<Definition term="Notation">
+
+`notation` and its relatives `infixl`, `infixr` and `prefix` give new syntax to an existing expression, with a precedence. They are pure abbreviations.
+
+</Definition>
+
+<Definition term="Macro">
+
+A **macro** rewrites one piece of syntax into another before elaboration. `macro` defines a single rule; `syntax` declares a new syntactic form and `macro_rules` gives its expansions, which may be recursive. Macros are **hygienic**: names introduced inside a macro cannot accidentally capture or be captured by names at the place where it is used.
+
+</Definition>
+
+<Definition term="Elaborator">
+
+An **elaborator**, declared with `elab`, is arbitrary Lean code that runs while the file is being checked, with access to the environment of all declarations, the types of terms and the proof goals. Custom commands, tactics and checkers are written as elaborators. They require `import Lean`, which makes the compiler's own API available.
+
+</Definition>
+
+```lean check
+import Lean
+
+-- 1. Notation: new syntax for an existing expression.
+notation:50 a " divides " b => b % a = 0
+
+example : 7 divides 91 := by decide
+#eval decide (3 divides 12)
+
+-- 2. A macro: a new term form that expands, recursively, into ordinary Lean.
+syntax "sumOf![" term,* "]" : term
+macro_rules
+  | `(sumOf![]) => `(0)
+  | `(sumOf![$x]) => `($x)
+  | `(sumOf![$x, $xs,*]) => `($x + sumOf![$xs,*])
+
+#eval sumOf![1, 2, 3, 4]
+#check sumOf![(1 : Int), 2]
+
+-- 3. A tactic macro: try several tactics in turn.
+macro "arith" : tactic => `(tactic| first | decide | omega | simp_all)
+
+example (a : Nat) (h : a > 3) : a ≠ 2 := by arith
+example : 2 ^ 5 = 32 := by arith
+
+-- 4. An elaborator: arbitrary Lean code that runs while the file is checked.
+open Lean Elab Command in
+elab "#count_constructors " id:ident : command => do
+  let env ← getEnv
+  match env.find? id.getId with
+  | some (.inductInfo info) => logInfo m!"{id.getId} has {info.ctors.length} constructors"
+  | _ => throwError "{id.getId} is not an inductive type"
+
+#count_constructors Option
+#count_constructors Ordering
+```
+
+```text
+true
+10
+1 + 2 : Int
+Option has 2 constructors
+Ordering has 3 constructors
+```
+
+The `divides` notation lets `7 divides 91` stand for `91 % 7 = 0`, a proposition that `decide` can check. `sumOf!` is a new kind of term with a comma-separated list inside; the backquoted patterns `` `(…) `` are **syntax quotations**, `$x` is a piece of syntax matched or inserted, and `$xs,*` is a comma-separated sequence. The `#check` shows the expansion: `sumOf![(1 : Int), 2]` is literally `1 + 2`. The `arith` tactic tries `decide`, then `omega`, then `simp_all`, and is how projects package their common proof steps. Finally, `#count_constructors` is a new command that looks a name up in the environment (the database of every declaration Lean knows), checks that it is an inductive type and reports how many constructors it has.
+
+Use the lightest layer that does the job. Notation and simple macros are common in ordinary projects; elaborators are for library and tool authors. Do not invent syntax casually, since every reader of your code must learn it. The [Metaprogramming in Lean 4](https://leanprover-community.github.io/lean4-metaprogramming-book/) book is the place to go deeper.
+
+</Section>
+
+<Section id="examples" kind="examples" title="The project: a verified compiler">
+
+The source language is arithmetic with variables: `(2 + x) * y`. The target is a **stack machine**, the model behind the Java virtual machine and WebAssembly: `push 2` puts a number on the stack, `load x` puts the value of a variable there, and `add` and `mul` replace the top two numbers with their sum or product. The compiler translates an expression into a list of instructions that leaves the expression's value on the stack. An optimiser simplifies expressions first. We prove both correct.
+
+```lean check
+/-! # A verified compiler for arithmetic expressions -/
+
+/-- Source language: arithmetic on natural numbers with named variables. -/
+inductive Expr where
+  | num (n : Nat)
+  | var (name : String)
+  | add (a b : Expr)
+  | mul (a b : Expr)
+
+instance : OfNat Expr n := ⟨.num n⟩
+instance : Add Expr := ⟨.add⟩
+instance : Mul Expr := ⟨.mul⟩
+
+/-- Values for the variables. -/
+abbrev Env := String → Nat
+
+namespace Expr
+
+def eval (env : Env) : Expr → Nat
+  | num n => n
+  | var x => env x
+  | add a b => a.eval env + b.eval env
+  | mul a b => a.eval env * b.eval env
+
+def toString : Expr → String
+  | num n => s!"{n}"
+  | var x => x
+  | add a b => s!"({a.toString} + {b.toString})"
+  | mul a b => s!"{a.toString} * {b.toString}"
+
+instance : ToString Expr := ⟨Expr.toString⟩
+
+/-- Constant folding and the identities 0 + e = e, 1 * e = e, 0 * e = 0. -/
+def simplify : Expr → Expr
+  | add a b =>
+    match a.simplify, b.simplify with
+    | num m, num n => num (m + n)
+    | num 0, e => e
+    | e, num 0 => e
+    | a', b' => add a' b'
+  | mul a b =>
+    match a.simplify, b.simplify with
+    | num m, num n => num (m * n)
+    | num 0, _ => num 0
+    | _, num 0 => num 0
+    | num 1, e => e
+    | e, num 1 => e
+    | a', b' => mul a' b'
+  | e => e
+
+theorem simplify_correct (env : Env) (e : Expr) : (e.simplify).eval env = e.eval env := by
+  induction e with
+  | num n => rfl
+  | var x => rfl
+  | add a b iha ihb =>
+    simp only [simplify]
+    split <;> grind [eval]
+  | mul a b iha ihb =>
+    simp only [simplify]
+    split <;> grind [eval]
+
+end Expr
+
+/-- Target language: instructions for a stack machine. -/
+inductive Instr where
+  | push (n : Nat)
+  | load (name : String)
+  | add
+  | mul
+deriving Repr
+
+def Instr.toString : Instr → String
+  | push n => s!"push {n}"
+  | load x => s!"load {x}"
+  | add => "add"
+  | mul => "mul"
+
+/-- Run a program on a stack (the head of the list is the top). -/
+def exec (env : Env) : List Instr → List Nat → List Nat
+  | [], stack => stack
+  | .push n :: rest, stack => exec env rest (n :: stack)
+  | .load x :: rest, stack => exec env rest (env x :: stack)
+  | .add :: rest, b :: a :: stack => exec env rest ((a + b) :: stack)
+  | .mul :: rest, b :: a :: stack => exec env rest ((a * b) :: stack)
+  | _ :: rest, stack => exec env rest stack   -- too few operands: skip
+
+def compile : Expr → List Instr
+  | .num n => [.push n]
+  | .var x => [.load x]
+  | .add a b => compile a ++ compile b ++ [.add]
+  | .mul a b => compile a ++ compile b ++ [.mul]
+
+/-- The key lemma: running the code for `e`, then anything else, is the same as
+    pushing the value of `e` and running the rest. -/
+theorem exec_compile (env : Env) (e : Expr) (rest : List Instr) (stack : List Nat) :
+    exec env (compile e ++ rest) stack = exec env rest (e.eval env :: stack) := by
+  induction e generalizing rest stack with
+  | num n => simp [compile, exec, Expr.eval]
+  | var x => simp [compile, exec, Expr.eval]
+  | add a b iha ihb => simp [compile, iha, ihb, exec, Expr.eval]
+  | mul a b iha ihb => simp [compile, iha, ihb, exec, Expr.eval]
+
+/-- The compiler is correct: the machine computes exactly the value of the expression. -/
+theorem compile_correct (env : Env) (e : Expr) : exec env (compile e) [] = [e.eval env] := by
+  simpa [exec] using exec_compile env e [] []
+
+def env : Env
+  | "x" => 6
+  | "y" => 7
+  | _ => 0
+
+def x : Expr := .var "x"
+def y : Expr := .var "y"
+
+def report (e : Expr) : IO Unit := do
+  let code := compile e
+  IO.println s!"{e}  =  {e.eval env}"
+  IO.println s!"  code ({code.length} instructions): {", ".intercalate (code.map Instr.toString)}"
+  IO.println s!"  machine result: {exec env code []}"
+  let s := e.simplify
+  IO.println s!"  simplified: {s}, {(compile s).length} instructions, value {s.eval env}"
+
+def main : IO Unit := do
+  report (x * y)
+  report ((2 + x) * (y + 0) * 1)
+  report ((3 * 4 + 0 * x) * (1 * y))
+```
+
+```text
+x * y  =  42
+  code (3 instructions): load x, load y, mul
+  machine result: [42]
+  simplified: x * y, 3 instructions, value 42
+(2 + x) * (y + 0) * 1  =  56
+  code (9 instructions): push 2, load x, add, load y, push 0, add, mul, push 1, mul
+  machine result: [56]
+  simplified: (2 + x) * y, 5 instructions, value 56
+(3 * 4 + 0 * x) * 1 * y  =  84
+  code (11 instructions): push 3, push 4, mul, push 0, load x, mul, add, push 1, load y, mul, mul
+  machine result: [84]
+  simplified: 12 * y, 3 instructions, value 84
+```
+
+Everything in the file is checked before `main` runs: if either proof were wrong, there would be no program to run. The output is a test that agrees with the proofs; the proofs say it would agree for every expression and every assignment of the variables.
+
+Some things to notice in the code, all from earlier lessons:
+
+- The three instances (lesson 5) let us write expressions in ordinary notation: `(2 + x) * y` builds `Expr.mul (Expr.add (Expr.num 2) x) y`, because `+` and `*` on `Expr` are its constructors and numerals become `num`.
+- `Env` is an `abbrev` for a function type, so an environment is just a function from names to values, here defined by pattern matching on strings.
+- `exec` has a last, catch-all case for a stack with too few operands. Compiled code never reaches it, and the correctness proof shows that; but `exec` must be total (lesson 4), so it has to do something. Skipping the instruction is one honest choice; returning an `Except` would be another.
+- The printer omits parentheses around products, so `(3 * 4 + 0 * x) * (1 * y)` prints as `(3 * 4 + 0 * x) * 1 * y`. Multiplication is associative, so the value is the same, but a printer that loses structure is the kind of thing a further theorem (printing and then parsing gives back the same tree) would catch.
+
+</Section>
+
+<Section id="computation" kind="computation" title="How the proofs work">
+
+**The compiler.** The statement we want is `compile_correct`: on an empty stack, the code for `e` leaves exactly `[e.eval env]`. As in lesson 9, it cannot be proved by induction directly. The code for `a + b` is `compile a ++ compile b ++ [add]`, so in the induction step we must know what `compile a` does when *more code follows it* and when *the stack is not empty* (when `compile b` runs, the value of `a` is already on the stack). The induction hypothesis about `compile_correct` mentions neither.
+
+So we prove the general statement `exec_compile`: for any code `rest` that follows and any stack, running `compile e ++ rest` is the same as pushing `e`'s value and running `rest`. Then `induction e generalizing rest stack` gives hypotheses `iha` and `ihb` that hold for *every* continuation and stack. For `add a b`, `simp` rewrites with `iha` (where the rest is `compile b ++ [add] ++ rest`), then `ihb` (with `a`'s value now on the stack), and finally one step of `exec` on `add`, which pops both values and pushes their sum. Associativity of `++`, which this needs, is a simp lemma in the library. `compile_correct` is the special case with no following code and an empty stack.
+
+This generalisation, over the continuation and the machine state, is the heart of compiler-correctness proofs in general, including the very large ones. If you remember one idea from this project, remember that one.
+
+**The optimiser.** `simplify_correct` says that simplification never changes the value of an expression, in any environment. Induction on `e` gives the hypotheses that simplifying `a` and `b` preserves their values; `split` then produces one goal per branch of the `match` in `simplify` (both constants, a zero on the left, and so on), and `grind` finishes each one, using the hypotheses and arithmetic facts such as `0 * n = 0`. Combining the two theorems, compiling `e.simplify` produces code that computes `e.eval env`: optimisation and compilation together are correct.
+
+The project leaves plenty to do; the exercises suggest some extensions, and each one is a realistic step: add subtraction (and discover that truncated `Nat` subtraction is part of the specification), add `let` bindings, write a parser and prove it inverse to the printer, or compile to registers instead of a stack.
+
+</Section>
+
+<Section id="reading" kind="reading" title="The ecosystem: building, sharing and asking">
+
+### Lake projects and dependencies
+
+Lesson 1 created a project with `lake new`. To depend on another package, add a `[[require]]` section to `lakefile.toml`. Packages listed on **[Reservoir](https://reservoir.lean-lang.org/)**, the Lean package registry, can be named with the account that publishes them, which Reservoir calls the scope:
+
+```text
+[[require]]
+name = "batteries"
+scope = "leanprover-community"
+```
+
+`lake update` then resolves the dependency and records the exact version in `lake-manifest.json`, which you commit so that everyone builds the same code; `lake build` fetches and compiles it. A package can also be required directly from a Git repository with `git = "…"` and `rev = "…"`. Note that a dependency must work with your project's Lean version, which is why projects that depend on Mathlib usually adopt Mathlib's `lean-toolchain`. The official installation page shows the one-line command that creates a new project already set up for Mathlib: `lake +leanprover-community/mathlib4:lean-toolchain new MyProject math`.
+
+Other everyday Lake commands are `lake test` and `lake lint`, which run whatever test and lint drivers the project configures, `lake clean`, and `lake env`, which runs a command with the project's paths set up. The project template from lesson 1 includes a GitHub Actions workflow that builds the project on every push, and most Lean projects keep it.
+
+### The libraries
+
+- **Mathlib** is the community's mathematics library: a single, unified, heavily reviewed library covering much of undergraduate and a growing share of research mathematics, maintained by a large group of volunteers. Lumenary Math's <TopicLink id="math.comp.formal-proof-lean">Formalising mathematics in Lean and Mathlib</TopicLink> is the place to start with it; this course's checks use core Lean only, so nothing here depends on it.
+- **Batteries** is a community library of extra data structures, functions and lemmas for programming, a testing ground for things that may later move into core.
+- **CSLib** is a newer open-source library of verified algorithms, data structures and tools for reasoning about programs, aimed at doing for computer science what Mathlib does for mathematics.
+
+### Documentation and tools
+
+The official [documentation page](https://lean-lang.org/documentation/) links the books and references, including the [API reference](https://lean-lang.org/doc/api/), generated by the same tool (doc-gen4) that projects use for their own documentation. [Loogle](https://loogle.lean-lang.org/) searches libraries by name and type. And the VS Code extension's infoview, which you have used throughout, remains the most important tool of all.
+
+### The community
+
+Lean's community meets on the **[Lean Zulip chat](https://leanprover.zulipchat.com/)**, where beginners, mathematicians, engineers and the core developers all ask and answer questions in public. It has a channel for new members, and a good question there includes a **minimal working example**: a short, complete file that others can paste into their editor (or the playground) to see the problem, with its imports. Write it the way the programs in this course are written. The Lean FRO publishes Lean's [roadmap](https://lean-lang.org/fro), and development happens openly on [GitHub](https://github.com/leanprover/lean4), where issues and pull requests are welcome.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You know enough Lean now to choose your own direction.
+
+- **As a programmer**, read [Functional Programming in Lean](https://lean-lang.org/functional_programming_in_lean/) from end to end, especially its chapters on monad transformers and on programming with dependent types; then build something real, a command-line tool, an interpreter, a parser, and prove the parts that matter. The [Lean Language Reference](https://lean-lang.org/doc/reference/latest/) answers precise questions.
+- **As a verifier**, go deeper into specification and proof: [Theorem Proving in Lean 4](https://lean-lang.org/theorem_proving_in_lean4/) for the logic, CSLib and Std's verified data structures for examples, and the `Std.Do` framework for verifying imperative-style monadic code.
+- **As a mathematician**, continue with Lumenary Math's <TopicLink id="math.comp.intro-lean">First steps in Lean</TopicLink> if you skipped it, then [Mathematics in Lean](https://leanprover-community.github.io/mathematics_in_lean/) and Mathlib.
+- **As a tool builder**, read [Metaprogramming in Lean 4](https://leanprover-community.github.io/lean4-metaprogramming-book/) and write a tactic.
+
+Whichever you choose, keep the habit this course has tried to teach: say precisely what your program should do, and let the machine check that it does.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Use the project's definitions; the stretch exercises are extensions worth trying in your own copy.
+
+<Exercises/>
+
+</Section>
