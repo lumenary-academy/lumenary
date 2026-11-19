@@ -26,6 +26,7 @@ const NAV = [
 /** On the pages of Lumenary Scientia's other subjects, the header links the subjects to one another (the rest of the list is in the menu). */
 const SCIENTIA_NAV = [
   { key: "math", path: "math" },
+  { key: "statistics", path: "statistics" },
   { key: "cs", path: "cs" },
   { key: "programming", path: "cs/languages" },
   { key: "ee", path: "ee" },
@@ -40,7 +41,7 @@ const SCIENTIA_MORE = [
   { key: "about", path: "about" },
   { key: "contribute", path: "contribute" },
 ] as const;
-const SCIENTIA_SUBJECTS = /^\/[^/]+\/(cs|ee|robotics|chemistry|me|materials)(\/|$)/;
+const SCIENTIA_SUBJECTS = /^\/[^/]+\/(statistics|cs|ee|robotics|chemistry|me|materials)(\/|$)/;
 
 /**
  * The site header. `available` lists the course paths that have pages (from the layout, which reads

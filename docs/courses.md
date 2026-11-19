@@ -1,4 +1,4 @@
-# Courses: Lumenary CS, EE, Robotics, Chemistry, ME and Materials
+# Courses: Lumenary CS, Statistics, EE, Robotics, Chemistry, ME and Materials
 
 Lumenary Math has its own knowledge graph, Lean library and experiments (see the [authoring guide](authoring-guide.md)). The other subjects are **courses**: a syllabus and a directory per lesson, rendered by the same lesson components. This guide is the contract for writing one.
 
@@ -9,13 +9,14 @@ Lumenary Lingua's language courses are no longer in this repository. They live i
 | Lumenary CS | `content/cs/` | English | `/en/cs/`, `/en/cs/<slug>/` |
 | Programming languages (Assembly … Zig) | `content/cs/languages/<id>/` | English | `/en/cs/languages/`, `/en/cs/languages/<id>/`, `/en/cs/languages/<id>/<slug>/` |
 | Lumenary CS electives (Blockchains & Verifiable Computation …) | `content/cs/electives/<id>/` | English | `/en/cs/electives/`, `/en/cs/electives/<id>/`, `/en/cs/electives/<id>/<slug>/` |
+| Lumenary Statistics | `content/statistics/` | English | `/en/statistics/`, `/en/statistics/<slug>/` |
 | Lumenary EE (electrical engineering) | `content/ee/` | English | `/en/ee/`, `/en/ee/<slug>/` |
 | Lumenary Robotics | `content/robotics/` | English | `/en/robotics/`, `/en/robotics/<slug>/` |
 | Lumenary Chemistry | `content/chemistry/` | English | `/en/chemistry/`, `/en/chemistry/<slug>/` |
 | Lumenary ME (mechanical engineering) | `content/me/` | English | `/en/me/`, `/en/me/<slug>/` |
 | Lumenary Materials (materials science) | `content/materials/` | English | `/en/materials/`, `/en/materials/<slug>/` |
 
-A Scientia subject is a directory under `content/` with a `course.json` (`cs`, `ee`, `robotics`, `chemistry`, `me`, `materials`); it is listed on the front page by `src/lib/subjects.ts`, and its routes are `src/app/[locale]/<id>/`; the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`).
+A Scientia subject is a directory under `content/` with a `course.json` (`statistics`, `cs`, `ee`, `robotics`, `chemistry`, `me`, `materials`); it is listed on the front page by `src/lib/subjects.ts`, and its routes are `src/app/[locale]/<id>/`; the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`).
 
 ## Files
 
@@ -181,6 +182,10 @@ In Start lessons the cats guide, ask and encourage; from then on they speak as f
 ### Lumenary CS electives
 
 An elective is a course nested in Lumenary CS (`content/cs/electives/<id>/`, listed on `/en/cs/electives/`) for a field the main course only touches: its own syllabus, usually in three levels from foundations to the research frontier, written to the same standard as Lumenary CS. Its description says which Lumenary CS lessons it assumes, and links them. A field that moves money or markets (the blockchain elective) is taught to inform, never to sell: no price talk, no investment advice, and fraud, failures and open problems are given as much room as successes.
+
+### Lumenary Statistics and the data electives
+
+Lumenary Statistics is a subject of its own: statistics as the science of learning from data under variation and uncertainty, from statistical literacy (Start, about age 11) to the frontier. Probability theory lives in Lumenary Math; link it rather than re-deriving it. The Lumenary CS electives Data Science, Data Engineering & Big Data, and Cloud Computing are practice-first; Data Science links to Lumenary Statistics for the methods. In these courses, Python blocks may also use pandas, SciPy, scikit-learn and pyarrow (pinned in compute/requirements.txt to the versions Pyodide bundles); prefer NumPy and the standard library when they suffice, since every package the browser loads costs the learner a download. Spark, Kafka, Airflow, Kubernetes, Terraform and cloud-provider code is shown in plain fences and labelled as not run. Name tools and providers fairly and by link; give costs and limits as plainly as benefits.
 
 ### Lumenary EE and Lumenary Robotics
 

@@ -2,13 +2,13 @@
 
 **All the sciences. Many languages. Every nation.**
 
-Lumenary Academy is a Christian-inspired education project in three divisions. This repository holds its website, [lumenary.academy](https://lumenary.academy), the open subjects of Lumenary Scientia — **Lumenary Math**, **Lumenary CS** (with its programming-language courses and electives), **Lumenary EE**, **Lumenary Robotics**, **Lumenary Chemistry**, **Lumenary ME** and **Lumenary Materials**. **Lumenary Lingua** and **Lumenary Prep** have their own sites and repositories.
+Lumenary Academy is a Christian-inspired education project in three divisions. This repository holds its website, [lumenary.academy](https://lumenary.academy), the open subjects of Lumenary Scientia — **Lumenary Math**, **Lumenary Statistics**, **Lumenary CS** (with its programming-language courses and electives), **Lumenary EE**, **Lumenary Robotics**, **Lumenary Chemistry**, **Lumenary ME** and **Lumenary Materials**. **Lumenary Lingua** and **Lumenary Prep** have their own sites and repositories.
 
 ## The three divisions
 
 | Division | What it is | Status |
 | --- | --- | --- |
-| **Lumenary Scientia** | The sciences, free and open source for ever: no accounts, no advertising, no paid tiers | Available: mathematics (**[Lumenary Math](content/math/README.md)**), computer science (**Lumenary CS**, `content/cs/`, with programming languages from Assembly to Zig in `content/cs/languages/` and electives in `content/cs/electives/`), electrical engineering (**Lumenary EE**, `content/ee/`), robotics (**Lumenary Robotics**, `content/robotics/`), chemistry (**Lumenary Chemistry**, `content/chemistry/`) mechanical engineering (**Lumenary ME**, `content/me/`) and materials science (**Lumenary Materials**, `content/materials/`). Physics, biology and other sciences pending |
+| **Lumenary Scientia** | The sciences, free and open source for ever: no accounts, no advertising, no paid tiers | Available: mathematics (**[Lumenary Math](content/math/README.md)**), statistics (**Lumenary Statistics**, `content/statistics/`), computer science (**Lumenary CS**, `content/cs/`, with programming languages from Assembly to Zig in `content/cs/languages/` and electives in `content/cs/electives/`), electrical engineering (**Lumenary EE**, `content/ee/`), robotics (**Lumenary Robotics**, `content/robotics/`), chemistry (**Lumenary Chemistry**, `content/chemistry/`) mechanical engineering (**Lumenary ME**, `content/me/`) and materials science (**Lumenary Materials**, `content/materials/`). Physics, biology and other sciences pending |
 | **Lumenary Lingua** | Languages, each taught through a language the learner already knows | At [lingua.lumenary.academy](https://lingua.lumenary.academy), built in its own repository, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua). Available, A1 to C2: Spanish taught in English and English taught in Spanish. Other pairs pending. Its old addresses here (`/<locale>/lingua/…`) redirect there (`vercel.json`) |
 | **Lumenary Prep** | Exam preparation as a paid service: one price per course, paid once, for lifetime access | At [prep.lumenary.academy](https://prep.lumenary.academy), built in a separate repository |
 
@@ -52,13 +52,14 @@ content/
   chemistry/         Lumenary Chemistry: course.json and lessons/<slug>/
   me/                Lumenary ME: course.json and lessons/<slug>/
   materials/         Lumenary Materials: course.json and lessons/<slug>/
+  statistics/        Lumenary Statistics: course.json and lessons/<slug>/
   pages/             About, Divisions, Contribute, Educators, evaluation package (MDX)
   registry/          languages.json, countries.json, glossaries/
   verification/      generated reports — never edit by hand
 formal/              Lean 4 project for Lumenary Math
 compute/             Python experiments for Lumenary Math, tests, verify.py, pinned requirements
 src/
-  app/[locale]/      routes (static export): the front page (the three divisions), math/, cs/, ee/, robotics/, chemistry/, me/, materials/, and the project pages
+  app/[locale]/      routes (static export): the front page (the three divisions), math/, cs/, ee/, robotics/, chemistry/, me/, materials/, statistics/, and the project pages
   components/        UI, lesson blocks, widgets, graph, exercises
   i18n/              locale config and message catalogues
   lib/               schemas (zod), content loaders, MDX, layout, sandbox

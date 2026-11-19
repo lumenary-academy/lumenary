@@ -26,6 +26,7 @@ const SOURCES = [
   ...files("content/chemistry", /\.(mdx|json)$/),
   ...files("content/me", /\.(mdx|json)$/),
   ...files("content/materials", /\.(mdx|json)$/),
+  ...files("content/statistics", /\.(mdx|json)$/),
   ...files("compute/experiments", /\.py$/),
   ...files("src/i18n/messages", /\.json$/),
   "content/math/graph/graph.json",
