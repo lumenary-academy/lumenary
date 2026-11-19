@@ -101,6 +101,7 @@ In the programming-language courses, a block whose fence reads ```` ```rust chec
 | `haskell`, `ocaml`, `elixir`, `erlang`, `clojure`, `scheme` | main.hs, main.ml, main.exs, main.erl (escript), main.clj, main.scm | runghc, ocaml, elixir, escript, clojure -M, chibi-scheme (R7RS) |
 | `sql`, `r`, `julia`, `matlab` | main.sql, main.R, main.jl, main.m | sqlite3, Rscript, julia, GNU Octave |
 | `prolog`, `cobol`, `ada`, `pascal` | main.pl, main.cob, main.adb, main.pas | SWI-Prolog, GnuCOBOL (free format), GNAT, Free Pascal |
+| `lean` | main.lean | Lean 4 (the version in formal/lean-toolchain), core only, no Mathlib: `lean --run` when the file defines `main`, otherwise checked; `sorry` fails |
 
 `compute/toolchains/setup.sh` installs these (tarballs under `~/.cache/lumenary-toolchains`, the rest as Docker images, run without network). A check whose toolchain is missing is reported as skipped and never counts as tested. To run one program by hand: `python3 compute/verify_courses.py --snippet rust path/to/main.rs`.
 

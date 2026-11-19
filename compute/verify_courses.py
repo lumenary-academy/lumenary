@@ -86,6 +86,9 @@ RUNNERS = {
     "lua": {"file": "main.lua", "cmd": "lua main.lua", "needs": "lua", "version": "lua -v"},
     "r": {"file": "main.R", "cmd": "Rscript --vanilla main.R", "needs": "Rscript", "version": "Rscript --version"},
     "julia": {"file": "main.jl", "cmd": f"JULIA_DEPOT_PATH={T}/julia-depot julia --startup-file=no main.jl", "needs": "julia", "version": "julia --version"},
+    # Core Lean (no Mathlib), the version Lumenary Math pins in formal/lean-toolchain: run `main` when
+    # there is one, otherwise just check the file; a `sorry` fails the check.
+    "lean": {"file": "main.lean", "cmd": f"if grep -q '^def main' main.lean; then out=$({T}/lean/bin/lean --run main.lean 2>&1); else out=$({T}/lean/bin/lean main.lean 2>&1); fi; s=$?; printf '%s\\n' \"$out\"; [ $s -eq 0 ] && ! printf '%s' \"$out\" | grep -q 'declaration uses .sorry'", "needs": f"{T}/lean/bin/lean", "version": f"{T}/lean/bin/lean --version"},
     "sql": {"file": "main.sql", "cmd": "sqlite3 -bail :memory: < main.sql", "needs": "sqlite3", "version": "sqlite3 --version"},
     "scheme": {"file": "main.scm", "cmd": f"LD_LIBRARY_PATH={T}/chibi/lib CHIBI_MODULE_PATH={T}/chibi/share/chibi:{T}/chibi/lib/chibi {T}/chibi/bin/chibi-scheme main.scm", "needs": f"{T}/chibi/bin/chibi-scheme", "version": f"LD_LIBRARY_PATH={T}/chibi/lib {T}/chibi/bin/chibi-scheme -V"},
     "cobol": {"file": "main.cob", "cmd": f"LD_LIBRARY_PATH={T}/cobol/lib {T}/cobol/bin/cobc -x -free main.cob -o main && LD_LIBRARY_PATH={T}/cobol/lib ./main", "needs": f"{T}/cobol/bin/cobc", "version": f"LD_LIBRARY_PATH={T}/cobol/lib {T}/cobol/bin/cobc --version"},
@@ -102,7 +105,7 @@ RUNNERS = {
     "pascal": {"file": "main.pas", "cmd": "fpc -v0 main.pas >/dev/null && ./main", "image": "lumenary/debian-toolchains", "version": "fpc -iV"},
     "ada": {"file": "main.adb", "cmd": "gnatmake -q main.adb && ./main", "image": "lumenary/debian-toolchains", "version": "gnatmake --version | head -1"},
 }
-ALIASES = {"c++": "cpp", "cs": "csharp", "c#": "csharp", "f#": "fsharp", "visual-basic": "vb", "js": "javascript", "ts": "typescript", "sh": "bash", "octave": "matlab", "object-pascal": "pascal", "py": "python", "fortran-free-form": "fortran"}
+ALIASES = {"lean4": "lean", "c++": "cpp", "cs": "csharp", "c#": "csharp", "f#": "fsharp", "visual-basic": "vb", "js": "javascript", "ts": "typescript", "sh": "bash", "octave": "matlab", "object-pascal": "pascal", "py": "python", "fortran-free-form": "fortran"}
 
 
 def runner_for(lang):

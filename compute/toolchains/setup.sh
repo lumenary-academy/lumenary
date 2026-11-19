@@ -68,6 +68,12 @@ if [ -z "$WANT" ] || want cobol; then
   rm -rf "$T/cobol-src" && mkdir "$T/cobol-src" && fetch https://ftp.gnu.org/gnu/gnucobol/gnucobol-3.2.tar.xz "$T/cobol.txz" && tar -C "$T/cobol-src" --strip-components=1 -xJf "$T/cobol.txz" && rm "$T/cobol.txz"
   (cd "$T/cobol-src" && ./configure -q --prefix="$T/cobol" --without-db --without-curses --without-xml2 --without-json >/dev/null && make -s -j8 >/dev/null 2>&1 && make -s install >/dev/null 2>&1); echo "gnucobol 3.2"
 fi
+if [ -z "$WANT" ] || want lean; then
+  # The Lean version Lumenary Math pins (formal/lean-toolchain), core only.
+  v=$(sed 's/.*:v//' "$(dirname "$0")/../../formal/lean-toolchain")
+  rm -rf "$T/lean" && mkdir "$T/lean" && fetch "https://github.com/leanprover/lean4/releases/download/v$v/lean-$v-linux.tar.zst" "$T/lean.tar.zst"
+  tar -C "$T/lean" --strip-components=1 --zstd -xf "$T/lean.tar.zst" && rm "$T/lean.tar.zst"; echo "lean $v"
+fi
 if [ -z "$WANT" ] || want python; then
   uv python install 3.13 >/dev/null 2>&1; ln -sf "$(uv python find 3.13)" "$T/bin/python3.13"; echo "python $("$T/bin/python3.13" --version)"
 fi
