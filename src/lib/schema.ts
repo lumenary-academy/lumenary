@@ -260,6 +260,13 @@ export const CourseLevel = z.object({
 });
 export type CourseLevel = z.infer<typeof CourseLevel>;
 
+/**
+ * The cat guides' roles outside Lumenary Math, by subject: each names a set of labels and questions
+ * (`narrators.sets.<set>` in the messages). Lumenary Math keeps the default roles.
+ */
+export const GUIDE_SETS = ["cs", "programming", "ee", "robotics", "chemistry", "me", "materials", "statistics"] as const;
+export type GuideSet = (typeof GUIDE_SETS)[number];
+
 export const CourseFile = z.object({
   version: z.literal(1),
   id: Slug,
@@ -275,6 +282,8 @@ export const CourseFile = z.object({
   /** Programming-language courses: the family they are listed under on /cs/languages/, and the year the language appeared. */
   group: z.string().optional(),
   year: z.number().int().optional(),
+  /** The cat guides' roles, when they differ from the subject's (e.g. a data-science elective uses "statistics"). */
+  guides: z.enum(GUIDE_SETS).optional(),
   /** Interface words the course pages need beyond the site catalogue, in the course's language. */
   ui: z.object({
     levels: z.string(),

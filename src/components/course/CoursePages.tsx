@@ -4,7 +4,7 @@ import { LOCALE_META, type Locale } from "@/i18n/config";
 import { Messages } from "@/i18n/Messages";
 import { getT } from "@/i18n/server";
 import { getTopic } from "@/lib/content";
-import { COLLECTIONS, getCourseExercises, getCourseLesson, lessonCodeStatus, type LoadedCourse } from "@/lib/courses";
+import { COLLECTIONS, getCourseExercises, getCourseLesson, guideSet, lessonCodeStatus, type LoadedCourse } from "@/lib/courses";
 import { renderExerciseList } from "@/lib/exercises";
 import { href } from "@/lib/href";
 import { mdInline, mdToHtml } from "@/lib/markdown";
@@ -12,6 +12,7 @@ import { linksToUnpublished, unlinkUnpublished } from "@/lib/subjects";
 import { extractToc, renderMdx } from "@/lib/mdx";
 import { widgetMessageNamespaces } from "@/lib/widget-messages";
 import { makeMdxComponents } from "@/components/lesson/mdx-components";
+import { guideKey } from "@/components/lesson/blocks";
 import { Toc } from "@/components/lesson/LessonChrome";
 import { VerificationBadge } from "@/components/ui/Badges";
 import { NarratorAvatar } from "@/components/brand/Narrators";
@@ -30,6 +31,8 @@ function parentOf(c: LoadedCourse, locale: string): { href: string; label: strin
 export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; locale: Locale; extra?: React.ReactNode }) {
   const parent = parentOf(c, locale);
   const { course } = c;
+  const t = await getT(locale);
+  const guides = guideSet(c);
   let n = 0;
   return (
     <div lang={course.locale} dir={LOCALE_META[course.locale].dir}>
@@ -58,6 +61,25 @@ export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; lo
             <VerificationBadge label="ai-drafted" text={course.ui.aiDrafted} />
             <VerificationBadge label="awaiting" text={course.ui.awaitingReview} />
           </div>
+          {guides && (
+            <ul className="mt-6 grid max-w-3xl gap-2 text-sm text-muted sm:grid-cols-3" aria-label={t("lesson.narrators")}>
+              {(["chloe", "margaret", "gideon"] as const).map((who) => (
+                <li key={who} className="flex items-start gap-2.5">
+                  <span data-cat className="shrink-0">
+                    <NarratorAvatar who={who} size={36} />
+                  </span>
+                  <span>
+                    <span className="font-semibold text-ink-2">
+                      <span data-cat>{t(`narrators.${who}`)} · </span>
+                      {t(guideKey(who, "Role", guides))}
+                    </span>
+                    <br />
+                    <em>“{t(guideKey(who, "Q", guides))}”</em>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
           <nav className="mt-8 flex flex-wrap gap-2" aria-label={course.ui.levels}>
             {course.levels.map((l) => (
               <a key={l.id} href={`#${l.id}`} className="chip hover:border-line-2 hover:text-ink">
@@ -145,7 +167,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
   const fm = lesson.frontmatter;
   const exercises = renderExerciseList(getCourseExercises(c, slug), slug, fm.title);
   const components = {
-    ...makeMdxComponents({ locale, t, exercises }),
+    ...makeMdxComponents({ locale, t, exercises, guides: guideSet(c) }),
     pre: CodeBlock,
     Say,
     // A link into a subject that is not published yet (Robotics before its release) is plain text until it is.
@@ -227,7 +249,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                       ))}
                     </div>
                     <p className="text-sm text-muted">
-                      {t("lesson.narrators")}: {fm.narrators.map((n) => t(`narrators.${n}`)).join(", ")}
+                      {t("lesson.narrators")}: {fm.narrators.map((n) => `${t(`narrators.${n}`)} · ${t(guideKey(n, "Role", guideSet(c)))}`).join(", ")}
                     </p>
                     <span className="no-print">
                       <CatToggle variant="text" />
