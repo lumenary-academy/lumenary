@@ -1,0 +1,353 @@
+---
+title: Slices, maps and strings
+subtitle: Go's workhorse data structures, how they share memory, and how text really works in UTF-8.
+minutes: 55
+objectives:
+  - Explain the difference between arrays and slices, and the meaning of length and capacity
+  - Use append, copy and slicing, and avoid the aliasing traps of shared backing arrays
+  - Use the slices and maps packages for sorting, searching and iterating in a stable order
+  - Create, read, update and delete map entries with the comma-ok idiom
+  - Work with strings as bytes and as runes, and build text efficiently with strings.Builder
+prerequisites: [functions]
+related: [math.found.sets, math.comp.algorithms-and-efficiency]
+references:
+  - title: "Go blog: Go Slices: usage and internals"
+    url: https://go.dev/blog/slices-intro
+  - title: "Go blog: Strings, bytes, runes and characters in Go"
+    url: https://go.dev/blog/strings
+  - title: The slices package
+    url: https://pkg.go.dev/slices
+  - title: The maps package
+    url: https://pkg.go.dev/maps
+  - title: The strings package
+    url: https://pkg.go.dev/strings
+---
+
+<Section id="motivation" kind="motivation" title="Three types that do most of the work">
+
+Look inside almost any Go program and you will find three data structures doing most of the work: **slices** (ordered sequences), **maps** (lookup by key) and **strings** (text). Go has no separate list, vector, dictionary or set classes; these three, built into the language, cover nearly every case, and the standard library's `slices`, `maps` and `strings` packages supply the operations around them.
+
+They are simple to use but not simple underneath, and the details matter. A slice is a *view* of an array that other slices may share, so changing one can change another. A map's iteration order is deliberately random. A string is a sequence of bytes, not of characters, so its length is not its number of letters. Programmers who know these facts write Go that is both fast and correct; programmers who don't meet them as mysterious bugs. This lesson goes through each, with programs that show exactly what happens.
+
+</Section>
+
+<Section id="slices" kind="definitions" title="Arrays and slices">
+
+<Definition term="array and slice">
+
+An **array** `[n]T` holds exactly `n` values of type `T`; its length is part of its type, and assigning or passing it copies every element. A **slice** `[]T` is a small descriptor of three fields: a pointer into an underlying array, a **length** (how many elements the slice shows) and a **capacity** (how many elements there are from the slice's start to the end of the array). Slices are what Go programs use almost everywhere; arrays mostly serve as the storage underneath them.
+
+</Definition>
+
+```go check
+package main
+
+import "fmt"
+
+func main() {
+	// An array has a fixed length that is part of its type.
+	week := [7]string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+	fmt.Println(len(week), week[5])
+
+	// A slice is a view of an array: pointer, length, capacity.
+	weekend := week[5:7]
+	fmt.Println(weekend, len(weekend), cap(weekend))
+
+	// append grows a slice, allocating a bigger array when capacity runs out.
+	var queue []int // nil slice: len 0, ready to use
+	for i := range 6 {
+		queue = append(queue, i*10)
+		fmt.Printf("len=%d cap=%d %v\n", len(queue), cap(queue), queue)
+	}
+
+	// Slicing shares the underlying array: a change through one view is seen by the other.
+	first := queue[:3]
+	first[0] = 99
+	fmt.Println(queue[0], first)
+
+	// copy makes an independent slice.
+	snapshot := make([]int, len(queue))
+	n := copy(snapshot, queue)
+	snapshot[1] = -1
+	fmt.Println(n, queue[1], snapshot[1])
+
+	// The aliasing trap: appending to a sub-slice can overwrite the original.
+	base := []int{1, 2, 3, 4}
+	head := base[:2]
+	head = append(head, 100) // fits in base's capacity, so it writes base[2]
+	fmt.Println(base, head)
+	safe := base[:2:2] // a full slice expression caps the capacity at 2
+	safe = append(safe, 200)
+	fmt.Println(base, safe)
+}
+```
+
+```text
+7 Sat
+[Sat Sun] 2 2
+len=1 cap=1 [0]
+len=2 cap=2 [0 10]
+len=3 cap=4 [0 10 20]
+len=4 cap=4 [0 10 20 30]
+len=5 cap=8 [0 10 20 30 40]
+len=6 cap=8 [0 10 20 30 40 50]
+99 [99 10 20]
+6 10 -1
+[1 2 100 4] [1 2 100]
+[1 2 100 4] [1 2 200]
+```
+
+Walk through the output:
+
+- `week[5:7]` is a slice of the array from index 5 up to (not including) 7. Its capacity is 2 because the array ends there.
+- A `nil` slice has length 0 and works with `append`, `len` and `range` like an empty one, so there is no need to initialise it.
+- `append` adds an element if there is room; otherwise it allocates a new, larger array (roughly doubling for small slices), copies the elements, and returns a slice of the new array. That is why you must always write `s = append(s, x)`: the result may point somewhere new. Doubling makes appending fast on average: the total copying is proportional to the final length. When you know the final size in advance, `make([]int, 0, n)` allocates the capacity once.
+- `first := queue[:3]` shares `queue`'s array, so setting `first[0] = 99` changes `queue[0]` too. `copy` (or `slices.Clone`) makes an independent copy.
+- **The aliasing trap.** `head := base[:2]` has length 2 but capacity 4, so `append(head, 100)` doesn't need a new array: it writes into `base[2]`, silently changing `base`. The **full slice expression** `base[:2:2]` sets the capacity to 2 as well, so the next `append` must allocate and `base` is safe.
+
+The trap matters most at function boundaries. A function that receives a slice and appends to it may or may not be scribbling on its caller's data, depending on capacity. The robust conventions are: functions that grow a slice **return** the new slice, and functions that must not affect their caller's data **copy** first.
+
+</Section>
+
+<Section id="maps-and-packages" kind="examples" title="The slices and maps packages, and maps themselves">
+
+<Definition term="map">
+
+A **map** `map[K]V` associates keys of type `K` with values of type `V`, using a hash table: lookup, insertion and deletion take constant time on average. Keys must be **comparable** with `==` (numbers, strings, booleans, pointers, arrays and structs of comparable fields, but not slices or maps). Reading a missing key returns the zero value of `V`; `v, ok := m[k]` also reports whether the key was present.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+)
+
+func main() {
+	// The slices package (Go 1.21+) covers everyday operations generically.
+	marks := []int{72, 88, 65, 91, 65, 40}
+	fmt.Println(slices.Contains(marks, 91), slices.Index(marks, 65), slices.Max(marks))
+	sorted := slices.Clone(marks)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted) // removes consecutive duplicates
+	pos, found := slices.BinarySearch(sorted, 88)
+	fmt.Println(sorted, pos, found)
+
+	// Maps: unordered key -> value.
+	capitals := map[string]string{"Kenya": "Nairobi", "Peru": "Lima", "Nepal": "Kathmandu"}
+	capitals["Ghana"] = "Accra"
+	delete(capitals, "Peru")
+	city, ok := capitals["Peru"] // "comma ok": was the key present?
+	fmt.Printf("%q %v %d\n", city, ok, len(capitals))
+
+	// Iteration order is deliberately random; sort the keys for stable output.
+	for _, country := range slices.Sorted(maps.Keys(capitals)) {
+		fmt.Println(country, "->", capitals[country])
+	}
+
+	// Counting and grouping.
+	text := "the river feeds the field and the field feeds the village"
+	counts := map[string]int{}
+	for _, w := range strings.Fields(text) {
+		counts[w]++ // a missing key reads as the zero value, 0
+	}
+	byCount := map[int][]string{}
+	for w, c := range counts {
+		byCount[c] = append(byCount[c], w)
+	}
+	for _, c := range slices.Backward(slices.Sorted(maps.Keys(byCount))) {
+		words := byCount[c]
+		slices.Sort(words)
+		fmt.Println(c, words)
+	}
+}
+```
+
+```text
+true 2 91
+[40 65 72 88 91] 3 true
+"" false 3
+Ghana -> Accra
+Kenya -> Nairobi
+Nepal -> Kathmandu
+4 [the]
+2 [feeds field]
+1 [and river village]
+```
+
+What to notice:
+
+- The **`slices` package** (Go 1.21) works on slices of any suitable element type: `Contains`, `Index`, `Max`, `Sort`, `Compact`, `BinarySearch`, `Reverse`, `Insert`, `Delete`, `Equal` and more. Before generics, much of this was hand-written loops or the older `sort` package. `Clone` copies the slice first so sorting doesn't reorder the original.
+- **Zero values make counting easy.** `counts[w]++` works even the first time a word is seen, because a missing key reads as 0. The same is true for `byCount[c] = append(byCount[c], w)`: a missing key yields a `nil` slice, and appending to `nil` works.
+- **Map iteration order is random**, and Go randomises it on purpose, so that nobody can depend on an order that might change. To print in a stable order, sort the keys: `slices.Sorted(maps.Keys(m))` collects the keys from an iterator (lesson 7) into a sorted slice. `slices.Backward` walks a slice from the end.
+- `delete(m, k)` removes a key (and does nothing if it is absent), `len(m)` counts entries, and `clear(m)` empties the map.
+- A `nil` map (declared with `var m map[string]int` and never made) can be read but **not written**: assigning to it panics with "assignment to entry in nil map". Create maps with a literal or `make`.
+
+Go has no built-in set type. The usual stand-in is `map[string]bool` (readable: `if seen[x]`) or `map[string]struct{}` (zero bytes per value).
+
+</Section>
+
+<Section id="strings" kind="examples" title="Strings, bytes and runes">
+
+<Definition term="string, byte and rune">
+
+A Go **string** is an immutable sequence of **bytes**; by convention, and in all string literals, those bytes are UTF-8 text. A **rune** is a Unicode code point (an `int32`). `len(s)` and indexing `s[i]` work in bytes; `for i, r := range s` decodes UTF-8 and yields each rune with its byte offset.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+func main() {
+	city := "Kraków"
+	fmt.Println(len(city), utf8.RuneCountInString(city)) // bytes vs characters
+	fmt.Println(city[0], string(city[0]), city[:3])      // indexing gives bytes
+
+	// range over a string decodes UTF-8: byte offset and rune.
+	for i, r := range "añ€" {
+		fmt.Printf("byte %d: %c %U\n", i, r, r)
+	}
+
+	// Strings are immutable; convert to []rune to work character by character.
+	runes := []rune("Grüße")
+	slices.Reverse(runes)
+	fmt.Println(string(runes))
+
+	// The strings package.
+	line := "  Lagos, Nairobi ,Cairo  "
+	parts := strings.Split(strings.TrimSpace(line), ",")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	fmt.Printf("%q\n", parts)
+	fmt.Println(strings.Join(parts, " -> "), strings.Contains(line, "Cairo"), strings.ToUpper("ß"))
+	before, after, found := strings.Cut("key=value=x", "=")
+	fmt.Println(before, after, found)
+
+	// Building strings efficiently.
+	var b strings.Builder
+	for i, w := range strings.Fields("go is fun to write") {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strings.ToUpper(w[:1]) + w[1:])
+	}
+	fmt.Println(b.String())
+
+	upper := 0
+	for _, r := range "Hello, Wörld" {
+		if unicode.IsUpper(r) {
+			upper++
+		}
+	}
+	fmt.Println(upper)
+}
+```
+
+```text
+7 6
+75 K Kra
+byte 0: a U+0061
+byte 1: ñ U+00F1
+byte 3: € U+20AC
+eßürG
+["Lagos" "Nairobi" "Cairo"]
+Lagos -> Nairobi -> Cairo true ß
+key value=x true
+Go Is Fun To Write
+2
+```
+
+The details:
+
+- "Kraków" has 6 characters but 7 bytes, because `ó` takes two bytes in UTF-8. `city[0]` is the byte 75 (the letter K); slicing `city[:3]` is by bytes too, and slicing through the middle of a multi-byte character would produce invalid UTF-8.
+- `range` over a string yields runes with their **byte offsets**: `ñ` starts at byte 1 and takes two bytes, so `€` starts at byte 3.
+- To work character by character, convert to `[]rune`; reversing the bytes of "Grüße" would scramble the two-byte letters, while reversing the runes gives a correct result. (Even runes are not always what a reader calls a character: some letters and most emoji with skin tones are several code points. The `golang.org/x/text` modules handle such cases.)
+- `strings.ToUpper("ß")` returns `ß` unchanged: Go's case functions map each rune separately, and ß has no single-rune upper-case form in that mapping. Language-aware casing (which would give "SS" in German) lives in `golang.org/x/text/cases`.
+- `strings.Cut` splits around the first separator and reports whether it was found; it replaces many uses of `Index` plus slicing.
+- Strings are immutable, so `s += piece` in a loop copies the whole string each time. **`strings.Builder`** accumulates text in a growing buffer and is the idiomatic way to build long strings; `bytes.Buffer` is its cousin for binary data.
+
+</Section>
+
+<Section id="design" kind="human" title="Designing with slices and maps">
+
+Some practical judgement that experienced Go programmers apply without thinking about it:
+
+**Slice or map?** If you mostly walk through the items in order, or there are only a handful, use a slice; a linear scan of twenty elements is often faster than hashing, because the elements sit together in memory. If you look items up by a key, or need to know quickly whether something is present, use a map. Many programs keep both: a slice for order and a map from key to index for lookup.
+
+**Composite keys are structs.** To index a grid by position, don't build strings like `"3,4"`; declare `type point struct{ x, y int }` and use `map[point]bool`. Structs of comparable fields are comparable, so they work as keys directly, with no parsing and no chance of a formatting mismatch.
+
+**Slices of structs versus slices of pointers.** `[]Order` stores the orders themselves, contiguously, which is compact and fast to scan. `[]*Order` stores pointers to orders allocated separately. The difference shows up when you take the address of an element: `p := &orders[0]` points into the slice's array, and if a later `append` moves the array, `p` still points at the *old* copy, which no longer changes when the slice does. If other parts of the program need to hold on to individual items while the slice grows, store pointers; otherwise prefer values.
+
+**Pre-size when you know the size.** `make([]T, 0, n)` and `make(map[K]V, n)` allocate once instead of growing repeatedly. It's a small, free improvement in loops that build large results.
+
+**nil versus empty.** A `nil` slice and an empty slice behave the same for `len`, `range` and `append`, so functions usually return `nil` for "no results". The difference becomes visible at boundaries: `encoding/json` encodes a `nil` slice as `null` and an empty one as `[]`, which matters to the program on the other end. Decide which your API promises and be consistent.
+
+**Don't share what you don't mean to share.** When a struct stores a slice it was given, or returns a slice of its internal state, the caller and the struct now share an array. Defensive copies at those boundaries (`slices.Clone`) prevent a whole category of "who changed my data?" bugs, at the cost of an allocation, which is usually worth paying.
+
+</Section>
+
+<Section id="performance" kind="computation" title="Costs and memory">
+
+A few cost facts guide everyday choices:
+
+| Operation | Cost |
+| --- | --- |
+| `s[i]`, `len(s)`, `cap(s)`, slicing `s[a:b]` | O(1); slicing copies no elements |
+| `append` | O(1) on average, O(n) when it has to grow the array |
+| inserting or deleting in the middle (`slices.Insert`, `slices.Delete`) | O(n): elements shift |
+| `slices.Contains`, `slices.Index` | O(n) linear search |
+| `slices.Sort` | O(n log n); `slices.BinarySearch` on sorted data O(log n) |
+| map lookup, insert, delete | O(1) on average |
+| `len(str)`, `str[i]` | O(1), in bytes |
+| `utf8.RuneCountInString`, converting to `[]rune` | O(n) |
+
+Two memory facts catch people in production. First, **a small slice can keep a large array alive**: if you read a 100 MB file and keep `data[:10]`, the garbage collector cannot free the other 99.99 MB, because your slice still points into the array. Copy the part you need (`slices.Clone(data[:10])`) to let the rest go. The same holds for substrings of large strings, where `strings.Clone` helps. Second, **maps do not shrink**: deleting most entries leaves the table's memory allocated, so a map that once held a million entries and now holds ten may be worth replacing with a fresh one.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`append` modifies the slice in place."** It returns a slice that may or may not share the old array. Always assign the result, `s = append(s, x)`; `go vet` and the compiler catch some, but not all, mistakes here.
+
+</Misconception>
+
+<Misconception>
+
+**"A sub-slice is a copy."** Slicing never copies elements. Two slices of the same array see each other's changes, and an `append` on one can overwrite the other's elements when there is spare capacity. Use `copy`, `slices.Clone` or a full slice expression when you need independence.
+
+</Misconception>
+
+<Misconception>
+
+**"`len` counts characters."** It counts bytes. Use `utf8.RuneCountInString` for code points, and remember that even that is not always what a person would call the number of letters.
+
+</Misconception>
+
+<Misconception>
+
+**"Map iteration order is insertion order, or at least stable."** It is randomised on every iteration. Tests that print a map with `range` will pass or fail at random; sort the keys. (Printing a map with `fmt.Println` is an exception: `fmt` sorts the keys for you, which is convenient for debugging.)
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

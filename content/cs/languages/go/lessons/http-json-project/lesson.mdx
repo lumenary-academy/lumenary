@@ -1,0 +1,482 @@
+---
+title: HTTP, JSON and a complete service
+subtitle: The standard library's HTTP server and client, encoding/json, and a small JSON API built and tested the way Go teams do it.
+minutes: 70
+objectives:
+  - Encode and decode JSON with struct tags, strict decoders and precise errors, and know what encoding/json/v2 changes
+  - Write HTTP handlers and route them with ServeMux method and path patterns
+  - Configure a production http.Server with timeouts, middleware and graceful shutdown, and call services with http.Client
+  - Test handlers without a network using httptest
+  - Read and extend a complete, idiomatic Go service that combines everything in the course
+prerequisites: [testing-and-tooling]
+related: [math.comp.algorithm-design]
+references:
+  - title: The net/http package
+    url: https://pkg.go.dev/net/http
+  - title: The encoding/json package
+    url: https://pkg.go.dev/encoding/json
+  - title: The encoding/json/v2 package
+    url: https://pkg.go.dev/encoding/json/v2
+  - title: "Go blog: Routing Enhancements for Go 1.22"
+    url: https://go.dev/blog/routing-enhancements
+  - title: The net/http/httptest package
+    url: https://pkg.go.dev/net/http/httptest
+  - title: "Tutorial: Developing a RESTful API with Go and Gin"
+    url: https://go.dev/doc/tutorial/web-service-gin
+    note: The Go team's tutorial using a popular third-party router, for comparison.
+---
+
+<Section id="motivation" kind="motivation" title="What Go is most often used for">
+
+If you ask what Go programmers build, the most common answer is network services: HTTP APIs, microservices, proxies, command-line tools that talk to cloud platforms. Go's standard library was designed for exactly this. `net/http` contains a production-quality HTTP/1.1 and HTTP/2 server and client; `encoding/json` converts between Go values and JSON; `context` carries cancellation through requests; `log/slog` writes structured logs; `crypto/tls` handles HTTPS. Many companies run large Go services that use no web framework at all.
+
+This final lesson puts those pieces together. It covers JSON first, because nearly every service speaks it, then the HTTP server, router, middleware, client and shutdown logic, and finally a complete small service: an API for a community library where people can list books, add books and borrow them. Since this course's programs can't open network connections, the service is exercised with `httptest`, which is also exactly how you would test it in a real project.
+
+</Section>
+
+<Section id="json" kind="examples" title="JSON with encoding/json">
+
+<Definition term="struct tags">
+
+A **struct tag** is a string literal after a field's type, read by packages through reflection. For `encoding/json`, `` `json:"due_back,omitzero"` `` sets the field's JSON name and options: `omitempty` leaves the field out when it holds an empty value, `omitzero` (Go 1.24) when it holds its zero value, and `"-"` always leaves it out. Only exported (capitalised) fields are encoded.
+
+</Definition>
+
+```go check
+package main
+
+import (
+	"encoding/json"
+	jsonv2 "encoding/json/v2"
+	"fmt"
+	"strings"
+	"time"
+)
+
+type Book struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Authors   []string  `json:"authors"`
+	Year      int       `json:"year,omitempty"` // left out when zero
+	DueBack   time.Time `json:"due_back,omitzero"`
+	internal  string    // unexported: never encoded
+	Available bool      `json:"available"`
+}
+
+func main() {
+	b := Book{ID: 7, Title: "Things Fall Apart", Authors: []string{"Chinua Achebe"}, Year: 1958, Available: true}
+	data, err := json.Marshal(b)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(data))
+
+	pretty, _ := json.MarshalIndent(map[string]any{"count": 2, "tags": []string{"novel"}}, "", "  ")
+	fmt.Println(string(pretty))
+
+	// Decoding: unknown fields are ignored by default; missing ones keep their zero values.
+	var got Book
+	input := `{"id": 12, "title": "Kiss of the Fur Queen", "authors": ["Tomson Highway"], "isbn": "x"}`
+	if err := json.Unmarshal([]byte(input), &got); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%d %q %v %d %v\n", got.ID, got.Title, got.Authors, got.Year, got.DueBack.IsZero())
+
+	// A Decoder can be stricter, and reads from any io.Reader.
+	dec := json.NewDecoder(strings.NewReader(input))
+	dec.DisallowUnknownFields()
+	var strict Book
+	fmt.Println(dec.Decode(&strict))
+
+	// Type errors are reported precisely.
+	err = json.Unmarshal([]byte(`{"id": "twelve"}`), &got)
+	fmt.Println(err)
+
+	// encoding/json/v2 (Go 1.27) differs in some defaults, e.g. nil slices.
+	empty := Book{ID: 1, Title: "Untitled"}
+	v1, _ := json.Marshal(empty)
+	v2, _ := jsonv2.Marshal(empty)
+	fmt.Println(string(v1))
+	fmt.Println(string(v2))
+}
+```
+
+```text
+{"id":7,"title":"Things Fall Apart","authors":["Chinua Achebe"],"year":1958,"available":true}
+{
+  "count": 2,
+  "tags": [
+    "novel"
+  ]
+}
+12 "Kiss of the Fur Queen" [Tomson Highway] 0 true
+json: unknown field "isbn"
+json: cannot unmarshal string into Go struct field Book.id of type int
+{"id":1,"title":"Untitled","authors":null,"available":false}
+{"id":1,"title":"Untitled","authors":[],"year":0,"available":false}
+```
+
+What the output shows:
+
+- `Marshal` produced compact JSON with the tag names. `year` appears because it isn't zero; `due_back` was left out by `omitzero` because the `time.Time` is zero (`omitempty` can't do that for structs, which is why `omitzero` was added); the unexported `internal` field is never encoded.
+- `MarshalIndent` pretty-prints; maps are encoded with their keys sorted.
+- `Unmarshal` is forgiving: unknown fields (`isbn`) are ignored, and missing fields keep their zero values. For an API that should reject typos in requests, a `Decoder` with `DisallowUnknownFields` is stricter, and decoders read from any `io.Reader`, such as a request body, without loading it into memory first.
+- Type mismatches produce precise errors that name the field and the types involved.
+- **encoding/json/v2.** After years of experience with the original package, Go 1.27 includes `encoding/json/v2` (available as an experiment since Go 1.25), and the original package is now implemented on top of it with its old behaviour preserved. Version 2 has safer, more consistent defaults: a nil slice becomes `[]` rather than `null`; `omitempty` now means "empty in JSON terms" (so a zero `year` is kept; use `omitzero` to drop zeros); field names match case-sensitively; duplicate names and invalid UTF-8 are rejected. Existing code keeps working with `encoding/json`; new code can choose v2.
+
+</Section>
+
+<Section id="server" kind="definitions" title="Handlers, routing and the server">
+
+<Definition term="handler">
+
+An `http.Handler` is any value with a method `ServeHTTP(w http.ResponseWriter, r *http.Request)`; `http.HandlerFunc` adapts an ordinary function with that signature. The handler reads the request (method, URL, headers, body, context) from `r` and writes the status, headers and body to `w`. An **`http.ServeMux`** is a handler that routes requests to other handlers by pattern; since Go 1.22, patterns may include a method and wildcards, such as `"GET /books/{id}"`, read with `r.PathValue("id")`.
+
+</Definition>
+
+The server runs each request in its own goroutine, so handlers run concurrently and any shared state must be protected (the library below uses a mutex). A production server should never use the zero-configuration `http.ListenAndServe(":8080", mux)`, because it has no timeouts and a client that sends its headers very slowly can hold a connection forever. The usual `main` looks like this:
+
+```go
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           logRequests(logger, (&server{lib: NewLibrary(), log: logger}).routes()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+
+	// Stop on Ctrl-C or SIGTERM (what container platforms send).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		logger.Info("listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("server failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done() // wait for a signal
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil { // finish in-flight requests
+		logger.Error("shutdown", "err", err)
+	}
+}
+```
+
+The server runs in a goroutine while `main` waits for a termination signal; `Shutdown` then stops accepting connections and waits, up to ten seconds, for requests in progress to finish, so a deployment doesn't cut users off mid-request. **Middleware** is a function that wraps a handler in another handler, adding behaviour around every request:
+
+```go
+func logRequests(log *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Info("request", "method", r.Method, "path", r.URL.Path, "took", time.Since(start))
+	})
+}
+```
+
+Authentication, request IDs, panic recovery, compression and metrics are all written this way, and they compose by nesting. On the client side, always set a timeout and pass the request's context, and always close the response body:
+
+```go
+func fetchBooks(ctx context.Context, client *http.Client, baseURL string) ([]Book, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/books", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch books: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch books: unexpected status %s", resp.Status)
+	}
+	var books []Book
+	if err := json.NewDecoder(resp.Body).Decode(&books); err != nil {
+		return nil, fmt.Errorf("fetch books: decoding: %w", err)
+	}
+	return books, nil
+}
+```
+
+Here `client` would be created once, for example `&http.Client{Timeout: 10 * time.Second}`, and reused: it keeps connections open between requests. `http.Get` and `http.DefaultClient` have no timeout at all, which is why production code avoids them.
+
+</Section>
+
+<Section id="project" kind="examples" title="The project: a library lending API">
+
+Here is the complete service: a domain layer (`Library`, safe for concurrent use), an HTTP layer (`server` with three handlers and a router), and a scripted session that sends requests through `httptest` instead of a network. Put the `main` above in place of the scripted session and it becomes a real server.
+
+```go check
+// A small JSON API for a community library: list books, add a book, lend one.
+// It runs entirely in memory and is exercised with httptest, so no network is used.
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// ---- domain ----
+
+type Book struct {
+	ID       int    `json:"id"`
+	Title    string `json:"title"`
+	Author   string `json:"author"`
+	Borrower string `json:"borrower,omitempty"`
+}
+
+var (
+	ErrNotFound = errors.New("book not found")
+	ErrOnLoan   = errors.New("book is already on loan")
+)
+
+// Library is safe for concurrent use: every HTTP request runs in its own goroutine.
+type Library struct {
+	mu     sync.Mutex
+	books  map[int]*Book
+	nextID int
+}
+
+func NewLibrary() *Library { return &Library{books: map[int]*Book{}, nextID: 1} }
+
+func (l *Library) Add(title, author string) Book {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := &Book{ID: l.nextID, Title: title, Author: author}
+	l.books[b.ID] = b
+	l.nextID++
+	return *b
+}
+
+func (l *Library) List() []Book {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]Book, 0, len(l.books))
+	for _, b := range l.books {
+		out = append(out, *b)
+	}
+	slices.SortFunc(out, func(a, b Book) int { return a.ID - b.ID })
+	return out
+}
+
+func (l *Library) Lend(id int, borrower string) (Book, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.books[id]
+	if !ok {
+		return Book{}, ErrNotFound
+	}
+	if b.Borrower != "" {
+		return Book{}, ErrOnLoan
+	}
+	b.Borrower = borrower
+	return *b, nil
+}
+
+// ---- HTTP layer ----
+
+type server struct {
+	lib *Library
+	log *slog.Logger
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /books", s.listBooks)
+	mux.HandleFunc("POST /books", s.addBook)
+	mux.HandleFunc("POST /books/{id}/loan", s.lendBook)
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (s *server) listBooks(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.lib.List())
+}
+
+func (s *server) addBook(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Title  string `json:"title"`
+		Author string `json:"author"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20)) // never trust a body's size
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Author) == "" {
+		writeError(w, http.StatusUnprocessableEntity, "title and author are required")
+		return
+	}
+	b := s.lib.Add(in.Title, in.Author)
+	s.log.Info("book added", "id", b.ID)
+	writeJSON(w, http.StatusCreated, b)
+}
+
+func (s *server) lendBook(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "id must be a number")
+		return
+	}
+	var in struct {
+		Borrower string `json:"borrower"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Borrower == "" {
+		writeError(w, http.StatusBadRequest, "borrower is required")
+		return
+	}
+	b, err := s.lib.Lend(id, in.Borrower)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrOnLoan):
+		writeError(w, http.StatusConflict, err.Error())
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "internal error")
+	default:
+		writeJSON(w, http.StatusOK, b)
+	}
+}
+
+// ---- a scripted session, standing in for real clients ----
+
+func main() {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil)) // quiet for this demo
+	h := (&server{lib: NewLibrary(), log: logger}).routes()
+
+	do := func(method, path, body string) {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		rec := httptest.NewRecorder() // records the response instead of sending it
+		h.ServeHTTP(rec, req)
+		fmt.Printf("%s %s -> %d %s", method, path, rec.Code, rec.Body.String())
+	}
+
+	do("POST", "/books", `{"title": "Half of a Yellow Sun", "author": "Chimamanda Ngozi Adichie"}`)
+	do("POST", "/books", `{"title": "One Hundred Years of Solitude", "author": "Gabriel García Márquez"}`)
+	do("POST", "/books", `{"title": "", "author": "Nobody"}`)
+	do("POST", "/books", `{"title": "x", "author": "y", "pages": 9}`)
+	do("POST", "/books/1/loan", `{"borrower": "Mele"}`)
+	do("POST", "/books/1/loan", `{"borrower": "Tavita"}`)
+	do("POST", "/books/9/loan", `{"borrower": "Tavita"}`)
+	do("GET", "/books", "")
+	do("DELETE", "/books", "")
+}
+```
+
+```text
+POST /books -> 201 {"id":1,"title":"Half of a Yellow Sun","author":"Chimamanda Ngozi Adichie"}
+POST /books -> 201 {"id":2,"title":"One Hundred Years of Solitude","author":"Gabriel García Márquez"}
+POST /books -> 422 {"error":"title and author are required"}
+POST /books -> 400 {"error":"invalid JSON: json: unknown field \"pages\""}
+POST /books/1/loan -> 200 {"id":1,"title":"Half of a Yellow Sun","author":"Chimamanda Ngozi Adichie","borrower":"Mele"}
+POST /books/1/loan -> 409 {"error":"book is already on loan"}
+POST /books/9/loan -> 404 {"error":"book not found"}
+GET /books -> 200 [{"id":1,"title":"Half of a Yellow Sun","author":"Chimamanda Ngozi Adichie","borrower":"Mele"},{"id":2,"title":"One Hundred Years of Solitude","author":"Gabriel García Márquez"}]
+DELETE /books -> 405 Method Not Allowed
+```
+
+How the course's ideas fit together here:
+
+- **Layers.** `Library` knows nothing about HTTP; it returns sentinel errors (`ErrNotFound`, `ErrOnLoan`, lesson 6). The handlers translate those into status codes with `errors.Is`: 404 for a missing book, 409 Conflict for one already on loan. Keeping the translation in one place makes the API's behaviour easy to audit.
+- **Concurrency.** Each request runs in its own goroutine, so `Library` guards its map with a mutex (lesson 8), and returns copies of books (`*b`), never pointers into its map, so callers can't change shared state behind the lock's back.
+- **Defensive input handling.** `io.LimitReader` caps the request body at 1 MiB, `DisallowUnknownFields` rejects misspelt fields, and validation returns 422 Unprocessable Entity with a message the client can show.
+- **Routing.** The Go 1.22 patterns do the method checks and path parsing. `DELETE /books` gets a 405 Method Not Allowed automatically, because a pattern exists for that path with other methods.
+- **Testing.** `httptest.NewRequest` builds a request without a network and `httptest.NewRecorder` captures the response, so `h.ServeHTTP(rec, req)` exercises the real routing and handlers in microseconds. In the project's `_test.go` file the scripted session becomes a table-driven test (lesson 9) with a method, path, body, expected status and expected body per row.
+- **Generics and slices.** `List` collects the books and sorts them with `slices.SortFunc` (lessons 4 and 7), since map order is random and API responses should be stable.
+
+Ideas for extending it, each practising a different part of Go: a `GET /books/{id}` route; returning a book (`DELETE /books/{id}/loan`); persistence with `database/sql` and a driver for SQLite or PostgreSQL behind a small interface, so tests can keep using the in-memory version; middleware that assigns each request an ID and adds it to every log line with `slog`'s `With`; and a `go test -race` suite that sends concurrent loan requests for the same book and checks that exactly one succeeds.
+
+</Section>
+
+<Section id="production" kind="human" title="From program to production service">
+
+A service that works on a laptop needs a few more things before it can run for real users. Go makes most of them straightforward, and teams tend to converge on the same choices:
+
+- **Configuration from the environment.** Read the listening address, database URL and secrets from environment variables or flags at start-up (`os.Getenv`, the `flag` package), validate them, and fail immediately with a clear message if something is missing. Never hard-code secrets.
+- **Health checks.** Add a cheap `GET /healthz` handler that returns 200 when the process can serve, so a load balancer or Kubernetes can route traffic away from an instance that is starting or stuck.
+- **Observability.** Structured logs with `log/slog` (one line per request, with a request ID), metrics such as request counts and latencies (Prometheus's Go client is the common choice), and traces with OpenTelemetry. `net/http/pprof` can expose profiling endpoints, on an internal port only.
+- **Small, static deployments.** `CGO_ENABLED=0 go build` produces a statically linked binary with no dependency on the system's C library. A container image can then be little more than that one file, which starts in milliseconds and has very little for an attacker to work with. Cross-compiling for the servers' architecture (`GOARCH=arm64`) needs no extra tools.
+- **Limits everywhere.** Timeouts on the server and on every outgoing call, a cap on request body sizes, a bound on concurrent work (a worker pool or semaphore), and rate limiting for public endpoints (the `golang.org/x/time/rate` package implements a token bucket). Each limit turns an overload into a fast, clear error rather than a slow collapse.
+- **Security basics.** Serve HTTPS (often terminated by a load balancer in front of the service), use `crypto/rand` for anything secret, use parameterised SQL queries rather than building SQL from strings, run `govulncheck` in CI, and keep the Go toolchain updated, since point releases often contain security fixes.
+
+None of this requires a framework, and most of it is a few dozen lines of code. The result is a service with a small, understandable codebase that a new team member can read in an afternoon, which is the property Go was designed to give you.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You have now seen the whole of Go as it is used day to day. Ways to keep going:
+
+- **Practise on real problems.** Rewrite a small script you use in Go; build a command-line tool with the standard `flag` package or the popular `cobra`; add a small service to a home project.
+- **Read the official material.** [Effective Go](https://go.dev/doc/effective_go), the [Go FAQ](https://go.dev/doc/faq), the [specification](https://go.dev/ref/spec) (short and readable), and the [Go blog](https://go.dev/blog/), where the Go team explains each new feature and its design.
+- **Read good code.** The standard library's own source is clear and well commented: `net/http`, `strings`, `slices` and `encoding/json` are excellent teachers. Large open-source Go projects such as Kubernetes, Prometheus and Hugo show how big codebases are organised.
+- **Learn the ecosystem.** Common choices include `pgx` or `database/sql` with `sqlc` for databases, `chi` or the standard `ServeMux` for routing, `cobra` for command-line interfaces, gRPC with `protobuf` for service-to-service calls, and OpenTelemetry for tracing. Browse [pkg.go.dev](https://pkg.go.dev/) to see what exists and how widely it is imported.
+- **Follow the language.** New versions appear every February and August; each release's notes on [go.dev/doc](https://go.dev/doc/) list what changed.
+
+<Reflection title="Simplicity as a gift to others">
+
+Go's designers often said they built the language for the people who would maintain code, not only for those who first write it. Choosing the plain loop over the clever trick, the explicit error check over the hidden jump, the name a newcomer will understand: each is a small act of consideration for a colleague you may never meet. An old saying asks us to do to others as we would have them do to us; in software, that might mean writing the code we would hope to inherit. Whatever your own convictions, it is a good test to apply to every pull request.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"You need a framework to build a web service in Go."** Since Go 1.22's routing patterns, the standard `ServeMux` covers method matching and path parameters, and middleware is a few lines of ordinary code. Frameworks such as Gin, Echo and chi are popular and fine to use, but many production services use only the standard library.
+
+</Misconception>
+
+<Misconception>
+
+**"`http.ListenAndServe` is production-ready."** It works, but with no timeouts a slow or malicious client can tie up connections indefinitely. Configure an `http.Server` with `ReadHeaderTimeout` and the other timeouts, and shut it down gracefully.
+
+</Misconception>
+
+<Misconception>
+
+**"JSON decoding validates my data."** It checks syntax and types, not meaning: an empty title, a negative quantity or an unknown enum value decode happily. Validate after decoding, and decide deliberately whether unknown fields are an error.
+
+</Misconception>
+
+<Misconception>
+
+**"Handlers run one at a time."** Every request has its own goroutine. Any state shared between requests (caches, counters, in-memory stores) needs a mutex, an atomic or a channel-owning goroutine, and `go test -race` should be part of your test suite.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

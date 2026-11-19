@@ -1,0 +1,455 @@
+---
+title: Smart pointers, concurrency and unsafe
+subtitle: Box, Rc, RefCell and Arc; threads, channels and locks without data races; async in outline; and what unsafe code is for.
+minutes: 65
+objectives:
+  - Use Box for heap allocation and recursive types, and Rc with RefCell for shared, mutable data in one thread
+  - Explain interior mutability and why RefCell checks borrows at run time
+  - Start threads, share work with scoped threads, pass messages over channels, and share state with Arc, Mutex and atomics
+  - Explain the Send and Sync traits and how they make data races compile errors
+  - Describe async/await and runtimes such as Tokio, and say what unsafe code and FFI are for and how they are kept contained
+prerequisites: [errors-and-testing]
+related: [math.comp.formal-methods]
+references:
+  - title: "The Rust Programming Language, chapter 15: Smart Pointers"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch15-04-rc.html
+  - title: "The Rust Programming Language, chapter 16: Fearless Concurrency"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch16-00-concurrency.html
+  - title: "The Rust Programming Language, chapter 17: Async and Await"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch17-00-async-await.html
+  - title: "The Rust Programming Language, section 20.1: Unsafe Rust"
+    author: Steve Klabnik, Carol Nichols, Chris Krycho and the Rust community
+    url: https://doc.rust-lang.org/book/ch20-01-unsafe-rust.html
+  - title: Tokio
+    url: https://tokio.rs/
+    note: The most widely used async runtime, with a thorough tutorial.
+  - title: The Rustonomicon
+    url: https://doc.rust-lang.org/nomicon/
+    note: The official guide to writing unsafe Rust correctly.
+  - title: Rust Atomics and Locks
+    author: Mara Bos
+    year: 2023
+    url: https://marabos.nl/atomics/
+    note: A book, free to read online, on how concurrency primitives work, by a member of the Rust library team.
+---
+
+<Section id="motivation" kind="motivation" title="When one owner isn't enough">
+
+Ownership as you learned it in lesson 4 is a tree: each value has exactly one owner, and borrows are temporary. Most data fits that shape, which is why most Rust code needs nothing in this lesson. But some data doesn't. A graph node may be pointed to by many others; a cache may be shared by several parts of a program; a counter may be updated by eight threads at once. For these, the standard library provides **smart pointers**: types that act like pointers but add rules of their own, such as counting their owners or checking borrows at run time.
+
+The same tools are the foundation of Rust's approach to **concurrency**. In most languages, sharing data between threads is where the worst bugs live: two threads write the same value without coordination (a **data race**), and the result depends on timing, so the bug appears once a week on one customer's machine. Rust turns data races into compile errors, using the ownership rules you already know plus two marker traits, `Send` and `Sync`. The Rust community calls this **fearless concurrency**. It doesn't remove every concurrency bug (deadlocks and logic races are still possible), but it removes the one that is hardest to find.
+
+At the bottom of every safe abstraction in this lesson there is a little **unsafe** code: a few lines where the compiler takes the programmer's word for something it can't check. The last section explains what that means and why it is not the hole in the bucket it might sound like.
+
+</Section>
+
+<Section id="box" kind="definitions" title="Box: a value on the heap">
+
+<Definition term="Box">
+
+<code>Box&lt;T&gt;</code> owns a value of type `T` stored on the heap. The box itself is one pointer; when the box is dropped, the heap value is dropped and its memory freed. Boxes are used for recursive types, for trait objects (<code>Box&lt;dyn Trait&gt;</code>, lesson 6), and occasionally to move a large value without copying it.
+
+</Definition>
+
+```rust check
+// A recursive type needs indirection: Box gives each child a fixed-size pointer.
+enum Expr {
+    Num(f64),
+    Add(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Neg(Box<Expr>),
+}
+
+use Expr::{Add, Mul, Neg, Num};
+
+fn eval(e: &Expr) -> f64 {
+    match e {
+        Num(x) => *x,
+        Add(a, b) => eval(a) + eval(b),
+        Mul(a, b) => eval(a) * eval(b),
+        Neg(a) => -eval(a),
+    }
+}
+
+fn show(e: &Expr) -> String {
+    match e {
+        Num(x) => x.to_string(),
+        Add(a, b) => format!("({} + {})", show(a), show(b)),
+        Mul(a, b) => format!("{} * {}", show(a), show(b)),
+        Neg(a) => format!("-{}", show(a)),
+    }
+}
+
+fn main() {
+    // (2 + 3) * -4
+    let e = Mul(
+        Box::new(Add(Box::new(Num(2.0)), Box::new(Num(3.0)))),
+        Box::new(Neg(Box::new(Num(4.0)))),
+    );
+    println!("{} = {}", show(&e), eval(&e));
+
+    let on_heap: Box<[u8; 4]> = Box::new([1, 2, 3, 4]);
+    println!(
+        "{} bytes behind a pointer of {} bytes",
+        on_heap.len(),
+        size_of::<Box<[u8; 4]>>()
+    );
+}
+```
+
+```text
+(2 + 3) * -4 = -20
+4 bytes behind a pointer of 8 bytes
+```
+
+An `Expr` can contain other `Expr`s. Without the boxes, the compiler would have to make an `Expr` big enough to hold two `Expr`s, each big enough to hold two more, forever; it reports a recursive type "has infinite size" and suggests adding indirection. With boxes, each child is a pointer of known size. This shape (an enum of boxed sub-trees, evaluated by a recursive `match`) is how compilers, interpreters, query planners and JSON libraries written in Rust represent their trees. (Since Rust 1.80, `size_of` is available without importing it.)
+
+</Section>
+
+<Section id="rc-refcell" kind="definitions" title="Rc and RefCell: shared ownership, interior mutability">
+
+<Definition term="Rc and RefCell">
+
+<code>Rc&lt;T&gt;</code> (reference-counted) allows **several owners** of one heap value in a single thread. `Rc::clone(&rc)` makes another owner by incrementing a count, without copying the value; the value is dropped when the last owner goes. An `Rc` gives only shared (`&T`) access. <code>RefCell&lt;T&gt;</code> provides **interior mutability**: it lets you mutate its contents through a shared reference, by checking the borrowing rules **at run time** instead of compile time. `borrow()` gives a shared borrow, `borrow_mut()` an exclusive one, and breaking the rules panics.
+
+</Definition>
+
+```rust check
+use std::cell::RefCell;
+use std::rc::Rc;
+
+// Every member shares one shopping list: shared ownership (Rc) of a value
+// that can be changed through a shared reference (RefCell).
+type SharedList = Rc<RefCell<Vec<String>>>;
+
+struct Member {
+    name: String,
+    list: SharedList,
+}
+
+impl Member {
+    fn new(name: &str, list: &SharedList) -> Member {
+        Member {
+            name: name.to_string(),
+            list: Rc::clone(list),
+        }
+    }
+
+    fn add(&self, item: &str) {
+        let entry = format!("{item} ({})", self.name);
+        self.list.borrow_mut().push(entry);
+    }
+}
+
+fn main() {
+    let list: SharedList = Rc::new(RefCell::new(Vec::new()));
+    println!("owners: {}", Rc::strong_count(&list));
+
+    let amina = Member::new("Amina", &list);
+    let tomas = Member::new("Tomás", &list);
+    println!("owners: {}", Rc::strong_count(&list));
+
+    amina.add("rice");
+    tomas.add("lemons");
+    amina.add("coriander");
+    println!("{:#?}", list.borrow());
+
+    // The borrow rules still apply, but they are checked at run time.
+    let reading = list.borrow();
+    match list.try_borrow_mut() {
+        Ok(_) => println!("got a mutable borrow"),
+        Err(e) => println!("refused while someone is reading: {e}"),
+    }
+    drop(reading);
+    list.borrow_mut().clear();
+    println!("cleared; {} items", list.borrow().len());
+
+    drop(tomas);
+    println!("owners after Tomás leaves: {}", Rc::strong_count(&list));
+    drop(amina);
+    println!("owners now: {}", Rc::strong_count(&list));
+}
+```
+
+```text
+owners: 1
+owners: 3
+[
+    "rice (Amina)",
+    "lemons (Tomás)",
+    "coriander (Amina)",
+]
+refused while someone is reading: RefCell already borrowed
+cleared; 0 items
+owners after Tomás leaves: 2
+owners now: 1
+```
+
+Each `Member` owns a clone of the `Rc`, so the list lives as long as any member does. `add` takes `&self`, yet changes the list: `borrow_mut()` hands out a temporary exclusive borrow, after checking at run time that no other borrow is active. While `reading` holds a shared borrow, `try_borrow_mut` reports an error; the plain `borrow_mut` would have panicked with "RefCell already borrowed". So the rule "many readers or one writer" still holds; it has just moved from compile time to run time, and the cost is a counter check per borrow plus the risk of a panic if you get it wrong.
+
+Two cautions from experience. First, **reach for these last**: <code>Rc&lt;RefCell&lt;T&gt;&gt;</code> everywhere is often a sign of a design ported from a garbage-collected language; owning data in one place and passing references or indices usually leads to simpler code. Second, reference counting cannot free **cycles**: if A holds an `Rc` to B and B holds one to A, neither count reaches zero and both leak. Back-pointers (child to parent, observer to subject) should use `Weak`, a non-owning pointer obtained with `Rc::downgrade`, which must be upgraded (and may fail) before use. For simple `Copy` values, `Cell` gives interior mutability with no borrow tracking at all, by only ever copying values in and out.
+
+</Section>
+
+<Section id="threads" kind="examples" title="Threads, scoped threads and channels">
+
+A **thread** is an independent line of execution that the operating system can run on another CPU core. `std::thread::spawn` starts one with a closure and returns a handle; `join` waits for it to finish and returns the closure's result.
+
+```rust check
+use std::sync::mpsc;
+use std::thread;
+
+fn is_prime(n: u64) -> bool {
+    n >= 2
+        && (2..)
+            .take_while(|d| d * d <= n)
+            .all(|d| !n.is_multiple_of(d))
+}
+
+fn main() {
+    // 1. spawn + join: the closure must own what it uses (`move`).
+    let label = String::from("background count");
+    let handle = thread::spawn(move || {
+        let count = (1..=50_000).filter(|&n| is_prime(n)).count();
+        format!("{label}: {count} primes up to 50,000")
+    });
+    println!("{}", handle.join().unwrap());
+
+    // 2. Scoped threads may borrow local data, because the scope
+    //    guarantees they finish before the data goes away.
+    let readings: Vec<u64> = (1..=1_000).collect();
+    let (left, right) = readings.split_at(readings.len() / 2);
+    let (a, b) = thread::scope(|s| {
+        let h1 = s.spawn(|| left.iter().sum::<u64>());
+        let h2 = s.spawn(|| right.iter().sum::<u64>());
+        (h1.join().unwrap(), h2.join().unwrap())
+    });
+    println!("halves {a} + {b} = {}", a + b);
+
+    // 3. Channels: several producers, one consumer.
+    let (tx, rx) = mpsc::channel();
+    for worker in 0..3 {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for job in 0..2 {
+                let msg = format!("worker {worker} finished job {job}");
+                tx.send(msg).unwrap();
+            }
+        });
+    }
+    drop(tx); // the receiver's loop ends when every sender is gone
+    let mut messages: Vec<String> = rx.iter().collect();
+    messages.sort(); // arrival order varies from run to run
+    println!("{} messages; first: {:?}", messages.len(), messages[0]);
+}
+```
+
+```text
+background count: 5133 primes up to 50,000
+halves 125250 + 375250 = 500500
+6 messages; first: "worker 0 finished job 0"
+```
+
+Three patterns, in increasing order of how often you will use them in real code:
+
+1. **`thread::spawn` with `move`.** The new thread might outlive the function that started it, so it may not borrow local variables: its closure must own everything it uses (the bound is `F: FnOnce() -> T + Send + 'static`). `move` transfers `label` into the thread, and `join` brings the result back. If the thread panics, `join` returns an `Err` instead of crashing the caller.
+2. **`thread::scope`** (stable since Rust 1.63). Threads spawned inside a scope are guaranteed to finish before the scope ends, so they *may* borrow local data: here two threads sum the two halves of one vector, with no copying and no `Arc`. This is the easiest way to parallelise work over data you already have.
+3. **Channels.** `mpsc::channel()` returns a sender and a receiver ("multiple producer, single consumer"). Each worker gets its own clone of the sender; `send` moves a value into the channel, transferring ownership to whichever thread receives it. Once every sender has been dropped, iterating over the receiver ends. Message passing avoids shared state altogether, which is why many concurrent designs start here.
+
+Notice that the program sorts the messages before printing them: the order in which threads run is decided by the operating system and changes from run to run. Never write tests that depend on it.
+
+</Section>
+
+<Section id="shared-state" kind="examples" title="Shared state: Arc, Mutex and atomics">
+
+When threads really do need to update the same data, combine **<code>Arc&lt;T&gt;</code>** (atomically reference-counted: the thread-safe `Rc`) with a lock such as **<code>Mutex&lt;T&gt;</code>**, or use an **atomic** type for a single number.
+
+```rust check
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+// `thread::spawn` needs data that lives for the whole program ('static),
+// so the words live in a static rather than in a local variable.
+static WORDS: [&str; 10] = [
+    "kwa", "heri", "na", "asante", "sana", "karibu", "tena", "kwa", "heri", "rafiki",
+];
+
+fn main() {
+    // Shared, mutable state across threads: Arc for shared ownership,
+    // Mutex so that only one thread changes the map at a time.
+    let counts: Arc<Mutex<HashMap<&str, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    // A simple counter can use an atomic integer instead of a lock.
+    let letters = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for chunk in WORDS.chunks(3) {
+        let counts = Arc::clone(&counts);
+        let letters = Arc::clone(&letters);
+        handles.push(thread::spawn(move || {
+            for &w in chunk {
+                letters.fetch_add(w.len() as u64, Ordering::Relaxed);
+                let mut map = counts.lock().unwrap(); // blocks until the lock is free
+                *map.entry(w).or_insert(0) += 1;
+            } // the guard `map` is dropped here, releasing the lock
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let map = counts.lock().unwrap();
+    let mut repeated: Vec<_> = map.iter().filter(|&(_, &n)| n > 1).collect();
+    repeated.sort();
+    println!("{} distinct words, repeated: {repeated:?}", map.len());
+    println!("{} letters in total", letters.load(Ordering::Relaxed));
+    println!("owners of the map now: {}", Arc::strong_count(&counts));
+}
+```
+
+```text
+8 distinct words, repeated: [("heri", 2), ("kwa", 2)]
+42 letters in total
+owners of the map now: 1
+```
+
+The Swahili phrases are split across four threads (`chunks(3)` makes groups of 3, 3, 3 and 1). A Rust `Mutex` *contains* the data it protects: the only way to reach the map is `lock()`, which returns a guard that dereferences to the map and unlocks when dropped. You cannot forget to take the lock, and you cannot keep using the data after releasing it, two classic mistakes in languages where the lock and the data are separate objects. `lock()` returns a `Result` because a thread that panicked while holding the lock "poisons" it; `unwrap` there is the usual choice. `AtomicU64::fetch_add` updates a counter with a single hardware instruction and no lock; the `Ordering` argument controls how the update is ordered relative to other memory operations, and `Relaxed` is enough for a simple tally. (For more on orderings, Mara Bos's book in the references is the standard guide.)
+
+### Why data races can't compile: Send and Sync
+
+What stops you from using `Rc` instead of `Arc` here? Two marker traits that the compiler implements automatically for types whose parts allow it:
+
+- **`Send`**: values of this type can be moved to another thread.
+- **`Sync`**: references to values of this type can be shared between threads (`&T` is `Send`).
+
+`Rc` is neither, because two threads updating its non-atomic count at once could corrupt it. `RefCell` is `Send` but not `Sync`. `Arc` and `Mutex` are both (when their contents allow). `thread::spawn` requires its closure to be `Send`, so trying to move an `Rc` into a thread fails before the program ever runs:
+
+```text
+error[E0277]: `Rc<i32>` cannot be sent between threads safely
+ --> rcsend.rs:7:32
+  |
+7 |     let handle = thread::spawn(move || println!("{copy}"));
+  |                  ------------- -------^^^^^^^^^^^^^^^^^^^
+  |                  |             |
+  |                  |             `Rc<i32>` cannot be sent between threads safely
+  |                  |             within this `{closure@rcsend.rs:7:32: 7:39}`
+  |                  required by a bound introduced by this call
+  |
+  = help: within `{closure@rcsend.rs:7:32: 7:39}`, the trait `Send` is not implemented for `Rc<i32>`
+```
+
+Combine that with the borrowing rule from lesson 4 (a `&mut` is exclusive), and a data race needs either two threads holding `&mut` to the same value, which the borrow checker forbids, or shared mutation through a type that isn't `Sync`, which the trait bounds forbid. The only ways left to mutate shared data are types designed for it: locks and atomics.
+
+</Section>
+
+<Section id="async" kind="human" title="Async/await, in outline">
+
+Threads are a fine way to do a handful of things at once. A web server holding fifty thousand mostly idle network connections is another matter: fifty thousand operating-system threads would waste memory and time switching between them. For this, Rust has **async/await**.
+
+An `async fn` does not run when called; it returns a **future**, a value representing work that can make progress, pause while waiting (for a network packet, a timer, a database reply), and resume later. Inside an async function, `.await` on another future means "pause me here until that is ready, and let something else run meanwhile". The compiler turns each async function into a state machine, so a paused task costs only the memory for its state, often a few hundred bytes.
+
+```rust
+async fn fetch_both(client: &Client) -> Result<(Page, Page), Error> {
+    let (a, b) = tokio::join!(client.get("/news"), client.get("/weather"));
+    Ok((a?, b?))
+}
+```
+
+Unusually, Rust's standard library defines futures but provides no **runtime** to drive them. You choose one as a dependency. **Tokio** is by far the most widely used, providing a multi-threaded scheduler, asynchronous networking, timers and synchronisation; the axum web framework and the tonic gRPC library are built on it. Embedded systems use runtimes such as Embassy. The trade-offs are real: async code adds concepts (pinning, cancellation when a future is dropped, `Send` bounds on tasks that move between threads) and a function-colouring split between async and ordinary code. Use it for I/O-heavy concurrency, such as servers, crawlers and proxies; for CPU-heavy work, threads and libraries such as **rayon**, which parallelises iterator chains, are simpler and faster.
+
+</Section>
+
+<Section id="unsafe" kind="human" title="Unsafe Rust and FFI">
+
+The compiler's checks are conservative: some correct programs can't be proven correct by them. And some code must talk to things the compiler knows nothing about: the operating system, hardware registers, libraries written in C. For these cases Rust has the `unsafe` keyword. Inside an `unsafe` block you gain exactly five extra abilities: dereferencing raw pointers, calling `unsafe` functions (including foreign ones), accessing mutable statics, implementing `unsafe` traits, and accessing fields of unions. Everything else, including the borrow checker, still applies.
+
+```rust check
+// Declarations of functions from the C standard library, which every Rust
+// program on Linux already links against. Since the 2024 edition the block
+// itself must be marked `unsafe`: the compiler cannot check these signatures.
+unsafe extern "C" {
+    fn abs(x: i32) -> i32;
+    fn strlen(s: *const std::ffi::c_char) -> usize;
+}
+
+/// A safe wrapper: callers can't misuse it, so it needs no `unsafe` itself.
+fn c_abs(x: i32) -> i32 {
+    // SAFETY: `abs` has no preconditions for this input range.
+    unsafe { abs(x) }
+}
+
+fn main() {
+    println!("abs(-42) from C: {}", c_abs(-42));
+
+    let text = c"Kia ora"; // a C string literal (Rust 1.77+), ending in a zero byte
+    // SAFETY: `text` is a valid, zero-terminated string that outlives the call.
+    let n = unsafe { strlen(text.as_ptr()) };
+    println!("strlen says {n}");
+
+    // Raw pointers can be created in safe code; only dereferencing is unsafe.
+    let mut values = [10, 20, 30];
+    let p: *mut i32 = values.as_mut_ptr();
+    // SAFETY: index 2 is inside the array, and no other reference is in use.
+    unsafe {
+        *p.add(2) += 1;
+    }
+    println!("{values:?}");
+}
+```
+
+```text
+abs(-42) from C: 42
+strlen says 7
+[10, 20, 31]
+```
+
+This program calls two functions from the C standard library through the **foreign function interface** (FFI). The `unsafe extern "C"` block declares their signatures; the compiler cannot check that they match the real C functions, which is why the 2024 edition requires the block itself to be marked `unsafe`. `c"Kia ora"` is a **C string literal** (Rust 1.77 and later), a zero-terminated string of the kind C expects. The last part shows that creating a raw pointer is safe, but reading or writing through it requires `unsafe`, because nothing guarantees the pointer is valid.
+
+`unsafe` does not switch the checks off; it means "the programmer promises an invariant the compiler cannot verify". Breaking that promise causes **undefined behaviour**, the same class of bugs Rust otherwise prevents. So professionals contain it:
+
+- Keep unsafe blocks small and wrap them in **safe abstractions** whose public API cannot be misused, like `c_abs` above. `Vec`, `Rc`, `Mutex` and `String` are all built exactly this way.
+- Write a `// SAFETY:` comment on every unsafe block explaining why the promise holds; Clippy can require it.
+- Test unsafe code with **Miri**, an interpreter that detects many kinds of undefined behaviour in tests (`cargo +nightly miri test`).
+- For FFI, generate bindings with tools rather than writing them by hand: **bindgen** produces Rust declarations from C headers, **cbindgen** does the reverse, and **cxx** builds safe bridges to C++.
+
+The result is that in a typical application, unsafe code is a tiny fraction of the total, concentrated in well-reviewed libraries, and a memory-safety bug can only originate in those few audited places.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Rust prevents all concurrency bugs."** It prevents data races in safe code. Deadlocks (two threads each waiting for a lock the other holds), starvation, and logic races (checking a value and acting on it as two separate locked steps) are still possible. Keep lock scopes short and take locks in a consistent order.
+
+</Misconception>
+
+<Misconception>
+
+**"<code>Rc&lt;RefCell&lt;T&gt;&gt;</code> is how you write normal Rust."** It is a tool for genuinely shared, mutable, single-threaded data, such as some graph and GUI structures. Most programs need it rarely or never; owning data in one place and passing references is simpler and checked at compile time.
+
+</Misconception>
+
+<Misconception>
+
+**"Async is faster than threads."** Async lets one thread juggle many waiting tasks cheaply. It does not make computation faster, and for CPU-bound work it can be slower than plain threads. Choose by workload: many waits, async; heavy computation, threads or rayon.
+
+</Misconception>
+
+<Misconception>
+
+**"`unsafe` turns off the borrow checker."** It doesn't. References inside unsafe blocks are checked as usual. `unsafe` grants five specific extra abilities, chiefly dereferencing raw pointers and calling functions whose requirements the compiler can't check.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
