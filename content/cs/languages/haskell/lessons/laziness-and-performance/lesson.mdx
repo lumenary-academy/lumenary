@@ -1,0 +1,324 @@
+---
+title: Laziness, strictness and performance
+subtitle: How lazy evaluation really works, why it can leak memory, and the handful of habits that keep Haskell programs fast and lean.
+minutes: 60
+objectives:
+  - Describe lazy evaluation in terms of thunks, sharing and weak head normal form
+  - Use laziness deliberately for infinite structures, short-circuiting and dynamic programming
+  - Recognise a space leak from a lazy accumulator, and fix it with foldl', strict fields, bang patterns or seq
+  - Choose strict data structures such as Data.Map.Strict, and know when deepseq is needed
+  - Measure a program's time and memory with the runtime's statistics and GHC's profiler
+prerequisites: [io-and-monads]
+references:
+  - title: "GHC User's Guide: Profiling"
+    url: https://downloads.haskell.org/ghc/latest/docs/users_guide/profiling.html
+    note: Cost-centre profiles, heap profiles and how to read them.
+  - title: "GHC User's Guide: Running a compiled program (RTS options)"
+    url: https://downloads.haskell.org/ghc/latest/docs/users_guide/runtime_control.html
+    note: What +RTS -s reports, and every other runtime flag.
+  - title: "GHC User's Guide: Strict extensions"
+    url: https://downloads.haskell.org/ghc/latest/docs/users_guide/exts/strict.html
+    note: BangPatterns, StrictData and Strict.
+  - title: The deepseq package
+    url: https://hackage.haskell.org/package/deepseq
+    note: NFData, deepseq and force, for evaluating a structure completely.
+  - title: "Why Functional Programming Matters"
+    author: John Hughes
+    year: 1990
+    note: A classic essay arguing that laziness and higher-order functions are what make programs modular, published in Research Topics in Functional Programming.
+---
+
+<Section id="motivation" kind="motivation" title="The gift and the bill">
+
+Laziness has given you a lot already. You have taken the first few elements of infinite lists, written `foldr` searches that stop as soon as they find an answer, and never worried about computing values that end up unused. John Hughes argued in a famous essay that laziness is what lets functional programs be built from small, reusable parts: a generator can produce "all candidate answers" and a separate consumer can decide how many to look at, without either knowing about the other.
+
+The bill comes in memory. A lazy program can postpone so much work that it holds millions of unfinished computations at once, and a program that should run in a few kilobytes uses gigabytes. Such a **space leak** is the most common performance problem in Haskell, and every professional learns to spot and prevent it. This lesson explains the evaluation model precisely enough that leaks stop being mysterious, and gives you the small set of habits that prevent almost all of them.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The evaluation model">
+
+<Definition term="Thunk">
+
+A **thunk** is an unevaluated expression together with the variables it refers to: a promise to compute a value later. When you write `let y = expensive x`, GHC allocates a thunk for `y` and moves on. The first time something needs `y`'s value, the thunk is evaluated and **overwritten with the result**, so the work is done at most once. This combination, delay plus sharing, is called **call-by-need**.
+
+</Definition>
+
+<Definition term="Weak head normal form (WHNF)">
+
+Evaluating a value "as much as needed to see its outermost constructor" puts it in **weak head normal form**. `Just (2 + 3)` is already in WHNF (its outer constructor is `Just`; the `2 + 3` inside is still a thunk). `1 : map f xs` is in WHNF. A number is in WHNF once it is computed. Pattern matching, `seq` and `case` evaluate to WHNF, and no further.
+
+</Definition>
+
+<Definition term="Normal form (NF)">
+
+A value is in **normal form** when nothing inside it remains unevaluated. Getting there requires walking the whole structure, which is what `deepseq` and `force` from the `deepseq` package (shipped with GHC) do.
+
+</Definition>
+
+<Definition term="seq, ($!) and bang patterns">
+
+``a `seq` b`` evaluates `a` to WHNF, then returns `b`. `f $! x` evaluates `x` to WHNF before calling `f`. A **bang pattern** `!x` in a function's parameters evaluates that argument to WHNF when the function is called. A **strict field** `data P = P !Int` evaluates the field when a `P` is built.
+
+</Definition>
+
+<Definition term="Space leak">
+
+A **space leak** is memory a program holds for longer than it needs, typically a growing chain of thunks that will eventually be evaluated but has not been yet.
+
+</Definition>
+
+</Section>
+
+<Section id="examples" kind="examples" title="Laziness, seen and controlled">
+
+### What gets evaluated
+
+```haskell check
+import Control.DeepSeq (force)
+import Control.Exception (ErrorCall, evaluate, try)
+
+-- Evaluate a value to weak head normal form (its outermost constructor)
+-- and report whether that hit an error.
+probe :: String -> a -> IO ()
+probe label x = do
+  result <- try (evaluate x)
+  putStrLn $ label ++ ": " ++ case result of
+    Left err -> "crashed (" ++ show (err :: ErrorCall) ++ ")"
+    Right _ -> "fine"
+
+fibs :: [Integer]
+fibs = 0 : 1 : zipWith (+) fibs (drop 1 fibs)
+
+main :: IO ()
+main = do
+  print (take 12 fibs)
+  print (fibs !! 90)
+  print (fst (1, error "never needed" :: Int))
+  print (length [error "a", error "b", error "c" :: Int])
+  probe "error \"boom\"" (error "boom" :: Int)
+  probe "Just (error \"boom\")" (Just (error "boom" :: Int))
+  probe "1 : error \"boom\"" (1 : error "boom" :: [Int])
+  probe "force (Just (error \"boom\"))" (force (Just (error "boom" :: Int)))
+```
+
+```text
+[0,1,1,2,3,5,8,13,21,34,55,89]
+2880067194370816120
+1
+3
+error "boom": crashed (boom)
+Just (error "boom"): fine
+1 : error "boom": fine
+force (Just (error "boom")): crashed (boom)
+```
+
+`fibs` is defined in terms of itself: the list of Fibonacci numbers is 0, 1, and then the sum of the list and its own tail, element by element. It works because each element is a thunk that refers only to earlier elements, and sharing means each is computed once, so the 90th is found in 90 additions, not the exponential number a naive recursive definition would need.
+
+The next two lines never touch the `error` values: `fst` does not look at the second component, and `length` counts list cells without looking inside them. `probe` uses `evaluate`, which forces a value to WHNF, and `try`, which catches the error if one is raised. It confirms the definitions: evaluating the bare `error` crashes, but `Just (error ...)` and `1 : error ...` are already in WHNF because their outer constructors are known. Only `force`, which evaluates all the way to normal form, reaches the error hidden inside the `Just`.
+
+You can watch thunks being evaluated in GHCi with `:sprint`, which prints a value without forcing it, showing unevaluated parts as `_`. A real session:
+
+```text
+ghci> let xs = map (*2) [1..5] :: [Int]
+ghci> :sprint xs
+xs = _
+ghci> length xs
+5
+ghci> :sprint xs
+xs = [_,_,_,_,_]
+ghci> sum xs
+30
+ghci> :sprint xs
+xs = [2,4,6,8,10]
+```
+
+`length` built the five list cells but never needed the elements; `sum` needed them all.
+
+### Anatomy of a space leak
+
+Here is a reasonable-looking way to compute an average in one pass:
+
+```haskell
+-- The mean of a list, computed in one pass with a lazy accumulator.
+mean :: [Double] -> Double
+mean xs = total / fromIntegral count
+  where
+    (total, count) = foldl step (0, 0 :: Int) xs
+    step (s, c) x = (s + x, c + 1)
+```
+
+Use it in a program whose `main` is `print (mean [1 .. 10000000])`. The answer is right, but look at what happens. `foldl` does not evaluate its accumulator as it goes, so after the first steps the accumulator is a thunk for `step (step (step (0, 0) 1) 2) 3`. Even when the pairs are built, their components are thunks: `((0 + 1) + 2) + 3` and `((0 + 1) + 1) + 1`. Ten million elements later, memory holds two chains of ten million unevaluated additions, which are only collapsed when `print` finally demands the result. Compiled without optimisation and run with the runtime's statistics switched on (`+RTS -s`, which requires linking with `-rtsopts`), it reported, among other lines:
+
+```text
+5000000.5
+     718,814,000 bytes maximum residency (13 sample(s))
+            1988 MiB total memory in use (0 MiB lost due to fragmentation)
+  Total   time    7.462s  (  7.456s elapsed)
+```
+
+Almost two gigabytes and seven seconds, nearly all of it spent by the garbage collector copying thunks. The fix is to keep the accumulator evaluated at every step:
+
+```haskell check
+{-# LANGUAGE BangPatterns #-}
+
+-- Two strict ways to keep a running result.
+data Acc = Acc !Double !Int -- strict fields: evaluated when an Acc is built
+
+mean :: [Double] -> Double
+mean xs = finish (foldl' step (Acc 0 0) xs)
+  where
+    step (Acc s c) x = Acc (s + x) (c + 1)
+    finish (Acc s c) = s / fromIntegral c
+
+-- A loop with bang patterns: the accumulators are forced on every call.
+sumSquares :: Int -> Int
+sumSquares n = go 0 1
+  where
+    go !acc i
+      | i > n = acc
+      | otherwise = go (acc + i * i) (i + 1)
+
+main :: IO ()
+main = do
+  print (mean [1 .. 1000000])
+  print (sumSquares 1000000)
+  let x = 3 + 4 :: Int
+  x `seq` putStrLn "x has been evaluated" -- seq: evaluate x, then continue
+  print $! x * 2 -- ($!): evaluate the argument before calling print
+```
+
+```text
+500000.5
+333333833333500000
+x has been evaluated
+14
+```
+
+Two changes, and both are needed. `foldl'` evaluates the accumulator to WHNF at each step, but for a *lazy* pair WHNF only means "it is a pair": the thunks inside would still pile up. The strict fields of `Acc` close that gap, because building an `Acc` evaluates its fields. With the same ten million elements and the same compiler settings, the statistics read:
+
+```text
+5000000.5
+          44,328 bytes maximum residency (2 sample(s))
+               6 MiB total memory in use (0 MiB lost due to fragmentation)
+  Total   time    0.242s  (  0.241s elapsed)
+```
+
+From 718 megabytes of live data to 44 kilobytes, and about thirty times faster. (Your numbers will differ with machine and compiler version; the ratio is the point.) Compiled with `-O2`, GHC's **strictness analysis** noticed by itself that the leaky version's pair components are always needed and evaluated them early, and it, too, ran in 44,328 bytes. That is good news, but professionals do not rely on it: the optimiser's analysis can be defeated by small changes, and the leak returns silently.
+
+`sumSquares` shows the other common tool, a **bang pattern** on a loop's accumulator. Bang patterns are part of GHC2021, so the `LANGUAGE` pragma is only needed with older compilers or editions; it is harmless and makes the code's intent clear.
+
+### Laziness as a tool
+
+```haskell check
+import Data.Array (array, listArray, range, (!))
+import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
+
+-- Word frequencies with a strict map: each count is evaluated as it is stored.
+frequencies :: String -> Map.Map String Int
+frequencies = foldl' (\m w -> Map.insertWith (+) w 1 m) Map.empty . words
+
+-- Longest common subsequence by dynamic programming with a lazy array:
+-- each cell is defined in terms of other cells, and laziness computes
+-- them in whatever order they are needed.
+lcsLength :: String -> String -> Int
+lcsLength xs ys = table ! (0, 0)
+  where
+    n = length xs
+    m = length ys
+    xa = listArray (0, n - 1) xs
+    ya = listArray (0, m - 1) ys
+    table = array ((0, 0), (n, m)) [(ij, cell ij) | ij <- range ((0, 0), (n, m))]
+    cell (i, j)
+      | i == n || j == m = 0
+      | xa ! i == ya ! j = 1 + table ! (i + 1, j + 1)
+      | otherwise = max (table ! (i + 1, j)) (table ! (i, j + 1))
+
+main :: IO ()
+main = do
+  let text = "the rain in spain falls mainly on the plain in the rain"
+      freq = frequencies text
+  print (Map.toList freq)
+  print (take 3 (sortOn (negate . snd) (Map.toList freq)))
+  print (Map.lookup "rain" freq, Map.findWithDefault 0 "snow" freq)
+  print (lcsLength "AGGTAB" "GXTXAYB", lcsLength "kitten" "sitting")
+```
+
+```text
+[("falls",1),("in",2),("mainly",1),("on",1),("plain",1),("rain",2),("spain",1),("the",3)]
+[("the",3),("in",2),("rain",2)]
+(Just 2,0)
+(4,4)
+```
+
+`Data.Map.Strict` (from the `containers` package, which ships with GHC) has the same interface as the lazy `Data.Map`, but evaluates every value it stores. For counters and accumulators, that is what you want: with the lazy map, each count would become a chain of `+ 1` thunks. A widespread rule in professional code is simply "import `Data.Map.Strict` unless you have a reason not to".
+
+`lcsLength` is laziness used on purpose. The table's cells are defined in terms of each other, and the array is built from a list of *thunks*. Asking for cell `(0, 0)` forces exactly the cells it depends on, each once, in the right order, with no explicit loop order to get wrong. In a strict language you would carefully fill the table bottom-up; here the definitions are the algorithm. (The lazy array holds a thunk per cell, so for very large tables a strict, mutable array in the `ST` monad is faster; it is a classic engineering trade-off.)
+
+</Section>
+
+<Section id="computation" kind="computation" title="Measuring before you optimise">
+
+Performance work in Haskell follows the same rule as everywhere: measure first. The tools, all part of GHC:
+
+| Tool | How | What it tells you |
+| --- | --- | --- |
+| Runtime statistics | link with `-rtsopts`, run with `+RTS -s` | total allocation, maximum live memory, time spent in garbage collection |
+| Heap profile by type | `+RTS -hT`, no special build needed | which kinds of values fill the heap over time; a growing band of thunks is the signature of a leak |
+| Cost-centre profiling | build with `-prof -fprof-auto`, run with `+RTS -p` | where the time and allocation go, function by function |
+| Benchmarks | libraries `criterion` or `tasty-bench` from Hackage | reliable timings with statistics, for comparing versions of a function |
+| Core output | `-ddump-simpl` | the optimised intermediate code, for experts checking that something was unboxed or specialised |
+
+With Cabal, `cabal build --enable-profiling` builds a profiled version of your program and its libraries. A high "%GC time" in the `+RTS -s` report, or a maximum residency far larger than your real data, is the first hint of a leak.
+
+</Section>
+
+<Section id="human" kind="human" title="Habits that prevent leaks">
+
+Experienced Haskell programmers do not sprinkle `seq` everywhere. They follow a few rules that make leaks rare and then measure the rest.
+
+1. **Accumulate strictly.** Use `foldl'` (never plain `foldl`) to reduce a list. Give loop accumulators a bang pattern.
+2. **Make data fields strict by default.** Write `!` on record fields that hold numbers, counters and other small values, or switch on the `StrictData` extension for a whole module. Keep fields lazy only where you want laziness, such as an infinite list or a cached value that may never be needed.
+3. **Use strict containers.** `Data.Map.Strict`, `Data.IntMap.Strict`, `modifyIORef'` (with the prime) rather than `modifyIORef`.
+4. **Use `Text` and `ByteString` for data.** `String` is a lazy list of characters, convenient for small messages and costly for megabytes.
+5. **Stream large inputs.** Reading a huge file with `readFile` and processing it lazily ("lazy IO") can hold file handles open unpredictably; production code reads in chunks or uses a streaming library such as `conduit` or `streaming`.
+6. **Force results that cross a boundary.** When a value is handed to another thread, stored in a long-lived cache or measured in a benchmark, evaluate it fully with `force` or `deepseq`, so that the work happens where you expect it.
+
+A note on speed in general: idiomatic, carefully written Haskell compiled with `-O2` is usually within a small factor of C for numeric and data-structure code, and GHC's optimiser (fusion, specialisation, unboxing, strictness analysis) is one of the most sophisticated anywhere. Getting the last factor requires unboxed arrays, explicit strictness and reading Core, and is a specialist skill.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`seq` evaluates its argument completely."** Only to weak head normal form: the outermost constructor. ``(undefined, undefined) `seq` 1`` is 1, because the pair's constructor is visible without touching its components. For complete evaluation use `deepseq` or `force`.
+
+</Misconception>
+
+<Misconception>
+
+**"Laziness is a mistake; strict everything for speed."** Laziness is what makes `foldr` short-circuit, `take 10 (filter p bigList)` cheap, and self-referential definitions like `fibs` and the lazy DP table possible. Make *accumulators and data fields* strict; let *control flow and producers* stay lazy. That division, not a blanket policy, is what experienced teams follow.
+
+</Misconception>
+
+<Misconception>
+
+**"If it compiles with -O2 it won't leak."** Strictness analysis rescued the leaky `mean` above, and often helps, but it is a heuristic. Refactor the code slightly (for example, return the pair from an exported function) and the leak may come back. Write the strictness you need.
+
+</Misconception>
+
+<Misconception>
+
+**"Haskell programs are slow because of laziness."** Unmeasured Haskell programs can be slow because of leaks, `String` and `foldl`, all of which have standard fixes. Well-written Haskell runs at the speed of other compiled, garbage-collected languages.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

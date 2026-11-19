@@ -1,0 +1,443 @@
+---
+title: "Concurrency: threads, executors, futures and virtual threads"
+subtitle: Doing many things at once safely, from locks and atomics to virtual threads, CompletableFuture and the structured concurrency preview of JDK 25.
+minutes: 65
+objectives:
+  - Explain race conditions, atomicity and visibility, and why count++ is not thread-safe
+  - Protect shared state with synchronized, atomic variables, LongAdder and concurrent collections
+  - Run tasks with executors, and use virtual threads for large numbers of blocking tasks
+  - Compose asynchronous results with CompletableFuture, including error recovery
+  - Describe structured concurrency and scoped values and their status in JDK 25
+  - Choose between virtual threads, platform-thread pools and parallel streams for a workload
+prerequisites: [exceptions-and-equality]
+references:
+  - title: "JEP 444: Virtual Threads"
+    url: https://openjdk.org/jeps/444
+    note: The design of virtual threads, final in JDK 21; its motivation section is a fine introduction to the problem.
+  - title: "JEP 491: Synchronize Virtual Threads without Pinning"
+    url: https://openjdk.org/jeps/491
+    note: Why synchronized no longer pins virtual threads to carriers (JDK 24).
+  - title: "JEP 505: Structured Concurrency (Fifth Preview)"
+    url: https://openjdk.org/jeps/505
+    note: The StructuredTaskScope API as previewed in JDK 25.
+  - title: "JEP 506: Scoped Values"
+    url: https://openjdk.org/jeps/506
+    note: A safer alternative to ThreadLocal for passing context, final in JDK 25.
+  - title: "java.util.concurrent package (Java SE 25 API)"
+    author: Oracle
+    url: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/package-summary.html
+    note: Executors, futures, concurrent collections, and the memory-consistency rules they guarantee.
+  - title: "Java Language Specification, chapter 17: Threads and Locks"
+    author: Oracle
+    url: https://docs.oracle.com/javase/specs/
+    note: The Java Memory Model and the happens-before relation, precisely.
+  - title: Java Concurrency in Practice
+    author: Brian Goetz, Tim Peierls, Joshua Bloch, Joseph Bowbeer, David Holmes and Doug Lea
+    year: 2006
+    note: Older than virtual threads, but still the clearest book on thread safety and the memory model.
+---
+
+<Section id="motivation" kind="motivation" title="Doing many things at once">
+
+A web shop's server receives a request: show this customer's basket. To answer, it must fetch the customer record, the basket, today's prices and the stock levels, perhaps from four different services, each taking 50 milliseconds to reply. Done one after another, that is 200 milliseconds per request, during which the processor is almost entirely idle, waiting. Meanwhile, thousands of other customers are sending requests too.
+
+**Concurrency** is how a program structures work so that many tasks make progress over the same period: while one waits for the network, another runs. **Parallelism** is running computations at literally the same instant on several processor cores. A laptop in 2026 has many cores, and a server has dozens. Java programs use both, and the Java platform has unusually good tools for each.
+
+Concurrency is also where the most frightening bugs live. When two threads touch the same data without coordination, a program can give wrong answers *sometimes*: once a week, only under load, never on the developer's laptop. This lesson shows you such a bug with real output, then the tools that prevent it, then the modern tools (virtual threads, `CompletableFuture`, and the structured concurrency preview) that make concurrent code both scalable and readable.
+
+</Section>
+
+<Section id="history" kind="history" title="Threads since 1995">
+
+Java was one of the first mainstream languages with threads built into the language: `Thread`, `synchronized` and `wait`/`notify` were in JDK 1.0. Java 5 (2004) added `java.util.concurrent`, largely the work of Doug Lea and the JSR 166 expert group: thread pools (**executors**), futures, locks, atomic variables, concurrent collections, and a rigorous **Java Memory Model**. Java 7 added the fork/join framework, and Java 8 brought `CompletableFuture` and parallel streams.
+
+For most of that history each Java thread was a thin wrapper around an operating-system thread. Those are expensive: each reserves memory for a stack, and a machine runs a few thousand comfortably, not millions. So servers used small pools of threads, and frameworks for "reactive" or callback-style asynchronous code grew up to avoid blocking any of them. That code scaled, but it was hard to write, read and debug.
+
+**Project Loom** changed this. JDK 21 (2023) made **virtual threads** final: threads managed by the JVM rather than the operating system, cheap enough to create one per task, even millions. JDK 24 removed the main remaining limitation ("pinning" inside `synchronized` blocks). Two companion features followed: **scoped values**, final in JDK 25, and **structured concurrency**, still a preview API in JDK 25.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="Thread">
+
+An independent path of execution with its own call stack, sharing the heap with every other thread in the program. A **platform thread** is backed one-to-one by an operating-system thread. A **virtual thread** is scheduled by the JVM onto a small pool of platform "carrier" threads; when it blocks (sleeping, waiting for I/O, waiting for a lock), it is unmounted and its carrier runs another virtual thread.
+
+</Definition>
+
+<Definition term="Race condition">
+
+A bug whose outcome depends on the timing of threads. The typical case is a **read-modify-write** on shared data (`count++` reads the value, adds one, writes it back); two threads can both read the same old value, and one increment is lost.
+
+</Definition>
+
+<Definition term="Atomicity and visibility">
+
+An operation is **atomic** if other threads see it either not at all or completely. **Visibility** is whether a write by one thread is guaranteed to be seen by another; without synchronization it is not, because of caches and compiler reordering. The Java Memory Model defines when it is guaranteed through the **happens-before** relation: for example, releasing a lock happens-before a later acquisition of the same lock, and a write to a `volatile` field happens-before every later read of it.
+
+</Definition>
+
+<Definition term="Executor and Future">
+
+An **executor** runs submitted tasks on threads it manages, so code describes *what* to run rather than *how* to schedule it. Submitting a task returns a **Future**, a handle to its eventual result. `CompletableFuture` is a future you can chain further work onto.
+
+</Definition>
+
+</Section>
+
+<Section id="shared-state" kind="examples" title="Shared state, and how to protect it">
+
+Two threads each add one to a shared counter a million times:
+
+```java
+public class Main {
+    static int count = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable work = () -> {
+            for (int i = 0; i < 1_000_000; i++) {
+                count++;                      // read, add one, write back: three steps
+            }
+        };
+        Thread a = new Thread(work);
+        Thread b = new Thread(work);
+        a.start();
+        b.start();
+        a.join();
+        b.join();
+        System.out.println("expected 2000000, got " + count);
+    }
+}
+```
+
+This program's output changes from run to run, so it is not one of the checked programs. Three runs on the course's test machine printed:
+
+```text
+expected 2000000, got 1877567
+expected 2000000, got 1070796
+expected 2000000, got 1064231
+```
+
+Nearly half the increments vanished in the later runs. `count++` compiles to a read, an addition and a write, and when both threads read the same value before either writes, one update overwrites the other. Nothing crashed, no exception was thrown, and on a machine with one core, or with a smaller loop, the bug might not show at all. That is what makes races dangerous.
+
+Here are three correct ways to count, each with different trade-offs:
+
+```java check
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
+public class Main {
+    static final int THREADS = 4;
+    static final int PER_THREAD = 250_000;
+
+    // 1. A lock: only one thread at a time may run a synchronized method of this object
+    static class LockedCounter {
+        private long value;
+
+        synchronized void increment() {
+            value++;
+        }
+
+        synchronized long get() {
+            return value;
+        }
+    }
+
+    static void runOnThreads(Runnable work) throws InterruptedException {
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < THREADS; t++) {
+            threads.add(Thread.ofPlatform().start(work));   // start a platform (operating-system) thread
+        }
+        for (Thread thread : threads) {
+            thread.join();                                   // wait for it to finish
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        LockedCounter locked = new LockedCounter();
+        runOnThreads(() -> {
+            for (int i = 0; i < PER_THREAD; i++) locked.increment();
+        });
+
+        // 2. An atomic variable: a lock-free compare-and-set loop inside incrementAndGet
+        AtomicLong atomic = new AtomicLong();
+        runOnThreads(() -> {
+            for (int i = 0; i < PER_THREAD; i++) atomic.incrementAndGet();
+        });
+
+        // 3. A LongAdder: per-thread cells, summed on demand; fastest under heavy contention
+        LongAdder adder = new LongAdder();
+        runOnThreads(() -> {
+            for (int i = 0; i < PER_THREAD; i++) adder.increment();
+        });
+
+        System.out.println("synchronized: " + locked.get());
+        System.out.println("AtomicLong:   " + atomic.get());
+        System.out.println("LongAdder:    " + adder.sum());
+    }
+}
+```
+
+```text
+synchronized: 1000000
+AtomicLong:   1000000
+LongAdder:    1000000
+```
+
+- **`synchronized`** makes a method (or a block, `synchronized (lock) { ... }`) a critical section: a thread must acquire the object's lock to enter, so increments happen one at a time. It also guarantees visibility: whatever a thread wrote before releasing the lock is seen by the next thread that acquires it. Note that `get()` is synchronized too; reading without the lock would not be guaranteed to see the latest value.
+- **`AtomicLong`** uses the processor's compare-and-set instruction: read the value, compute the new one, and store it only if nobody changed it in between, retrying otherwise. No thread ever blocks.
+- **`LongAdder`** spreads increments over several internal cells to avoid threads fighting over one memory location, and adds them up when asked. It is the right tool for statistics counters that are written far more often than read.
+
+For shared maps, use `ConcurrentHashMap`, and use its atomic compound operations (`merge`, `compute`, `computeIfAbsent`) rather than a separate `get` followed by `put`, which is a race just like `count++`. For handing work between threads, use a `BlockingQueue`. The low-level `wait` and `notify` methods are almost never needed in modern code.
+
+</Section>
+
+<Section id="virtual-threads" kind="examples" title="Virtual threads: one thread per task">
+
+The second program simulates ten thousand calls to a slow service, each waiting 100 milliseconds, and gives each call its own virtual thread:
+
+```java check
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class Main {
+    /** Pretend to call a slow remote service: wait 100 ms, then answer. */
+    static int lookUpStock(int productId) throws InterruptedException {
+        Thread.sleep(Duration.ofMillis(100));
+        return productId % 7;
+    }
+
+    public static void main(String[] args) throws Exception {
+        int tasks = 10_000;
+        long start = System.nanoTime();
+
+        List<Future<Integer>> results = new ArrayList<>();
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int id = 0; id < tasks; id++) {
+                int productId = id;
+                results.add(executor.submit(() -> lookUpStock(productId)));
+            }
+        }   // close() waits for every task to finish
+
+        long total = 0;
+        for (Future<Integer> f : results) {
+            total += f.get();
+        }
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+        System.out.println(tasks + " lookups, total stock " + total);
+        System.out.println("sequentially this would take about " + Duration.ofMillis(100L * tasks).toSeconds() + " s");
+        System.out.println("finished in under 5 s: " + (elapsed.toSeconds() < 5));
+
+        Thread vt = Thread.ofVirtual().unstarted(() -> {});
+        System.out.println("virtual? " + vt.isVirtual() + ", daemon? " + vt.isDaemon());
+    }
+}
+```
+
+```text
+10000 lookups, total stock 29994
+sequentially this would take about 1000 s
+finished in under 5 s: true
+virtual? true, daemon? true
+```
+
+The program prints a coarse yes-or-no about timing so that its output is the same on every machine; in a separate timing run on the test machine, the ten thousand lookups took 173 milliseconds in total. With a fixed pool of 100 platform threads, the same machine needed about 2 seconds for just 2,000 such tasks: twenty rounds of 100 milliseconds, because each blocked thread holds its operating-system thread hostage while it sleeps.
+
+What makes this work:
+
+- **`Executors.newVirtualThreadPerTaskExecutor()`** starts a new virtual thread for every submitted task. Do not pool virtual threads; they are cheap to create and are meant to be used once.
+- **The `try`-with-resources block** around the executor: since JDK 19, `ExecutorService` is `AutoCloseable`, and `close()` waits for all submitted tasks to finish. That gives the code a clear shape: the tasks start and finish inside the block.
+- **The code is ordinary blocking code.** `lookUpStock` simply sleeps; with a real service it would call an HTTP client or a database driver and wait. When a virtual thread blocks, the JVM unmounts it and its carrier thread picks up another, so ten thousand waits overlap on a handful of carriers.
+- **`productId` is copied into a local variable** before the lambda captures it, because lambdas may capture only effectively final variables, and the loop variable `id` changes.
+
+Virtual threads make *waiting* cheap. They do not make *computation* faster: a CPU-bound task still needs a core, and a hundred thousand virtual threads doing arithmetic will share the same few cores as a hundred. For CPU-bound work, use a pool sized to the number of cores (`Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())`), the fork/join framework, or a parallel stream.
+
+</Section>
+
+<Section id="futures" kind="computation" title="Composing results with CompletableFuture">
+
+When you want to start several operations, combine their results, and handle failures without blocking at each step, `CompletableFuture` lets you describe the dependencies:
+
+```java check
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class Main {
+    record Quote(String supplier, long cents) {}
+
+    static Quote ask(String supplier, long cents, long delayMs) {
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();          // restore the flag; never swallow it
+            throw new IllegalStateException(e);
+        }
+        if (cents < 0) {
+            throw new IllegalArgumentException(supplier + " is offline");
+        }
+        return new Quote(supplier, cents);
+    }
+
+    public static void main(String[] args) {
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            CompletableFuture<Quote> lagos = CompletableFuture.supplyAsync(() -> ask("Lagos", 12_500, 80), pool);
+            CompletableFuture<Quote> accra = CompletableFuture.supplyAsync(() -> ask("Accra", 11_900, 40), pool);
+            CompletableFuture<Quote> lome = CompletableFuture.supplyAsync(() -> ask("Lomé", -1, 10), pool)
+                    .exceptionally(e -> new Quote("Lomé (fallback)", 99_999));   // recover from failure
+
+            // thenApply transforms a result; thenCombine waits for two
+            CompletableFuture<Long> withTax = accra.thenApply(q -> q.cents() * 115 / 100);
+            CompletableFuture<String> cheaper = lagos.thenCombine(accra,
+                    (a, b) -> a.cents() <= b.cents() ? a.supplier() : b.supplier());
+
+            // allOf waits for every future; join returns the result (or throws if it failed)
+            CompletableFuture.allOf(lagos, accra, lome, withTax, cheaper).join();
+            for (var f : List.of(lagos, accra, lome)) {
+                System.out.println(f.join());
+            }
+            System.out.println("Accra with 15% tax: " + withTax.join());
+            System.out.println("cheaper of Lagos and Accra: " + cheaper.join());
+
+            // A failure that is not handled surfaces when you join
+            CompletableFuture<Quote> broken = CompletableFuture.supplyAsync(() -> ask("Kano", -1, 5), pool);
+            try {
+                broken.join();
+            } catch (Exception e) {
+                System.out.println(e.getClass().getSimpleName() + ": " + e.getCause().getMessage());
+            }
+        }
+    }
+}
+```
+
+```text
+Quote[supplier=Lagos, cents=12500]
+Quote[supplier=Accra, cents=11900]
+Quote[supplier=Lomé (fallback), cents=99999]
+Accra with 15% tax: 13685
+cheaper of Lagos and Accra: Accra
+CompletionException: Kano is offline
+```
+
+`supplyAsync(task, executor)` starts a task and returns immediately. `thenApply` registers a transformation to run when the result arrives; `thenCombine` waits for two futures; `thenCompose` (not shown) chains a step that itself returns a future; `exceptionally` replaces a failure with a fallback value. A failure that nobody handles is wrapped in a `CompletionException` and rethrown by `join()`.
+
+Two professional notes. First, always pass an executor: without one, `supplyAsync` uses the shared common fork/join pool, which is sized for CPU-bound work, and blocking calls there can starve unrelated code. Second, **handle `InterruptedException` properly**. Interruption is how Java asks a thread to stop; a method that catches it should either rethrow it or restore the flag with `Thread.currentThread().interrupt()`, as `ask` does, so that code further up can see the request.
+
+With virtual threads, much code that once needed `CompletableFuture` chains can simply be written as blocking calls in separate tasks. `CompletableFuture` remains useful when an API hands you futures, and for expressing "when both of these are ready, do this" pipelines.
+
+</Section>
+
+<Section id="structured" kind="human" title="Structured concurrency and scoped values in JDK 25">
+
+The executor examples above have a weakness: nothing in the language ties the tasks to the code that started them. If one of two subtasks fails, the other keeps running unless you cancel it by hand; if the parent is interrupted, the children may not be. **Structured concurrency** applies to threads the same discipline that structured programming applied to `goto`: subtasks start and end inside one lexical block, and the block does not exit until they are all finished or cancelled.
+
+In JDK 25, `StructuredTaskScope` is a **preview API** ([JEP 505](https://openjdk.org/jeps/505), its fifth preview, with a redesigned API opened by `StructuredTaskScope.open()`). Preview APIs can change between releases, so they are switched off by default; this course's checked programs run without preview features, so this one is shown in a plain block. Its output below is from running it with `java --enable-preview --source 25 Main.java`.
+
+```java
+import java.util.concurrent.StructuredTaskScope;
+import java.util.concurrent.StructuredTaskScope.Subtask;
+
+public class Main {
+    record Order(String customer, int items) {}
+
+    static String findCustomer(int id) throws InterruptedException {
+        Thread.sleep(50);
+        return "customer-" + id;
+    }
+
+    static int countItems(int id) throws InterruptedException {
+        Thread.sleep(80);
+        if (id < 0) throw new IllegalStateException("no basket for " + id);
+        return id % 5 + 1;
+    }
+
+    static Order load(int id) throws InterruptedException {
+        try (var scope = StructuredTaskScope.open()) {        // JDK 25 preview API
+            Subtask<String> customer = scope.fork(() -> findCustomer(id));
+            Subtask<Integer> items = scope.fork(() -> countItems(id));
+            scope.join();               // waits for both; throws if either failed, cancelling the other
+            return new Order(customer.get(), items.get());
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println(load(42));
+        try {
+            load(-1);
+        } catch (StructuredTaskScope.FailedException e) {
+            System.out.println("failed: " + e.getCause().getMessage());
+        }
+    }
+}
+```
+
+```text
+Order[customer=customer-42, items=3]
+failed: no basket for -1
+```
+
+Each `fork` runs a subtask in its own virtual thread. `join()` waits for both; if either fails, the scope cancels the other and `join()` throws a `FailedException` carrying the cause. When the `try` block ends, no subtask can still be running. Without `--enable-preview`, javac refuses the program ("StructuredTaskScope is a preview API and is disabled by default"). Check the [JEP index](https://openjdk.org/jeps/0) for its status in releases after JDK 25 before relying on it in production.
+
+**Scoped values** ([JEP 506](https://openjdk.org/jeps/506)), by contrast, are *final* in JDK 25. A `ScopedValue` carries a piece of context, such as the current user or a request ID, to all the code called within a bounded scope, including subtasks, without passing it as a parameter through every method. It is designed to replace most uses of `ThreadLocal`, whose values are mutable, live as long as the thread, and become expensive when there are millions of virtual threads.
+
+</Section>
+
+<Section id="rules" kind="human" title="Rules professionals follow">
+
+1. **Do not share mutable state if you can avoid it.** Immutable objects (records, `List.of`) and data confined to one thread need no synchronization at all. Most thread-safety problems are solved by design, not by locks.
+2. **When you must share, use the highest-level tool that fits:** concurrent collections, atomic variables, executors, `CompletableFuture`, then `synchronized` or `ReentrantLock`, and only then anything lower.
+3. **Hold locks briefly, and never call unknown code while holding one.** Calling out to a callback or another service inside a lock is how deadlocks and stalls are born.
+4. **Match the tool to the work.** Many blocking tasks (HTTP calls, database queries): virtual threads. CPU-heavy computation: a pool sized to the cores, or parallel streams for large data. Limit how many tasks hit a fragile resource at once with a `Semaphore`, not with a small thread pool.
+5. **Never ignore `InterruptedException`.** Rethrow it or restore the interrupt flag.
+6. **Test under load, and use the tools.** Races hide on quiet machines. Thread dumps (`jcmd <pid> Thread.dump_to_file`, which includes virtual threads) and Java Flight Recorder show what threads are actually doing.
+
+<Reflection title="Many hands">
+
+"Two are better than one; because they have a good reward for their labour" (Ecclesiastes 4:9, King James Version). Concurrency is the computing version of many hands sharing work, and it carries the same lesson as any shared human labour: the work goes faster only when everyone keeps to agreed rules about what is shared and who may touch it when. A lock is a small act of courtesy, waiting your turn. Good concurrent design, like a good team, mostly arranges things so that people seldom need to wait for one another at all.
+
+</Reflection>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Declaring the counter `volatile` fixes `count++`."** `volatile` guarantees visibility of each read and write, but `count++` is still three steps, and two threads can still interleave them. Use an atomic variable or a lock.
+
+</Misconception>
+
+<Misconception>
+
+**"Virtual threads make my program faster."** They make blocking cheap, so a server can handle far more simultaneous waiting tasks. CPU-bound code gains nothing, and code that was not waiting will not speed up.
+
+</Misconception>
+
+<Misconception>
+
+**"A `ConcurrentHashMap` makes all my map code thread-safe."** Each single operation is thread-safe, but `if (!map.containsKey(k)) map.put(k, v);` is two operations with a gap between them. Use `putIfAbsent`, `computeIfAbsent` or `merge`.
+
+</Misconception>
+
+<Misconception>
+
+**"`parallelStream()` is a free speed-up."** It splits work over the common fork/join pool. For small collections, for I/O, or for pipelines with shared mutable state, it is slower or wrong. Measure first.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

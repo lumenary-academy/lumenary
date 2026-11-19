@@ -1,0 +1,375 @@
+---
+title: Hygienic macros, continuations and exceptions
+subtitle: Extending the language with syntax-rules, a careful first look at call/cc, and how R7RS signals and handles errors.
+minutes: 70
+objectives:
+  - Define new syntax with define-syntax and syntax-rules, using patterns, ellipses and literals
+  - Explain the two halves of hygiene and why hygienic macros cannot capture or be captured by the user's names
+  - Describe a continuation as "the rest of the computation" and use call/cc for early exit
+  - Recognise re-entrant uses of continuations and know where they are used in practice
+  - Signal and handle errors with error, raise, guard, with-exception-handler and dynamic-wind
+prerequisites: [alists-vectors-records]
+references:
+  - title: "R7RS-small, section 4.3: Macros"
+    url: https://standards.scheme.org/corrected-r7rs/r7rs.html
+    note: The definition of define-syntax, let-syntax and syntax-rules.
+  - title: "R7RS-small, sections 6.10 and 6.11"
+    url: https://standards.scheme.org/corrected-r7rs/r7rs.html
+    note: Control features (call/cc, dynamic-wind, values) and exceptions (raise, guard, error objects).
+  - title: The Scheme Programming Language, fourth edition
+    author: R. Kent Dybvig
+    year: 2009
+    url: https://www.scheme.com/tspl4/
+    note: Free online; its chapters on control operations, syntactic extension and exceptions go deeper (it follows R6RS).
+  - title: The Lambda Papers
+    url: https://research.scheme.org/lambda-papers/
+    note: The original papers behind Scheme's design, including its treatment of control.
+---
+
+<Section id="motivation" kind="motivation" title="Changing the language, and changing the flow">
+
+Every language lets you define new procedures. Few let you define new *syntax*: a new kind of loop, a new binding form, a new way to write tests. In most languages, if you want `while` and the language lacks it, you wait for the next version. In Scheme you write it in a few lines. Because Scheme code is made of lists, a **macro** is simply a rule for rewriting one piece of code into another before it runs, and Scheme's macros are **hygienic**: the rewriting cannot accidentally confuse the names in your code with the names in the macro.
+
+The second half of this lesson is about control. Every language has some way to jump out of the normal flow: `return`, `break`, exceptions, generators, `async`. Scheme provides one primitive from which all of these can be built: the **continuation**, a value representing "the rest of the computation" at some point, which you can capture and later invoke. Continuations are powerful and easy to misuse, so this lesson introduces them carefully, with the uses you are likely to meet, and then shows the exception system that R7RS provides for everyday error handling.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Macros, hygiene and continuations">
+
+<Definition term="Macro">
+
+A rule that transforms a piece of code into other code before it is evaluated. `define-syntax` names a macro; `syntax-rules` specifies it as a list of **patterns** and **templates**. When a use of the macro matches a pattern, it is replaced by the corresponding template, with the pattern variables filled in.
+
+</Definition>
+
+<Definition term="Hygiene">
+
+Two guarantees about names in a macro expansion. First, a name that the macro's template *introduces* (such as a temporary variable) never captures a name from the user's code. Second, a free name in the template (such as `if`, `let` or `else`) refers to the binding visible where the macro was *defined*, even if the user has shadowed that name where the macro is *used*.
+
+</Definition>
+
+<Definition term="Continuation">
+
+The rest of the computation from a given point: what will be done with the value of an expression once it is computed. `call-with-current-continuation`, abbreviated `call/cc`, captures the current continuation as a procedure; calling that procedure with a value abandons whatever is happening and continues from the captured point with that value.
+
+</Definition>
+
+In a `syntax-rules` pattern, the first element (written `_` by convention) stands for the macro's name. A pattern variable followed by `...` (an **ellipsis**) matches zero or more forms, and the same variable followed by `...` in the template reproduces them. The list right after `syntax-rules` names **literals**: words that must appear exactly, like `in` in `(for x in lst ...)`.
+
+</Section>
+
+<Section id="macros" kind="examples" title="Writing macros with syntax-rules">
+
+```scheme check
+(import (scheme base) (scheme write))
+
+(define-syntax swap!
+  (syntax-rules ()
+    ((_ a b)
+     (let ((tmp a))
+       (set! a b)
+       (set! b tmp)))))
+
+(define-syntax while
+  (syntax-rules ()
+    ((_ condition body ...)
+     (let loop ()
+       (when condition
+         body ...
+         (loop))))))
+
+(define-syntax my-or
+  (syntax-rules ()
+    ((_) #f)
+    ((_ e) e)
+    ((_ e rest ...)
+     (let ((tmp e))
+       (if tmp tmp (my-or rest ...))))))
+
+(define x 1)
+(define y 2)
+(swap! x y)
+(write (list x y)) (newline)
+
+(define tmp 'mine)
+(define other 'yours)
+(swap! tmp other)
+(write (list tmp other)) (newline)
+
+(define i 0)
+(while (< i 3)
+  (display "round ") (write i) (newline)
+  (set! i (+ i 1)))
+
+(define calls 0)
+(define (noisy v) (set! calls (+ calls 1)) v)
+(write (my-or #f (noisy 7) (noisy 8))) (newline)
+(write calls) (newline)
+(let ((tmp 5))
+  (write (my-or #f tmp)) (newline))
+
+(define-syntax my-if
+  (syntax-rules ()
+    ((_ c t e) (cond (c t) (else e)))))
+(let ((else #f))
+  (write (my-if #f 'then 'otherwise)) (newline))
+```
+
+```text
+(2 1)
+(yours mine)
+round 0
+round 1
+round 2
+7
+1
+5
+otherwise
+```
+
+**Why these must be macros.** `swap!` assigns to the caller's variables, which a procedure cannot do: a procedure receives values, not variables. `while` must evaluate its condition and body repeatedly, and a procedure's arguments are evaluated exactly once, before the call. `my-or` must stop evaluating as soon as one operand is true, so `(noisy 8)` never runs, as the count of 1 shows.
+
+**Hygiene in action.** Three lines test it.
+
+- `(swap! tmp other)` expands into code containing `(let ((tmp tmp)) ...)`, which in a naive textual macro system would mix up the macro's temporary with the user's variable named `tmp`, and the swap would silently fail. The hygienic expander renames the macro's `tmp` behind the scenes, and the swap works.
+- `(let ((tmp 5)) (my-or #f tmp))` is the same protection in the other direction: the user's `tmp` is not captured by the `let` inside `my-or`, so the answer is 5, not `#f`.
+- In `my-if`, the template uses `cond` with `else`. The user shadowed `else` with a local variable, but the `else` in the template still means what it meant where `my-if` was defined, so the macro works.
+
+Lisp dialects with non-hygienic macros, such as Common Lisp and Clojure, solve the first problem by generating fresh names (`gensym`, or Clojure's `name#`) and the second largely by convention and namespaces. In Scheme, `syntax-rules` handles both automatically.
+
+### Recursive macros and literals
+
+```scheme check
+(import (scheme base) (scheme write))
+
+(define-syntax my-let*
+  (syntax-rules ()
+    ((_ () body ...) (let () body ...))
+    ((_ ((name value) more ...) body ...)
+     (let ((name value))
+       (my-let* (more ...) body ...)))))
+
+(define-syntax for
+  (syntax-rules (in from to)
+    ((_ x in lst body ...)
+     (for-each (lambda (x) body ...) lst))
+    ((_ x from start to end body ...)
+     (do ((x start (+ x 1))) ((> x end)) body ...))))
+
+(write (my-let* ((a 2) (b (* a 10)) (c (+ a b))) (list a b c))) (newline)
+
+(for city in '("Accra" "Hanoi" "Quito")
+  (display " ") (display city))
+(newline)
+
+(for k from 1 to 5
+  (display " ") (write (* k k)))
+(newline)
+
+(define-syntax my-assert
+  (syntax-rules ()
+    ((_ expr)
+     (unless expr
+       (error "assertion failed" 'expr)))))
+
+(my-assert (= (+ 2 2) 4))
+(write (guard (e ((error-object? e)
+                  (list (error-object-message e) (error-object-irritants e))))
+         (my-assert (> 1 2))))
+(newline)
+```
+
+```text
+(2 20 22)
+ Accra Hanoi Quito
+ 1 4 9 16 25
+("assertion failed" ((> 1 2)))
+```
+
+- `my-let*` rewrites itself into nested `let`s, one binding at a time, until the binding list is empty. This is how `let*` is defined in the R7RS report itself: much of Scheme's syntax is "derived" from a few primitives this way.
+- `for` has two patterns, distinguished by the literals `in` and `from`/`to`. The first expands into `for-each` with a `lambda`; the second into a `do` loop. Patterns are tried in order.
+- `my-assert` quotes its argument in the template, `'expr`, so the error message contains the *source code* of the failed assertion, something no procedure could do, because a procedure only ever sees values. Testing libraries in Scheme use exactly this trick.
+
+`syntax-rules` is the only macro system in R7RS-small, and it covers most needs. Some macros need to compute with the code more freely (for example, to build a new identifier from parts of others). For those, implementations offer lower-level systems such as `syntax-case` (standard in R6RS, available in Racket, Chez and Guile, and as a library in Chibi) or explicit-renaming transformers (Chibi, CHICKEN), which are beyond this course.
+
+</Section>
+
+<Section id="continuations" kind="intuition" title="Continuations: the rest of the computation">
+
+Consider `(+ 1 (* 10 x))`. When `x` is being evaluated, what remains to be done is: "multiply the result by 10, add 1, and then carry on with the rest of the program". That pending work is the **continuation** of `x`. Every expression has one; normally it is implicit. `call/cc` makes it a value.
+
+```scheme check
+(import (scheme base) (scheme write))
+
+(define (find-first pred lst)
+  (call-with-current-continuation
+   (lambda (return)
+     (for-each (lambda (x)
+                 (when (pred x) (return x)))
+               lst)
+     #f)))
+
+(write (find-first even? '(1 3 8 5 6))) (newline)
+(write (find-first even? '(1 3 5))) (newline)
+
+(define visited '())
+(define (product lst)
+  (call/cc
+   (lambda (abort)
+     (let loop ((lst lst))
+       (cond ((null? lst) 1)
+             ((= (car lst) 0) (abort 0))
+             (else
+              (set! visited (cons (car lst) visited))
+              (* (car lst) (loop (cdr lst)))))))))
+
+(write (product '(2 3 4))) (newline)
+(set! visited '())
+(write (product '(5 7 0 9 11))) (newline)
+(write (reverse visited)) (newline)
+
+(define (count-to-three)
+  (let ((resume #f) (n 0) (seen '()))
+    (call/cc (lambda (k) (set! resume k)))
+    (set! n (+ n 1))
+    (set! seen (cons n seen))
+    (if (< n 3) (resume 'again))
+    (reverse seen)))
+
+(write (count-to-three)) (newline)
+
+(write (+ 1 (call/cc (lambda (k) (* 10 (k 5)))))) (newline)
+```
+
+```text
+8
+#f
+24
+0
+(5 7)
+(1 2 3)
+6
+```
+
+Read the examples from the simplest up.
+
+**The last line.** `call/cc` calls its argument with the continuation `k`, which means "take a value, and add 1 to it as the final result". Inside, `(* 10 (k 5))` starts a multiplication, but calling `k` with 5 abandons it: the multiplication never happens, and 5 goes straight to the waiting `(+ 1 ...)`. The result is 6, not 51.
+
+**Early exit.** `find-first` captures its own return point as `return`. `for-each` has no way to stop early, but calling `return` from inside the loop abandons the `for-each` and makes `find-first` return immediately. This is how `return` and `break` can be built from continuations.
+
+**Abandoning pending work.** `product` multiplies with a non-tail recursion, so each level waits to multiply. When it meets a 0, it calls `abort` and every pending multiplication is discarded: the answer is 0 without touching 9 or 11, as `visited` shows.
+
+**Re-entry.** The first three uses only *escape*: the continuation is called while its `call/cc` is still active, to jump outwards. `count-to-three` does something stranger. It stores the continuation in `resume` and later calls it *after* the `call/cc` has already returned. Execution jumps back to just after the `call/cc` inside the `let` body and runs the following lines again, with `n` and `seen` holding their updated values. Continuations in Scheme are **re-entrant**: they can be resumed any number of times.
+
+Re-entry is what makes continuations more than exceptions. With it, library authors build **generators** (a procedure that pauses after producing each value and resumes later), **coroutines** and cooperative threads, **backtracking** search (return to an earlier choice point and try the next option), and web frameworks in which a page handler can pause while waiting for the user's next click, as Racket's web server does. In application code you will rarely write `call/cc` yourself; you will use features built on it.
+
+<Note>
+
+Use continuations with care. Code that jumps back into the middle of a computation is hard to read, and re-entering code that has side effects (opening files, printing) repeats them. Captured continuations can also be costly to create in some implementations. For error handling, use the exception system below; for early exit, a named `let` that simply stops recursing is often clearer still. Many Scheme experts also recommend *delimited* continuations (which capture only part of the rest of the computation) over `call/cc` for building control abstractions; several implementations provide them, though R7RS-small does not.
+
+</Note>
+
+</Section>
+
+<Section id="exceptions" kind="examples" title="Exceptions: error, raise, guard and dynamic-wind">
+
+R7RS provides a small, complete exception system. `raise` signals any value as an exception; `error` creates a standard **error object** with a message and a list of **irritants** and raises it. `guard` catches exceptions with `cond`-like clauses. `with-exception-handler` installs a handler procedure, and `raise-continuable` lets that handler return a value to the point of the raise. `dynamic-wind` guarantees that setup and cleanup code run whenever control enters or leaves a block, however it leaves.
+
+```scheme check
+(import (scheme base) (scheme write))
+
+(define (safe-divide a b)
+  (if (= b 0)
+      (error "cannot divide by zero" a)
+      (/ a b)))
+
+(define (try-divide a b)
+  (guard (e ((error-object? e)
+             (list 'error (error-object-message e) (error-object-irritants e)))
+            ((symbol? e) (list 'signal e)))
+    (safe-divide a b)))
+
+(write (try-divide 10 4)) (newline)
+(write (try-divide 10 0)) (newline)
+(write (guard (e ((symbol? e) (list 'caught e))) (raise 'out-of-paper))) (newline)
+(write (guard (e ((string? e) (string-append "caught: " e))) (raise "disk full"))) (newline)
+
+(write (with-exception-handler
+        (lambda (condition) 42)
+        (lambda () (+ 1 (raise-continuable 'need-a-number)))))
+(newline)
+
+(define log '())
+(define (note x) (set! log (cons x log)))
+(guard (e (#t (note (list 'handled e))))
+  (dynamic-wind
+   (lambda () (note 'open))
+   (lambda () (note 'working) (raise 'oops) (note 'never))
+   (lambda () (note 'close))))
+(write (reverse log)) (newline)
+
+(write (guard (e ((string? e) 'string))
+         (guard (e ((number? e) 'number))
+           (raise "not a number"))))
+(newline)
+```
+
+```text
+5/2
+(error "cannot divide by zero" (10))
+(caught out-of-paper)
+"caught: disk full"
+43
+(open working close (handled oops))
+string
+```
+
+- `error` is the everyday way to signal a problem; its message and irritants are retrieved with `error-object-message` and `error-object-irritants`.
+- Any value can be raised: symbols, strings, records. Raising a record type of your own lets handlers recognise your library's errors precisely.
+- `guard` tries its clauses in order. If none matches, the exception is **re-raised** to the next enclosing handler, as the nested example shows: the inner `guard` only handles numbers, so the string reaches the outer one.
+- With `raise-continuable`, the handler's return value (42) becomes the value of the `raise-continuable` expression, so the computation continues and adds 1. Plain `raise` does not allow that: a handler that returns from a non-continuable `raise` causes a secondary error.
+- `dynamic-wind` ran `close` when the exception passed through, before the `guard` handler ran. It is Scheme's general mechanism for cleanup, and it also runs its "before" and "after" thunks when continuations jump in and out of the block. Implementations use it to build `parameterize` and resource-safe ports.
+
+</Section>
+
+<Section id="history" kind="history" title="Where these ideas came from">
+
+Macros have been part of Lisp since the 1960s, and so has the problem of accidental name capture. Eugene Kohlbecker, Daniel Friedman, Matthias Felleisen and Bruce Duba described **hygienic macro expansion** in 1986, and later work by William Clinger, Jonathan Rees and others made it efficient. `syntax-rules` entered the Scheme standard with R5RS in 1998 and remains the portable macro system of R7RS. Racket has since taken the idea further than any other language, with a macro system rich enough to build entire new languages, each selected with a `#lang` line.
+
+Continuations were studied in the theory of programming languages from the 1960s and 1970s, as a way of giving a precise meaning to jumps. Scheme was the first widely used language to make them first-class values, and `call/cc` has been part of the standard reports since the 1980s. The style of writing programs in which every procedure takes an explicit continuation argument (**continuation-passing style**) became a standard technique inside compilers, starting with Steele's 1978 Rabbit compiler for Scheme. Today the same ideas appear, in more restricted forms, as generators, `async`/`await` and effect handlers in many mainstream languages.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Writing a macro where a procedure would do.** Macros are not values: you cannot pass `my-or` to `map` or `apply`. They are also harder to debug. Use a macro only when you must control evaluation, bind variables, or see the source code of an argument.
+
+</Misconception>
+
+<Misconception>
+
+**Forgetting that a macro may duplicate its arguments.** A template that uses a pattern variable twice evaluates the corresponding expression twice. `my-or` binds the value to `tmp` first precisely so that `e` runs once. Hygiene protects names; it does not protect against duplicated side effects.
+
+</Misconception>
+
+<Misconception>
+
+**Thinking a continuation saves the values of variables.** A continuation captures *where* the computation will continue, not a snapshot of the data. In `count-to-three`, `n` kept its updated value each time the continuation was resumed. That is why the loop advanced instead of repeating 1 forever.
+
+</Misconception>
+
+<Misconception>
+
+**Expecting `guard` to catch everything.** A `guard` with no matching clause re-raises the exception. Add a final `(else ...)` clause, or a clause with test `#t`, only when you really mean to handle every possible exception.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

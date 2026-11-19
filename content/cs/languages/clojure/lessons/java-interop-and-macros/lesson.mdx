@@ -1,0 +1,328 @@
+---
+title: "The host and the language: Java interop, errors and macros"
+subtitle: Reach down into the Java platform, handle failure with exceptions that carry data, and extend Clojure's syntax with macros.
+minutes: 65
+objectives:
+  - Call Java constructors, static and instance methods and fields, including the method values added in Clojure 1.12
+  - Pass Clojure functions to Java APIs and use Java collections and java.time from Clojure
+  - Throw and catch exceptions with try, catch, finally and ex-info, and decide between exceptions and error values
+  - Write simple macros with syntax-quote, unquote and auto-gensyms, and inspect them with macroexpand
+  - Explain when a macro is the right tool and when a function is better
+prerequisites: [state-and-concurrency]
+references:
+  - title: Java interop
+    url: https://clojure.org/reference/java_interop
+    note: The official reference, including the Clojure 1.12 additions.
+  - title: Clojure 1.12.0 release announcement
+    url: https://clojure.org/news/2024/09/05/clojure-1-12-0
+    note: Method values, qualified methods, functional interface conversion and more.
+  - title: Macros
+    url: https://clojure.org/reference/macros
+    note: The official reference for defmacro and the macros in clojure.core.
+  - title: The reader, syntax-quote
+    url: https://clojure.org/reference/reader
+    note: How syntax-quote, unquote and unquote-splicing are read.
+  - title: Java Platform API documentation (Java 21)
+    url: https://docs.oracle.com/en/java/javase/21/docs/api/
+    note: Every class you can call from Clojure on Java 21.
+---
+
+<Section id="motivation" kind="motivation" title="Two directions of reach">
+
+Every language eventually needs something its core library does not provide. Clojure answers that need in two directions.
+
+**Downward, to the host.** Clojure runs on the JVM, and the entire Java ecosystem sits one function call away: dates and times, cryptography, HTTP clients, database drivers, concurrency utilities, image processing, and hundreds of thousands of libraries on Maven Central. Clojure does not wrap these; it calls them directly, with syntax that fits naturally into Lisp forms. Knowing interop well is what turns Clojure from an elegant language into a practical one.
+
+**Upward, to new syntax.** Because Clojure code is Clojure data, a function that runs at compile time can take code as a list, rearrange it, and return new code. That is a **macro**. Many forms you have already used, including `defn`, `when`, `cond`, `->`, `->>`, `for` and `doseq`, are macros written in Clojure itself. Macros let libraries add language features that would require a new compiler release in most languages.
+
+Between the two sits error handling, which comes from the host: Clojure uses the JVM's exceptions, and adds a convenient way to attach data to them.
+
+</Section>
+
+<Section id="interop" kind="examples" title="Calling Java">
+
+The interop syntax is small:
+
+| Java | Clojure |
+| --- | --- |
+| `Math.sqrt(2.0)` | `(Math/sqrt 2.0)` |
+| `Math.PI` | `Math/PI` |
+| `"kwame".toUpperCase()` | `(.toUpperCase "kwame")` |
+| `new StringBuilder()` | `(StringBuilder.)` or `(new StringBuilder)` |
+| `s.trim().toUpperCase()` | `(.. s trim toUpperCase)` or `(-> s .trim .toUpperCase)` |
+| `import java.time.LocalDate;` | `(import '[java.time LocalDate])`, or `(:import ...)` in `ns` |
+
+Classes in `java.lang` (`Math`, `String`, `Integer`, `StringBuilder`) are available without an import.
+
+```clojure check
+(import '[java.time LocalDate DayOfWeek]
+        '[java.util ArrayList])
+
+(println (Math/sqrt 2.0) Math/PI Integer/MAX_VALUE)
+(println (.toUpperCase "kwame") (.length "kwame") (.indexOf "banana" "nan"))
+(println (.. "  padded  " trim toUpperCase))
+
+(def sb (doto (StringBuilder.)
+          (.append "Clo")
+          (.append "jure")
+          (.reverse)))
+(println (str sb))
+
+(def launch (LocalDate/of 2007 10 16))
+(println (str launch) (str (.getDayOfWeek launch)) (str (.plusDays launch 100)))
+(println (= DayOfWeek/TUESDAY (.getDayOfWeek launch)))
+
+(def names (ArrayList. ["Zainab" "Ivan" "Mei"]))
+(.add names "Ana")
+(println (str names) (.size names) (class names))
+(println (sort names) (mapv count names))
+(println (instance? java.util.List [1 2]) (instance? java.util.Map {:a 1}))
+(println (instance? Runnable inc) (instance? java.util.Comparator compare))
+```
+
+```text
+1.4142135623730951 3.141592653589793 2147483647
+KWAME 5 2
+PADDED
+erujolC
+2007-10-16 TUESDAY 2008-01-24
+true
+[Zainab, Ivan, Mei, Ana] 4 java.util.ArrayList
+(Ana Ivan Mei Zainab) [6 4 3 3]
+true true
+true true
+```
+
+- `doto` calls several methods on the same object and returns the object: the standard way to configure mutable Java objects such as builders.
+- `java.time` is the modern Java date and time library, and the right choice for dates in Clojure too. Its objects are immutable, which fits Clojure well. (`str` is used here because printing a Java object directly includes an identity hash code that changes from run to run.)
+- Interop goes both ways. Clojure's sequence functions work on Java collections (`sort` and `mapv` above work on an `ArrayList`), and Clojure's collections implement the read-only parts of Java's interfaces: a vector *is* a `java.util.List`, a map a `java.util.Map`, so they can be passed to Java code that expects those types. Clojure functions implement `Runnable`, `Callable` and `Comparator`.
+- Mutable Java objects stay mutable. `.add` changed `names` in place, so keep such objects local to one function, convert them to Clojure data (`vec`, `into {}`) at the boundary, and never share them between threads unguarded.
+
+### What Clojure 1.12 added
+
+Before version 1.12, Java methods were not values: to map a Java method over a collection you had to wrap it in a function, as in `(map #(.toUpperCase %) words)`. Clojure 1.12 (September 2024) made Java methods usable directly wherever a function is expected, and made Clojure functions convert automatically to Java's functional interfaces:
+
+```clojure check
+(println (map String/.toUpperCase ["sol" "luna"]))
+(println (map Integer/parseInt ["7" "35" "-2"]))
+(println (map Long/toBinaryString [5 8]))
+(println (map (comp str StringBuilder/new) ["ab" "cd"]))
+
+(def scores (java.util.ArrayList. [3 8 5 10 1]))
+(.removeIf scores even?)
+(println (vec scores))
+
+(def langs (java.util.ArrayList. ["Scheme" "Clojure" "Lisp"]))
+(.sort langs compare)
+(println (vec langs))
+```
+
+```text
+(SOL LUNA)
+(7 35 -2)
+(101 1000)
+(ab cd)
+[3 5 1]
+[Clojure Lisp Scheme]
+```
+
+- `String/.toUpperCase` is a **qualified instance method**: the class, a slash, then the method with its leading dot. It names the method precisely, so no reflection is needed.
+- `Integer/parseInt` and `Long/toBinaryString` are static methods used as values.
+- `StringBuilder/new` names a constructor as a value.
+- `.removeIf` expects a `java.util.function.Predicate`; since 1.12 the Clojure function `even?` is converted to one automatically. Many modern Java APIs (streams, `CompletableFuture`, collection methods) take functional interfaces, so this removes a lot of boilerplate.
+
+### Reflection and type hints
+
+When the compiler cannot tell the type of an object at a method call like `(.length s)`, it compiles a **reflective** call that looks the method up at run time, which is much slower. Put `(set! *warn-on-reflection* true)` at the top of a file and the compiler prints a warning for each such call; fix the ones on hot paths with a **type hint**, `(defn len [^String s] (.length s))`. Most code needs no hints at all, and the qualified-method syntax of 1.12 avoids reflection by construction.
+
+</Section>
+
+<Section id="errors" kind="examples" title="Errors: exceptions that carry data">
+
+Clojure uses the JVM's exceptions. `throw` raises one; `try` with `catch` clauses handles them by class, and `finally` runs no matter what. What Clojure adds is `ex-info`, which creates an exception carrying a **map of data**, so a handler can see exactly what went wrong without parsing a message string.
+
+```clojure check
+(defn parse-age [s]
+  (let [n (try
+            (Long/parseLong s)
+            (catch NumberFormatException e
+              (throw (ex-info "Age is not a number" {:input s :field :age} e))))]
+    (when-not (<= 0 n 150)
+      (throw (ex-info "Age out of range" {:input s :field :age :value n})))
+    n))
+
+(defn safe-parse [s]
+  (try
+    {:ok (parse-age s)}
+    (catch clojure.lang.ExceptionInfo e
+      {:error (ex-message e) :data (ex-data e)})
+    (finally
+      (println "checked" (pr-str s)))))
+
+(prn (safe-parse "42"))
+(prn (safe-parse "forty"))
+(prn (safe-parse "200"))
+
+(try
+  (/ 1 0)
+  (catch ArithmeticException e
+    (println "caught" (.getSimpleName (class e)) "-" (ex-message e))))
+
+(try
+  (parse-age "x")
+  (catch Exception e
+    (println (ex-message e) "| cause:" (class (ex-cause e)))))
+```
+
+```text
+checked "42"
+{:ok 42}
+checked "forty"
+{:error "Age is not a number", :data {:input "forty", :field :age}}
+checked "200"
+{:error "Age out of range", :data {:input "200", :field :age, :value 200}}
+caught ArithmeticException - Divide by zero
+Age is not a number | cause: java.lang.NumberFormatException
+```
+
+- `(ex-info message data cause)` builds a `clojure.lang.ExceptionInfo`. The third argument chains the original exception as the **cause**, so stack traces keep the full story; `ex-cause` retrieves it.
+- `ex-message` and `ex-data` read the message and the map back. Logging the data map gives you structured, searchable error reports.
+- `catch` clauses are tried in order and match by class, including subclasses: `Exception` catches almost everything you should catch.
+- `finally` ran for every call, success or failure: the place to release resources. For anything that implements `java.io.Closeable`, use `with-open`, which writes the `finally` for you.
+
+`safe-parse` shows a common style at boundaries: convert exceptions into **data**, here a map with either `:ok` or `:error`. Inside a system, Clojure developers generally let exceptions propagate for truly exceptional situations (a database that is down, a bug) and use plain return values (`nil`, an `:error` key) for expected outcomes like invalid user input. Neither style is enforced by the language; consistency within a codebase matters more than which you choose.
+
+</Section>
+
+<Section id="macros" kind="examples" title="Macros: functions from code to code">
+
+A macro is defined with `defmacro`. It looks like a function, but it runs at **compile time**, receives its arguments *unevaluated* (as data: lists, symbols, literals), and returns a new form that the compiler then compiles in its place. Three pieces of reader syntax make building that form pleasant:
+
+- **Syntax-quote**, the backquote `` ` ``, quotes a template and qualifies its symbols with their namespaces (so `println` inside it becomes `clojure.core/println`, immune to local shadowing).
+- **Unquote**, `~x`, inserts the value of `x` into the template.
+- **Unquote-splicing**, `~@xs`, inserts the *elements* of a sequence.
+- **Auto-gensym**: a symbol ending in `#` inside a syntax-quote, such as `result#`, becomes a unique generated name, so the macro's locals cannot collide with the caller's.
+
+```clojure check
+(defmacro unless [test & body]
+  `(if ~test nil (do ~@body)))
+
+(prn (macroexpand-1 '(unless (empty? xs) (println "has items") :ok)))
+(println (unless false :ran) (unless true :ran))
+
+(defn bad-unless [test & body]
+  (if test nil (last body)))
+(println (bad-unless true (do (println "side effect ran anyway") :oops)))
+
+(defmacro with-retries [n & body]
+  `(loop [attempt# 1]
+     (let [result# (try {:value (do ~@body)}
+                        (catch Exception e# {:error e#}))]
+       (cond
+         (contains? result# :value) (:value result#)
+         (< attempt# ~n) (recur (inc attempt#))
+         :else (throw (:error result#))))))
+
+(def calls (atom 0))
+(println (with-retries 5
+           (swap! calls inc)
+           (if (< @calls 3) (throw (ex-info "flaky" {})) :success))
+         "after" @calls "calls")
+
+(prn (macroexpand '(-> order (assoc :paid true) (update :total * 2))))
+(prn (macroexpand-1 '(when ready (start!) (log "started"))))
+```
+
+```text
+(if (empty? xs) nil (do (println "has items") :ok))
+:ran nil
+side effect ran anyway
+nil
+:success after 3 calls
+(update (assoc order :paid true) :total * 2)
+(if ready (do (start!) (log "started")))
+```
+
+Read the results carefully:
+
+- `macroexpand-1` shows what a macro call turns into. `unless` became an ordinary `if`. Expanding macros at the REPL is the first thing to do whenever one surprises you.
+- `bad-unless` is a *function* attempting the same thing, and it cannot: a function's arguments are evaluated before it is called, so the side effect happened even though the test was true. Controlling **whether and when** code runs is the classic reason to write a macro.
+- `with-retries` wraps arbitrary code in a retry loop, something no function could do without the caller wrapping the code in a `fn`. The `#` names (`attempt#`, `result#`, `e#`) become unique symbols, so the caller's code can use names like `result` freely.
+- `->` and `when` are macros too: the threading macro is pure syntax, rewritten into nested calls before the compiler ever sees it.
+
+### When to write a macro
+
+The Clojure community's advice is blunt: **do not write a macro when a function will do.** Macros are not values: you cannot pass `unless` to `map` or `apply`. They make code harder to read, because a reader must know each macro's evaluation rules. Errors inside them can be confusing. Good reasons for a macro are few and specific:
+
+1. Controlling evaluation: running code conditionally, repeatedly or later (`when`, `with-retries`, `lazy-seq`, `future`).
+2. Introducing bindings or a context around a body (`let`, `with-open`, `binding`).
+3. Removing real, repeated boilerplate that functions cannot remove, such as defining several related functions at once (`defrecord`, `defprotocol`).
+4. Doing work at compile time, such as checking or precomputing a constant.
+
+Even then, the best macros are thin: they turn syntax into a call to an ordinary function that does the real work, and that function can be tested on its own.
+
+</Section>
+
+<Section id="practice" kind="human" title="How professionals use the host">
+
+Day to day, interop in a Clojure codebase usually looks like a small namespace of **thin wrappers**: a few functions that hide a Java API's ceremony behind a data-in, data-out interface. Here is a typical one, hashing a string with the JDK's built-in SHA-256 (`HexFormat` arrived in Java 17):
+
+```clojure
+(import '[java.security MessageDigest]
+        '[java.nio.charset StandardCharsets]
+        '[java.util HexFormat])
+
+(defn sha-256 [^String s]
+  (let [digest (MessageDigest/getInstance "SHA-256")
+        bytes  (.digest digest (.getBytes s StandardCharsets/UTF_8))]
+    (.formatHex (HexFormat/of) bytes)))
+
+(sha-256 "hello")
+;; => "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+```
+
+The rest of the program sees a function from string to string and never touches a `MessageDigest`. Notice the habits: a type hint on the parameter so `.getBytes` is not reflective, an explicit character set instead of the platform default, and a fresh `MessageDigest` per call because that object is mutable and not safe to share between threads.
+
+A few more practices worth adopting early:
+
+- **Read the Javadoc.** Clojure developers spend real time in Java's API documentation. The skill of reading a class's method list and translating it into `(.method obj args)` pays off constantly.
+- **Convert at the boundary.** Turn Java results into Clojure data as soon as they enter your code: `vec` or `into` for collections, a map built with the fields you need for objects (`bean` does this automatically but slowly, so it is best kept to the REPL).
+- **Turn on reflection warnings in libraries and hot code.** Many projects set `*warn-on-reflection*` in every namespace and treat the warnings like compiler errors.
+- **Structured errors.** Throw `ex-info` with a map that includes a stable `:type` or `:error/kind` key, so callers can dispatch on it, and always chain the cause. Logs then show both the human message and searchable data.
+- **Macros are rare and reviewed.** Most production namespaces define no macros at all. When a team does add one, it usually comes with a docstring showing the expansion and with tests of the function it delegates to.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**Evaluating a macro argument twice.** A macro like ``(defmacro square [x] `(* ~x ~x))`` looks harmless, but `(square (do (println "hi") 3))` prints twice, because the *code* for `x` was pasted in twice. Bind it once: ``(let [v# ~x] (* v# v#))``. Better still, `square` should be a function.
+
+</Misconception>
+
+<Misconception>
+
+**Catching `Throwable` everywhere.** `Throwable` includes `Error`s such as `OutOfMemoryError` and `StackOverflowError`, which a program usually cannot recover from. Catch `Exception` (or a more specific class) unless you are writing top-level logging code that must see absolutely everything.
+
+</Misconception>
+
+<Misconception>
+
+**Assuming Java collections are immutable because Clojure's are.** An `ArrayList` from a Java library can be changed by that library, by you, or by another thread. Convert to Clojure data at the boundary with `vec`, `set` or `into`.
+
+</Misconception>
+
+<Misconception>
+
+**Thinking interop is a second-class escape hatch.** Calling Java is idiomatic Clojure. There is no need to search for a Clojure wrapper library when a Java class already does the job well; many experienced Clojure developers prefer the Java library directly, with a few small helper functions around it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

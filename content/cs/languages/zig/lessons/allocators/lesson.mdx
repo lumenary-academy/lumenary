@@ -1,0 +1,385 @@
+---
+title: Explicit allocators
+subtitle: Why every Zig function that needs memory asks for an allocator, the allocators in the standard library, and how to use lists and maps without leaks.
+minutes: 65
+objectives:
+  - Explain the "no hidden allocations" rule and the std.mem.Allocator interface
+  - Allocate and free slices and single items, and return owned memory from a function with a clear contract
+  - Use std.ArrayList and std.StringHashMap, including who owns the keys
+  - Choose between SafeAllocator, the page allocator, an arena and a fixed buffer for a given job
+  - Find leaks and double frees with the standard library's checking allocator
+prerequisites: [errors-and-optionals]
+references:
+  - title: "Zig language reference: Memory, Choosing an Allocator"
+    url: https://ziglang.org/documentation/0.17.0/
+    note: The language's own short guide to which allocator to use when.
+  - title: "std.heap and std.mem.Allocator (standard library documentation)"
+    url: https://ziglang.org/documentation/master/std/
+  - title: "std.ArrayList and std.hash_map (standard library documentation)"
+    url: https://ziglang.org/documentation/master/std/
+---
+
+<Section id="motivation" kind="motivation" title="Where does the memory come from?">
+
+In most languages, memory just appears. Python allocates when you create a list, Java when you write `new`, C++ when a `std::string` grows. Usually that is fine. But sometimes it matters enormously: a game cannot pause for a garbage collector in the middle of a frame; firmware on a microcontroller may have 64 KiB of RAM and no heap at all; a server handling a request wants to throw away all that request's temporary memory in one step; a library author does not know which of these situations their code will run in.
+
+Zig's answer is a rule with no exceptions in the language and few in the standard library: **anything that allocates takes an allocator as a parameter.** You can see from a function's signature whether it may allocate, and the caller decides how. The same parsing function can allocate from a leak-checking allocator in tests, from an arena in a web server, and from a fixed buffer on a microcontroller, without changing a line. And because allocation can fail, `error.OutOfMemory` is an ordinary error that code can handle rather than a crash.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Memory management, language by language">
+
+Every systems language has to answer the same question: when is memory given back?
+
+- **C** gives you `malloc` and `free` and no help at all. Every library also picks its own allocation strategy, usually the global `malloc`, and you cannot change it.
+- **C++** frees memory in destructors (RAII), so most code never calls `delete`. Allocators exist, but they are template parameters that few people customise, and allocation inside library code is mostly invisible.
+- **Garbage-collected languages** (Java, Go, Python, JavaScript) free memory some time after it becomes unreachable. Very convenient, at the cost of pauses, extra memory and little control.
+- **Rust** frees memory when its owner goes out of scope, with ownership checked by the compiler.
+- **Zig** frees nothing automatically. Instead it makes allocation visible and pluggable: you see every place that may allocate, you choose the strategy, and you release memory with `defer`, `errdefer`, container `deinit`s and arenas.
+
+<Analogy>
+
+Think of allocators as different ways to get desk space in a shared office. A general-purpose allocator is a desk you book and must hand back yourself. An arena is a project room: you spread out freely, and the whole room is cleared when the project ends. A fixed buffer is the one small desk you were given, and when it is full, it is full. Zig lets each part of your program say which kind of space it is using.
+
+</Analogy>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="std.mem.Allocator">
+
+A small interface value (a pointer to some allocator's state plus a table of functions) passed by value. Its main methods: `alloc(T, n)` and `free(slice)` for many items, `create(T)` and `destroy(ptr)` for one, `dupe(T, slice)` to copy, `realloc` to resize. Allocating methods return `error.OutOfMemory` on failure.
+
+</Definition>
+
+<Definition term="ownership">
+
+The code that must eventually free some memory **owns** it. Zig has no automatic ownership tracking, so ownership is part of each function's contract: a function that returns allocated memory documents that the caller owns it and must free it with the same allocator.
+
+</Definition>
+
+<Definition term="general-purpose allocator">
+
+An allocator that can allocate and free individually in any order. In Zig 0.17 the standard choice while developing is `std.heap.SafeAllocator`, which detects leaks, double frees and many uses of freed memory (it replaces the older `DebugAllocator`, formerly `GeneralPurposeAllocator`). For release builds there is the fast, thread-safe `std.heap.smp_allocator`, and `std.heap.c_allocator` when linking the C library. A `main` that takes `std.process.Init` receives a suitable one as `init.gpa`.
+
+</Definition>
+
+<Definition term="arena allocator">
+
+`std.heap.ArenaAllocator` hands out memory from large blocks obtained from another allocator and frees everything at once in `deinit`. Individual `free` calls do (almost) nothing. Ideal when many objects share one lifetime: one request, one compilation phase, one frame.
+
+</Definition>
+
+<Definition term="fixed buffer allocator">
+
+`std.heap.FixedBufferAllocator` allocates from a byte array you give it, typically on the stack, and returns `error.OutOfMemory` when it is full. No heap is touched at all.
+
+</Definition>
+
+</Section>
+
+<Section id="computation" kind="computation" title="Allocating, freeing and growing">
+
+```zig check
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const Point = struct { x: i32, y: i32 };
+
+/// Returns memory the caller owns and must free with the same allocator.
+fn repeat(gpa: Allocator, text: []const u8, times: usize) ![]u8 {
+    const out = try gpa.alloc(u8, text.len * times);
+    for (0..times) |i| @memcpy(out[i * text.len ..][0..text.len], text);
+    return out;
+}
+
+pub fn main() !void {
+    // A general-purpose allocator for this program: one that checks for leaks
+    // and double frees in debug builds.
+    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = safe.deinit();
+    const gpa = safe.allocator();
+
+    // A slice of many items: alloc / free.
+    const squares = try gpa.alloc(u64, 5);
+    defer gpa.free(squares);
+    for (squares, 0..) |*s, i| s.* = i * i;
+    std.debug.print("squares {any}\n", .{squares});
+
+    // A single item: create / destroy.
+    const p = try gpa.create(Point);
+    defer gpa.destroy(p);
+    p.* = .{ .x = 3, .y = -1 };
+    std.debug.print("point ({d}, {d})\n", .{ p.x, p.y });
+
+    // Copying and formatting strings onto the heap.
+    const copy = try gpa.dupe(u8, "Kraków");
+    defer gpa.free(copy);
+    const label = try std.fmt.allocPrint(gpa, "{s} has {d} bytes", .{ copy, copy.len });
+    defer gpa.free(label);
+    std.debug.print("{s}\n", .{label});
+
+    const echo = try repeat(gpa, "ha", 3);
+    defer gpa.free(echo);
+    std.debug.print("{s}\n", .{echo});
+
+    // A growable list. ArrayList does not store its allocator: you pass it to each call.
+    var primes: std.ArrayList(u32) = .empty;
+    defer primes.deinit(gpa);
+    var n: u32 = 2;
+    while (primes.items.len < 10) : (n += 1) {
+        const is_prime = for (primes.items) |q| {
+            if (n % q == 0) break false;
+        } else true;
+        if (is_prime) try primes.append(gpa, n);
+    }
+    std.debug.print("primes {any} (capacity {d})\n", .{ primes.items, primes.capacity });
+}
+```
+
+```text
+squares { 0, 1, 4, 9, 16 }
+point (3, -1)
+Kraków has 7 bytes
+hahaha
+primes { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29 } (capacity 33)
+```
+
+The pattern repeats on every allocation: **allocate, then `defer` the free on the very next line.** `alloc`/`free` handle slices; `create`/`destroy` a single value. `dupe` and `allocPrint` return new heap strings that this code owns. `repeat` shows the contract for your own functions: it returns `![]u8`, memory the caller must free (its doc comment says so), and `@memcpy` copies bytes into each part of the result. (`Kraków` is 7 bytes because `ó` takes two in UTF-8.)
+
+When a function allocates several things and returns them together, the `errdefer` habit from the last lesson becomes essential, because a failure halfway must not leak the parts already allocated:
+
+```zig
+fn makePair(gpa: Allocator, a: []const u8, b: []const u8) !struct { []u8, []u8 } {
+    const first = try gpa.dupe(u8, a);
+    errdefer gpa.free(first); // only if the second allocation fails
+    const second = try gpa.dupe(u8, b);
+    return .{ first, second }; // success: the caller now owns both
+}
+```
+
+`std.ArrayList(u32)` is Zig's growable array. Since Zig 0.15 it does not store an allocator: it starts as `.empty`, and you pass the allocator to every method that may allocate (`append`, `appendSlice`, `ensureTotalCapacity`) and to `deinit`. That makes every possible allocation visible at the call site and the list itself smaller. The capacity of 33 shows the list's growth strategy: it allocates more than it needs, so that most appends are cheap. When you know the final size, `ensureTotalCapacity` once and then `appendAssumeCapacity` avoid repeated growth.
+
+</Section>
+
+<Section id="maps" kind="examples" title="Hash maps and who owns the keys">
+
+```zig check
+const std = @import("std");
+
+const text =
+    \\the river runs to the sea and the sea runs
+    \\to the sky and the sky rains on the river
+;
+
+const Entry = struct { word: []const u8, count: u32 };
+
+fn byCountThenWord(_: void, a: Entry, b: Entry) bool {
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.lessThan(u8, a.word, b.word);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa; // the program's general-purpose allocator, set up by the startup code
+
+    // Keys are slices of `text`, which outlives the map, so they need no copying.
+    var counts: std.StringHashMap(u32) = .init(gpa);
+    defer counts.deinit();
+
+    var words = std.mem.tokenizeAny(u8, text, " \n");
+    while (words.next()) |w| {
+        const slot = try counts.getOrPut(w);
+        if (!slot.found_existing) slot.value_ptr.* = 0;
+        slot.value_ptr.* += 1;
+    }
+
+    // Hash maps have no order: copy the entries into a list and sort them.
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(gpa);
+    try entries.ensureTotalCapacity(gpa, counts.count());
+    var it = counts.iterator();
+    while (it.next()) |kv| entries.appendAssumeCapacity(.{ .word = kv.key_ptr.*, .count = kv.value_ptr.* });
+    std.mem.sort(Entry, entries.items, {}, byCountThenWord);
+
+    std.debug.print("{d} distinct words; top five:\n", .{counts.count()});
+    for (entries.items[0..5]) |e| std.debug.print("  {s:<6} {d}\n", .{ e.word, e.count });
+}
+```
+
+```text
+9 distinct words; top five:
+  the    6
+  and    2
+  river  2
+  runs   2
+  sea    2
+```
+
+This `main` uses `init.gpa`, the general-purpose allocator the startup code provides (a checking allocator in debug builds). `std.StringHashMap(u32)` maps byte-slice keys to values. Unlike `ArrayList`, the hash maps in 0.17 come in two flavours: this "managed" one stores its allocator (`.init(gpa)`, then `deinit()` with no argument), and `std.StringHashMapUnmanaged` takes the allocator on each call like `ArrayList`. Library code increasingly prefers the unmanaged forms.
+
+`getOrPut` looks a key up and inserts it if missing in a single hash operation, returning a pointer to the value slot; it is the idiomatic way to count. **The map stores the key slices, not copies of the bytes.** Here the keys point into `text`, a constant that lives for the whole program, so that is safe. If the words came from a buffer that is reused for each line of a file, every key would silently change under the map. In that case, copy each new key with `try gpa.dupe(u8, w)` when `found_existing` is false, and free the keys before `deinit`, or put the keys in an arena. Deciding who owns map keys is one of the first real design questions in any Zig program.
+
+Hash maps have no order, so to print the most frequent words the program copies the entries into a list and sorts it, by count and then alphabetically, with a comparison function that takes a context (`void` here) and two items.
+
+</Section>
+
+<Section id="strategies" kind="examples" title="Arenas and fixed buffers">
+
+```zig check
+const std = @import("std");
+
+const Node = struct {
+    name: []const u8,
+    children: std.ArrayList(*Node) = .empty,
+};
+
+fn addChild(arena: std.mem.Allocator, parent: *Node, name: []const u8) !*Node {
+    const child = try arena.create(Node);
+    child.* = .{ .name = try arena.dupe(u8, name) };
+    try parent.children.append(arena, child);
+    return child;
+}
+
+fn printTree(node: *const Node, depth: usize) void {
+    for (0..depth) |_| std.debug.print("  ", .{});
+    std.debug.print("{s}\n", .{node.name});
+    for (node.children.items) |c| printTree(c, depth + 1);
+}
+
+pub fn main() !void {
+    // An arena hands out memory and frees all of it at once in deinit.
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var root: Node = .{ .name = "world" };
+    const africa = try addChild(arena, &root, "Africa");
+    _ = try addChild(arena, africa, "Ghana");
+    _ = try addChild(arena, africa, "Kenya");
+    const asia = try addChild(arena, &root, "Asia");
+    _ = try addChild(arena, asia, "Mongolia");
+    printTree(&root, 0); // no individual frees anywhere: the arena owns every node
+
+    // A fixed buffer allocator never touches the heap, and fails cleanly when full.
+    var buffer: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    const small = fba.allocator();
+    var list: std.ArrayList(u32) = .empty;
+    var pushed: u32 = 0;
+    while (true) : (pushed += 1) {
+        list.append(small, pushed) catch |err| {
+            std.debug.print("stopped after {d} items: {t}\n", .{ pushed, err });
+            break;
+        };
+    }
+}
+```
+
+```text
+world
+  Africa
+    Ghana
+    Kenya
+  Asia
+    Mongolia
+stopped after 33 items: OutOfMemory
+```
+
+The tree has six nodes, each with a heap-allocated name and a list of children, and the code frees none of them individually. Every allocation came from the arena, and `arena_state.deinit()` releases all of it at once. This is simpler and faster than tracking each node, and it is exactly right when the whole structure lives and dies together. Notice that the children lists also grow inside the arena: `append` may reallocate a list several times, and the arena simply keeps the old blocks until the end. Compilers, parsers, request handlers and game frames use arenas this way. The cost is that memory is only released at the end; an arena is the wrong choice for a long-running process that allocates and frees steadily.
+
+The fixed buffer allocator served the list from a 256-byte array on the stack until the list asked for more room than remained, and then `append` returned `error.OutOfMemory`, which the program handled like any other error. No heap, no crash: this is how Zig code runs on devices with no heap at all, and how you can cap the memory a task may use.
+
+</Section>
+
+<Section id="leaks" kind="examples" title="Catching leaks">
+
+Forgetting a `free` is easy. Here the second greeting is never freed:
+
+```zig check
+const std = @import("std");
+
+fn makeGreeting(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "Hello, {s}!", .{name});
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const kept = try makeGreeting(gpa, "Ayumi");
+    defer gpa.free(kept);
+    const forgotten = try makeGreeting(gpa, "Tomás"); // bug: never freed
+    std.debug.print("{s} {s}\n", .{ kept, forgotten });
+}
+```
+
+The program works, and then, as it exits, the checking allocator behind `init.gpa` reports (abridged: standard-library frames are left out and their paths shortened):
+
+```text
+Hello, Ayumi! Hello, Tomás!
+error(SafeAllocator): leaked [addr: 74208ab51288, len: 14 (0xe) align: 1] allocated at: 
+.../lib/std/mem/Allocator.zig:512:27: 0x11f6142 in print__func_829 (std.zig)
+    return aw.toOwnedSlice();
+                          ^
+...
+/tmp/tmp90q5y0pg/main.zig:4:30: 0x11e996b in makeGreeting (main.zig)
+    return std.fmt.allocPrint(gpa, "Hello, {s}!", .{name});
+                             ^
+/tmp/tmp90q5y0pg/main.zig:11:39: 0x11e9b0e in main (main.zig)
+    const forgotten = try makeGreeting(gpa, "Tomás"); // bug: never freed
+                                      ^
+...
+```
+
+The report gives the size of the leaked block (14 bytes: `Hello, Tomás!` with its two-byte `á`) and the stack trace of the allocation, which leads straight to the line to fix. The leak is reported but does not change the exit status of `main`. In tests, `std.testing.allocator` does the same checking and *fails* the test, which is how most Zig projects catch leaks: every test that allocates uses it, so a leak anywhere is a test failure. Double frees and many uses of freed memory are caught too, as panics.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Choosing an allocator">
+
+| Situation | Allocator |
+| --- | --- |
+| Developing and testing | `SafeAllocator` (or `init.gpa`), `std.testing.allocator` in tests |
+| A release build that allocates and frees in any order | `std.heap.smp_allocator`, or `c_allocator` if you link libc |
+| Many objects that die together | `ArenaAllocator` on top of another allocator |
+| A known upper bound, or no heap | `FixedBufferAllocator` on a stack or static buffer |
+| Big, page-sized chunks | `std.heap.page_allocator` (every allocation is at least one page) |
+
+Two more tools are worth knowing. `std.heap.MemoryPool(T)` hands out and recycles objects of a single type very quickly, which suits node-based structures that churn. And `list.toOwnedSlice(gpa)` turns a finished `ArrayList` into a plain slice that the caller owns, the usual way for a function to build a result of unknown length and hand it back.
+
+Two habits make this work in larger programs. **Accept an allocator, don't choose one:** library functions take `std.mem.Allocator` as a parameter and let the application decide. And **name the lifetime:** many Zig programs pass two allocators, a general-purpose `gpa` for things that live long and an `arena` for scratch memory that dies at the end of the current task. The `std.process.Init` parameter of `main` provides both (`init.gpa` and `init.arena`), which is a nudge toward that style. The same philosophy has recently been extended to input and output: functions that do I/O take a `std.Io` parameter, just as functions that allocate take an `Allocator`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Explicit allocators mean Zig code is full of `malloc` and `free` calls, like C."** Much Zig code allocates through containers and arenas, where a single `defer deinit` covers many allocations. What is explicit is *who decides*, not how many lines it takes.
+
+</Misconception>
+
+<Misconception>
+
+**"I can free memory with any allocator."** Memory must be freed by the allocator that allocated it, with the same length it was allocated with (the slice you got back). Freeing with a different allocator is illegal behaviour; `SafeAllocator` detects some of these mistakes.
+
+</Misconception>
+
+<Misconception>
+
+**"An arena leaks memory because nothing is freed."** Nothing is freed *individually*; everything is freed by `deinit`. An arena only leaks in the sense that matters if it lives too long, for example an arena that is never reset in a server loop.
+
+</Misconception>
+
+<Misconception>
+
+**"A `std.StringHashMap` copies my keys."** It stores the slices you give it. If the bytes behind a key change or are freed, the map is corrupted. Copy keys whose bytes you do not control.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

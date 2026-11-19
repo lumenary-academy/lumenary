@@ -1,0 +1,489 @@
+---
+title: "A project: CMake, packages and the Core Guidelines"
+subtitle: A complete small program in idiomatic C++23, the build system and package manager around it, and how professional teams keep a C++ codebase healthy.
+minutes: 75
+objectives:
+  - Read and extend a complete C++23 program that uses classes, std::expected, containers, ranges and a custom formatter
+  - Organise a project into a library, an executable and tests, and build it with CMake targets
+  - Add dependencies with vcpkg or Conan, and run tests with CTest
+  - Configure warnings, sanitizers, clang-format and clang-tidy as part of the build
+  - Use the C++ Core Guidelines to justify design decisions, and know where to go next
+prerequisites: [concurrency]
+references:
+  - title: CMake documentation
+    url: https://cmake.org/cmake/help/latest/
+    note: Start with the tutorial, then the reference for add_library, target_link_libraries and target_compile_features.
+  - title: vcpkg
+    author: Microsoft
+    url: https://vcpkg.io/
+    note: A C and C++ package manager; manifest mode keeps dependencies in a vcpkg.json file in the repository.
+  - title: Conan
+    url: https://conan.io/
+    note: A decentralised C and C++ package manager with a large public package index, ConanCenter.
+  - title: GoogleTest
+    url: https://github.com/google/googletest
+  - title: clang-tidy
+    author: LLVM project
+    url: https://clang.llvm.org/extra/clang-tidy/
+  - title: C++ Core Guidelines
+    url: https://isocpp.github.io/CppCoreGuidelines/
+  - title: CppCon
+    url: https://cppcon.org/
+    note: The largest C++ conference; its talks are published free online and are one of the best ways to keep learning.
+---
+
+<Section id="motivation" kind="motivation" title="From programs to projects">
+
+Everything so far has been one file, compiled with one command. Real C++ lives in projects: dozens or thousands of files, third-party libraries, tests, several compilers and platforms, and a team. The language alone does not tell you how to organise that. C++ has no official build tool and no official package manager, which surprises people coming from Rust's Cargo or JavaScript's npm. Instead it has *de facto* standards that most projects now share: **CMake** to describe the build, **vcpkg** or **Conan** to fetch libraries, **GoogleTest** or **Catch2** for tests, and **clang-format** and **clang-tidy** to keep the code consistent and catch mistakes.
+
+This lesson builds a complete small program in the style of the whole course, then wraps it in that professional tooling.
+
+</Section>
+
+<Section id="project" kind="computation" title="The program: splitting shared expenses">
+
+Four friends travel together and take turns paying. At the end, who owes whom? The program reads lines like `Amara; 120.00; Amara, Bruno, Chen, Dilnoza` (payer, amount, the people who share it), reports lines it cannot parse, prints each person's balance, and proposes transfers to settle up. The names and amounts are invented.
+
+```cpp check
+// splitter: who owes whom after a shared trip.
+// One file here; in the repository it is split into ledger.hpp, ledger.cpp, main.cpp and tests.
+#include <algorithm>
+#include <cassert>
+#include <charconv>
+#include <cstdint>
+#include <cstdlib>
+#include <expected>
+#include <format>
+#include <map>
+#include <print>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace splitter {
+
+// Money in integer cents: never use floating point for currency.
+class Money {
+public:
+    constexpr Money() = default;
+    constexpr explicit Money(std::int64_t cents) : cents_{cents} {}
+    constexpr std::int64_t cents() const { return cents_; }
+    constexpr Money& operator+=(Money o) { cents_ += o.cents_; return *this; }
+    constexpr Money& operator-=(Money o) { cents_ -= o.cents_; return *this; }
+    friend constexpr Money operator-(Money m) { return Money{-m.cents_}; }
+    friend constexpr auto operator<=>(Money, Money) = default;
+private:
+    std::int64_t cents_ = 0;
+};
+
+struct Expense {
+    std::string payer;
+    Money amount;
+    std::vector<std::string> shared_by;
+};
+
+struct Transfer {
+    std::string from;
+    std::string to;
+    Money amount;
+};
+
+enum class ParseError { missing_field, bad_amount, no_participants };
+
+std::string_view describe(ParseError e) {
+    switch (e) {
+        case ParseError::missing_field: return "expected payer;amount;names";
+        case ParseError::bad_amount: return "amount must look like 12.50";
+        case ParseError::no_participants: return "nobody shares this expense";
+    }
+    return "unknown error";
+}
+
+std::string_view trim(std::string_view s) {
+    while (!s.empty() && s.front() == ' ') s.remove_prefix(1);
+    while (!s.empty() && s.back() == ' ') s.remove_suffix(1);
+    return s;
+}
+
+// "12.50" -> 1250 cents. Accepts 0, 1 or 2 decimal digits.
+std::expected<Money, ParseError> parse_money(std::string_view s) {
+    auto dot = s.find('.');
+    std::string_view whole = s.substr(0, dot);
+    std::string_view frac = dot == std::string_view::npos ? "" : s.substr(dot + 1);
+    if (whole.empty() || frac.size() > 2) return std::unexpected(ParseError::bad_amount);
+    std::int64_t units = 0;
+    std::int64_t hundredths = 0;
+    auto r1 = std::from_chars(whole.data(), whole.data() + whole.size(), units);
+    if (r1.ec != std::errc{} || r1.ptr != whole.data() + whole.size() || units < 0)
+        return std::unexpected(ParseError::bad_amount);
+    if (!frac.empty()) {
+        auto r2 = std::from_chars(frac.data(), frac.data() + frac.size(), hundredths);
+        if (r2.ec != std::errc{} || r2.ptr != frac.data() + frac.size())
+            return std::unexpected(ParseError::bad_amount);
+        if (frac.size() == 1) hundredths *= 10;
+    }
+    return Money{units * 100 + hundredths};
+}
+
+// One line: "payer; amount; name, name, ..."
+std::expected<Expense, ParseError> parse_line(std::string_view line) {
+    auto parts = line | std::views::split(';')
+                      | std::views::transform([](auto r) { return trim(std::string_view(r)); })
+                      | std::ranges::to<std::vector>();
+    if (parts.size() != 3 || parts[0].empty()) return std::unexpected(ParseError::missing_field);
+    auto amount = parse_money(parts[1]);
+    if (!amount) return std::unexpected(amount.error());
+    Expense e{std::string(parts[0]), *amount, {}};
+    for (auto name : parts[2] | std::views::split(',')) {
+        auto n = trim(std::string_view(name));
+        if (!n.empty()) e.shared_by.emplace_back(n);
+    }
+    if (e.shared_by.empty()) return std::unexpected(ParseError::no_participants);
+    return e;
+}
+
+// Net balance per person: positive means others owe them.
+std::map<std::string, Money> balances(const std::vector<Expense>& expenses) {
+    std::map<std::string, Money> net;
+    for (const auto& e : expenses) {
+        net[e.payer] += e.amount;
+        const auto n = static_cast<std::int64_t>(e.shared_by.size());
+        const std::int64_t share = e.amount.cents() / n;
+        const std::int64_t leftover = e.amount.cents() % n;   // the first few pay one cent more
+        for (std::int64_t i = 0; i < n; ++i) {
+            net[e.shared_by[static_cast<std::size_t>(i)]] -= Money{share + (i < leftover ? 1 : 0)};
+        }
+    }
+    return net;
+}
+
+// Greedy settlement: repeatedly match the largest debtor with the largest creditor.
+std::vector<Transfer> settle(std::map<std::string, Money> net) {
+    std::vector<Transfer> plan;
+    if (net.empty()) return plan;
+    while (true) {
+        auto [debtor, creditor] = std::ranges::minmax_element(net, {}, [](const auto& kv) { return kv.second; });
+        if (creditor->second.cents() <= 0) break;
+        Money amount = std::min(creditor->second, -debtor->second);
+        plan.push_back({debtor->first, creditor->first, amount});
+        debtor->second += amount;
+        creditor->second -= amount;
+    }
+    return plan;
+}
+
+}  // namespace splitter
+
+template <>
+struct std::formatter<splitter::Money> : std::formatter<std::string> {
+    auto format(splitter::Money m, std::format_context& ctx) const {
+        auto c = m.cents();
+        auto text = std::format("{}{}.{:02}", c < 0 ? "-" : "", std::abs(c) / 100, std::abs(c) % 100);
+        return std::formatter<std::string>::format(text, ctx);
+    }
+};
+
+void self_test() {
+    using namespace splitter;
+    assert(parse_money("12.5").value() == Money{1250});
+    assert(parse_money("7").value() == Money{700});
+    assert(!parse_money("1.234").has_value());
+    assert(parse_line("Ama; 10; Ama, Ben").value().shared_by.size() == 2);
+    auto net = balances({{"A", Money{100}, {"A", "B", "C"}}});   // 1.00 split three ways
+    assert(net["A"] == Money{66} && net["B"] == Money{-33} && net["C"] == Money{-33});
+}
+
+int main() {
+    self_test();
+
+    constexpr std::string_view input =
+        "Amara; 120.00; Amara, Bruno, Chen, Dilnoza\n"
+        "Bruno; 45.60; Bruno, Chen\n"
+        "Chen; eighty; Amara, Chen\n"
+        "Dilnoza; 33.3; Amara, Bruno, Chen, Dilnoza\n"
+        "Amara; 9.99; Dilnoza\n";
+
+    std::vector<splitter::Expense> expenses;
+    int line_no = 0;
+    for (auto raw : input | std::views::split('\n')) {
+        std::string_view line(raw);
+        if (line.empty()) continue;
+        ++line_no;
+        if (auto e = splitter::parse_line(line)) {
+            expenses.push_back(std::move(*e));
+        } else {
+            std::println("line {} skipped: {}", line_no, splitter::describe(e.error()));
+        }
+    }
+
+    auto net = splitter::balances(expenses);
+    std::println("{:<8} {:>9}", "person", "balance");
+    for (const auto& [person, amount] : net) std::println("{:<8} {:>9}", person, amount);
+
+    std::println("settle up:");
+    for (const auto& t : splitter::settle(net)) {
+        std::println("  {} pays {} {}", t.from, t.to, t.amount);
+    }
+}
+```
+
+```text
+line 3 skipped: amount must look like 12.50
+person     balance
+Amara        91.66
+Bruno       -15.53
+Chen        -61.12
+Dilnoza     -15.01
+settle up:
+  Chen pays Amara 61.12
+  Bruno pays Amara 15.53
+  Dilnoza pays Amara 15.01
+```
+
+Almost every lesson of the course appears somewhere in it.
+
+- **Values and types.** Money is a small class around an integer number of cents. Floating-point numbers cannot represent most decimal fractions exactly (0.1 has no exact binary form), and errors accumulate, so financial code uses integers or decimal types. `Money` is a distinct type, so a count of people cannot be added to an amount by mistake; its constructor is `explicit` for the same reason.
+- **Classes and the rule of zero.** No class in the program declares a destructor or copy operation. `Expense` and `Transfer` are plain structs; `Money` defaults its comparisons with `<=>`.
+- **Errors as values.** `parse_money` and `parse_line` return `std::expected`, and `main` reports a bad line and carries on, which is right for input that users type. Nothing throws.
+- **The standard library.** `std::views::split` and `std::ranges::to` break lines into fields; `std::map` keeps balances sorted by name; `std::ranges::minmax_element` with a projection finds the largest debtor and creditor in one pass.
+- **Templates.** The `std::formatter` specialisation inherits from the string formatter, so `Money` supports widths and alignment (`{:>9}`) for free.
+- **Correctness.** Splitting 33.30 four ways does not divide evenly; `balances` gives the first `leftover` people one extra cent so the shares add up exactly, and the balances sum to zero. `settle` guards against an empty map before calling `minmax_element`, whose result must not be dereferenced on an empty range. `self_test` checks a few facts with `assert` every time the program starts, a stand-in for the real tests below.
+
+<Example title="Why Money counts cents">
+
+The first design decision, integer cents, deserves a demonstration. Add ten coffees at 0.10 each, once with `double` and once with integer cents:
+
+```cpp check
+#include <cstdint>
+#include <print>
+
+int main() {
+    double total = 0.0;
+    std::int64_t total_cents = 0;
+    for (int i = 0; i < 10; ++i) {
+        total += 0.10;        // ten coffees at 0.10 each
+        total_cents += 10;
+    }
+    std::println("double: {} (== 1.0? {})", total, total == 1.0);
+    std::println("cents:  {}.{:02}", total_cents / 100, total_cents % 100);
+    std::println("0.1 is really {:.20f}", 0.1);
+}
+```
+
+```text
+double: 0.9999999999999999 (== 1.0? false)
+cents:  1.00
+0.1 is really 0.10000000000000000555
+```
+
+The `double` total is not 1.0, because 0.1 cannot be stored exactly in binary floating point and every addition rounds. Printed with default formatting it shows its true value, 0.9999999999999999, and a comparison with 1.0 fails. With integer cents there is nothing to round. Floating point is the right tool for measurements and science, where every value is approximate anyway; it is the wrong tool for money, where every cent must be accounted for.
+
+</Example>
+
+The greedy settlement is simple and always settles everyone, but it does not always find the fewest possible transfers (that problem is NP-hard in general). Being able to say what an algorithm does *not* guarantee is part of writing it professionally.
+
+</Section>
+
+<Section id="layout" kind="examples" title="A project layout and a CMake build">
+
+In a repository, the program becomes a small library with a thin `main` and its own tests:
+
+```text
+splitter/
+├── CMakeLists.txt
+├── vcpkg.json
+├── .clang-format
+├── .clang-tidy
+├── include/splitter/ledger.hpp     declarations: Money, Expense, parse_line, balances, settle
+├── src/ledger.cpp                  definitions
+├── src/main.cpp                    reads the input, prints the report
+└── tests/ledger_test.cpp           GoogleTest unit tests
+```
+
+Putting the logic in a library means the tests link exactly the code the program runs. The header holds only what callers need, with the implementation in the source file:
+
+```cpp
+// include/splitter/ledger.hpp
+#pragma once
+#include <expected>
+#include <map>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace splitter {
+class Money { /* as in the program: small, so it stays entirely in the header */ };
+struct Expense { std::string payer; Money amount; std::vector<std::string> shared_by; };
+struct Transfer { std::string from; std::string to; Money amount; };
+enum class ParseError { missing_field, bad_amount, no_participants };
+
+std::string_view describe(ParseError e);
+std::expected<Expense, ParseError> parse_line(std::string_view line);
+std::map<std::string, Money> balances(const std::vector<Expense>& expenses);
+std::vector<Transfer> settle(std::map<std::string, Money> net);
+}  // namespace splitter
+```
+
+`#pragma once` stops the header being pasted twice into one translation unit; it is not in the standard, but every major compiler supports it, and the older alternative is an `#ifndef` include guard. Helpers such as `trim` and `parse_money` stay out of the header, in an unnamed namespace in `ledger.cpp`, unless tests need them. **CMake** describes the build in terms of **targets** (libraries and executables) and their properties:
+
+```cmake
+cmake_minimum_required(VERSION 3.25)
+project(splitter VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_EXTENSIONS OFF)   # -std=c++23 rather than -std=gnu++23
+option(SPLITTER_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+# The logic, as a library that both the program and the tests link.
+add_library(splitter_core src/ledger.cpp)
+target_include_directories(splitter_core PUBLIC include)
+target_compile_features(splitter_core PUBLIC cxx_std_23)
+target_compile_options(splitter_core PRIVATE
+  "$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Wconversion>"
+  "$<$<CXX_COMPILER_ID:MSVC>:/W4>")
+
+if(SPLITTER_SANITIZE)
+  target_compile_options(splitter_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(splitter_core PUBLIC -fsanitize=address,undefined)
+endif()
+
+add_executable(splitter src/main.cpp)
+target_link_libraries(splitter PRIVATE splitter_core)
+
+include(CTest)
+if(BUILD_TESTING)
+  find_package(GTest CONFIG REQUIRED)
+  add_executable(splitter_tests tests/ledger_test.cpp)
+  target_link_libraries(splitter_tests PRIVATE splitter_core GTest::gtest_main)
+  include(GoogleTest)
+  gtest_discover_tests(splitter_tests)
+endif()
+```
+
+The key idea of modern CMake is that requirements travel with targets. `PUBLIC` on the include directory and on `cxx_std_23` means "anything that links `splitter_core` gets these too", so the executable and the tests are compiled with the right standard and can include `splitter/ledger.hpp` without repeating anything. `PRIVATE` warnings apply only to the library's own files. Generator expressions (`$<...>`) choose flags per compiler. Avoid the older style of setting global variables such as `CMAKE_CXX_FLAGS` for everything; it does not compose when your project becomes someone else's dependency.
+
+A test file is ordinary C++ using the framework's macros:
+
+```cpp
+#include <gtest/gtest.h>
+#include "splitter/ledger.hpp"
+
+using namespace splitter;
+
+TEST(Balances, SplitsLeftoverCentsSoTheTotalIsExact) {
+    auto net = balances({{"A", Money{100}, {"A", "B", "C"}}});
+    EXPECT_EQ(net["A"], Money{66});
+    EXPECT_EQ(net["B"], Money{-33});
+    EXPECT_EQ(net["C"], Money{-33});
+}
+```
+
+Building and testing is then the same three commands on every platform:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DSPLITTER_SANITIZE=ON \
+      -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Teams usually record such settings in a `CMakePresets.json` file, so that `cmake --preset debug-asan` replaces the long first line and every developer and CI machine configures the same way. CMake also writes a `compile_commands.json` when asked (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), which editors' language servers and clang-tidy read to know exactly how each file is compiled.
+
+</Section>
+
+<Section id="packages" kind="examples" title="Getting libraries: vcpkg and Conan">
+
+The test target needs GoogleTest. C++ has two widely used package managers, and both integrate with CMake through `find_package`.
+
+With **vcpkg**, a `vcpkg.json` manifest in the repository lists the dependencies:
+
+```json
+{
+  "name": "splitter",
+  "version": "0.1.0",
+  "dependencies": ["gtest"]
+}
+```
+
+Passing vcpkg's toolchain file to CMake (as in the commands above) makes vcpkg build or download each dependency for your compiler and platform the first time you configure, and `find_package(GTest CONFIG REQUIRED)` then finds it. A `builtin-baseline` field pins the exact versions of the whole package collection, so that everybody gets the same ones.
+
+With **Conan**, a `conanfile.txt` (or a Python `conanfile.py` for more control) plays the same role:
+
+```text
+[requires]
+gtest/1.14.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+```
+
+`conan install . --output-folder=build --build=missing` fetches or builds the packages and writes a `conan_toolchain.cmake` into `build/`, which you pass to CMake as the toolchain file. Conan's strengths are binary caching across a company and fine control over build settings; vcpkg's are tight CMake and Visual Studio integration and a single curated collection. Both are reasonable; pick one per project. Some projects avoid package managers entirely with CMake's `FetchContent`, which downloads a dependency's source at configure time, convenient for small projects but slower and harder to cache.
+
+</Section>
+
+<Section id="quality" kind="human" title="Formatting, static analysis and the Core Guidelines">
+
+**clang-format** rewrites source code to a consistent layout described in a `.clang-format` file (for example `BasedOnStyle: Google` plus a few overrides). Running it automatically, in the editor on save and in CI as a check, ends arguments about brace placement for good.
+
+**clang-tidy** is a static analyser and linter with hundreds of checks, configured in `.clang-tidy`. Families worth enabling early: `bugprone-*` (likely bugs such as suspicious string comparisons and use-after-move), `modernize-*` (old idioms with modern replacements), `performance-*` (needless copies), and `cppcoreguidelines-*`, which enforces a subset of the **C++ Core Guidelines**.
+
+The Core Guidelines, edited by Bjarne Stroustrup and Herb Sutter, are a large set of rules, each with a reason, examples and a note on how a tool could enforce it. You do not read them cover to cover; you look rules up when a design question comes up, and cite them in code review. Several shaped this program:
+
+| Rule | In short | Where it shows |
+| --- | --- | --- |
+| P.1 | express ideas directly in code | `Money` instead of a bare integer |
+| ES.20 | always initialise an object | default member initialiser `cents_ = 0` |
+| Con.1 | make objects immutable by default | `const` locals in `balances` |
+| F.16 | pass cheap types by value, others by `const&` | `Money` by value, `std::vector` by `const&` |
+| C.20 | avoid defining default operations when you can | no destructors or copies anywhere |
+| R.1 | manage resources with RAII handles | containers and strings own all memory |
+| I.11 | never transfer ownership by a raw pointer | no raw owning pointers at all |
+
+(The rule names in the second column are paraphrased; the [guidelines](https://isocpp.github.io/CppCoreGuidelines/) give each one's exact wording and rationale.)
+
+It helps to picture what happens to a single change in such a team. A developer edits `ledger.cpp`; their editor, reading `compile_commands.json`, shows clang-tidy warnings as they type, and clang-format tidies the file on save. They add a test, run `ctest` locally, and open a pull request. Continuous integration then configures the project from the presets on Linux, Windows and macOS, builds with GCC, Clang and MSVC, runs the tests in a normal build, an ASan-and-UBSan build and a ThreadSanitizer build, and checks formatting and static analysis. Only when all of that passes, and a colleague has reviewed the change, is it merged. Each step is cheap; together they catch most mistakes before a user ever sees them.
+
+Put together, a healthy C++ project in 2026 typically has: a CMake build with presets; dependencies pinned through vcpkg or Conan; warnings high and treated as errors in CI; a test suite run on at least two compilers, under ASan with UBSan and separately under ThreadSanitizer; clang-format and clang-tidy checks on every change; and, increasingly, a hardened standard library in production. None of it is glamorous, and all of it is what lets a team change a large C++ codebase without fear.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"CMake builds my code."** CMake is a build-system *generator*: it reads `CMakeLists.txt` and writes files for a real build tool, usually Ninja, Make or Visual Studio's MSBuild, which then runs the compiler. That is why there are two steps (configure, then build), and why a build directory can be deleted and regenerated at any time.
+
+</Misconception>
+
+<Misconception>
+
+**"Warnings are optional extras."** Many serious bugs in this course (narrowing, signed–unsigned comparisons, initialiser order, pessimising moves) are reported only as warnings. A project that tolerates a hundred existing warnings will not notice the hundred-and-first. Keep the count at zero and make CI enforce it with `-Werror` or `/WX`.
+
+</Misconception>
+
+<Misconception>
+
+**"Using a package manager means my build depends on the internet."** Both vcpkg and Conan can work from a local cache or a company mirror, and binary caching means most builds download nothing new. Pinning versions (a vcpkg baseline, Conan lockfiles) makes builds reproducible.
+
+</Misconception>
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You now know the core of modern C++ and the practices around it. Some directions, depending on where you want to go:
+
+- **Deepen the language.** Bjarne Stroustrup's *A Tour of C++* (third edition, covering C++20) is a compact overview by the language's designer; Scott Meyers's *Effective Modern C++* explains the C++11 and C++14 features in depth, and most of its advice still holds. Keep [cppreference](https://en.cppreference.com/w/cpp) open as you work.
+- **Watch the community.** Talks from [CppCon](https://cppcon.org/), C++Now and Meeting C++ are published free and range from beginner-friendly to the frontier of the language, including static reflection and contracts in C++26.
+- **Read real code.** Well-engineered open-source C++ projects such as LLVM, Abseil, fmt, Godot or DuckDB show how large codebases organise headers, tests and builds. Start with a small issue labelled for newcomers.
+- **Extend this project.** Read expenses from a file given on the command line (`std::ifstream`), support several currencies with exchange rates, print the settlement as JSON, or find a settlement with fewer transfers. Each extension exercises a different part of the course.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

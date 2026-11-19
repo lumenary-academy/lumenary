@@ -1,0 +1,88 @@
+{
+  "lesson": "allocators",
+  "exercises": [
+    {
+      "id": "fixed-buffer-count",
+      "type": "integer",
+      "difficulty": "warm-up",
+      "mode": "C",
+      "prompt": "How many times does the loop below allocate successfully before `alloc` fails?\n\n```zig\nvar buffer: [20]u8 = undefined;\nvar fba: std.heap.FixedBufferAllocator = .init(&buffer);\nconst a = fba.allocator();\nvar ok: u32 = 0;\nwhile (true) {\n    _ = a.alloc(u8, 6) catch break;\n    ok += 1;\n}\nstd.debug.print(\"{d}\\n\", .{ok});\n```",
+      "answer": 3,
+      "feedback": [{"match": "4", "message": "Not yet — four allocations of 6 bytes would need 24 bytes, but the buffer has 20."}],
+      "hints": ["Each allocation takes 6 bytes of the 20, and bytes need no alignment padding.", "Nothing is ever freed in this loop."],
+      "solution": "Three allocations use 18 bytes; the fourth would need bytes 18 to 23, but the buffer ends at 20, so `alloc` returns `error.OutOfMemory` and the loop breaks. It prints **3**. (Allocations of types with larger alignment, such as `u64`, may also lose a few bytes to padding.)"
+    },
+    {
+      "id": "count-words",
+      "type": "text",
+      "difficulty": "warm-up",
+      "mode": "C",
+      "prompt": "What does this program print?\n\n```zig\nconst std = @import(\"std\");\n\npub fn main(init: std.process.Init) !void {\n    var counts: std.StringHashMap(u32) = .init(init.gpa);\n    defer counts.deinit();\n    var it = std.mem.tokenizeScalar(u8, \"a b a c b a\", ' ');\n    while (it.next()) |w| {\n        const slot = try counts.getOrPut(w);\n        if (!slot.found_existing) slot.value_ptr.* = 0;\n        slot.value_ptr.* += 1;\n    }\n    std.debug.print(\"{d} {d}\\n\", .{ counts.count(), counts.get(\"a\").? });\n}\n```",
+      "answers": ["3 3"],
+      "feedback": [{"match": "6 3", "message": "Not yet — `count()` is the number of distinct keys, not the number of insertions."}],
+      "hints": ["How many distinct words are there? How many times does `a` occur?"],
+      "solution": "It prints `3 3`: three distinct keys (`a`, `b`, `c`), and `a` occurs three times. `getOrPut` finds the existing slot for a repeated word, so only new words add keys."
+    },
+    {
+      "id": "reused-buffer-keys",
+      "type": "choice",
+      "difficulty": "stretch",
+      "mode": "H",
+      "prompt": "A program reads a file line by line into the same 256-byte buffer `line_buf`, splits each line into words, and does `try counts.put(word, 1)` (or increments) for each word, where `counts` is a `std.StringHashMap(u32)`. At the end the counts are printed and the words look like garbage. What is wrong?",
+      "options": [
+        {"id": "a", "label": "The keys are slices of `line_buf`, which is overwritten by every new line, so earlier keys now show later text. Each new key must be copied (for example with `gpa.dupe` or an arena) before being stored.", "correct": true, "feedback": "Yes. The map stores slices, not bytes. Copy keys whose underlying memory you do not control, and free the copies (or deinit the arena) at the end."},
+        {"id": "b", "label": "`StringHashMap` cannot store more than 256 keys.", "correct": false, "feedback": "Not yet — the map grows as needed. The number 256 is the size of the line buffer, which is the real clue."},
+        {"id": "c", "label": "The map was created with the wrong allocator.", "correct": false, "feedback": "Not yet — the map's own memory is fine. The problem is the memory its keys point to, which the map does not own."},
+        {"id": "d", "label": "Hash maps in Zig do not support string keys; use `AutoHashMap`.", "correct": false, "feedback": "Not yet — `StringHashMap` is designed for byte-slice keys. `AutoHashMap` with a slice key would hash the pointer, not the text."}
+      ],
+      "hints": ["What exactly does the map store for each key: bytes, or a slice?", "What happens to `line_buf`'s contents when the next line is read?"],
+      "solution": "A `StringHashMap` stores the key slices it is given. Those slices point into `line_buf`, which the next read overwrites, so old keys change under the map (and their hashes no longer match their contents). The fix is to copy each *new* key: `if (!slot.found_existing) slot.key_ptr.* = try arena.dupe(u8, word);`, using an arena (freed at the end) or the general-purpose allocator (freeing each key before `deinit`)."
+    },
+    {
+      "id": "choose-allocator",
+      "type": "choice",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "A web server parses each incoming request into many small objects (headers, a JSON tree, strings) that are all discarded when the response has been sent. Which allocation strategy fits best for that per-request memory?",
+      "options": [
+        {"id": "a", "label": "An `ArenaAllocator` per request (or one reset after each request), freed in one step when the response is sent.", "correct": true, "feedback": "Yes. All the objects share one lifetime, so one bulk free is simpler and faster than freeing each object."},
+        {"id": "b", "label": "`std.heap.page_allocator` directly for every small object.", "correct": false, "feedback": "Not yet — every page-allocator allocation takes at least a whole page from the operating system, which is very wasteful for small objects."},
+        {"id": "c", "label": "A `FixedBufferAllocator` of 1 KiB shared by all requests.", "correct": false, "feedback": "Not yet — requests vary in size and run concurrently; a single small fixed buffer would run out and would be shared unsafely."},
+        {"id": "d", "label": "No allocator: Zig allocates request memory automatically.", "correct": false, "feedback": "Not yet — Zig never allocates behind your back. Someone has to choose."}
+      ],
+      "hints": ["What do all the objects for one request have in common?"],
+      "solution": "An arena per request: allocate freely while handling the request, then release everything at once. Arenas are the standard tool when many allocations share a lifetime. The arena itself typically sits on top of a general-purpose allocator such as `smp_allocator`."
+    },
+    {
+      "id": "spot-the-leak",
+      "type": "choice",
+      "multiple": true,
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "`gpa` is a general-purpose allocator. Which of these snippets **leak** memory when they run to completion without errors? Select all that apply.",
+      "options": [
+        {"id": "a", "label": "`const s = try gpa.dupe(u8, name); defer gpa.free(s); use(s);`", "correct": false, "feedback": "Not yet — the `defer` frees `s` when the block ends."},
+        {"id": "b", "label": "`var list: std.ArrayList(u8) = .empty; try list.appendSlice(gpa, \"abc\"); use(list.items);`", "correct": true, "feedback": "Yes. The list's buffer is never released; it needs `defer list.deinit(gpa);`."},
+        {"id": "c", "label": "`const msg = try std.fmt.allocPrint(gpa, \"{d}\", .{n}); std.debug.print(\"{s}\\n\", .{msg});`", "correct": true, "feedback": "Yes. `allocPrint` returns memory the caller owns, and nothing frees it."},
+        {"id": "d", "label": "`var arena: std.heap.ArenaAllocator = .init(gpa); defer arena.deinit(); _ = try arena.allocator().alloc(u8, 100);`", "correct": false, "feedback": "Not yet — the 100 bytes are never freed individually, but `arena.deinit()` releases them with everything else."}
+      ],
+      "hints": ["For each allocation, find the statement that releases it. Is there one?"],
+      "solution": "(b) and (c) leak: an `ArrayList` must be `deinit`ed, and `allocPrint` hands ownership to the caller. (a) frees with `defer`, and (d) relies on the arena's `deinit`, which releases everything allocated from it. Running code like this under `std.testing.allocator` or `SafeAllocator` would report (b) and (c) with stack traces."
+    },
+    {
+      "id": "why-allocator-parameter",
+      "type": "choice",
+      "difficulty": "warm-up",
+      "mode": "H",
+      "prompt": "Why does `std.fmt.allocPrint` take an allocator as its first parameter, instead of using a global heap?",
+      "options": [
+        {"id": "a", "label": "So that the caller can see that it allocates and choose where the memory comes from (an arena, a checking allocator, a fixed buffer).", "correct": true, "feedback": "Yes. That is Zig's \"no hidden allocations\" rule, applied in the standard library itself."},
+        {"id": "b", "label": "Because Zig has no heap.", "correct": false, "feedback": "Not yet — Zig programs use the heap all the time, through allocators such as `page_allocator` and `smp_allocator`."},
+        {"id": "c", "label": "To make it faster than `bufPrint`.", "correct": false, "feedback": "Not yet — `bufPrint`, which writes into a buffer you supply, avoids allocation entirely and is usually faster. `allocPrint` is for when the size is not known in advance."},
+        {"id": "d", "label": "Because the allocator is needed to format numbers.", "correct": false, "feedback": "Not yet — formatting itself needs no heap; only the resulting string does."}
+      ],
+      "hints": ["What would a library user lose if `allocPrint` always used a global heap?"],
+      "solution": "Passing the allocator makes allocation visible at the call site and lets the caller decide the strategy: leak-checking in tests, an arena in a request handler, a fixed buffer on a microcontroller. The same function works everywhere because it does not decide for you."
+    }
+  ]
+}

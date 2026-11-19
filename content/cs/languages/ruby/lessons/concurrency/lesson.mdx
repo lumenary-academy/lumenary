@@ -1,0 +1,365 @@
+---
+title: "Concurrency: threads, fibers and Ractors"
+subtitle: How Ruby does several things at once — threads under the global VM lock, fibers and the fiber scheduler, parallel Ractors, and processes — and which to choose for which job.
+minutes: 60
+objectives:
+  - Explain the global VM lock and why threads still speed up I/O-bound work
+  - Use Thread, Mutex and Queue, and recognise a race condition
+  - Build a worker pool with a closed Queue
+  - Describe fibers, cooperative scheduling and the fiber scheduler interface
+  - Run CPU-bound work in parallel with Ractors, and explain shareable objects
+  - Choose between threads, fibers, Ractors and processes for a given workload
+prerequisites: [pattern-matching-and-errors]
+references:
+  - title: "Ruby docs: Thread"
+    url: https://docs.ruby-lang.org/en/master/Thread.html
+  - title: "Ruby docs: Thread::Queue"
+    url: https://docs.ruby-lang.org/en/master/Thread/Queue.html
+  - title: "Ruby docs: Fiber"
+    url: https://docs.ruby-lang.org/en/master/Fiber.html
+    note: Fibers and the non-blocking fiber scheduler interface.
+  - title: "Ruby docs: Ractor"
+    url: https://docs.ruby-lang.org/en/master/Ractor.html
+    note: The Ractor API as it stands in the current release.
+  - title: async
+    url: https://github.com/socketry/async
+    note: The most widely used fiber-scheduler-based concurrency library for Ruby.
+---
+
+<Section id="motivation" kind="motivation" title="Waiting, and working">
+
+A program can be slow for two very different reasons. It can be **waiting**: for a web page to download, a database to answer, a file to be read. Or it can be **working**: computing prime numbers, resizing images, parsing a large file. Most web applications spend most of their time waiting. A request handler might spend a few milliseconds of CPU time and fifty milliseconds waiting for the database and other services.
+
+Concurrency helps both kinds of slowness, but with different tools. For waiting, you want to start several waits at once, so the total time is the longest wait rather than the sum. For working, you need **parallelism**: several CPU cores computing at the same moment.
+
+Ruby gives you four tools: **threads**, **fibers**, **Ractors** and **processes**. Which one fits depends on whether you are waiting or working, and on one important detail of CRuby's design, the global VM lock. This lesson explains that lock, then shows each tool at work, and ends with how Ruby web servers and job systems actually combine them.
+
+</Section>
+
+<Section id="threads" kind="examples" title="Threads, the GVL, Mutex and Queue">
+
+<Definition term="Global VM lock (GVL)">
+
+In CRuby, only one thread at a time can execute Ruby code inside a Ractor. A thread releases the lock whenever it waits for I/O (network, files, `sleep`, many C extensions), so other threads can run during the wait. The lock makes Ruby's own internals safe and simple, at the cost of CPU parallelism between threads. JRuby and TruffleRuby have no such lock.
+
+</Definition>
+
+So threads are excellent for **I/O-bound** work and give no speed-up for **CPU-bound** Ruby code. The program below fetches five prices, each taking a fifth of a second of simulated network time, first one by one and then with one thread per request:
+
+```ruby check
+# Threads overlap waiting. sleep stands in for a network call or a database query.
+def fetch_price(item)
+  sleep 0.2
+  { "teff" => 120, "rice" => 80, "millet" => 95, "sorghum" => 70, "maize" => 40 }.fetch(item)
+end
+
+items = %w[teff rice millet sorghum maize]
+
+started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+sequential = items.map { fetch_price(it) }
+sequential_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+threads = items.map { |item| Thread.new { fetch_price(item) } }
+threaded = threads.map(&:value)              # value waits for the thread and returns its result
+threaded_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+p sequential, threaded == sequential
+puts "threads were at least 3 times faster: #{sequential_time > 3 * threaded_time}"
+
+# Shared state needs a lock. Both threads check the balance before either withdraws.
+balance = 100
+withdraw = lambda do |amount|
+  if balance >= amount
+    sleep 0.01                              # the thread is paused here, e.g. waiting for a log write
+    balance -= amount
+  end
+end
+[Thread.new { withdraw.call(80) }, Thread.new { withdraw.call(80) }].each(&:join)
+puts "without a lock: balance #{balance}"
+
+balance = 100
+lock = Mutex.new
+safe_withdraw = lambda do |amount|
+  lock.synchronize do
+    if balance >= amount
+      sleep 0.01
+      balance -= amount
+    end
+  end
+end
+[Thread.new { safe_withdraw.call(80) }, Thread.new { safe_withdraw.call(80) }].each(&:join)
+puts "with a Mutex:   balance #{balance}"
+
+# A worker pool: jobs go into one Queue, results come back through another.
+jobs = Queue.new
+results = Queue.new
+(1..8).each { jobs << it }
+jobs.close                                   # pop returns nil once the queue is closed and empty
+
+workers = 3.times.map do |id|
+  Thread.new do
+    while (n = jobs.pop)
+      results << [n, n * n, id]
+    end
+  end
+end
+workers.each(&:join)
+squares = Array.new(results.size) { results.pop }.sort
+p squares.map { |n, square, _| "#{n}²=#{square}" }
+p squares.map(&:last).uniq.size <= 3
+```
+
+```text
+[120, 80, 95, 70, 40]
+true
+threads were at least 3 times faster: true
+without a lock: balance -60
+with a Mutex:   balance 20
+["1²=1", "2²=4", "3²=9", "4²=16", "5²=25", "6²=36", "7²=49", "8²=64"]
+true
+```
+
+**Overlapping waits.** `Thread.new { … }` starts a thread running the block, and `value` waits for it to finish and returns the block's result (`join` waits without returning it). The threaded version gets the same prices in about the time of the slowest request, more than three times faster here. The program checks the ratio rather than printing times, because exact timings differ from machine to machine.
+
+**Race conditions.** The balance example has a bug that only shows up with threads. Both threads check `balance >= amount` (both see 100), then both subtract, and the balance ends at −60: money that did not exist was withdrawn. The `sleep` makes the problem happen every time; in real code the same pause comes from a log write or a database call, and the bug appears only sometimes, which is worse. A **check-then-act** sequence on shared data must be atomic.
+
+**`Mutex`** (mutual exclusion) makes it so: only one thread at a time can be inside `lock.synchronize { … }`. With the lock, the second thread waits, sees a balance of 20, and does not withdraw. The GVL does *not* protect you here, because a thread can lose the GVL in the middle of your method; it protects Ruby's internals, not your invariants.
+
+**`Queue`** (`Thread::Queue`) is a thread-safe first-in, first-out channel, and the cleanest way for threads to cooperate. The worker pool pushes eight jobs into a queue and closes it; three worker threads `pop` jobs until `pop` returns `nil` (a closed, empty queue), and push results into a second queue. No shared variable is ever modified by two threads, so no lock is needed. Results come back in whatever order the workers finish, which is why the program sorts them before printing. Prefer this style, passing messages through queues, over sharing mutable state behind locks.
+
+</Section>
+
+<Section id="patterns" kind="examples" title="Timeouts, request context and waiting for a signal">
+
+Three smaller tools solve problems you will meet as soon as threads do real work: never waiting forever, carrying a request's context into the threads that serve it, and waiting until another thread says something is ready.
+
+```ruby check
+# Waiting with a limit: Queue#pop and Thread#join both accept timeouts.
+inbox = Queue.new
+p inbox.pop(timeout: 0.1)                    # nothing arrived: nil after 0.1 s
+
+slow = Thread.new { sleep 5; :done }
+p slow.join(0.1)                             # still running after 0.1 s: nil
+slow.kill                                    # stop it (only safe because it holds no resources)
+
+# Fiber storage (Ruby 3.2): request-scoped values, inherited by threads and fibers you start.
+Fiber[:request_id] = "req-7f3a"
+log = Queue.new
+workers = 2.times.map { |i| Thread.new { log << "worker #{i} handling #{Fiber[:request_id]}" } }
+workers.each(&:join)
+p Array.new(log.size) { log.pop }.sort
+
+Fiber[:request_id] = "req-9c1e"
+p Thread.new { Fiber[:request_id] }.value
+
+# ConditionVariable lets one thread wait until another signals that something changed.
+lock = Mutex.new
+ready = ConditionVariable.new
+config = nil
+loader = Thread.new do
+  sleep 0.05
+  lock.synchronize do
+    config = { "currency" => "KES" }
+    ready.signal
+  end
+end
+lock.synchronize { ready.wait(lock) until config }
+p config
+loader.join
+```
+
+```text
+nil
+nil
+["worker 0 handling req-7f3a", "worker 1 handling req-7f3a"]
+"req-9c1e"
+{"currency" => "KES"}
+```
+
+- **Timeouts.** `Queue#pop(timeout: 0.1)` (Ruby 3.2) returns `nil` if nothing arrives in time, and `Thread#join(0.1)` returns `nil` if the thread has not finished. Every wait on something outside your program should have a limit. For network calls, set the library's own timeouts (`Net::HTTP` has `open_timeout` and `read_timeout`) rather than wrapping code in `Timeout.timeout`, which interrupts a thread at an arbitrary point and can leave connections and locks in a broken state. For the same reason, `Thread#kill` is safe only for a thread that holds no resources, as here.
+- **Fiber storage** (Ruby 3.2). `Fiber[:request_id] = …` stores a value in the current execution context, and threads and fibers started afterwards inherit a copy. Web frameworks use this kind of storage for per-request data such as the current user or a request id for logs, so that a background thread started during a request still knows which request it belongs to. Changing the value later does not affect threads that were already started; a new thread sees the new value.
+- **`ConditionVariable`** lets a thread sleep until another thread signals that a condition may have changed. The waiting side always re-checks the condition in a loop (`wait(lock) until config`), because a wake-up does not guarantee the condition is true, and `wait` releases the lock while sleeping so the other thread can take it. In application code, a `Queue` usually expresses the same idea more simply; `ConditionVariable` is the building block underneath such tools.
+
+</Section>
+
+<Section id="fibers" kind="human" title="Fibers and the fiber scheduler">
+
+A **fiber** is a block of code that can pause itself and be resumed later, keeping all its local state. Unlike threads, fibers never switch on their own: a fiber runs until it explicitly yields, and something else decides when to resume it. That is **cooperative** multitasking.
+
+```ruby check
+# A fiber runs until it yields, then waits until it is resumed.
+fiber = Fiber.new do
+  puts "  fiber: step 1"
+  Fiber.yield :paused
+  puts "  fiber: step 2"
+  :finished
+end
+
+puts "main: start"
+p fiber.resume
+puts "main: doing other work"
+p fiber.resume
+p fiber.alive?
+
+# Two fibers taking turns: cooperative multitasking, decided entirely by the code.
+log = []
+ping = Fiber.new { 3.times { |i| log << "ping #{i}"; Fiber.yield } }
+pong = Fiber.new { 3.times { |i| log << "pong #{i}"; Fiber.yield } }
+3.times { ping.resume; pong.resume }
+p log
+
+# External enumerators are built on fibers.
+words = %w[sun moon star].each
+p words.next, words.next, words.next
+begin
+  words.next
+rescue StopIteration
+  puts "no more words"
+end
+
+p Fiber.respond_to?(:set_scheduler), Fiber.current.class
+```
+
+```text
+main: start
+  fiber: step 1
+:paused
+main: doing other work
+  fiber: step 2
+:finished
+false
+["ping 0", "pong 0", "ping 1", "pong 1", "ping 2", "pong 2"]
+"sun"
+"moon"
+"star"
+no more words
+true
+Fiber
+```
+
+`Fiber.yield` pauses the fiber and hands a value back to whoever called `resume`; the next `resume` continues from that point. The ping-pong log shows two fibers interleaving in exactly the order the main program chose, with no locks and no surprises. You have already used fibers without knowing it: the external enumerators from the collections lesson (`words.next`) and `Enumerator.new` generators are built on them, and `StopIteration` signals the end.
+
+Fibers are cheap (thousands are fine), but on their own they do not help with waiting, because a fiber that calls a blocking method blocks everything. Since **Ruby 3.0**, the **fiber scheduler** interface fixes that. When a scheduler is installed with `Fiber.set_scheduler`, blocking operations (socket reads, `sleep`, DNS lookups and others) inside a non-blocking fiber ask the scheduler to resume another fiber until the I/O is ready. Ruby defines only the interface; libraries provide schedulers. The best known is the [async](https://github.com/socketry/async) gem, on which the Falcon web server is built. With it, one thread can handle thousands of concurrent connections, each written as simple sequential code:
+
+```ruby
+require "async"
+
+Async do |task|
+  prices = %w[teff rice millet].map { |item| task.async { fetch_price(item) } }.map(&:wait)
+end
+```
+
+(This fragment needs the async gem, so it is not run by this course's tests.) Fibers suit very high numbers of concurrent waits, such as websockets, crawlers and API gateways, where a thread per connection would be too heavy.
+
+</Section>
+
+<Section id="ractors" kind="examples" title="Ractors: parallel Ruby">
+
+A **Ractor** ("Ruby actor", added in Ruby 3.0) is an isolated unit of execution with its own GVL, so several Ractors run Ruby code on several CPU cores at the same time. The price of that parallelism is isolation: Ractors cannot share mutable objects, so they cannot have data races.
+
+```ruby check
+# Ractors run Ruby code in parallel, each with its own isolated objects.
+def count_primes(range) = range.count { |n| n > 1 && (2..Integer.sqrt(n)).none? { n % it == 0 } }
+
+ranges = [1..50_000, 50_001..100_000, 100_001..150_000, 150_001..200_000]
+ractors = ranges.map { |r| Ractor.new(r) { |range| count_primes(range) } }
+counts = ractors.map(&:value)               # Ruby 4.0: value waits for the result
+p counts, counts.sum, counts.sum == count_primes(1..200_000)
+
+# Ractors cannot share mutable objects. A block that reaches outside itself is refused.
+greeting = "hello"
+begin
+  Ractor.new { greeting.upcase }
+rescue ArgumentError => e
+  puts "ArgumentError: #{e.message}"
+end
+
+# Deeply frozen ("shareable") objects can be shared freely.
+settings = Ractor.make_shareable({ "units" => ["kg", "km"] })
+p Ractor.shareable?(settings), settings["units"].frozen?
+p Ractor.new(settings) { |s| s["units"].join("/") }.value
+
+# Messages: every Ractor has a default port that send writes to and receive reads from.
+doubler = Ractor.new do
+  total = 0
+  while (n = Ractor.receive) != :stop
+    total += n * 2
+  end
+  total
+end
+[1, 2, 3].each { doubler.send(it) }
+doubler.send(:stop)
+p doubler.value
+```
+
+```text
+[5133, 4459, 4256, 4136]
+17984
+true
+ArgumentError: can not isolate a Proc because it accesses outer variables (greeting).
+true
+true
+"kg/km"
+12
+```
+
+Ruby prints a warning to the error stream when the first Ractor is created (`warning: Ractor API is experimental and may change in future versions of Ruby.`), and it means it: the Ractor API changed noticeably in Ruby 4.0. In earlier versions you collected a result with `take`; in 4.0 you call `value` (or `join`), and communication goes through `Ractor::Port` objects. Each Ractor has a default port, so `send` and `Ractor.receive` still work as shown.
+
+- **Parallel work.** Counting the primes in four ranges runs in four Ractors at once. Arguments passed to `Ractor.new` are copied (or moved) into the new Ractor, and `value` returns the result. The sum matches a single-threaded count, 17,984 primes below 200,000.
+- **Isolation is enforced.** A Ractor's block may not touch local variables from outside it. Ruby refuses to create one that does, naming the variable.
+- **Shareable objects.** Integers, symbols, `nil`, `true` and deeply frozen objects can be shared between Ractors without copying. `Ractor.make_shareable` freezes a structure all the way down so it can be passed freely.
+- **Messages.** A Ractor can wait for messages with `Ractor.receive`, process them, and finish with a value, which makes it an actor in the classic sense.
+
+Ractors are still experimental, and many gems are not yet Ractor-safe (they rely on mutable global state). Use them for self-contained CPU-heavy computations; for most application code, the other tools are the practical choice in 2026.
+
+</Section>
+
+<Section id="choosing" kind="reading" title="Choosing a tool, and how Ruby servers do it">
+
+| Workload | Tool | Why |
+| --- | --- | --- |
+| A handful of slow network calls or queries | Threads (or a thread pool via `Queue`) | Simple, built in, and the GVL is released while waiting |
+| Thousands of concurrent connections | Fibers with a scheduler (async) | Far cheaper than a thread per connection |
+| CPU-heavy Ruby computation | Ractors, or processes | The only ways around the GVL in CRuby |
+| Isolation, or using every core with any gem | Processes (`fork`, `Process.spawn`, separate workers) | Separate memory; nothing to share or lock |
+
+Real deployments combine these. **Puma**, the most common Rails server, runs several **processes** ("workers"), each with a pool of **threads**: processes use all CPU cores, and threads overlap each request's waiting. Background-job systems such as **Sidekiq** and Rails' **Solid Queue** run jobs on threads in worker processes. **Falcon** uses fibers. When you deploy a Ruby application, tuning the number of processes and threads per process for your machine is one of the most effective performance settings.
+
+On Unix-like systems, `fork` creates a child process with a copy of the parent's memory; it is how Puma creates workers, and it is not available on Windows. Separate processes communicate through pipes, sockets, files or a database.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"Because of the GVL, Ruby threads are useless."** They are useless for speeding up pure Ruby computation in CRuby, and very useful for overlapping I/O, which is what most applications spend their time on. Every Rails server and job runner relies on them.
+
+</Misconception>
+
+<Misconception>
+
+**"The GVL makes my code thread-safe."** It makes Ruby's internals safe. Your own check-then-act sequences, `@count += 1` on shared objects, and lazily initialised caches (`@cache ||= expensive`) can still interleave between threads. Protect shared mutable state with a `Mutex`, or better, avoid sharing it.
+
+</Misconception>
+
+<Misconception>
+
+**"Fibers run in parallel."** Fibers in one thread take turns; only one runs at any moment, and only when another yields or waits on I/O through a scheduler. They give concurrency (many things in progress), not parallelism (many things computing at once).
+
+</Misconception>
+
+<Misconception>
+
+**"An exception in a thread will crash my program."** By default, an exception that ends a thread is reported (Ruby prints it, because `report_on_exception` is true) and then re-raised in whichever thread calls `join` or `value` on it. If nobody joins the thread, the error can go unnoticed. Always join your threads, or use a pool that does.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

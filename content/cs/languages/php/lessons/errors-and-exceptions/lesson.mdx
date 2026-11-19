@@ -1,0 +1,430 @@
+---
+title: Errors and exceptions
+subtitle: PHP's two ways of reporting trouble, the Throwable hierarchy, try, catch and finally, your own exception types, and how professional applications handle failure.
+minutes: 50
+objectives:
+  - Distinguish PHP's old-style errors (warnings, notices, deprecations) from exceptions
+  - Navigate the Throwable hierarchy and say what Error and Exception are each for
+  - Use try, catch (including multi-catch) and finally correctly
+  - Design a small exception hierarchy and chain exceptions with previous
+  - Convert warnings into exceptions, and configure error display and logging safely
+  - Decide when to throw, when to return null, and where to catch
+prerequisites: [enums-and-the-type-system]
+references:
+  - title: "PHP Manual: Throwable errors"
+    url: https://www.php.net/manual/en/language.error-handling.throwable.php
+    note: try, catch, finally and throw, and the Exception and Error hierarchies.
+  - title: "PHP Manual: Diagnostic errors"
+    url: https://www.php.net/manual/en/language.error-handling.diagnostic.php
+    note: The error levels, and how they are reported and logged.
+  - title: "PHP Manual: SPL Exceptions"
+    url: https://www.php.net/manual/en/spl.exceptions.php
+    note: LogicException, RuntimeException and their standard subclasses.
+  - title: "PHP Manual: Runtime configuration for errors"
+    url: https://www.php.net/manual/en/errorfunc.configuration.php
+    note: error_reporting, display_errors, log_errors and friends.
+  - title: "PSR-3: Logger Interface"
+    url: https://www.php-fig.org/psr/psr-3/
+    note: The common logging interface that frameworks and libraries share.
+---
+
+<Section id="motivation" kind="motivation" title="Things go wrong; the question is who finds out">
+
+A file that should be there is missing. A user types 104 into a box that allows 0 to 100. A remote service times out. A programmer passes `null` where an object was expected. Every real program meets problems like these, and its quality depends less on avoiding them than on what happens next: does the problem stop the operation cleanly, with a message that says what went wrong and where, or does a wrong value travel on until it corrupts a database row?
+
+PHP has two systems for reporting trouble, because of its history. The older one, from PHP's early days, is **errors**: messages at different levels (notice, warning, deprecation, fatal) that are printed or logged, while the function usually returns `false` or `null` and the script carries on. The newer one is **exceptions**, which arrived with the object model in PHP 5: an object that is *thrown*, stops normal execution, and travels up the call stack until some code *catches* it. Since PHP 7, most serious problems inside the engine are exceptions too, and modern code is written almost entirely with exceptions. You still need to understand the old system, because parts of the standard library speak it.
+
+</Section>
+
+<Section id="hierarchy" kind="definitions" title="The Throwable family">
+
+Anything that can be thrown implements the interface `Throwable`. It has two branches:
+
+<Definition term="Error">
+
+Thrown by the engine for programming mistakes: calling a method on `null`, a type mismatch, a wrong number of arguments, division by zero, an unhandled `match`. Your code normally does *not* catch these, except at the very top to log them. The fix for an `Error` is to change the code.
+
+</Definition>
+
+<Definition term="Exception">
+
+The base class for conditions a correct program can still meet at run time: invalid input, missing files, failed network calls, malformed JSON. Libraries and your own code throw these, and callers catch the ones they can do something about. The standard library offers two families: `LogicException` (the calling code is wrong, such as `InvalidArgumentException` or `DomainException`) and `RuntimeException` (something outside the code went wrong, such as `UnexpectedValueException`).
+
+</Definition>
+
+Here are seven ordinary mistakes and what PHP throws for each:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+/** "TypeError < Error < Throwable"-style ancestry of an exception object. */
+function ancestry(Throwable $e): string
+{
+    $names = [get_class($e)];
+    for ($parent = get_parent_class($e); $parent !== false; $parent = get_parent_class($parent)) {
+        $names[] = $parent;
+    }
+    return implode(" < ", $names);
+}
+
+$attempts = [
+    "intdiv(1, 0)" => fn() => intdiv(1, 0),
+    "strlen(42) in strict mode" => fn() => strlen(42),
+    "array_combine([1, 2], [1])" => fn() => array_combine([1, 2], [1]),
+    "match (5) { 1 => 'one' }" => fn() => match (5) { 1 => "one" },
+    "null->format()" => fn() => null->format(),
+    "json_decode('{oops')" => fn() => json_decode("{oops", flags: JSON_THROW_ON_ERROR),
+    "new DateTimeImmutable('soon')" => fn() => new DateTimeImmutable("soon"),
+];
+
+foreach ($attempts as $code => $attempt) {
+    try {
+        $attempt();
+        echo "$code: no problem\n";
+    } catch (Throwable $e) {
+        printf("%-30s %s\n", $code, ancestry($e));
+        printf("%-30s \"%s\"\n", "", $e->getMessage());
+    }
+}
+```
+
+```text
+intdiv(1, 0)                   DivisionByZeroError < ArithmeticError < Error
+                               "Division by zero"
+strlen(42) in strict mode      TypeError < Error
+                               "strlen(): Argument #1 ($string) must be of type string, int given"
+array_combine([1, 2], [1])     ValueError < Error
+                               "array_combine(): Argument #1 ($keys) and argument #2 ($values) must have the same number of elements"
+match (5) { 1 => 'one' }       UnhandledMatchError < Error
+                               "Unhandled match case 5"
+null->format()                 Error
+                               "Call to a member function format() on null"
+json_decode('{oops')           JsonException < Exception
+                               "Syntax error near location 1:2"
+new DateTimeImmutable('soon')  DateMalformedStringException < DateException < Exception
+                               "Failed to parse time string (soon) at position 0 (s): The timezone could not be found in the database"
+```
+
+The output shows each class with its parent classes (the shared interface `Throwable` is not listed, because it is an interface rather than a parent class). Notice the split: the programming mistakes are all `Error`s, while the two problems with *data* (malformed JSON and an unreadable date) are `Exception`s. `DateMalformedStringException` is new in PHP 8.3; earlier versions threw a plain `Exception` for the same input, which is a reminder to catch the most specific type you know about and test on the version you deploy.
+
+Two details are worth noting. `json_decode` throws only because the call passes `JSON_THROW_ON_ERROR`; without it, invalid JSON returns `null`, and you would have to call `json_last_error()` to find out why. And the message of each exception names the function and the argument at fault, which is a large part of why modern PHP is pleasant to debug.
+
+Every throwable object carries the same information, available through methods: `getMessage()` (the text), `getCode()` (an optional integer, used by some libraries for error numbers), `getFile()` and `getLine()` (where it was created), `getTrace()` and `getTraceAsString()` (the **stack trace**: the chain of function calls that led there), and `getPrevious()` (an earlier exception that caused this one, which you will use in the next section). When an exception is never caught, PHP reports its message and stack trace, on screen or in the log depending on the settings described below. Learning to read a stack trace from the top (where it was thrown) down to your own code (where the call started) is one of the most useful debugging skills in any language.
+
+</Section>
+
+<Section id="try-catch" kind="examples" title="Throwing, catching and chaining">
+
+A good exception design gives each layer of your program something it can catch. Here is an importer for "name,score" lines, the kind of thing that sits behind a file-upload form:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+/** Everything that can go wrong in an import extends this. */
+class ImportFailed extends RuntimeException
+{
+}
+
+final class InvalidLine extends ImportFailed
+{
+    public function __construct(public readonly int $lineNumber, string $reason, ?Throwable $previous = null)
+    {
+        parent::__construct("line $lineNumber: $reason", previous: $previous);
+    }
+}
+
+function parseScore(string $raw): int
+{
+    $score = filter_var($raw, FILTER_VALIDATE_INT, ["options" => ["min_range" => 0, "max_range" => 100]]);
+    return $score !== false ? $score : throw new DomainException("score must be a whole number from 0 to 100, got '$raw'");
+}
+
+/**
+ * @param list<string> $lines "name,score"
+ * @return array<string, int>
+ */
+function importScores(array $lines): array
+{
+    $scores = [];
+    foreach ($lines as $index => $line) {
+        try {
+            $fields = array_map(trim(...), explode(",", $line));
+            if (count($fields) !== 2 || $fields[0] === "") {
+                throw new InvalidArgumentException("expected 'name,score'");
+            }
+            [$name, $raw] = $fields;
+            $scores[$name] = parseScore($raw);
+        } catch (InvalidArgumentException | DomainException $e) {
+            throw new InvalidLine($index + 1, $e->getMessage(), $e);
+        }
+    }
+    return $scores;
+}
+
+function runImport(string $label, array $lines): void
+{
+    echo "[$label] ";
+    try {
+        $scores = importScores($lines);
+        echo "imported ", count($scores), " scores, mean ", round(array_sum($scores) / count($scores), 1), "\n";
+    } catch (InvalidLine $e) {
+        echo "rejected at ", $e->getMessage(), " (caused by ", get_class($e->getPrevious()), ")\n";
+    } catch (ImportFailed) {
+        echo "import failed\n";                      // no variable needed (PHP 8.0)
+    } finally {
+        echo "[$label] import finished\n";
+    }
+}
+
+runImport("class A", ["Aroha, 91", "Bilal, 78", "Chiara,85"]);
+runImport("class B", ["Dmitri, 88", "Esi, 104", "Femi, 70"]);
+runImport("class C", ["Gulnara 95"]);
+```
+
+```text
+[class A] imported 3 scores, mean 84.7
+[class A] import finished
+[class B] rejected at line 2: score must be a whole number from 0 to 100, got '104' (caused by DomainException)
+[class B] import finished
+[class C] rejected at line 1: expected 'name,score' (caused by InvalidArgumentException)
+[class C] import finished
+```
+
+Read it from the bottom up:
+
+- **`throw` is an expression** (PHP 8.0), so `parseScore` can write `return $ok ? $score : throw new …` in one line.
+- **Low-level code throws standard exceptions** describing the immediate problem: `DomainException` for a value outside the allowed range, `InvalidArgumentException` for a line with the wrong shape.
+- **Multi-catch** (`catch (InvalidArgumentException | DomainException $e)`) handles several types with one block.
+- **Translation and chaining.** `importScores` catches the low-level exception and throws its own `InvalidLine`, which adds what only it knows (the line number) and passes the original as `previous`. The caller deals with one meaningful type, and nothing is lost: `getPrevious()` returns the original, and a logger prints the whole chain with each one's stack trace.
+- **A small hierarchy.** `InvalidLine` extends `ImportFailed`, which extends `RuntimeException`. A caller can catch `InvalidLine` to report the line, or `ImportFailed` to catch anything the importer might throw, including kinds added later. The order of `catch` blocks matters: PHP uses the first one that matches, so specific types come first.
+- **Catch without a variable** (`catch (ImportFailed)`, PHP 8.0) when you do not need the object.
+- **`finally` always runs**, whether the `try` finished normally, returned, or threw, which makes it the place to release resources.
+
+Exception classes are ordinary classes. Giving them a readonly property (here `lineNumber`) lets calling code act on details without parsing the message text.
+
+</Section>
+
+<Section id="old-errors" kind="human" title="Warnings, finally, and throw as an expression">
+
+Many functions from PHP's earlier years still report problems the old way: they emit a **warning** and return `false`. `file_get_contents`, `fopen`, `mkdir` and many others behave like this. If you ignore the return value, your program carries on with `false` where it expected a string. The usual professional fix is to install an **error handler** that turns every warning into an exception, so there is only one system to think about:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+// Older functions report many problems as a warning plus a false return value.
+set_error_handler(function (int $severity, string $message, string $file, int $line): bool {
+    throw new ErrorException($message, 0, $severity, $file, $line);
+});
+
+try {
+    $text = file_get_contents("/no/such/file.txt");
+    echo "read ", strlen($text), " bytes\n";
+} catch (ErrorException $e) {
+    echo "ErrorException: ", $e->getMessage(), "\n";
+}
+
+restore_error_handler();
+
+// finally runs on every path out of the try: normal, return, or exception.
+function attempt(bool $fail): string
+{
+    try {
+        echo "  working\n";
+        if ($fail) {
+            throw new RuntimeException("disk full");
+        }
+        return "saved";
+    } catch (RuntimeException $e) {
+        return "not saved: " . $e->getMessage();
+    } finally {
+        echo "  releasing the lock\n";
+    }
+}
+
+echo attempt(false), "\n";
+echo attempt(true), "\n";
+
+// throw is an expression (PHP 8.0), so it fits after ?? and in arrow functions.
+$config = ["region" => "eu-west"];
+$region = $config["region"] ?? throw new LogicException("region is not configured");
+echo "region: $region\n";
+try {
+    $bucket = $config["bucket"] ?? throw new LogicException("bucket is not configured");
+} catch (LogicException $e) {
+    echo get_class($e), ": ", $e->getMessage(), "\n";
+}
+```
+
+```text
+ErrorException: file_get_contents(): Failed to open stream: No such file or directory
+  working
+  releasing the lock
+saved
+  working
+  releasing the lock
+not saved: disk full
+region: eu-west
+LogicException: bucket is not configured
+```
+
+- `set_error_handler` registers a function that PHP calls for every warning, notice and deprecation. Throwing an `ErrorException` from it turns them into exceptions with the original severity, file and line. Frameworks such as Laravel and Symfony install a handler like this for you, at least in development.
+- The `attempt` function shows `finally` on both paths. Even when the `try` or `catch` block executes `return`, the `finally` block runs first, and then the function returns. (If `finally` itself contains a `return`, that value wins and any exception in flight is silently thrown away. Never return from `finally`; PHP 8.6 deprecates it and prints a warning when you do.)
+- `$config["bucket"] ?? throw new LogicException(…)` reads a required setting or fails immediately with a clear message, instead of carrying `null` into code that will fail later with a vaguer one.
+
+You will also meet the **`@` operator**, as in `@file_get_contents($path)`, which silences warnings from one expression. It hides the reason something failed and makes debugging miserable; avoid it, and check return values or convert warnings to exceptions instead.
+
+**The last line of defence.** An exception that nobody catches ends the script. `set_exception_handler` registers a function to run in that case, which is where applications log the problem and show a generic error page:
+
+```php check
+<?php
+set_exception_handler(function (Throwable $e): void { echo "Last-resort handler: ", get_class($e), " - ", $e->getMessage(), "\n"; });
+throw new LogicException("nobody caught this");
+```
+
+```text
+Last-resort handler: LogicException - nobody caught this
+```
+
+**Display versus logging.** Three settings in `php.ini` decide what happens to errors. `error_reporting` chooses which levels are reported; use `E_ALL` everywhere. `display_errors` prints them into the output; turn it on in development and **off in production**, because error messages reveal file paths, SQL and sometimes data to anyone who triggers them. `log_errors` writes them to a log; turn it on everywhere. In production, a visitor should see a polite generic page, and the full details should go to the log, usually through a PSR-3 logger such as Monolog.
+
+</Section>
+
+<Section id="web-handling" kind="examples" title="One place that turns exceptions into responses">
+
+In a web application, almost all exceptions end up in a single place: a handler wrapped around every request that decides what the visitor sees. Frameworks provide this for you, and it is worth seeing how small the idea is. The program below simulates four requests. Each "controller" either returns a page or throws; one function, `handle`, maps the outcome to an HTTP status code and a body.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+set_error_handler(function (int $severity, string $message, string $file, int $line): bool {
+    throw new ErrorException($message, 0, $severity, $file, $line);
+});
+
+final class NotFound extends RuntimeException
+{
+}
+
+final class ValidationFailed extends RuntimeException
+{
+    /** @param array<string, string> $errors field => problem */
+    public function __construct(public readonly array $errors)
+    {
+        parent::__construct("validation failed for: " . implode(", ", array_keys($errors)));
+    }
+}
+
+final class MemoryLog
+{
+    /** @var list<string> */
+    public private(set) array $lines = [];
+
+    public function error(string $message): void
+    {
+        $this->lines[] = "ERROR $message";
+    }
+}
+
+/** A "controller": reads the query, returns the page body, or throws. */
+function showBook(array $query): string
+{
+    $id = filter_var($query["id"] ?? "", FILTER_VALIDATE_INT, ["options" => ["min_range" => 1]]);
+    if ($id === false) {
+        throw new ValidationFailed(["id" => "must be a positive whole number"]);
+    }
+    $books = [1 => "Half of a Yellow Sun", 2 => "The Wind-Up Bird Chronicle"];
+    return $books[$id] ?? throw new NotFound("no book with id $id");
+}
+
+/** @return array{int, string} HTTP status and body */
+function handle(callable $controller, array $query, MemoryLog $log): array
+{
+    try {
+        return [200, $controller($query)];
+    } catch (ValidationFailed $e) {
+        $problems = array_map(fn(string $field, string $why): string => "$field $why", array_keys($e->errors), $e->errors);
+        return [422, "Please check: " . implode("; ", $problems)];
+    } catch (NotFound) {
+        return [404, "Sorry, we could not find that page."];
+    } catch (Throwable $e) {
+        $log->error(get_class($e) . ": " . $e->getMessage());
+        return [500, "Something went wrong on our side. We have been notified."];
+    }
+}
+
+$log = new MemoryLog();
+$requests = [
+    [showBook(...), ["id" => "2"]],
+    [showBook(...), ["id" => "abc"]],
+    [showBook(...), ["id" => "99"]],
+    [fn(array $q): string => strtoupper($q["title"]), []],    // a bug: no "title"
+];
+
+foreach ($requests as [$controller, $query]) {
+    [$status, $body] = handle($controller, $query, $log);
+    echo "$status  $body\n";
+}
+echo implode("\n", $log->lines), "\n";
+```
+
+```text
+200  The Wind-Up Bird Chronicle
+422  Please check: id must be a positive whole number
+404  Sorry, we could not find that page.
+500  Something went wrong on our side. We have been notified.
+ERROR ErrorException: Undefined array key "title"
+```
+
+Each request ends differently:
+
+- **200 OK.** The controller returned normally.
+- **422 Unprocessable Content.** The input was invalid. `ValidationFailed` carries a structured list of problems (field name to message), so the handler can show them next to the right form fields. The user can fix this, so the message speaks to them.
+- **404 Not Found.** A well-formed request for something that does not exist. A specific exception type makes this one line in the handler.
+- **500 Internal Server Error.** The fourth controller has a bug: it reads a `"title"` key that is not there. Because the program installed the warning-to-exception handler from the previous section, the "Undefined array key" warning became an `ErrorException` at the exact line of the bug, instead of a `null` that failed later somewhere else. The handler catches `Throwable`, logs the details for developers, and shows the visitor a generic apology that reveals nothing about the code.
+
+Real applications add more around this core: they log with context (the request URL, the user's id, a request id that also appears in the response headers), send unexpected exceptions to an error-tracking service, and render the 500 page with full details only in the development environment. Laravel's exception handler and Symfony's `kernel.exception` event are this function, grown up. The design rule that makes it work is the one this lesson has been building: low-level code throws specific exceptions, and only the top level decides what each one means to the outside world.
+
+**Assertions.** PHP also has `assert($condition)`, for checking things that must be true if the code is correct. Assertions are meant for development: production configurations usually set `zend.assertions = -1`, which removes them from compiled code entirely, so never use `assert` to validate input. Use it to document and check your own assumptions while developing.
+
+</Section>
+
+<Section id="when-to-throw" kind="misconceptions" title="When to throw, and where to catch">
+
+<Misconception>
+
+**"Catch exceptions as close as possible to where they are thrown."** Catch them where you can *do something useful*: retry, use a fallback, show the user a message, or add context and rethrow. A function that catches an exception only to log it and return `null` has thrown away the information its caller needed. Most exceptions should travel up to a request-level handler, which logs them and renders an error page.
+
+</Misconception>
+
+<Misconception>
+
+**"`catch (Exception $e)` catches everything."** It does not catch `Error`s, such as a `TypeError` or calling a method on null, because `Error` is not a subclass of `Exception`. To catch absolutely everything (only appropriate in a top-level handler or a worker loop that must keep running), catch `Throwable`.
+
+</Misconception>
+
+<Misconception>
+
+**"Exceptions are for errors, so never use them for expected situations."** An exception is right whenever a function cannot do what its name promises: `importScores` cannot import a bad file. When "not found" is a normal outcome, return a nullable type instead: `findUser(int $id): ?User` tells callers they must handle `null`, and static analysers make sure they do. Throwing for absence makes callers wrap ordinary lookups in `try`.
+
+</Misconception>
+
+<Misconception>
+
+**"The exception message is for the user."** Messages are for developers and logs. They may contain internal details, and they are written in whatever language the code is. Show users a message you wrote for them, translated if needed, and keep the exception for the log.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,357 @@
+---
+title: Handling web requests and forms safely
+subtitle: How a request reaches your PHP code, and the habits that keep a site safe from its own input — validation, escaping, prepared statements with PDO, passwords and CSRF tokens.
+minutes: 60
+objectives:
+  - Describe how PHP exposes an HTTP request and builds a response
+  - Validate form input on the server with explicit rules and allowlists
+  - Escape output correctly for HTML, attributes, URLs and JavaScript
+  - Query a database safely with PDO prepared statements, and explain SQL injection
+  - Store passwords with password_hash and protect forms with CSRF tokens
+  - Name the main security settings for sessions, cookies, uploads and errors
+prerequisites: [errors-and-exceptions]
+references:
+  - title: OWASP Top Ten
+    url: https://owasp.org/www-project-top-ten/
+    note: The most common categories of web-application security risks, kept current by the security community.
+  - title: "OWASP Cheat Sheet: Cross Site Scripting Prevention"
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+    note: Output encoding for every context, explained in detail.
+  - title: "OWASP Cheat Sheet: SQL Injection Prevention"
+    url: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+  - title: "OWASP Cheat Sheet: Cross-Site Request Forgery Prevention"
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+  - title: "PHP Manual: PDO"
+    url: https://www.php.net/manual/en/book.pdo.php
+    note: Connections, prepared statements, transactions and error modes.
+  - title: "PHP Manual: password_hash"
+    url: https://www.php.net/manual/en/function.password-hash.php
+  - title: "PHP Manual: Data filtering"
+    url: https://www.php.net/manual/en/book.filter.php
+    note: filter_var and its validation filters.
+---
+
+<Section id="motivation" kind="motivation" title="Every request is a message from a stranger">
+
+A web application is a program that strangers can talk to. Anyone on the internet can send your PHP code any request they like: any URL, any form fields, any cookies, any headers, at any speed, from scripts as well as browsers. Most of them are customers. Some are automated scanners trying thousands of known tricks on every site they find. A few are people deliberately looking for a way into yours.
+
+PHP's long history on the web includes a long history of insecure tutorials, and many of the classic attacks (SQL injection, cross-site scripting) were once everyday events on PHP sites. The defences are well understood and not complicated. They are habits: *validate input* when it arrives, *escape output* for wherever it goes, *never build SQL from strings*, *never store passwords*, and *check that a form was submitted by your own page*. This lesson teaches each one with code you can run. Frameworks do much of this for you, but you need to know what they are doing, because the day you step outside their defaults is the day it matters.
+
+</Section>
+
+<Section id="request" kind="definitions" title="A request, as PHP sees it">
+
+When PHP-FPM (or the built-in server) runs your script for a request, it fills a set of **superglobals**, arrays available everywhere:
+
+| Variable | Contains |
+| --- | --- |
+| `$_GET` | the query-string parameters: for `/search?q=tea&page=2`, `["q" => "tea", "page" => "2"]` |
+| `$_POST` | form fields from a POST request with a form encoding |
+| `$_COOKIE` | the cookies the browser sent |
+| `$_FILES` | uploaded files, with their temporary paths, sizes and error codes |
+| `$_SERVER` | request details: `REQUEST_METHOD`, `REQUEST_URI`, headers as `HTTP_…`, and server information |
+| `$_SESSION` | your own per-visitor data, after `session_start()` |
+
+Every value in `$_GET`, `$_POST` and `$_COOKIE` is a **string** (or an array, if the field name ends in `[]`, which an attacker can also arrange). A JSON request body is not parsed for you: read it with `file_get_contents("php://input")` and decode it with `json_decode`. The response is whatever your script prints, plus the headers you set with `header()` and the status code you set with `http_response_code()`.
+
+A complete page handler for the built-in server looks like this (save it as `index.php` and run `php -S localhost:8000`):
+
+```php
+<?php
+declare(strict_types=1);
+
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    [$values, $errors] = validateSignup($_POST);
+    if ($errors === []) {
+        saveMember($values);
+        header("Location: /thanks", response_code: 303);   // redirect after a successful POST
+        exit;
+    }
+    http_response_code(422);
+}
+echo renderForm($values ?? [], $errors ?? []);
+```
+
+The **redirect after POST** (status 303 to a new page) stops the browser from resubmitting the form when the user presses reload. Frameworks wrap all of this in request and response objects (the PSR-7 standard describes a common shape for them), but underneath it is the same data.
+
+</Section>
+
+<Section id="validation" kind="examples" title="Validate input, escape output">
+
+The program below plays the part of a form handler, receiving a hostile submission as `$_POST` would deliver it.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+/** Escape for HTML text and quoted attributes. Use it for every value you print into HTML. */
+function e(string $text): string
+{
+    return htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, "UTF-8");
+}
+
+/**
+ * Validate a "join the reading club" form.
+ *
+ * @param array<string, mixed> $input usually $_POST
+ * @return array{0: array<string, mixed>, 1: array<string, string>} [clean values, errors by field]
+ */
+function validateSignup(array $input): array
+{
+    $clean = [];
+    $errors = [];
+
+    $name = trim((string) ($input["name"] ?? ""));
+    if ($name === "" || strlen($name) > 80) {
+        $errors["name"] = "Please enter your name (at most 80 characters).";
+    }
+    $clean["name"] = $name;
+
+    $email = filter_var(trim((string) ($input["email"] ?? "")), FILTER_VALIDATE_EMAIL);
+    if ($email === false) {
+        $errors["email"] = "Please enter a valid email address.";
+    }
+    $clean["email"] = $email === false ? (string) ($input["email"] ?? "") : $email;
+
+    $age = filter_var($input["age"] ?? "", FILTER_VALIDATE_INT, ["options" => ["min_range" => 13, "max_range" => 120]]);
+    if ($age === false) {
+        $errors["age"] = "Age must be a whole number from 13 to 120.";
+    }
+    $clean["age"] = $age;
+
+    $genres = ["fiction", "history", "poetry", "science"];
+    $genre = $input["genre"] ?? "";
+    if (!in_array($genre, $genres, true)) {        // an allowlist: only known values pass
+        $errors["genre"] = "Please choose one of the listed genres.";
+    }
+    $clean["genre"] = $genre;
+
+    return [$clean, $errors];
+}
+
+function renderForm(array $values, array $errors): string
+{
+    $html = "<form method=\"post\">\n";
+    foreach (["name", "email"] as $field) {
+        $html .= sprintf("  <input name=\"%s\" value=\"%s\">", $field, e((string) $values[$field]));
+        $html .= isset($errors[$field]) ? " <em>" . e($errors[$field]) . "</em>\n" : "\n";
+    }
+    return $html . "</form>\n";
+}
+
+// A hostile submission, as it would arrive in $_POST: every value is a string.
+$post = [
+    "name" => '"><script>steal(document.cookie)</script>',
+    "email" => "not-an-email",
+    "age" => "12",
+    "genre" => "poetry",
+];
+
+[$values, $errors] = validateSignup($post);
+foreach ($errors as $field => $message) {
+    echo "$field: $message\n";
+}
+echo renderForm($values, $errors);
+
+[$values, $errors] = validateSignup(["name" => " Wangari ", "email" => "wangari@example.org", "age" => "34", "genre" => "history"]);
+echo $errors === [] ? "accepted: " . json_encode($values) : "rejected", "\n";
+```
+
+```text
+email: Please enter a valid email address.
+age: Age must be a whole number from 13 to 120.
+<form method="post">
+  <input name="name" value="&quot;&gt;&lt;script&gt;steal(document.cookie)&lt;/script&gt;">
+  <input name="email" value="not-an-email"> <em>Please enter a valid email address.</em>
+</form>
+accepted: {"name":"Wangari","email":"wangari@example.org","age":34,"genre":"history"}
+```
+
+**Validation** is the question "is this input acceptable?", answered on the server for every field, every time. Browser-side checks (`required`, `type="email"`) are a convenience for honest users; anyone can bypass them by sending a request directly. The habits in `validateSignup`:
+
+- **Never assume a field exists or is a string.** `$input["age"] ?? ""` handles a missing field; `(string)` handles an array where a string was expected.
+- **Use precise rules.** `FILTER_VALIDATE_EMAIL` checks the address format; `FILTER_VALIDATE_INT` with a range rejects `"12"` for an age that must be at least 13, and rejects `"1e2"` or `"34 years"` outright.
+- **Allowlists beat blocklists.** The genre must be one of four known values. Trying to list every *bad* value never works; listing the good ones always does.
+- **Collect all errors**, keyed by field, so the form can show every problem at once next to the right input.
+
+**Escaping** is the separate question "how do I put this value into HTML safely?". Notice that the hostile name *passed* validation: it is a legal, if odd, name of under 80 characters. Validation alone cannot make data safe to print, because what is dangerous depends on where it goes. The `e()` helper calls `htmlspecialchars`, which turned `"><script>…` into harmless text: the browser will show the visitor exactly what they typed, inside the input box, and run nothing. Without it, the quote would have closed the `value` attribute and the script would have run in the browser of everyone who viewed the page. That attack is **cross-site scripting (XSS)**, and it can steal sessions, deface pages or act as the victim.
+
+Pass `ENT_QUOTES` so single quotes are escaped too (the default since PHP 8.1, but older code may differ), always quote HTML attributes, and escape at the moment of output, not when storing: the database should hold what the user actually typed. Template engines such as Twig and Blade escape every `{{ value }}` automatically, which is the best argument for using one.
+
+</Section>
+
+<Section id="pdo" kind="examples" title="Prepared statements with PDO">
+
+**PDO** (PHP Data Objects) is PHP's standard database layer, with drivers for MySQL and MariaDB, PostgreSQL, SQLite, SQL Server and others. The program below uses an SQLite database in memory, so it runs anywhere:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+$db = new PDO("sqlite::memory:", options: [
+    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,          // the default since PHP 8.0; say it anyway
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+]);
+
+$db->exec("CREATE TABLE members (id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, secret TEXT NOT NULL)");
+
+$insert = $db->prepare("INSERT INTO members (name, city, secret) VALUES (:name, :city, :secret)");
+$db->beginTransaction();
+foreach ([["Thandiwe", "Durban"], ["Rahul", "Pune"], ["Ayşe", "İzmir"], ["Kenji", "Sendai"]] as [$name, $city]) {
+    $insert->execute(["name" => $name, "city" => $city, "secret" => "private notes of $name"]);
+}
+$db->commit();
+
+$typed = "x' OR '1'='1";      // what an attacker types into the "city" search box
+
+// WRONG: building SQL by joining strings lets the input rewrite the query.
+$unsafe = $db->query("SELECT name, secret FROM members WHERE city = '$typed'")->fetchAll();
+echo "unsafe query returned ", count($unsafe), " rows, e.g. ", $unsafe[0]["secret"], "\n";
+
+// RIGHT: a prepared statement sends the value separately; it can never become SQL.
+$search = $db->prepare("SELECT name, city FROM members WHERE city = ?");
+$search->execute([$typed]);
+echo "safe query returned ", count($search->fetchAll()), " rows\n";
+$search->execute(["Pune"]);
+echo "searching for Pune: ", json_encode($search->fetchAll(), JSON_UNESCAPED_UNICODE), "\n";
+
+// Placeholders can only stand for values, not column names: use an allowlist for those.
+function listMembers(PDO $db, string $sort): array
+{
+    $columns = ["name" => "name", "city" => "city", "newest" => "id DESC"];
+    $orderBy = $columns[$sort] ?? "name";
+    return $db->query("SELECT name FROM members ORDER BY $orderBy")->fetchAll(PDO::FETCH_COLUMN);
+}
+echo "by city: ", implode(", ", listMembers($db, "city")), "\n";
+echo "hostile sort falls back: ", implode(", ", listMembers($db, "name; DROP TABLE members")), "\n";
+
+// Errors become exceptions you can catch.
+try {
+    $db->prepare("INSERT INTO members (name, city, secret) VALUES (?, ?, ?)")->execute(["Zara", null, "x"]);
+} catch (PDOException $e) {
+    echo "PDOException: ", $e->getMessage(), "\n";
+}
+```
+
+```text
+unsafe query returned 4 rows, e.g. private notes of Thandiwe
+safe query returned 0 rows
+searching for Pune: [{"name":"Rahul","city":"Pune"}]
+by city: Thandiwe, Rahul, Kenji, Ayşe
+hostile sort falls back: Ayşe, Kenji, Rahul, Thandiwe
+PDOException: SQLSTATE[23000]: Integrity constraint violation: 19 NOT NULL constraint failed: members.city
+```
+
+The first query is the classic **SQL injection**. The "city" typed by the attacker contains a quote, which ends the string in the SQL, and the rest (`OR '1'='1'`) becomes part of the query. The `WHERE` clause is now always true, and the page leaks every member's private notes. With other inputs the same mistake can modify or delete data, or read other tables entirely.
+
+The fix is not to clean the input but to keep it out of the SQL altogether. A **prepared statement** sends the query with placeholders (`?` or `:name`) to the database first, and the values separately. The database never parses the values as SQL, so the attacker's text is just an odd city name that matches nothing. This is the one rule to follow without exception: **every value in a query goes through a placeholder.** It also makes repeated queries faster, because the statement is parsed once and executed many times, as the insert loop does.
+
+The rest of the program shows the practical details:
+
+- **Errors as exceptions.** With `PDO::ERRMODE_EXCEPTION` (the default since PHP 8.0) a failed query throws a `PDOException` instead of returning `false`. The `NOT NULL` violation at the end is caught like any other exception.
+- **Transactions.** `beginTransaction()` and `commit()` make the four inserts succeed or fail together; on an exception you would call `rollBack()`.
+- **Identifiers cannot be bound.** Placeholders stand for values, never for table or column names or SQL keywords. When the user chooses a sort order, map their choice through an allowlist to a fixed piece of SQL, as `listMembers` does; the hostile "sort" simply falls back to the default.
+- **Byte order.** SQLite sorted `İzmir` after `Sendai` because it compares bytes, and `İ` is not an ASCII letter: the strings lesson again. Real databases let you choose a collation for each language.
+
+For MySQL, also pass `PDO::ATTR_EMULATE_PREPARES => false` so the driver uses real server-side prepared statements. Most teams use a query builder or ORM (Doctrine in Symfony, Eloquent in Laravel) that prepares every statement for you, but raw `$pdo->query("… $variable …")` in a code review is always worth a comment.
+
+</Section>
+
+<Section id="passwords-csrf" kind="human" title="Passwords, CSRF tokens and escaping in context">
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+// Passwords: store only a slow, salted hash, and let PHP choose the algorithm.
+$hash = password_hash("correct horse battery staple", PASSWORD_DEFAULT);
+echo "hash starts with ", substr($hash, 0, 4), " and is ", strlen($hash), " characters long\n";
+var_dump(password_verify("correct horse battery staple", $hash), password_verify("Correct horse battery staple", $hash));
+var_dump($hash === password_hash("correct horse battery staple", PASSWORD_DEFAULT));   // a new random salt every time
+var_dump(password_needs_rehash($hash, PASSWORD_DEFAULT, ["cost" => 13]));
+
+// CSRF protection: a random token in the session and in every form, compared in constant time.
+$sessionToken = bin2hex(random_bytes(32));
+$formField = $sessionToken;                     // what the honest form sends back
+echo "token length: ", strlen($sessionToken), "\n";
+var_dump(hash_equals($sessionToken, $formField), hash_equals($sessionToken, "guess"));
+
+// Escaping depends on where the value goes.
+$search = "Tom & Jerry <3 'cartoons'";
+echo "HTML:  <p>", htmlspecialchars($search), "</p>\n";
+echo "URL:   /search?", http_build_query(["q" => $search, "page" => 2]), "\n";
+echo "Path:  /tags/", rawurlencode("café & bar"), "\n";
+echo "JS:    <script>const q = ", json_encode($search, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT), ";</script>\n";
+```
+
+```text
+hash starts with $2y$ and is 60 characters long
+bool(true)
+bool(false)
+bool(false)
+bool(true)
+token length: 64
+bool(true)
+bool(false)
+HTML:  <p>Tom &amp; Jerry &lt;3 &#039;cartoons&#039;</p>
+URL:   /search?q=Tom+%26+Jerry+%3C3+%27cartoons%27&page=2
+Path:  /tags/caf%C3%A9%20%26%20bar
+JS:    <script>const q = "Tom \u0026 Jerry \u003C3 \u0027cartoons\u0027";</script>
+```
+
+**Passwords.** Never store a password, and never store a fast hash of one (such as MD5 or SHA-256): attackers who steal a database can try billions of guesses per second against fast hashes. `password_hash` uses a deliberately slow algorithm with a random salt (bcrypt by default, recognisable by `$2y$`; Argon2id is available with `PASSWORD_ARGON2ID` when PHP is built with it), and `password_verify` checks a login attempt against the stored hash. Because the salt is random, hashing the same password twice gives different results, so you can never compare hashes with `===`. PHP 8.4 raised bcrypt's default cost from 10 to 12; `password_needs_rehash` tells you, at login when you have the plain password in hand, that a stored hash uses older settings and should be replaced.
+
+**Cross-site request forgery (CSRF).** If a member is logged in to your site and visits a malicious page, that page can make their browser submit a form to your site, with their cookies attached. Your server would see a valid session and act on it. The defence is a **CSRF token**: a random value (`random_bytes`, never `rand`) stored in the session and included as a hidden field in every form; on submission, compare the two with `hash_equals`, which takes the same time whether the strings differ in the first character or the last, so an attacker cannot learn the token by timing. Setting session cookies with `SameSite=Lax` adds a second layer. Frameworks generate and check these tokens automatically.
+
+**Escaping depends on context.** The same search text needs different treatment in each place it appears: `htmlspecialchars` for HTML, `http_build_query` or `urlencode` for query strings, `rawurlencode` for a path segment, and `json_encode` with the `JSON_HEX_*` flags for a value inside a `<script>` block (so that `</script>` in the data cannot end the block). There is no single "make safe" function, which is exactly why output escaping is done at the point of output, by code that knows the context.
+
+</Section>
+
+<Section id="checklist" kind="reading" title="A short checklist for PHP applications">
+
+The OWASP cheat sheets linked below go deep on each topic. As a starting point, a PHP application in production should:
+
+- **Sessions:** call `session_regenerate_id(true)` when a user logs in (so a session id fixed before login becomes useless), and set the session cookie with `Secure`, `HttpOnly` and `SameSite=Lax` (the `session.cookie_*` settings).
+- **Uploads:** check `$_FILES[...]["error"]` and the size, determine the type from the file's contents (the `finfo` functions) rather than its name or the browser's claim, generate your own file name, and store uploads outside the web root so they can never be executed as PHP.
+- **Errors:** `display_errors = Off` in production, with errors logged instead (the previous lesson).
+- **Transport and headers:** serve everything over HTTPS, and send security headers such as `Content-Security-Policy` to limit what a successful XSS could do.
+- **Dependencies:** keep PHP and your Composer packages up to date; `composer audit` (next lesson) reports packages with known vulnerabilities.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"I escape input when it arrives, so output is safe."** Escaping is specific to where a value is going, and at the moment input arrives you do not know that yet: the same name may go into HTML, an email subject, a CSV export and a JSON API. Escape on the way *out*, for the context you are writing to. On the way *in*, validate.
+
+</Misconception>
+
+<Misconception>
+
+**"`addslashes` or `mysqli_real_escape_string` prevents SQL injection."** Escaping quotes by hand is fragile: it depends on the connection's character set, on quoting the value in the SQL, and on never forgetting once. Prepared statements remove the problem instead of patching it.
+
+</Misconception>
+
+<Misconception>
+
+**"Hashing passwords with SHA-256 and a salt is good enough."** SHA-256 is designed to be fast, which is the opposite of what a password hash needs. Use `password_hash`; it is slow on purpose, salted automatically, and upgradeable.
+
+</Misconception>
+
+<Misconception>
+
+**"A hidden form field cannot be changed, so I can trust it."** Hidden fields, select options, disabled inputs and prices in the HTML are all just text that the browser sends back, and anyone can send something else. Re-check everything on the server, and look up prices and permissions from your own data.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

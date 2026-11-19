@@ -1,0 +1,550 @@
+---
+title: Enums, readonly data and the type system
+subtitle: Make invalid states impossible to represent with enums and immutable value objects, and use the whole of PHP's type system, including what it leaves to static analysis.
+minutes: 55
+objectives:
+  - Define pure and backed enums with methods, and convert backed enums to and from stored values
+  - Use match on enums to keep every case handled
+  - Build immutable value objects with readonly classes and clone with (8.5)
+  - Explain the difference between == and === for objects and enums
+  - Read and write union, intersection, DNF, nullable and never types
+  - Express generic types in docblocks for PHPStan and Psalm
+prerequisites: [classes-interfaces-traits]
+references:
+  - title: "PHP Manual: Enumerations"
+    url: https://www.php.net/manual/en/language.enumerations.php
+    note: Pure and backed enums, methods, interfaces and constants.
+  - title: "PHP Manual: Readonly properties"
+    url: https://www.php.net/manual/en/language.oop5.properties.php#language.oop5.properties.readonly-properties
+    note: The rules for readonly properties and readonly classes.
+  - title: "PHP Manual: Type declarations"
+    url: https://www.php.net/manual/en/language.types.declarations.php
+    note: Union, intersection and DNF types, and every type keyword.
+  - title: PHPStan
+    url: https://phpstan.org/
+    note: The most widely used static analyser for PHP; its documentation explains generics in docblocks.
+  - title: Psalm
+    url: https://psalm.dev/
+    note: Another mature static analyser with strong support for generics and immutability.
+---
+
+<Section id="motivation" kind="motivation" title="Making wrong states impossible">
+
+Imagine an online shop that stores each order's status as a string: `"pending"`, `"paid"`, `"shipped"`. Somewhere a developer writes `"payed"`. Somewhere else an order goes from `"pending"` straight to `"shipped"` without being paid. Neither mistake is caught when it happens; both are found weeks later by an unhappy customer or an accountant.
+
+The cure is to design types that cannot hold those wrong values in the first place. If a status can only be one of five named cases, a misspelling does not compile. If the rules for moving between statuses live on the status type itself, every part of the program uses the same rules. If an amount of money is an object that cannot be changed after it is created, nobody can corrupt it halfway through a calculation.
+
+PHP 8.1 and 8.2 gave PHP the tools for this: **enums**, **readonly properties** and **readonly classes**, plus richer type declarations. This lesson shows how professionals use them, and where PHP's own type checks end and static analysis tools take over.
+
+</Section>
+
+<Section id="enums" kind="examples" title="Enums">
+
+An **enum** (PHP 8.1) is a type with a fixed set of named values, its **cases**. A *pure* enum has only the names. A *backed* enum gives each case a scalar value (all `int` or all `string`), which is what you store in a database or send as JSON.
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+enum OrderStatus: string
+{
+    case Pending = "pending";
+    case Paid = "paid";
+    case Shipped = "shipped";
+    case Delivered = "delivered";
+    case Cancelled = "cancelled";
+
+    /** @return list<self> the statuses an order may move to from this one */
+    public function next(): array
+    {
+        return match ($this) {
+            self::Pending => [self::Paid, self::Cancelled],
+            self::Paid => [self::Shipped, self::Cancelled],
+            self::Shipped => [self::Delivered],
+            self::Delivered, self::Cancelled => [],
+        };
+    }
+
+    public function canBecome(self $other): bool
+    {
+        return in_array($other, $this->next(), true);
+    }
+
+    public function label(): string
+    {
+        return ucfirst($this->value);
+    }
+}
+
+foreach (OrderStatus::cases() as $status) {
+    $next = array_map(fn(OrderStatus $s): string => $s->value, $status->next());
+    printf("%-10s -> %s\n", $status->label(), $next === [] ? "(final)" : implode(", ", $next));
+}
+
+// Converting to and from the stored value, e.g. a database column.
+$fromDatabase = OrderStatus::from("paid");
+var_dump($fromDatabase === OrderStatus::Paid);
+var_dump(OrderStatus::tryFrom("lost"));
+try {
+    OrderStatus::from("lost");
+} catch (ValueError $e) {
+    echo get_class($e), ": ", $e->getMessage(), "\n";
+}
+
+var_dump(OrderStatus::Paid->canBecome(OrderStatus::Pending));
+echo json_encode(["order" => 1042, "status" => OrderStatus::Shipped]), "\n";
+echo OrderStatus::Paid->name, " / ", OrderStatus::Paid->value, "\n";
+var_dump(OrderStatus::Paid instanceof BackedEnum);
+```
+
+```text
+Pending    -> paid, cancelled
+Paid       -> shipped, cancelled
+Shipped    -> delivered
+Delivered  -> (final)
+Cancelled  -> (final)
+bool(true)
+NULL
+ValueError: "lost" is not a valid backing value for enum OrderStatus
+bool(false)
+{"order":1042,"status":"shipped"}
+Paid / paid
+bool(true)
+```
+
+What the program shows:
+
+- **Cases are objects, and singletons.** `OrderStatus::Paid` is the one and only instance of that case, so `===` compares cases correctly and quickly. You cannot write `new OrderStatus()`, and enums cannot have properties that change.
+- **Enums can have methods**, constants, static methods, and can implement interfaces. Putting `next()` and `canBecome()` on the enum keeps the business rules in one place. Inside, `$this` is the current case.
+- **`match` on an enum** is the idiomatic way to give each case its behaviour. If someone later adds a case `Refunded` and forgets to update `next()`, the `match` throws an `UnhandledMatchError` when it meets the new case, and a static analyser reports the missing arm before the code ever runs. That is why `next()` lists every case explicitly instead of ending with `default`.
+- **`cases()`** lists every case in declaration order, which is perfect for building a drop-down menu or a test that covers them all.
+- **`from()` and `tryFrom()`** turn a stored value back into a case. `from` throws a `ValueError` for an unknown value; `tryFrom` returns `null`, so you can decide what to do. Use `from` when an unknown value means corrupted data, `tryFrom` when it comes from a user.
+- Each case has a **`name`** (`Paid`, the identifier in the code) and, if backed, a **`value`** (`paid`, the stored form). `json_encode` writes backed enums as their value.
+
+Before PHP 8.1, people used class constants (`const PAID = 'paid'`) for this. Constants are just strings, so any string could still slip in where a status was expected. An enum type in a parameter (`function ship(OrderStatus $s)`) accepts only real cases.
+
+**Pure enums, interfaces and constants.** Not every enum needs a stored value. A *pure* enum, with cases but no `: string` or `: int`, is right when the cases only ever live inside your program. Both kinds can implement interfaces and declare constants:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+interface HasLabel
+{
+    public function label(): string;
+}
+
+// A pure enum: cases with names only.
+enum Priority implements HasLabel
+{
+    case Low;
+    case Normal;
+    case Urgent;
+
+    public function responseTime(): string
+    {
+        return match ($this) {
+            self::Low => "5 days",
+            self::Normal => "2 days",
+            self::Urgent => "4 hours",
+        };
+    }
+
+    public function label(): string
+    {
+        return strtolower($this->name);
+    }
+}
+
+// A backed enum with a constant and a static constructor.
+enum Weekday: int implements HasLabel
+{
+    case Monday = 1;
+    case Tuesday = 2;
+    case Wednesday = 3;
+    case Thursday = 4;
+    case Friday = 5;
+    case Saturday = 6;
+    case Sunday = 7;
+
+    public const array WEEKEND = [self::Saturday, self::Sunday];
+
+    public static function of(DateTimeImmutable $date): self
+    {
+        return self::from((int) $date->format("N"));   // N: ISO day, 1 = Monday
+    }
+
+    public function isWeekend(): bool
+    {
+        return in_array($this, self::WEEKEND, true);
+    }
+
+    public function label(): string
+    {
+        return substr($this->name, 0, 3);
+    }
+}
+
+foreach (Priority::cases() as $p) {
+    echo str_pad($p->label(), 7), $p->responseTime(), "\n";
+}
+
+foreach (["2026-11-19", "2026-11-21"] as $iso) {
+    $day = Weekday::of(new DateTimeImmutable($iso));
+    echo $iso, " is a ", $day->name, $day->isWeekend() ? " (weekend)" : "", "\n";
+}
+
+$labels = array_map(fn(HasLabel $x): string => $x->label(), [Priority::Urgent, Weekday::Friday]);
+echo implode(", ", $labels), "\n";
+var_dump(Priority::Low instanceof UnitEnum, Priority::Low instanceof BackedEnum, count(Weekday::cases()));
+```
+
+```text
+low    5 days
+normal 2 days
+urgent 4 hours
+2026-11-19 is a Thursday
+2026-11-21 is a Saturday (weekend)
+urgent, Fri
+bool(true)
+bool(false)
+int(7)
+```
+
+`Priority` is pure: it has `name` but no `value`, no `from()` and no `tryFrom()`, and it is a `UnitEnum` but not a `BackedEnum` (every enum implements `UnitEnum`; backed ones also implement `BackedEnum`). `Weekday` is backed by the ISO day number, which makes `Weekday::of()` a one-line conversion from a date. Its constant `WEEKEND` holds enum cases, which is allowed because cases are constant expressions. And because both enums implement `HasLabel`, a function that only needs a label can accept either, exactly as with classes.
+
+A good rule for choosing: use a **backed** enum when the value leaves your program (a database column, an API, a form field) and you need a stable external spelling; use a **pure** enum otherwise, so renaming a case in code never silently changes stored data. When a set of things needs data that varies per item (each product has its own price), that is not an enum at all but a class with instances, usually loaded from a database.
+
+</Section>
+
+<Section id="value-objects" kind="examples" title="Readonly classes and value objects">
+
+A **value object** is a small object defined entirely by its data: an amount of money, a date range, an email address, a geographic coordinate. Two value objects with the same data are interchangeable, and they never change; an operation returns a *new* object instead. The second lesson warned never to store money as a float. Here is how a PHP team would actually represent it:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+enum Currency: string
+{
+    case EUR = "EUR";
+    case JPY = "JPY";
+    case KES = "KES";
+
+    public function decimals(): int
+    {
+        return match ($this) {
+            self::JPY => 0,
+            self::EUR, self::KES => 2,
+        };
+    }
+}
+
+/** An amount of money in the currency's smallest unit (cents, yen, …). Immutable. */
+final readonly class Money
+{
+    private function __construct(
+        public int $minor,
+        public Currency $currency,
+    ) {
+    }
+
+    public static function of(string $amount, Currency $currency): self
+    {
+        if (!preg_match('/^\d+(\.\d+)?$/', $amount)) {
+            throw new InvalidArgumentException("Not an amount: '$amount'");
+        }
+        [$whole, $fraction] = array_pad(explode(".", $amount), 2, "");
+        $decimals = $currency->decimals();
+        if (strlen($fraction) > $decimals) {
+            throw new InvalidArgumentException("Too many decimals for {$currency->value}: $amount");
+        }
+        return new self((int) ($whole . str_pad($fraction, $decimals, "0")), $currency);
+    }
+
+    public function plus(Money $other): self
+    {
+        if ($other->currency !== $this->currency) {
+            throw new LogicException("Cannot add {$other->currency->value} to {$this->currency->value}");
+        }
+        return clone($this, ["minor" => $this->minor + $other->minor]);   // PHP 8.5
+    }
+
+    public function times(int $factor): self
+    {
+        return clone($this, ["minor" => $this->minor * $factor]);
+    }
+
+    /** @return list<self> parts that differ by at most one minor unit and add up exactly */
+    public function split(int $parts): array
+    {
+        $base = intdiv($this->minor, $parts);
+        $remainder = $this->minor % $parts;
+        $result = [];
+        for ($i = 0; $i < $parts; $i++) {
+            $result[] = new self($base + ($i < $remainder ? 1 : 0), $this->currency);
+        }
+        return $result;
+    }
+
+    public function format(): string
+    {
+        $d = $this->currency->decimals();
+        $number = $d === 0
+            ? (string) $this->minor
+            : sprintf("%d.%0{$d}d", intdiv($this->minor, 10 ** $d), $this->minor % 10 ** $d);
+        return "{$this->currency->value} $number";
+    }
+}
+
+$dinner = Money::of("100", Currency::EUR);
+echo "split three ways: ", implode(" + ", array_map(fn(Money $m) => $m->format(), $dinner->split(3))), "\n";
+
+$ticket = Money::of("1250", Currency::KES)->times(3)->plus(Money::of("99.50", Currency::KES));
+echo "tickets: ", $ticket->format(), "\n";
+echo "ramen: ", Money::of("980", Currency::JPY)->format(), "\n";
+
+var_dump(Money::of("5", Currency::EUR) == Money::of("5.00", Currency::EUR));
+var_dump(Money::of("5", Currency::EUR) === Money::of("5.00", Currency::EUR));
+
+foreach ([fn() => Money::of("1.5", Currency::JPY), fn() => $dinner->plus(Money::of("1", Currency::KES)), fn() => $dinner->minor = 1] as $attempt) {
+    try {
+        $attempt();
+    } catch (Throwable $e) {
+        echo get_class($e), ": ", $e->getMessage(), "\n";
+    }
+}
+```
+
+```text
+split three ways: EUR 33.34 + EUR 33.33 + EUR 33.33
+tickets: KES 3849.50
+ramen: JPY 980
+bool(true)
+bool(false)
+InvalidArgumentException: Too many decimals for JPY: 1.5
+LogicException: Cannot add KES to EUR
+Error: Cannot modify readonly property Money::$minor
+```
+
+The pieces:
+
+- **`final readonly class`** (PHP 8.2) makes every property readonly: each can be assigned once, during construction, and never again. The last line of the output is PHP refusing to change `minor` from outside.
+- **A private constructor plus a named constructor.** `Money::of("99.50", Currency::KES)` parses and validates the text; there is no way to create a `Money` that skipped those checks. The amount is stored as an integer count of the smallest unit (cents, or whole yen for a currency with no decimals), so arithmetic is exact.
+- **Operations return new objects.** `plus` and `times` never modify `$this`. They use **`clone` with new property values** (PHP 8.5), which copies the object and sets the listed properties on the copy in one step, even though they are readonly. It must be called from inside the class: readonly properties can only be written from the class's own scope, so `clone($money, ["minor" => 1])` written outside the class fails. Before 8.5, the same "wither" methods simply called `new self(...)` with the changed value.
+- **`split` shows why integers matter.** 100 euros split three ways cannot be three equal amounts of cents. The method gives the extra cent to the first part, and the parts add up to exactly 100.00. With floats you would get 33.333… three times and lose (or invent) a fraction of a cent.
+- **Invalid operations fail loudly.** Too many decimals for yen, or adding shillings to euros, throws an exception at the moment of the mistake, with a message that says what went wrong.
+
+**Comparing objects.** `==` on two objects of the same class compares their properties, so two `Money` objects for 5.00 euros are equal. `===` asks whether they are the *same instance*, so it is false. For value objects, give the class an `equals()` method that states exactly what equality means; for enums, `===` is always right.
+
+The standard library has a well-known lesson in this area. PHP has two date classes: `DateTime`, whose `modify()` method changes the object in place, and `DateTimeImmutable`, whose methods return new objects. Code that passes a `DateTime` to a function that calls `->modify('+1 day')` on it has silently changed the caller's date. Modern code uses `DateTimeImmutable` everywhere.
+
+</Section>
+
+<Section id="types" kind="definitions" title="The rest of the type system">
+
+You have now met most of PHP's type declarations. Here they are working together:
+
+```php check
+<?php
+
+declare(strict_types=1);
+
+interface HasId
+{
+    public function id(): int;
+}
+
+interface Named
+{
+    public function name(): string;
+}
+
+final readonly class Customer implements HasId, Named
+{
+    public function __construct(private int $id, private string $name)
+    {
+    }
+
+    public function id(): int
+    {
+        return $this->id;
+    }
+
+    public function name(): string
+    {
+        return $this->name;
+    }
+}
+
+final readonly class Invoice implements HasId
+{
+    public function __construct(private int $id)
+    {
+    }
+
+    public function id(): int
+    {
+        return $this->id;
+    }
+}
+
+final class Limits
+{
+    public const int MAX_LINES = 50;             // typed class constant (PHP 8.3)
+}
+
+// An intersection type: the argument must implement both interfaces.
+function label(HasId&Named $thing): string
+{
+    return "#{$thing->id()} {$thing->name()}";
+}
+
+// A union type, narrowed inside with a match on the actual type.
+function describeKey(int|string|null $key): string
+{
+    return match (true) {
+        $key === null => "no key",
+        is_int($key) => "numeric key $key",
+        default => "text key '$key'",
+    };
+}
+
+/**
+ * Generic in the docblock only: PHP checks `array` and `mixed`; PHPStan and Psalm check T.
+ *
+ * @template T
+ * @param list<T> $items
+ * @param callable(T): bool $test
+ * @return T|null
+ */
+function firstWhere(array $items, callable $test): mixed
+{
+    foreach ($items as $item) {
+        if ($test($item)) {
+            return $item;
+        }
+    }
+    return null;
+}
+
+// A DNF type (PHP 8.2): either something with an id and a name, or null.
+function findNamed(array $things, int $id): (HasId&Named)|null
+{
+    $found = firstWhere($things, fn(HasId $t): bool => $t->id() === $id);
+    return $found instanceof Named ? $found : null;
+}
+
+function fail(string $message): never
+{
+    throw new DomainException($message);
+}
+
+$things = [new Customer(7, "Oluwaseun"), new Invoice(8), new Customer(9, "Ines")];
+
+echo label($things[0]), "\n";
+echo describeKey(null), "; ", describeKey(42), "; ", describeKey("sku-9"), "\n";
+echo findNamed($things, 9)?->name() ?? "none", ", ", findNamed($things, 8)?->name() ?? "none", "\n";
+echo "max lines: ", Limits::MAX_LINES, "\n";
+
+try {
+    echo label($things[1]), "\n";
+} catch (TypeError $e) {
+    echo "TypeError: ", explode(", called", $e->getMessage())[0], "\n";
+}
+try {
+    fail("stock cannot be negative");
+} catch (DomainException $e) {
+    echo get_class($e), ": ", $e->getMessage(), "\n";
+}
+```
+
+```text
+#7 Oluwaseun
+no key; numeric key 42; text key 'sku-9'
+Ines, none
+max lines: 50
+TypeError: label(): Argument #1 ($thing) must be of type HasId&Named, Invoice given
+DomainException: stock cannot be negative
+```
+
+<Definition term="Union type (8.0)">
+
+`int|string|null` accepts any of the listed types. Inside the function you narrow it with `is_int`, `instanceof` or `=== null` before using type-specific operations.
+
+</Definition>
+
+<Definition term="Intersection type (8.1)">
+
+`HasId&Named` accepts only objects that implement *both* interfaces. It lets a function ask for exactly the capabilities it uses instead of a concrete class. The `Invoice` has an id but no name, so it is rejected with a `TypeError`.
+
+</Definition>
+
+<Definition term="DNF type (8.2)">
+
+Disjunctive normal form combines the two: a union of intersections, each in parentheses, such as `(HasId&Named)|null`.
+
+</Definition>
+
+<Definition term="Typed class constant (8.3)">
+
+`public const int MAX_LINES = 50;` declares the constant's type, so a subclass or interface implementation cannot redefine it with a value of another type.
+
+</Definition>
+
+**What PHP does not check.** PHP has no generics. A parameter typed `array` accepts an array of anything, and `mixed` accepts any value at all. The `@template T` docblock on `firstWhere` says "whatever type the list holds, the result has that type (or is null)". PHP ignores the comment completely; **static analysers** read it. PHPStan and Psalm analyse your whole codebase without running it, using both the real types and these docblock types, and report calls that would fail, nulls that are not handled, missing `match` arms and unreachable code. They work at configurable strictness levels, so a team can adopt one on an old codebase and tighten the level over time. On most professional PHP teams, a static analyser runs on every pull request, and its docblock dialect (`list<int>`, `array<string, Money>`, `non-empty-string`, `positive-int`, `callable(T): bool`) is a language you will learn to read.
+
+Two smaller notes from the program: the nullsafe operator in `findNamed($things, 9)?->name()` calls `name()` only if the result is not null, and `?? "none"` supplies a fallback when it is. And `fail()` is declared `never`: it always throws, so an analyser knows that no code after a call to it can run.
+
+</Section>
+
+<Section id="adopting" kind="human" title="Bringing types into an existing codebase">
+
+Most PHP you meet at work was not written yesterday. A ten-year-old application may have no type declarations, arrays everywhere and strings for statuses. Rewriting it is rarely possible, and it does not need to be: PHP's types are gradual, so a team can tighten things one file at a time while the application keeps running. Experienced teams tend to follow roughly this path:
+
+1. **Run a static analyser at a low level, with a baseline.** PHPStan and Psalm can record every existing problem in a baseline file and report only *new* ones. The build stays green, and no new code makes things worse.
+2. **Add `declare(strict_types=1)` and types to the code you touch.** New files are strict from day one; old files get return types and parameter types as they are edited. Return types are the safest place to start, because a wrong return type fails inside the function you are editing rather than in a distant caller.
+3. **Replace stringly-typed values with enums and value objects at the boundaries.** Convert the database string to an enum where it is loaded, and the form input to a value object where it arrives; the code in between becomes simpler because it can trust what it receives.
+4. **Automate the mechanical parts.** [Rector](https://getrector.com/) rewrites PHP code automatically according to rules, for example adding types that can be inferred, or upgrading syntax from one PHP version to the next. Teams use it for large upgrades that would take weeks by hand, and review its changes like any other.
+5. **Raise the analyser's level** as the baseline shrinks.
+
+None of this changes what the application does, which is the point: every step is small, reviewable and safe to ship. The payoff is that the next person to change the code, possibly you, finds out about mistakes from a tool in seconds rather than from a customer.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"An enum is a set of constants."** It is a type. Constants are values of some other type (strings, integers), so nothing stops a wrong string from being passed where a status is expected. An enum parameter accepts only its own cases, and enum cases can carry behaviour through methods.
+
+</Misconception>
+
+<Misconception>
+
+**"`OrderStatus::from($_GET['status'])` is a safe way to read user input."** For anything outside the list, `from` throws a `ValueError`, which becomes a server error page if nobody catches it. For input from users, use `tryFrom` and respond with a helpful validation message when it returns `null`.
+
+</Misconception>
+
+<Misconception>
+
+**"Readonly means I can never create a changed copy."** You can, by constructing a new object, and since PHP 8.5 with `clone($this, [...])` from inside the class. Immutability is about not changing an object that someone else may be holding, not about never having a different value.
+
+</Misconception>
+
+<Misconception>
+
+**"Docblock types are just documentation."** To PHP they are comments. To PHPStan, Psalm and modern editors they are checked types, and a wrong docblock is a bug the analyser will report. Keep them accurate, and remove ones that only repeat the real type declaration.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

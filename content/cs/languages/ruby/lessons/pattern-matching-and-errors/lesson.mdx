@@ -1,0 +1,413 @@
+---
+title: Pattern matching and error handling
+subtitle: Taking data apart by its shape with case/in, and dealing with failure through Ruby's exceptions — raise, rescue, else, ensure, retry and your own error classes.
+minutes: 60
+objectives:
+  - Match values, arrays and hashes with case/in, including guards, alternatives, binding and the pin operator
+  - Use the find pattern, rightward assignment (=>) and the boolean in test
+  - Make your own classes matchable with deconstruct and deconstruct_keys
+  - Raise and rescue exceptions, and use else, ensure, retry and method-level rescue
+  - Design a small hierarchy of exception classes, and use cause
+  - Explain why rescue catches StandardError and not Exception
+prerequisites: [metaprogramming]
+references:
+  - title: "Ruby docs: Pattern matching"
+    url: https://docs.ruby-lang.org/en/master/syntax/pattern_matching_rdoc.html
+    note: The complete syntax, with every kind of pattern.
+  - title: "Ruby docs: Exceptions"
+    url: https://docs.ruby-lang.org/en/master/syntax/exceptions_rdoc.html
+    note: begin, rescue, else, ensure and retry.
+  - title: "Ruby docs: Exception"
+    url: https://docs.ruby-lang.org/en/master/Exception.html
+    note: The built-in exception hierarchy and the methods every exception has.
+  - title: "Ruby docs: Data"
+    url: https://docs.ruby-lang.org/en/master/Data.html
+---
+
+<Section id="motivation" kind="motivation" title="What shape is this, and what if it is wrong?">
+
+Programs spend a great deal of their time receiving data from somewhere else: a JSON payload from a payment provider, a row from a CSV export, a message from a queue, the response of an API. Two questions come up every time. *What shape is this data?* (Is it a payment or a refund? Does it have an amount? Is the list empty?) And *what do we do when it is not what we expected?*
+
+Ruby has a dedicated tool for each. **Pattern matching**, introduced experimentally in Ruby 2.7 and stable since 3.0, lets you describe the shape you expect and pull out the parts you need in a single step. **Exceptions** let code that cannot continue say so loudly, and let the right layer of the program decide what to do. They work well together: a pattern that matches nothing raises an exception, and a rescue clause chooses what to catch by class, which is itself a kind of pattern.
+
+</Section>
+
+<Section id="patterns" kind="examples" title="case/in: matching by shape">
+
+Here is a handler for events of the kind a payment service might send to a web application, decoded from JSON:
+
+```ruby check
+require "json"
+
+def describe(event)
+  case event
+  in { type: "payment", amount: Integer => cents, currency: "EUR" | "USD" => currency } if cents >= 100_000
+    "large #{currency} payment: #{cents / 100}"
+  in { type: "payment", amount: Integer => cents, currency: }
+    "payment: #{cents / 100} #{currency}"
+  in { type: "refund", original: { id: String => id } }
+    "refund of #{id}"
+  in { type: "batch", items: [] }
+    "empty batch"
+  in { type: "batch", items: [first, *rest] }
+    "batch: a #{first[:type]} and #{rest.size} more"
+  in { type: String => type }
+    "unrecognised event type '#{type}'"
+  end
+end
+
+events = JSON.parse(<<~JSON, symbolize_names: true)
+  [
+    {"type": "payment", "amount": 250000, "currency": "EUR"},
+    {"type": "payment", "amount": 4500, "currency": "INR"},
+    {"type": "refund", "original": {"id": "pay_81"}, "reason": "duplicate"},
+    {"type": "batch", "items": []},
+    {"type": "batch", "items": [{"type": "refund"}, {"type": "payment"}, {"type": "payment"}]},
+    {"type": "subscription", "plan": "monthly"}
+  ]
+JSON
+
+events.each { puts describe(it) }
+
+# Array patterns, and the find pattern [*, x, *].
+def where(point)
+  case point
+  in [0, 0] then "origin"
+  in [Integer | Float => x, 0] then "on the x axis at #{x}"
+  in [_, _] then "somewhere else"
+  end
+end
+p [[0, 0], [2.5, 0], [3, 4]].map { where(it) }
+
+logs = [{ level: "info" }, { level: "error", code: 503 }, { level: "info" }]
+case logs
+in [*, { level: "error", code: }, *]
+  puts "first error code: #{code}"
+end
+
+# The pin operator ^ matches against an existing value instead of binding a new variable.
+expected = 200
+p [{ status: 200 }, { status: 404 }].map {
+  case it
+  in { status: ^expected } then "ok"
+  in { status: } then "unexpected #{status}"
+  end
+}
+```
+
+```text
+large EUR payment: 2500
+payment: 45 INR
+refund of pay_81
+empty batch
+batch: a refund and 2 more
+unrecognised event type 'subscription'
+["origin", "on the x axis at 2.5", "somewhere else"]
+first error code: 503
+["ok", "unexpected 404"]
+```
+
+The pieces of the pattern language, as they appear above:
+
+| Pattern | Matches |
+| --- | --- |
+| `"payment"`, `0`, `Integer`, `..0` | a value, a class or a range, compared with `===`, exactly like `case`/`when` |
+| `"EUR" \| "USD"` | any of the alternatives |
+| `Integer => cents` | the pattern on the left, and binds the value to `cents` |
+| `currency:` (a key with no pattern) | the key is present; binds its value to a variable of the same name |
+| `{ type: "refund", original: { id: String => id } }` | a hash with at least these keys (other keys are allowed), nested to any depth |
+| `[first, *rest]`, `[]`, `[_, _]` | an array of exactly this shape; `*rest` collects the rest, `_` matches anything |
+| `[*, { level: "error", code: }, *]` | the **find pattern**: anywhere in the array |
+| `^expected` | the **pin**: the current value of an existing variable, instead of binding a new one |
+| `in … if condition` | a **guard**: the pattern matches only if the condition is also true |
+
+Branches are tried in order, so the specific "large payment" branch (with its guard) comes before the general payment branch. The final `in { type: String => type }` catches every other well-formed event; an event without a `type` at all would match nothing and raise an error, which is often exactly what you want for malformed input.
+
+Notice that hash patterns let extra keys through (the refund has a `reason` that the pattern ignores), while array patterns must match the whole array unless you use `*`. That fits how the two are used: hashes usually carry optional extra fields, arrays usually have a fixed meaning by position. Write `**nil` at the end of a hash pattern to insist on no extra keys.
+
+</Section>
+
+<Section id="objects" kind="human" title="Matching your own objects, rightward assignment and in">
+
+```ruby check
+# Data classes support pattern matching out of the box.
+Point = Data.define(:x, :y)
+case Point.new(x: 3, y: -1)
+in { x:, y: } if y.negative?
+  puts "below the axis at x=#{x}"
+end
+case Point.new(x: 1, y: 2)
+in [x, y]
+  puts "as an array: #{x}, #{y}"
+end
+
+# Your own classes opt in with deconstruct_keys (hash patterns) and deconstruct (array patterns).
+class Temperature
+  attr_reader :degrees, :unit
+
+  def initialize(degrees, unit) = (@degrees, @unit = degrees, unit)
+  def deconstruct_keys(_keys) = { degrees:, unit: }
+  def deconstruct = [degrees, unit]
+end
+
+def feels(reading)
+  case reading
+  in { unit: :celsius, degrees: ..0 } | { unit: :fahrenheit, degrees: ..32 } then "freezing"
+  in [Numeric => d, :celsius] if d > 30 then "hot"
+  in Temperature then "fine"
+  end
+end
+p [Temperature.new(-5, :celsius), Temperature.new(20, :fahrenheit), Temperature.new(35, :celsius), Temperature.new(18, :celsius)].map { feels(it) }
+
+# `in` as a true/false test, and => for destructuring that must succeed.
+config = { db: { host: "db.internal", port: 5432 }, mode: "production" }
+production = (config in { mode: "production" })
+p production
+config => { db: { host:, port: } }
+puts "connecting to #{host}:#{port}"
+
+begin
+  config => { cache: { host: } }
+rescue NoMatchingPatternKeyError => e
+  puts "#{e.class}: #{e.message}"
+end
+
+begin
+  case 42
+  in String then "text"
+  end
+rescue NoMatchingPatternError => e
+  puts "#{e.class}: #{e.message}"
+end
+```
+
+```text
+below the axis at x=3
+as an array: 1, 2
+["freezing", "freezing", "hot", "fine"]
+true
+connecting to db.internal:5432
+NoMatchingPatternKeyError: {db: {host: "db.internal", port: 5432}, mode: "production"}: key not found: :cache
+NoMatchingPatternError: 42: String === 42 does not return true
+```
+
+**Objects opt in.** A hash pattern calls `deconstruct_keys` on the object, and an array pattern calls `deconstruct`. `Data` classes (and `Struct`s) define both for you, so a `Point` matches `{ x:, y: }` and `[x, y]`. Your own class defines them to expose the fields it wants matchable, as `Temperature` does. `deconstruct_keys` receives the list of keys the pattern asks for, so an expensive object can compute only those; returning everything, as here, is fine for small objects. A class name followed by parentheses, such as `Temperature(degrees:, unit: :celsius)`, checks the class and deconstructs in one go.
+
+**`expr in pattern`** returns `true` or `false` without raising, which is handy in `if` statements and `select` blocks. It needs parentheses inside an argument list, which is why the program assigns it to a variable first. (We tried `p(config in { … })` and Ruby 4.0 reported a syntax error.)
+
+**`expr => pattern`** is **rightward assignment**: it destructures the value, binding `host` and `port` from deep inside the config, and *raises* if the pattern does not match. That makes it a compact way to say "this data must have this shape". The error is a `NoMatchingPatternKeyError` when a required key is missing, naming the key, and a `NoMatchingPatternError` otherwise, which is also what a `case`/`in` with no matching branch and no `else` raises.
+
+When should you use pattern matching rather than ordinary method calls? It shines at the **edges** of a program, where data arrives as nested hashes and arrays (JSON, YAML, API responses, parsed command lines), and for small sum types (a message that can be one of several shapes). Inside your domain, where values are already objects with methods, a method call (`payment.large?`) usually reads better than a pattern.
+
+</Section>
+
+<Section id="exceptions" kind="examples" title="Raising and rescuing">
+
+```ruby check
+class OrderError < StandardError; end
+
+class OutOfStock < OrderError
+  attr_reader :item
+
+  def initialize(item)
+    @item = item
+    super("#{item} is out of stock")
+  end
+end
+
+STOCK = { "teff" => 3, "sumac" => 0 }.freeze
+
+def reserve(item, quantity)
+  available = STOCK.fetch(item) { raise OrderError, "unknown item #{item.inspect}" }
+  raise ArgumentError, "quantity must be positive" unless quantity.positive?
+  raise OutOfStock, item if available < quantity
+
+  "reserved #{quantity} × #{item}"
+end
+
+[["teff", 2], ["sumac", 1], ["saffron", 1], ["teff", 0]].each do |item, quantity|
+  puts reserve(item, quantity)
+rescue OutOfStock => e
+  puts "sorry: #{e.message} (item: #{e.item})"
+rescue OrderError, ArgumentError => e
+  puts "#{e.class}: #{e.message}"
+end
+
+# else runs only when nothing was raised; ensure runs no matter what.
+def checkout(item)
+  puts "  open basket"
+  result = reserve(item, 1)
+rescue OrderError => e
+  puts "  failed: #{e.message}"
+  nil
+else
+  puts "  succeeded"
+  result
+ensure
+  puts "  close basket"
+end
+p checkout("teff"), checkout("sumac")
+
+# Raising inside rescue records the original as the cause.
+def load_settings(text)
+  Integer(text)
+rescue ArgumentError
+  raise OrderError, "settings are corrupt"
+end
+begin
+  load_settings("twelve")
+rescue OrderError => e
+  puts "#{e.message}, caused by #{e.cause.class}: #{e.cause.message}"
+end
+
+# rescue without a class catches StandardError, not every Exception.
+p ZeroDivisionError.ancestors.take_while { it != Object }
+p [ArgumentError, KeyError, NoMethodError, Interrupt, SystemExit].to_h { [it, it.ancestors.include?(StandardError)] }
+```
+
+```text
+reserved 2 × teff
+sorry: sumac is out of stock (item: sumac)
+OrderError: unknown item "saffron"
+ArgumentError: quantity must be positive
+  open basket
+  succeeded
+  close basket
+  open basket
+  failed: sumac is out of stock
+  close basket
+"reserved 1 × teff"
+nil
+settings are corrupt, caused by ArgumentError: invalid value for Integer(): "twelve"
+[ZeroDivisionError, StandardError, Exception]
+{ArgumentError => true, KeyError => true, NoMethodError => true, Interrupt => false, SystemExit => false}
+```
+
+<Definition term="raise">
+
+`raise SomeError, "message"` creates an exception of that class with that message and throws it. `raise "text"` raises a `RuntimeError`. Inside a `rescue`, a bare `raise` re-raises the current exception. Execution stops and unwinds up the call stack until a matching `rescue` is found; if none is, the program prints the error and exits.
+
+</Definition>
+
+<Definition term="rescue, else, ensure, retry">
+
+`rescue SomeError => e` handles exceptions of that class or its subclasses and binds the exception to `e`; list several classes separated by commas, and write several `rescue` clauses for different handling (the first match wins, so put specific classes first). `else` runs only if nothing was raised. `ensure` runs no matter what, which makes it the place for clean-up. `retry`, inside `rescue`, starts the `begin` block again. These clauses can be attached directly to a method body (`def … rescue … ensure … end`) or to a `do … end` block, as the loop above does, with no `begin` needed.
+
+</Definition>
+
+**Design an exception hierarchy.** `OutOfStock` inherits from `OrderError`, which inherits from `StandardError`. Callers can rescue `OutOfStock` specifically (and read its `item` attribute instead of parsing the message) or rescue `OrderError` to catch every ordering problem, including kinds you add later. Most gems define one base error class (`Stripe::StripeError`, `Faraday::Error`) for exactly this reason.
+
+**`fetch` with a block** runs the block when the key is missing, which here raises a domain error with a clear message rather than the generic `KeyError`.
+
+**`cause`.** When you raise a new exception inside a `rescue`, Ruby automatically records the exception being handled as the new one's `cause`. `load_settings` translates a low-level `ArgumentError` into a domain-level `OrderError`, and nothing is lost: logging tools print the whole chain.
+
+**What `rescue` catches by default.** A `rescue` with no class (or `rescue => e`) catches `StandardError` and its subclasses, which covers almost every error a program meets at run time: `ArgumentError`, `KeyError`, `NoMethodError`, `ZeroDivisionError` and your own errors. It deliberately does *not* catch the other direct subclasses of `Exception`, such as `Interrupt` (the user pressed Ctrl-C), `SystemExit` (the program called `exit`), `NoMemoryError` and `SignalException`. Those mean "stop", and a program that rescued them would be impossible to stop. That is why your own errors should inherit from `StandardError`, never directly from `Exception`, and why `rescue Exception` is a well-known bug.
+
+</Section>
+
+<Section id="together" kind="examples" title="Both together: a tiny command interpreter">
+
+Text commands are a natural fit for array patterns: split the line into words and match on the result. Invalid commands raise a domain error, and a single `rescue` reports them.
+
+```ruby check
+class CommandError < StandardError; end
+
+class TodoList
+  def initialize = @items = []
+
+  def run(line)
+    case line.split
+    in ["add", *words] if words.any?
+      @items << { title: words.join(" "), done: false }
+      "added ##{@items.size}"
+    in ["add"] then raise CommandError, "add needs a title"
+    in ["done", /\A[1-9]\d*\z/ => number]
+      item = @items.fetch(Integer(number) - 1) { raise CommandError, "no item ##{number}" }
+      item[:done] = true
+      "completed: #{item[:title]}"
+    in ["list"]
+      @items.each_with_index.map { |item, i| "#{i + 1}. [#{item[:done] ? 'x' : ' '}] #{item[:title]}" }.join("\n")
+    in [] then raise CommandError, "empty command"
+    in [command, *] then raise CommandError, "cannot understand '#{command}'"
+    end
+  end
+end
+
+list = TodoList.new
+["add Buy teff flour", "add Call Grandma Wanjiku", "done 1", "done 7", "done 0", "add", "dance now", "list"].each do |line|
+  puts "> #{line}"
+  puts list.run(line)
+rescue CommandError => e
+  puts "error: #{e.message}"
+end
+```
+
+```text
+> add Buy teff flour
+added #1
+> add Call Grandma Wanjiku
+added #2
+> done 1
+completed: Buy teff flour
+> done 7
+error: no item #7
+> done 0
+error: cannot understand 'done'
+> add
+error: add needs a title
+> dance now
+error: cannot understand 'dance'
+> list
+1. [x] Buy teff flour
+2. [ ] Call Grandma Wanjiku
+```
+
+Each command shape is one branch. `["add", *words] if words.any?` accepts "add" followed by at least one word, and the next branch catches a bare "add" with a helpful message, so the order of branches encodes the rules. `["done", /\A[1-9]\d*\z/ => number]` uses a regular expression as a pattern (patterns use `===`, and `Regexp#===` means "matches") and binds the matching string. The regular expression deliberately rejects `0`: the first version of this program accepted any digits, and `done 0` would have looked up index −1, which in Ruby means *the last item*, quietly completing the wrong task. The last two branches turn anything else into a `CommandError`, so the method never falls off the end of the `case`.
+
+The loop shows the error-handling side: the `rescue` attached to the `do … end` block handles each line's error and moves on to the next line, which is the right behaviour for an interactive tool or a batch import, where one bad line should not stop the rest. A web controller would do the same with a different reporting step: render the form again with the error message next to the field.
+
+</Section>
+
+<Section id="practice" kind="human" title="How Ruby teams handle errors">
+
+- **Fail fast at boundaries.** Validate input where it arrives (a form, a file, an API response), and raise or report there. Use the strict conversion functions (`Integer(text)`, `Float(text)`) and `fetch`, which fail loudly, rather than `to_i` and `[]`, which turn bad data into `0` and `nil`.
+- **Rescue narrowly.** Rescue the specific classes you know how to handle, around the smallest piece of code that can raise them. A wide `rescue => e` around a long method hides programming mistakes (a `NoMethodError` from a typo) as if they were expected conditions.
+- **Do not use exceptions for ordinary control flow.** If "not found" is normal, return `nil` (and let callers use `&.` or `||`) or use a method like `find`. Many core methods offer both: `Integer("x", exception: false)` returns `nil` instead of raising. For leaving deeply nested loops early, Ruby has `catch`/`throw`, which are control flow, not errors.
+- **Log once, at the top.** In a web application or background job, let unexpected exceptions travel up to the framework's handler, which logs them with context and returns an error response or retries the job. Rails, Sidekiq and similar tools do this for you, and error-monitoring services collect the reports.
+- **Retry with limits.** `retry` is ideal for transient failures such as a network timeout, but always count attempts, as the `retrying` helper in the lesson on blocks did, and add a delay between attempts against real services.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misunderstandings">
+
+<Misconception>
+
+**"`rescue Exception => e` is the safest way to catch everything."** It also catches `Interrupt` and `SystemExit`, so Ctrl-C and `exit` stop working, and it catches `NoMemoryError` and `ScriptError`, which you cannot meaningfully handle. Use `rescue => e` (which means `StandardError`) or, better, a specific class.
+
+</Misconception>
+
+<Misconception>
+
+**"A hash pattern must list every key."** Hash patterns match if the listed keys are present and match; other keys are ignored. Add `**nil` to forbid extras, or `**rest` to capture them. Array patterns are the opposite: they must match the whole array unless you use `*`.
+
+</Misconception>
+
+<Misconception>
+
+**"`in x` inside a pattern compares with the variable `x`."** A bare name in a pattern *binds* a new variable, matching anything. To compare against an existing variable's value, pin it with `^x`. Forgetting the pin is the most common pattern-matching bug, because the branch silently matches everything.
+
+</Misconception>
+
+<Misconception>
+
+**"`ensure` is the place to return a fallback value."** The value of an `ensure` clause is ignored (unless it uses an explicit `return`, which also swallows any exception in flight and should be avoided). Return fallbacks from `rescue`, put the success value in the body or `else`, and keep `ensure` for clean-up.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

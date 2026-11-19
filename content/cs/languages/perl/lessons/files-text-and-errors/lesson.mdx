@@ -1,0 +1,365 @@
+---
+title: Files, text and errors
+subtitle: Reading and writing files safely, handling Unicode text correctly, and reporting and catching errors with die, eval and try.
+minutes: 60
+objectives:
+  - Open files with the three-argument open and lexical file handles, and always check for failure
+  - Read files line by line, all at once, or into an array, and write and append to files
+  - Use file tests, temporary directories and portable path functions from core modules
+  - Decode and encode UTF-8 text at the edges of a program so that length, case and regexes work on characters
+  - Raise errors with die, catch them with eval or try/catch, and use exception objects, warn and autodie
+prerequisites: [regular-expressions]
+references:
+  - title: perlopentut
+    url: https://perldoc.perl.org/perlopentut
+    note: The official tutorial on opening files, with every mode and layer.
+  - title: "perlfunc: open"
+    url: https://perldoc.perl.org/functions/open
+    note: The full reference for open.
+  - title: perlunitut
+    url: https://perldoc.perl.org/perlunitut
+    note: The official Unicode tutorial for Perl, short and practical.
+  - title: "perlfunc: die and eval"
+    url: https://perldoc.perl.org/functions/die
+    note: How die builds its message and exception objects; eval is documented beside it.
+  - title: autodie
+    url: https://perldoc.perl.org/autodie
+    note: The core pragma that makes built-in functions die when they fail.
+  - title: File::Temp
+    url: https://perldoc.perl.org/File::Temp
+    note: Safe temporary files and directories, removed automatically.
+---
+
+<Section id="motivation" kind="motivation" title="Where programs meet the world">
+
+So far every program has worked on data written inside it. Real programs read files that someone else wrote, in formats that are almost but not quite what the documentation says, on disks that fill up, with names in many alphabets. This lesson is about the edges of a program: getting text in and out, and dealing honestly with things going wrong.
+
+Perl was built for this. Its file handling is short, its line-by-line reading is fast, and its error messages tell you the file and line. But Perl, true to its forgiving nature, will also let you ignore failures entirely: if you `open` a file that does not exist and do not check, your program carries on reading nothing. Experienced Perl programmers have strong habits here, and this lesson teaches them: check every system call, decode text when it comes in and encode it when it goes out, and make errors loud, specific and catchable.
+
+</Section>
+
+<Section id="files" kind="examples" title="Opening, reading and writing">
+
+<Definition term="File handle">
+
+A value that represents an open file (or another stream, such as a pipe or the terminal). You create one with `open my $fh, MODE, PATH`, read from it with `<$fh>`, write to it with `print {$fh} ...`, and release it with `close $fh`. A **lexical** file handle like `$fh` is closed automatically when the variable goes out of scope. Three handles are always open: `STDIN`, `STDOUT` and `STDERR`.
+
+</Definition>
+
+The **mode** is the second argument: `'<'` to read, `'>'` to write (creating the file or emptying an existing one), `'>>'` to append. Always use this three-argument form. The old two-argument form, `open FH, $path`, read the mode from the start of the filename, so a file named `>important.txt` could be overwritten; you will see it in old code and should not write it.
+
+Every program in this lesson works inside a temporary directory created by the core module File::Temp and removed when the program ends.
+
+```perl check
+use strict;
+use warnings;
+use feature qw(say);
+use File::Temp qw(tempdir);
+use File::Spec;
+
+my $dir  = tempdir(CLEANUP => 1);              # removed when the program ends
+my $path = File::Spec->catfile($dir, 'visits.txt');
+
+# Write: '>' creates or truncates the file.
+open my $out, '>', $path or die "Cannot write $path: $!";
+print {$out} "Quito 3\n";
+printf {$out} "%s %d\n", 'Hanoi', 5;
+close $out or die "Cannot close $path: $!";
+
+# Append: '>>' adds to the end.
+open my $add, '>>', $path or die "Cannot append to $path: $!";
+say {$add} "Quito 4";
+say {$add} "Nairobi 2";
+close $add;
+
+say "size: ", -s $path, " bytes; exists: ", (-e $path ? 'yes' : 'no');
+
+# Read line by line: the usual way, and memory-friendly for huge files.
+open my $in, '<', $path or die "Cannot read $path: $!";
+my %visits;
+while (my $line = <$in>) {
+    chomp $line;
+    my ($city, $n) = split ' ', $line;
+    $visits{$city} += $n;
+    say "line $.: $city";                       # $. is the current line number
+}
+close $in;
+say "$_ => $visits{$_}" for sort keys %visits;
+
+# Slurp: read the whole file into one string.
+my $all = do {
+    local $/;                                   # undef the line separator for this block
+    open my $fh, '<', $path or die "Cannot read $path: $!";
+    <$fh>;
+};
+say "the file has ", ($all =~ tr/\n//), " lines";
+
+# Read all lines into an array (list context).
+open my $again, '<', $path or die "Cannot read $path: $!";
+chomp(my @lines = <$again>);
+close $again;
+say "last line: $lines[-1]";
+
+my $missing = File::Spec->catfile($dir, 'nope.txt');
+open(my $fh, '<', $missing) or say "open failed as expected: $!";
+```
+
+It printed:
+
+```text
+size: 34 bytes; exists: yes
+line 1: Quito
+line 2: Hanoi
+line 3: Quito
+line 4: Nairobi
+Hanoi => 5
+Nairobi => 2
+Quito => 7
+the file has 4 lines
+last line: Nairobi 2
+open failed as expected: No such file or directory
+```
+
+### The habits in that program
+
+- **`open ... or die "...: $!"`.** `open` returns false on failure and puts the operating system's reason in the special variable `$!`. A good message names the file *and* gives `$!`: "Cannot read /etc/app.conf: Permission denied" is something a person can fix. Note `or`, not `||`: with `||`, the `die` would bind to `$path` and never run.
+- **`print {$fh} ...`.** The braces around the handle are optional but make it unmistakable that `$fh` is where the output goes, not the first thing printed. Notice there is no comma after the handle.
+- **`while (my $line = <$in>)`** reads one line per pass, newline included, and stops at the end of the file. It holds only one line in memory at a time, so it works the same on a 10-line file and a 10-gigabyte log. `chomp` removes the trailing newline. `$.` is the number of the line just read, perfect for error messages ("bad value on line 1042").
+- **Slurping.** The special variable `$/` is the input record separator, normally `"\n"`. Making it undef with `local $/;` inside a small block means one read returns the whole file. `local` restores it when the block ends, so the rest of the program is unaffected: exactly the job `local` is for. Many teams use the CPAN module **Path::Tiny** instead, whose `path($file)->slurp_utf8` reads and decodes a whole file in one call.
+- **`chomp(my @lines = <$fh>)`** reads every line in list context and chomps them all. Convenient for small files; for large ones, prefer the `while` loop.
+- **File tests.** `-e` (exists), `-f` (plain file), `-d` (directory), `-s` (size in bytes, or false if empty), `-r`/`-w`/`-x` (readable, writable, executable) and `-M` (age in days) are unary operators that ask the operating system about a path.
+- **Portable paths.** `File::Spec->catfile($dir, $name)` joins path parts with the right separator for the operating system. The core module File::Basename splits paths, and File::Path's `make_path` creates nested directories.
+
+Closing a file you wrote to is worth checking (`close $out or die ...`): on a full disk or a network drive, buffered data is often written only at close, and that is where the failure shows up.
+
+### Reading whatever the user gives you: the diamond operator
+
+Unix tools read the files named on the command line, or standard input if there are none, so they can sit in a pipeline. Perl gives you that behaviour for free. The **diamond operator** `<>` reads, line by line, from every file named in `@ARGV` in turn, or from STDIN when `@ARGV` is empty; the special variable `$ARGV` holds the name of the current file. Its safer form `<<>>` (Perl 5.22) treats every argument strictly as a file name, so an argument such as `"rm -rf ~ |"` cannot be mistaken for a command to run, which the old form allowed:
+
+```perl
+while (my $line = <<>>) {
+    print "$ARGV:$.: $line" if $line =~ /TODO/;
+}
+```
+
+Saved as `todo.pl`, this works as `perl todo.pl *.txt` and as `grep -h fix notes.txt | perl todo.pl` alike. One detail: `$.` keeps counting across files; add `close ARGV if eof;` inside the loop to restart the numbering for each file. This is also exactly the loop that the `-n` and `-p` switches from lesson 1 wrap around a one-liner.
+
+</Section>
+
+<Section id="unicode" kind="examples" title="Text is characters, files are bytes">
+
+A file holds **bytes**. Text is made of **characters**. Between them sits an **encoding**, today almost always UTF-8, in which a character such as `é` takes two bytes and `東` takes three. Perl strings can hold either, and Perl cannot tell by looking which one you meant. The rule that keeps Unicode text working:
+
+**Decode on the way in, work with characters inside, encode on the way out.**
+
+```perl check
+use strict;
+use warnings;
+use utf8;                                   # this source file is UTF-8
+use feature qw(say);
+use Encode qw(encode);
+use File::Temp qw(tempdir);
+binmode STDOUT, ':encoding(UTF-8)';         # encode characters on the way out
+
+my @words = ('São Paulo', 'Kraków', 'Δελφοί', '東京');
+for my $w (@words) {
+    printf "%d characters, %2d bytes in UTF-8: %s\n", length $w, length encode('UTF-8', $w), $w;
+}
+
+my $dir  = tempdir(CLEANUP => 1);
+my $path = "$dir/cities.txt";
+open my $out, '>:encoding(UTF-8)', $path or die "Cannot write $path: $!";
+say {$out} $_ for @words;
+close $out;
+
+open my $raw, '<', $path or die "Cannot read $path: $!";        # no layer: bytes
+my $first_raw = <$raw>;
+close $raw;
+open my $in, '<:encoding(UTF-8)', $path or die "Cannot read $path: $!";   # decoded
+my $first = <$in>;
+close $in;
+chomp($first_raw, $first);
+say "read as bytes: ", length $first_raw, ", read as characters: ", length $first;
+say "upper case: ", uc $first;
+```
+
+It printed:
+
+```text
+9 characters, 10 bytes in UTF-8: São Paulo
+6 characters,  7 bytes in UTF-8: Kraków
+6 characters, 12 bytes in UTF-8: Δελφοί
+2 characters,  6 bytes in UTF-8: 東京
+read as bytes: 10, read as characters: 9
+upper case: SÃO PAULO
+```
+
+Three switches are at work:
+
+- **`use utf8;`** tells Perl that the *source code* is written in UTF-8, so the literal `'São Paulo'` becomes nine characters, not ten bytes. It says nothing about files you read.
+- **I/O layers** such as `'<:encoding(UTF-8)'` decode bytes into characters as a file is read, and `'>:encoding(UTF-8)'` encodes on writing. Read the same file without the layer and you get ten bytes for "São Paulo", and `length`, `uc`, `substr` and `\w` all give wrong answers.
+- **`binmode STDOUT, ':encoding(UTF-8)'`** does the same for the terminal. Without it, printing a character string prints a "Wide character" warning, or mangles the output.
+
+The core **Encode** module converts explicitly when the data does not come through a file handle, for example from a network library: `decode('UTF-8', $bytes)` and `encode('UTF-8', $text)`. Many teams put the module `utf8::all` from CPAN, or the `-CSDA` command-line switch, at the top of scripts to set these defaults in one go, but understanding the three switches above is what lets you debug the day something comes out as `SÃ£o Paulo`.
+
+</Section>
+
+<Section id="errors" kind="examples" title="die, eval and exception objects">
+
+<Definition term="Exception in Perl">
+
+`die LIST` stops normal execution and **throws** an exception: the program unwinds out of every subroutine until something catches it, or exits with an error message if nothing does. `eval BLOCK` catches: if the block dies, `eval` returns undef (or an empty list) and puts the exception in the special variable `$@`. The exception is usually a string, but it can be any scalar, including a reference to a hash or an object.
+
+</Definition>
+
+```perl check
+use strict;
+use warnings;
+use feature qw(say);
+
+sub parse_age {
+    my ($text) = @_;
+    die "age is missing\n" unless defined $text && length $text;
+    die "not a number: '$text'\n" unless $text =~ /\A[0-9]+\z/;
+    die "out of range: $text\n" if $text > 150;
+    return $text + 0;
+}
+
+# The robust idiom: eval returns 1 on success, so 'or do' runs only on failure.
+for my $input ('42', 'forty', '', '200') {
+    my $age;
+    eval { $age = parse_age($input); 1 } or do {
+        my $err = $@ || 'unknown error';
+        chomp $err;
+        say "rejected '$input': $err";
+        next;
+    };
+    say "accepted $age";
+}
+
+# Without a trailing newline, die adds the file and line.
+eval { die "no newline" };
+print "message: $@";
+
+# Exceptions can be objects (here a plain hash reference) carrying data.
+sub fetch {
+    my ($id) = @_;
+    die { code => 404, message => "no record $id" } if $id > 3;
+    return "record $id";
+}
+for my $id (2, 7) {
+    my $result = eval { fetch($id) };
+    if (my $e = $@) {
+        if (ref $e eq 'HASH') { say "error $e->{code}: $e->{message}" }
+        else                  { die $e }      # not ours: rethrow
+    } else {
+        say "got $result";
+    }
+}
+
+# warn prints to STDERR and carries on; a __WARN__ handler can capture it.
+my @captured;
+{
+    local $SIG{__WARN__} = sub { push @captured, $_[0] };
+    warn "low disk space\n";
+}
+chomp(my $warning = $captured[0]);
+say "captured warning: $warning";
+
+# autodie: built-in functions such as open die on failure by themselves.
+use autodie qw(open);
+my $ok = eval { open my $fh, '<', '/no/such/file.txt'; 1 };
+say "autodie: ", ($ok ? "opened?" : "open failed and died");
+```
+
+It printed:
+
+```text
+accepted 42
+rejected 'forty': not a number: 'forty'
+rejected '': age is missing
+rejected '200': out of range: 200
+message: no newline at main.pl line 26.
+got record 2
+error 404: no record 7
+captured warning: low disk space
+autodie: open failed and died
+```
+
+### Reading the error code
+
+- **The trailing newline matters.** `die "age is missing\n"` uses your message exactly. Without the newline, Perl appends ` at FILE line N.`, which is what you want for programming errors (you need to find the line) and not what you want for messages meant for users.
+- **`eval { ...; 1 } or do { ... }`.** This is the idiom to learn, rather than `eval { ... }; if ($@) { ... }`. Inside the `eval`, the last statement is `1`, so a successful block returns true. The `or do` block runs only when the `eval` returned false, which happens only when something died. Checking `$@` directly is fragile: in older Perls a destructor running during unwinding could reset `$@` to empty, making a real failure look like success. Copy `$@` into a variable immediately, as `my $err = $@` does, because the next `eval` anywhere will overwrite it.
+- **Exception objects.** `die { code => 404, ... }` throws a reference, so the catcher can inspect fields instead of parsing message strings. Real code usually throws *objects* of exception classes (lesson 7 shows how to make classes), and CPAN modules such as Throwable or Exception::Class help build them. Rethrowing what you do not recognise, with `die $e`, keeps unexpected errors from being swallowed.
+- **`warn`** prints to STDERR and continues. The `%SIG` hash holds signal handlers, and the special key `__WARN__` lets you intercept warnings, here to collect them; tests use this to check that code warns when it should.
+- **`autodie`** (core since Perl 5.10.1) replaces built-ins like `open`, `close`, `rename` and `unlink` with versions that die with a detailed message on failure. Many modern scripts start with `use autodie;` and drop the explicit `or die` checks.
+
+For errors in a module that should be reported from the *caller's* point of view ("you passed a bad argument at line 12 of *your* script"), use **Carp**: `croak` is `die` from the caller's perspective, and `confess` adds a full stack trace.
+
+</Section>
+
+<Section id="try" kind="examples" title="try and catch">
+
+`eval` works, but it reads oddly and has the traps described above. Perl 5.34 added an experimental `try`/`catch` syntax, which **Perl 5.40** declared stable. It looks like other languages, and `return` inside `try` returns from the enclosing subroutine, as you would expect:
+
+```perl check
+use strict;
+use warnings;
+use feature qw(say try);
+no warnings qw(experimental::try);          # try/catch is stable from Perl 5.40
+
+sub divide {
+    my ($x, $y) = @_;
+    die "division by zero\n" if $y == 0;
+    return $x / $y;
+}
+
+for my $pair ([10, 4], [1, 0]) {
+    try {
+        say "result: ", divide(@$pair);
+    }
+    catch ($e) {
+        chomp $e;
+        say "caught: $e";
+    }
+}
+```
+
+It printed:
+
+```text
+result: 2.5
+caught: division by zero
+```
+
+On a Perl that has it, prefer `try`/`catch`; on 5.40 and later, `use v5.40;` enables it without any warning. On older Perls, which you will meet on servers for years to come, use the `eval`/`or do` idiom, or the CPAN module **Try::Tiny**, which gives similar syntax on any Perl and is extremely widely used.
+
+<Misconception>
+
+"An `eval` that catches everything makes my program robust." Catching an error and carrying on as if nothing happened usually makes a program *wrong* rather than robust: the bad data flows further and fails somewhere harder to debug. Catch errors where you can do something useful about them: retry, skip one bad record with a clear message, or turn a low-level error into one the user understands. Let everything else propagate and stop the program loudly.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="human" title="A checklist for scripts that touch files">
+
+Professional Perl scripts that read and write files tend to share a shape:
+
+1. `use strict; use warnings;` and often `use autodie;`.
+2. Read input paths from the command line (`@ARGV`, or Getopt::Long for options, shown in lesson 8), never hard-coded.
+3. Decode input with an `:encoding(UTF-8)` layer and set `binmode` on STDOUT if any text is not plain ASCII.
+4. Process input **line by line** with `while (my $line = <$fh>)`, so memory stays flat however large the file.
+5. Write output to a **temporary file in the same directory, then `rename`** it over the target. A rename is atomic on Unix, so readers never see a half-written file, even if the script is killed mid-way.
+6. Report bad input with the file name and `$.`, and decide deliberately whether to skip the line or stop.
+7. Exit with a non-zero status on failure (`die` does this for you; `exit 1` does it explicitly), so that shell scripts, cron and CI notice.
+
+The capstone project in lesson 8 follows this checklist.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,325 @@
+---
+title: "OCaml 5: domains, effects and concurrency"
+subtitle: Parallelism on several cores with domains, atomics and mutexes, and effect handlers, the new mechanism behind lightweight threads, generators and direct-style I/O.
+minutes: 65
+objectives:
+  - Explain what changed in OCaml 5 and the difference between parallelism and concurrency
+  - Run computations in parallel with Domain.spawn and Domain.join, and share state safely with Atomic and Mutex
+  - Describe what OCaml's memory model guarantees, including for programs with data races
+  - Declare, perform and handle effects, and resume or discard continuations
+  - Build a generator and a small cooperative scheduler with effects, and know which libraries (Domainslib, Eio) build on these features
+prerequisites: [standard-library]
+references:
+  - title: "The OCaml Manual: Parallel programming"
+    url: https://ocaml.org/manual/parallelism.html
+    note: Domains, the Atomic and Mutex modules, and how to use them well.
+  - title: "The OCaml Manual: Effect handlers"
+    url: https://ocaml.org/manual/effects.html
+    note: The tutorial chapter on effects, including the syntax added in OCaml 5.3.
+  - title: "The OCaml Manual: Memory model"
+    url: https://ocaml.org/manual/memorymodel.html
+    note: The precise guarantees OCaml gives for programs with and without data races.
+  - title: Eio
+    url: https://github.com/ocaml-multicore/eio
+    note: Effects-based, direct-style concurrent I/O for OCaml 5.
+  - title: Domainslib
+    url: https://github.com/ocaml-multicore/domainslib
+    note: Task pools and parallel loops on top of domains.
+  - title: "Retrofitting Parallelism onto OCaml"
+    author: KC Sivaramakrishnan, Stephen Dolan, Leo White and others
+    year: 2020
+    note: The ICFP paper describing OCaml 5's parallel runtime and garbage collector.
+  - title: "Retrofitting Effect Handlers onto OCaml"
+    author: KC Sivaramakrishnan, Stephen Dolan, Leo White and others
+    year: 2021
+    note: The PLDI paper describing how effect handlers are implemented in OCaml 5.
+---
+
+<Section id="motivation" kind="motivation" title="One core was not enough">
+
+For most of its history, OCaml ran your code on **one processor core at a time**. Its runtime had a single lock, so the `Thread` module could interleave several threads (useful while one waits for the network) but never ran OCaml code on two cores at once. As machines grew from one core to dozens, this became OCaml's most-cited weakness, and programmers used separate processes to use more cores.
+
+**OCaml 5.0** (December 2022) removed that limit with a new runtime and two new features, which solve two different problems:
+
+- **Parallelism** is doing several computations *at the same instant* on different cores, to finish sooner. OCaml 5 provides it with **domains**.
+- **Concurrency** is *structuring* a program as several tasks that make progress independently, such as a server handling ten thousand connections, most of them waiting. OCaml 5 provides a new foundation for it with **effect handlers**, on which libraries build lightweight threads and direct-style I/O.
+
+Making this work without breaking existing code took the "Multicore OCaml" project years, including a new garbage collector that lets each domain allocate independently. This lesson covers both features, as they stand in OCaml 5.4.
+
+</Section>
+
+<Section id="history" kind="history" title="How OCaml became multicore">
+
+Adding parallelism to an existing language is much harder than designing it in from the start, because millions of lines of code, and the runtime itself, assume that only one thing happens at a time. For OCaml, the hardest part was the **garbage collector**: OCaml programs allocate at a very high rate, and their performance depends on a minor heap that is extremely fast precisely because only one thread uses it.
+
+The **Multicore OCaml** project, started in the mid-2010s at OCaml Labs at the University of Cambridge and continued by the company Tarides and many contributors, spent years on this. Its researchers built and measured more than one garbage-collector design, and chose the one that kept existing single-threaded programs as fast as before while scaling across cores; the trade-offs are described in the ICFP 2020 paper listed in this lesson's references. The work also had to preserve backwards compatibility for C bindings and existing libraries, which is why OCaml 5 kept the `Thread` module and most of the runtime's C interface.
+
+**Effect handlers** came from programming-language research on algebraic effects, in which handlers generalise exception handlers by allowing the computation to be resumed. OCaml's designers chose a deliberately minimal version: effects are not tracked in types, and continuations can be resumed at most once, which allows a very efficient implementation using small, growable stacks for each computation. Instead of building `async`/`await` into the language, as many languages did in the 2010s, OCaml added this one general mechanism and left schedulers, I/O and concurrency models to libraries.
+
+The new runtime was merged into the main compiler in early 2022 and released as OCaml 5.0 that December. Later 5.x releases restored features temporarily missing from 5.0 and improved performance, and OCaml 5.3 added the `effect` syntax used in this lesson.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The vocabulary of OCaml 5">
+
+<Definition term="Domain">
+
+A **domain** is a unit of parallelism: an operating-system thread running OCaml code, with its own minor heap for fast allocation. `Domain.spawn f` starts `f ()` on a new domain and returns a handle; `Domain.join d` waits for it and returns its result (or re-raises its exception). Domains are heavyweight; a program should use about as many as there are cores (`Domain.recommended_domain_count ()`).
+
+</Definition>
+
+<Definition term="Atomic and Mutex">
+
+`Atomic.t` is a cell whose operations (`get`, `set`, `incr`, `fetch_and_add`, `compare_and_set`) are indivisible across domains. `Mutex.t` is a lock: `Mutex.protect m f` runs `f` while holding it, releasing it even on exceptions. `Condition` lets domains wait for a change.
+
+</Definition>
+
+<Definition term="Data race">
+
+A **data race** happens when two domains access the same mutable location at the same time, at least one of them writes, and the location is not atomic. OCaml's memory model guarantees that a program *without* data races behaves as if its domains' steps were interleaved one at a time. Even a racy program cannot crash or break type safety; a racy read may return a stale value, but always one that was actually written to that location.
+
+</Definition>
+
+<Definition term="Effect, handler and continuation">
+
+An **effect** is an operation a function can *perform* without knowing who will carry it out, declared with `type _ Effect.t += Name : args -> result Effect.t`. A **handler** around a computation decides what each effect means. When an effect is performed, the handler receives its arguments and a **continuation** `k`, the rest of the computation from the point of the `perform`, which it may resume once with `Effect.Deep.continue k value`, or drop.
+
+</Definition>
+
+</Section>
+
+<Section id="examples" kind="examples" title="Domains, effects and a scheduler">
+
+### Parallelism with domains
+
+```ocaml check
+let sum_range lo hi =
+  let s = ref 0 in
+  for i = lo to hi do
+    s := !s + i
+  done;
+  !s
+
+let () =
+  (* 1. Split a computation across domains and join the results. *)
+  let parts = 4 and size = 1_000_000 in
+  let domains =
+    List.init parts (fun k -> Domain.spawn (fun () -> sum_range ((k * size) + 1) ((k + 1) * size)))
+  in
+  let partials = List.map Domain.join domains in
+  Printf.printf "partial sums: %s\n" (String.concat " " (List.map string_of_int partials));
+  Printf.printf "total: %d (check: %d)\n" (List.fold_left ( + ) 0 partials) (sum_range 1 (parts * size));
+
+  (* 2. An atomic counter shared by several domains. *)
+  let hits = Atomic.make 0 in
+  let workers =
+    List.init 4 (fun _ -> Domain.spawn (fun () -> for _ = 1 to 25_000 do Atomic.incr hits done))
+  in
+  List.iter Domain.join workers;
+  Printf.printf "atomic counter: %d\n" (Atomic.get hits);
+
+  (* 3. A mutex protecting a shared, non-thread-safe structure. *)
+  let lock = Mutex.create () in
+  let seen = Hashtbl.create 64 in
+  let record_multiples k =
+    Domain.spawn (fun () ->
+        for i = 1 to 50 do
+          if i mod k = 0 then Mutex.protect lock (fun () -> Hashtbl.replace seen i ())
+        done)
+  in
+  List.iter Domain.join (List.map record_multiples [ 3; 5; 7 ]);
+  Printf.printf "numbers up to 50 divisible by 3, 5 or 7: %d\n" (Hashtbl.length seen)
+```
+
+```text
+partial sums: 500000500000 1500000500000 2500000500000 3500000500000
+total: 8000002000000 (check: 8000002000000)
+atomic counter: 100000
+numbers up to 50 divisible by 3, 5 or 7: 27
+```
+
+Three patterns, in order of preference.
+
+1. **Share nothing mutable.** Each domain computes its own part of the sum from its arguments and returns a result; `Domain.join` collects them. There is nothing to synchronise, so there is nothing to get wrong. Immutable data (lists, maps, records) can be read by any number of domains at once, safely, which is a large practical advantage of OCaml's functional style in a parallel world.
+2. **Atomics for simple shared counters and flags.** Four domains each increment `hits` 25,000 times, and no increment is lost. With a plain `int ref` and `incr`, increments from different domains could overwrite each other and the total would usually come out short: a data race.
+3. **A mutex around a structure that is not safe for parallel use.** `Hashtbl` is not, so every access goes through `Mutex.protect`. Correct, but every domain waits its turn for the lock; heavy contention can make a parallel program slower than a sequential one.
+
+The output is the same on every run, even though the domains' schedule is not, because the program only prints after joining. Notice also that the work must be big enough to be worth a domain: starting one costs far more than starting a lightweight thread, which is why real programs use a **pool** of domains (see below) rather than one domain per small task.
+
+### Effect handlers
+
+```ocaml check
+(* Declare effects: operations whose meaning is supplied by a handler. *)
+type _ Effect.t += Yield : int -> unit Effect.t
+type _ Effect.t += Exchange_rate : string -> float Effect.t
+
+(* A producer written as a plain loop: it just performs Yield. *)
+let squares_up_to n =
+  for i = 1 to n do
+    Effect.perform (Yield (i * i))
+  done
+
+(* A handler that collects every yielded value (OCaml 5.3 effect syntax). *)
+let collect producer =
+  let acc = ref [] in
+  match producer () with
+  | () -> List.rev !acc
+  | effect Yield x, k ->
+      acc := x :: !acc;
+      Effect.Deep.continue k ()
+
+(* A handler that stops after the first value above a limit: k is never resumed. *)
+let first_above limit producer =
+  match producer () with
+  | () -> None
+  | effect Yield x, k -> if x > limit then Some x else Effect.Deep.continue k ()
+
+(* Code that needs a value from its context, without being passed it. *)
+let price_in currency amount_usd =
+  let rate = Effect.perform (Exchange_rate currency) in
+  Printf.sprintf "%.2f %s" (amount_usd *. rate) currency
+
+let with_rates (rates : (string * float) list) f =
+  match f () with
+  | result -> result
+  | effect Exchange_rate c, k -> Effect.Deep.continue k (List.assoc c rates)
+
+let () =
+  print_endline (String.concat " " (List.map string_of_int (collect (fun () -> squares_up_to 8))));
+  (match first_above 30 (fun () -> squares_up_to 1000) with
+  | Some x -> Printf.printf "first square above 30: %d\n" x
+  | None -> print_endline "none");
+  let rates = [ ("KES", 129.0); ("INR", 88.5); ("EUR", 0.86) ] (* made-up rates *) in
+  with_rates rates (fun () -> List.map (fun c -> price_in c 20.) [ "KES"; "INR"; "EUR" ])
+  |> String.concat ", " |> print_endline;
+  match Effect.perform (Yield 1) with
+  | () -> print_endline "not reached"
+  | exception Effect.Unhandled _ -> print_endline "no handler for Yield here"
+```
+
+```text
+1 4 9 16 25 36 49 64
+first square above 30: 36
+2580.00 KES, 1770.00 INR, 17.20 EUR
+no handler for Yield here
+```
+
+An effect is like an exception that can come back. `squares_up_to` performs `Yield` without knowing what it means. Inside `collect`, the `match` has an **effect case**, `| effect Yield x, k ->`, written with the syntax introduced in OCaml 5.3 (earlier 5.x versions use the more verbose functions of `Effect.Deep` to the same effect). When the producer yields, control jumps to that case with the value `x` and the continuation `k`. The handler stores `x` and resumes the producer with `continue k ()`, as if `perform` had simply returned `()`. When the producer finishes, the ordinary `| () ->` case returns the collected list.
+
+The same producer means something else under a different handler. `first_above` resumes the producer only while the values are small, and as soon as one exceeds the limit it returns without resuming: the loop up to 1000 simply never continues. A producer written as a plain loop has become a lazy generator, without rewriting it.
+
+`Exchange_rate` shows an effect that *returns* a value: `price_in` asks its context for a rate, and `with_rates` answers by resuming the continuation with a float. This is a form of dependency injection; tests can run the same code under a handler with fixed rates. (The type annotation on `rates` is needed because effect cases are type-checked like GADT matches; without it, OCaml cannot be sure which type the float belongs to.)
+
+Finally, performing an effect with no handler raises `Effect.Unhandled`. OCaml 5 does **not** track effects in function types, so this is a run-time error, not a compile-time one: a deliberate trade-off that kept effects compatible with all existing code.
+
+### A cooperative scheduler in twenty lines
+
+```ocaml check
+(* A tiny cooperative scheduler: lightweight threads from effects. *)
+type _ Effect.t += Pause : unit Effect.t
+type _ Effect.t += Spawn : (unit -> unit) -> unit Effect.t
+
+let run main =
+  let ready = Queue.create () in
+  let next () = match Queue.take_opt ready with Some resume -> resume () | None -> () in
+  let rec start task =
+    match task () with
+    | () -> next ()
+    | effect Pause, k ->
+        Queue.push (fun () -> Effect.Deep.continue k ()) ready;
+        next ()
+    | effect Spawn child, k ->
+        Queue.push (fun () -> Effect.Deep.continue k ()) ready;
+        start child
+  in
+  start main
+
+let pause () = Effect.perform Pause
+let spawn f = Effect.perform (Spawn f)
+
+let worker name steps () =
+  for i = 1 to steps do
+    Printf.printf "%s: step %d\n" name i;
+    pause ()
+  done;
+  Printf.printf "%s: done\n" name
+
+let () =
+  run (fun () ->
+      spawn (worker "download" 3);
+      spawn (worker "render" 2);
+      print_endline "main: both tasks started";
+      pause ();
+      print_endline "main: done")
+```
+
+```text
+download: step 1
+render: step 1
+download: step 2
+main: both tasks started
+render: step 2
+download: step 3
+main: done
+render: done
+download: done
+```
+
+This is the idea at the heart of OCaml 5's concurrency libraries, in miniature. The scheduler keeps a queue of suspended tasks, each represented by "resume this continuation". `Pause` puts the current task at the back of the queue and runs the next one; `Spawn` queues the parent and starts the child immediately; when a task finishes, the next queued one runs. Trace the output against the queue and you will see a fair round-robin: no task runs twice before every other ready task has had a turn.
+
+The tasks themselves are ordinary, direct-style code: a `for` loop with a call to `pause` in it. No callbacks, no promises, no special syntax. Replace `Pause` with "wait until this socket is readable", let the scheduler ask the operating system which sockets are ready, and you have the essence of **Eio**, the effects-based I/O library: thousands of lightweight fibers, each written as straight-line code, on one domain or several.
+
+</Section>
+
+<Section id="human" kind="human" title="Concurrency and parallelism in practice">
+
+Few application programmers write handlers like the ones above every day; they use libraries built on them. The landscape, as of 2026:
+
+- **Domainslib** provides a pool of domains and parallel loops (`parallel_for`, `parallel_for_reduce`) and tasks (`async` and `await` within the pool). It is the usual way to speed up CPU-bound work: create one pool of about `Domain.recommended_domain_count ()` domains and submit work to it.
+- **Eio** provides effects-based concurrent I/O: fibers, structured concurrency with switches that guarantee child fibers finish before their parent, networking, files and timers, with direct-style code.
+- **Lwt** and **Async** (Jane Street) are the older, monadic concurrency libraries from before OCaml 5. They are mature and still very widely used; their code uses promises and binding operators (`let*` and `let%bind`) rather than effects.
+- The **Thread** module (systhreads) still exists for blocking calls and compatibility; threads within one domain still share that domain's lock.
+- **Saturn** offers lock-free data structures (queues, stacks, hash tables) designed for use across domains.
+
+Rules of thumb that experienced OCaml 5 programmers follow:
+
+1. Prefer immutable data and message passing between domains; when you must share mutable state, use `Atomic` for single values and a `Mutex` (or a Saturn structure) for anything bigger.
+2. Never use more domains than cores, and reuse them through a pool; use fibers or tasks, not domains, for "many things at once".
+3. Remember that the standard library's mutable structures (`Hashtbl`, `Queue`, `Buffer` and so on) are not safe for unsynchronised parallel use; the documentation of each module says so.
+4. Measure. Parallel speed-ups depend on the work per task, on allocation (the garbage collector is parallel but not free) and on contention.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Domains are lightweight threads, like goroutines."** Each domain is an operating-system thread with its own heap area; you want roughly one per core. Lightweight concurrency (thousands of tasks) is built *on top*, with effects, by libraries such as Eio, or with Lwt and Async.
+
+</Misconception>
+
+<Misconception>
+
+**"OCaml 5 makes data races impossible."** It does not prevent them; it **bounds their consequences**. A racy program cannot crash, read a value of the wrong type, or see a value no thread ever wrote, which is far better than C or C++, but its results can still be wrong. Use `Atomic`, `Mutex` or immutable data.
+
+</Misconception>
+
+<Misconception>
+
+**"The type checker tells me which effects a function performs."** Not in OCaml 5: effects are untyped, and an unhandled effect is a run-time error. Typed effects remain an active research topic for future versions.
+
+</Misconception>
+
+<Misconception>
+
+**"Effects replace exceptions and monads."** Exceptions remain the right tool for errors that abort a computation (effects that are never resumed behave much like them, at higher cost). Effects shine where a computation must be *suspended and resumed*: generators, schedulers, asynchronous I/O. Monadic libraries such as Lwt keep working unchanged.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
