@@ -8,6 +8,7 @@ import { COLLECTIONS, getCourseExercises, getCourseLesson, lessonCodeStatus, typ
 import { renderExerciseList } from "@/lib/exercises";
 import { href } from "@/lib/href";
 import { mdInline, mdToHtml } from "@/lib/markdown";
+import { linksToUnpublished, unlinkUnpublished } from "@/lib/subjects";
 import { extractToc, renderMdx } from "@/lib/mdx";
 import { widgetMessageNamespaces } from "@/lib/widget-messages";
 import { makeMdxComponents } from "@/components/lesson/mdx-components";
@@ -47,10 +48,10 @@ export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; lo
             )}
           </p>
           <h1 className="mt-4 text-4xl font-semibold leading-[1.08] text-ink sm:text-[3.4rem]">{course.title}</h1>
-          <p className="mt-4 max-w-3xl font-serif text-xl leading-relaxed text-ink-2" dangerouslySetInnerHTML={{ __html: mdInline(course.subtitle) }} />
+          <p className="mt-4 max-w-3xl font-serif text-xl leading-relaxed text-ink-2" dangerouslySetInnerHTML={{ __html: unlinkUnpublished(mdInline(course.subtitle)) }} />
           <div className="prose-lumen mt-6 max-w-3xl text-ink-2">
             {course.description.map((p, i) => (
-              <div key={i} dangerouslySetInnerHTML={{ __html: mdToHtml(p) }} />
+              <div key={i} dangerouslySetInnerHTML={{ __html: unlinkUnpublished(mdToHtml(p)) }} />
             ))}
           </div>
           <div className="mt-6 flex flex-wrap gap-2">
@@ -147,6 +148,15 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
     ...makeMdxComponents({ locale, t, exercises }),
     pre: CodeBlock,
     Say,
+    // A link into a subject that is not published yet (Robotics before its release) is plain text until it is.
+    a: ({ href: to, children, ...props }: React.ComponentProps<"a">) =>
+      linksToUnpublished(to) ? (
+        <>{children}</>
+      ) : (
+        <a href={to} {...props}>
+          {children}
+        </a>
+      ),
     LessonLink: ({ slug: to, children }: { slug: string; children?: React.ReactNode }) => {
       if (!c.slugs.includes(to)) throw new Error(`<LessonLink slug="${to}">: no such lesson in ${c.dir}`);
       return (

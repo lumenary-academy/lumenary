@@ -36,7 +36,11 @@ const SCIENTIA_NAV = [
 ] as const;
 const SCIENTIA_SUBJECTS = /^\/[^/]+\/(cs|ee|robotics)(\/|$)/;
 
-export function SiteHeader() {
+/**
+ * The site header. `available` lists the course paths that have pages (from the layout, which reads
+ * the content), so a subject appears in the navigation only once its course is published.
+ */
+export function SiteHeader({ available = [] }: { available?: string[] }) {
   const { locale, t } = useI18n();
   const pathname = usePathname() ?? "";
   const [open, setOpen] = useState(false);
@@ -52,7 +56,8 @@ export function SiteHeader() {
 
   // The front page lists the three divisions; Lumenary Math's navigation starts on its own front page.
   const home = pathname === `/${locale}/` || pathname === `/${locale}`;
-  const nav = SCIENTIA_SUBJECTS.test(pathname) ? SCIENTIA_NAV : NAV;
+  const scientiaNav = SCIENTIA_NAV.filter((item) => item.path === "math" || item.path === "divisions" || item.path === "about" || available.includes(item.path));
+  const nav = SCIENTIA_SUBJECTS.test(pathname) ? scientiaNav : NAV;
 
   const isActive = (path: string) => {
     const target = `/${locale}/${path}`;
@@ -113,7 +118,7 @@ export function SiteHeader() {
           <ul className="container-page grid grid-cols-2 gap-1 py-3 sm:grid-cols-4">
             {(nav === NAV
               ? [...NAV, { key: "divisions", path: "divisions" }, { key: "progress", path: "progress" }, { key: "languages", path: "languages" }, { key: "contribute", path: "contribute" }, { key: "verification", path: "verification" }]
-              : [...SCIENTIA_NAV, { key: "contribute", path: "contribute" }]
+              : [...scientiaNav, { key: "contribute", path: "contribute" }]
             ).map((item) => (
               <li key={item.key}>
                 <Link

@@ -41,3 +41,20 @@ export function scientiaSubjects(): { open: OpenSubject[]; pending: string[] } {
   }
   return { open, pending };
 }
+
+/**
+ * Whether a site link ("/en/robotics/moving/") points into a Scientia subject whose course is not
+ * published yet. Lessons may link ahead to a subject that ships in a later release; those links render
+ * as plain text until it does, and become links on their own once its course.json exists.
+ */
+export function linksToUnpublished(href: string | undefined): boolean {
+  const m = href?.match(/^\/[a-z]{2,3}(?:-[A-Za-z]+)?\/([a-z][a-z-]*)(?=[/?#]|$)/);
+  if (!m) return false;
+  const subject = SUBJECTS.find((s) => s.course && s.path === m[1]);
+  return subject !== undefined && !getCourse(subject.course!, "scientia");
+}
+
+/** Rendered HTML (a course's description) with links into unpublished subjects replaced by their text. */
+export function unlinkUnpublished(html: string): string {
+  return html.replace(/<a href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g, (link, to: string, text: string) => (linksToUnpublished(to) ? text : link));
+}

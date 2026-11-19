@@ -182,3 +182,15 @@ it("course pages are linked to their teaching locale", async () => {
   expect(href("es", "lingua/spanish/sounds-and-greetings")).toBe("/en/lingua/spanish/sounds-and-greetings/");
   expect(href("hi", "lingua")).toBe("/hi/lingua/");
 });
+
+it("links into a Scientia subject that is not published yet are plain text until it is", async () => {
+  const { linksToUnpublished, unlinkUnpublished } = await import("@/lib/subjects");
+  expect(linksToUnpublished("/en/cs/")).toBe(false);
+  expect(linksToUnpublished("/en/ee/feedback-control/")).toBe(false);
+  expect(linksToUnpublished("/en/math/topics/")).toBe(false);
+  expect(linksToUnpublished("https://example.org/en/robotics/")).toBe(false);
+  const published = subjects.has("robotics");
+  expect(linksToUnpublished("/en/robotics/moving/#motors")).toBe(!published);
+  const link = '<a href="/en/robotics/">Lumenary Robotics</a>';
+  expect(unlinkUnpublished(`See ${link}.`)).toBe(published ? `See ${link}.` : "See Lumenary Robotics.");
+});

@@ -84,6 +84,8 @@ Components (anything else fails the tests):
 
 Plain Markdown is encouraged: headings (`###`, `####`; `##` is the section title), lists, tables (GFM), **bold**, *italics*, `inline code`, blockquotes, links.
 
+Link to another course with a Markdown link to its page, e.g. `[feedback and PID](/en/robotics/feedback-and-pid/)`; `npm test` checks that the page exists. A link into a Scientia subject that is not published yet (its `course.json` is not in the tree) is shown as plain text until the subject ships, so lessons can link ahead to it (`linksToUnpublished` in `src/lib/subjects.ts`).
+
 ### Code
 
 Fenced code blocks are highlighted (python, bash, sql, javascript, typescript, c, cpp, go, rust, java, json, yaml, html, css, diff; anything else is shown plain, e.g. `text`). A Python block whose fence reads ```` ```python run ```` gets **Run** and **Edit** buttons and runs in the learner's browser (Pyodide: CPython 3.13 with numpy, in a sandboxed worker).
