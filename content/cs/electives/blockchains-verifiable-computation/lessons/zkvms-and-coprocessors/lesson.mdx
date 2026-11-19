@@ -1,0 +1,379 @@
+---
+title: zkVMs and ZK coprocessors
+subtitle: Proving whole programs instead of hand-built circuits — execution traces, memory checking, RISC-V and EVM provers, coprocessors for chain data and databases, verifiable machine learning, and the hardware alternative.
+minutes: 85
+objectives:
+  - Describe a zkVM as an execution trace plus transition, boundary and program constraints, and check a stack machine's trace in code
+  - Explain memory checking by sorting and multiset fingerprints, and catch an inconsistent read
+  - Compare RISC-V zkVMs, Cairo and Starknet, and zkEVMs of the four types, and explain continuations and proof aggregation
+  - Describe GPU proving, prover networks and the 2025–2026 race to prove Ethereum blocks in real time
+  - Explain what ZK coprocessors prove about chain data and databases, and what zkML can and cannot do
+  - Compare zero-knowledge proofs with trusted execution environments (SGX, TDX, SEV-SNP, Nitro) by trust model, cost and known attacks
+narrators: [chloe, margaret, gideon]
+prerequisites: [smart-contracts, rollups-and-scaling, interactive-proofs-and-sumcheck, snarks-and-polynomial-commitments, starks-and-folding]
+related: [math.comp.computability, math.comp.complexity-theory, math.algebra.polynomials, math.discrete.combinatorics]
+references:
+  - title: "Cairo – a Turing-complete STARK-friendly CPU architecture"
+    author: Lior Goldberg, Shahar Papini and Michael Riabzev
+    year: 2021
+    url: https://eprint.iacr.org/2021/1063
+  - title: "Jolt: SNARKs for virtual machines via lookups"
+    author: Arasu Arun, Srinath Setty and Justin Thaler
+    year: 2023
+    url: https://eprint.iacr.org/2023/1217
+  - title: "Twist and Shout: faster memory checking arguments via one-hot addressing and increments"
+    author: Srinath Setty and Justin Thaler
+    year: 2025
+    url: https://eprint.iacr.org/2025/105
+  - title: The different types of ZK-EVMs
+    author: Vitalik Buterin
+    year: 2022
+    url: https://vitalik.eth.limo/general/2022/08/04/zkevm.html
+  - title: "Shipping an L1 zkEVM #1: realtime proving"
+    author: Ethereum Foundation
+    year: 2025
+    url: https://blog.ethereum.org/2025/07/10/realtime-proving
+  - title: Ethproofs
+    url: https://ethproofs.org/
+    note: A public dashboard of zkVM proofs of Ethereum mainnet blocks, with latency and cost per proof.
+  - title: RISC Zero zkVM
+    url: https://github.com/risc0/risc0
+  - title: SP1
+    author: Succinct
+    url: https://github.com/succinctlabs/sp1
+  - title: Jolt
+    author: a16z crypto
+    url: https://github.com/a16z/jolt
+  - title: OpenVM
+    url: https://github.com/openvm-org/openvm
+  - title: Proof of SQL
+    author: Space and Time
+    url: https://github.com/spaceandtimefdn/sxt-proof-of-sql
+  - title: "zkLLM: zero knowledge proofs for large language models"
+    author: Haochen Sun, Jason Li and Hongyang Zhang
+    year: 2024
+    url: https://arxiv.org/abs/2404.16109
+  - title: EZKL
+    url: https://github.com/zkonduit/ezkl
+    note: A library that turns ONNX machine-learning models into Halo2 circuits.
+  - title: "TEE.Fail: breaking trusted execution environments via DDR5 memory bus interposition"
+    year: 2025
+    url: https://tee.fail/
+---
+
+<Section id="motivation" kind="motivation" title="From circuits to programs">
+
+<LessonLink slug="snarks-and-polynomial-commitments">Arithmetisation and SNARKs</LessonLink> ended with a warning: hand-written circuits are easy to get subtly wrong, and every new application needs a new circuit, a new audit and, for Groth16, a new ceremony. Imagine instead writing an ordinary program in Rust, compiling it for an ordinary instruction set, running it, and getting a proof that it ran correctly. That is a **zkVM**: a proof system for *one* circuit, the processor itself, which then proves any program that the processor can run.
+
+The price is overhead. Interpreting a program instruction by instruction costs more than a circuit tailored to the task, just as an emulator is slower than native code. But since 2022 the gap has closed so fast that by 2025 several zkVMs could prove Ethereum blocks about as fast as the chain produces them. This lesson builds the core of a zkVM in miniature, surveys the real ones, then turns to two neighbouring ideas — **coprocessors**, which prove facts about large datasets for smart contracts, and **trusted execution environments**, which offer verifiable computation with hardware trust instead of mathematics.
+
+</Section>
+
+<Section id="traces" kind="definitions" title="Execution traces and their constraints">
+
+A processor's run is a sequence of states. A zkVM writes them in a table and proves that the table is a valid run.
+
+<Definition term="execution trace">
+
+An **execution trace** is a table with one row per step of the machine and one column per piece of state (program counter, registers, decoded instruction fields, auxiliary values). A trace is **valid** for a program, an input and an output if it satisfies:
+
+- **transition constraints**: polynomial equations relating each row to the next (for example: if this row's instruction is ADD, the next row's top of stack equals the sum of this row's top two entries);
+- **boundary constraints**: the first row is the initial state and the last row contains the claimed output;
+- **program constraints**: each row's instruction is the instruction stored at its program counter, typically checked with a **lookup** into a table holding the program;
+- **memory constraints**: every read returns the value most recently written to that address.
+
+</Definition>
+
+The transition constraints for a whole instruction set are combined with **selector** columns: one 0/1 column per opcode, exactly one of them equal to 1 in each row, multiplying that opcode's equations so they apply only where the opcode runs. The **degree** of the constraints matters, because the quotient by the vanishing polynomial grows with it, and with it the low-degree extension the prover must commit to (<LessonLink slug="starks-and-folding">STARKs</LessonLink>). Real zkVMs split their constraints over several tables ("chips" for the CPU, the arithmetic unit, memory, hash precompiles), linked to one another by lookup and permutation arguments.
+
+<Figure caption="A zkVM pipeline. The prover runs the program in an emulator to produce the trace, splits long traces into segments proved in parallel, aggregates the segment proofs recursively, and usually wraps the result in a small SNARK for an on-chain verifier.">
+
+<svg viewBox="0 0 460 250" role="img" aria-label="A flow diagram. A Rust or C program is compiled to a RISC-V binary, which an emulator runs on the input to produce an execution trace. The trace is split into segments, each proved separately, possibly on its own GPU. The segment proofs are combined two at a time by recursion into one proof, which is wrapped into a Groth16 or PLONK proof checked by a smart contract.">
+  <defs>
+    <marker id="zv-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1.4">
+    <rect x="10" y="20" width="100" height="40" rx="6" fill="var(--card)" />
+    <rect x="135" y="20" width="100" height="40" rx="6" fill="var(--card)" />
+    <rect x="260" y="20" width="100" height="40" rx="6" fill="var(--sky-soft)" />
+    <rect x="245" y="100" width="40" height="30" rx="4" fill="var(--gold-soft)" />
+    <rect x="290" y="100" width="40" height="30" rx="4" fill="var(--gold-soft)" />
+    <rect x="335" y="100" width="40" height="30" rx="4" fill="var(--gold-soft)" />
+    <rect x="380" y="100" width="40" height="30" rx="4" fill="var(--gold-soft)" />
+    <rect x="267" y="160" width="40" height="26" rx="4" fill="var(--gold-soft)" />
+    <rect x="357" y="160" width="40" height="26" rx="4" fill="var(--gold-soft)" />
+    <rect x="312" y="205" width="40" height="26" rx="4" fill="var(--gold-soft)" />
+    <rect x="120" y="200" width="120" height="36" rx="6" fill="var(--card)" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3" markerEnd="url(#zv-arrow)">
+    <path d="M 110 40 L 133 40" />
+    <path d="M 235 40 L 258 40" />
+    <path d="M 310 60 L 265 98" />
+    <path d="M 310 60 L 310 98" />
+    <path d="M 310 60 L 355 98" />
+    <path d="M 310 60 L 400 98" />
+    <path d="M 265 130 L 285 158" />
+    <path d="M 310 130 L 289 158" />
+    <path d="M 355 130 L 375 158" />
+    <path d="M 400 130 L 379 158" />
+    <path d="M 287 186 L 328 203" />
+    <path d="M 377 186 L 336 203" />
+    <path d="M 312 218 L 242 218" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="60" y="37">Rust / C</text>
+    <text x="60" y="51">program</text>
+    <text x="185" y="37">RISC-V binary</text>
+    <text x="185" y="51">+ input</text>
+    <text x="310" y="37">emulator →</text>
+    <text x="310" y="51">execution trace</text>
+    <text x="265" y="119">seg 1</text>
+    <text x="310" y="119">seg 2</text>
+    <text x="355" y="119">seg 3</text>
+    <text x="400" y="119">seg 4</text>
+    <text x="180" y="215">wrap: Groth16/PLONK</text>
+    <text x="180" y="229">→ on-chain verifier</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10">
+    <text x="10" y="120">segment proofs (GPUs)</text>
+    <text x="10" y="178">recursive aggregation</text>
+  </g>
+</svg>
+
+</Figure>
+
+</Section>
+
+<Section id="stack-machine" kind="computation" title="A tiny zkVM: checking a stack machine's trace">
+
+Here is the whole idea at toy scale: a stack machine with five instructions (PUSH, ADD, MUL, DUP, SWAP) and a stack of three slots, running a seven-instruction program that computes $(3 + 4)^2 + 2 = 51$. Every constraint is a polynomial over $\mathbb{F}_p$ in the cells of two consecutive rows. A real prover would interpolate each column into a polynomial and prove, with FRI or a polynomial commitment, that all these constraint polynomials vanish on the trace domain; here we simply evaluate them row by row, which is what that proof certifies.
+
+```python run
+p = 2**31 - 1                        # toy field; every constraint below is a polynomial over F_p
+OPS = ["PUSH", "ADD", "MUL", "DUP", "SWAP"]
+program = [("PUSH", 3), ("PUSH", 4), ("ADD", 0), ("DUP", 0), ("MUL", 0), ("PUSH", 2), ("ADD", 0)]
+
+def run(program):
+    """Execute, recording one trace row per step: pc, one selector per opcode, imm, stack s0..s2."""
+    s, rows = [0, 0, 0], []
+    for pc, (op, imm) in enumerate(program):
+        rows.append([pc] + [int(op == o) for o in OPS] + [imm] + s)
+        if op == "PUSH":   s = [imm, s[0], s[1]]
+        elif op == "ADD":  s = [(s[0] + s[1]) % p, s[2], 0]
+        elif op == "MUL":  s = [s[0] * s[1] % p, s[2], 0]
+        elif op == "DUP":  s = [s[0], s[0], s[1]]
+        elif op == "SWAP": s = [s[1], s[0], s[2]]
+    rows.append([len(program)] + [0] * len(OPS) + [0] + s)   # the final state
+    return rows
+
+def constraints(cur, nxt):
+    """Transition constraints between a row and the next. Each value must be 0 in F_p.
+    A selector multiplies each opcode's equations, so they only bite on rows with that opcode."""
+    pc, push, add, mul, dup, swap, imm, s0, s1, s2 = cur
+    pc2, t0, t1, t2 = nxt[0], nxt[7], nxt[8], nxt[9]
+    return {
+        "selectors are bits": [b * (b - 1) for b in (push, add, mul, dup, swap)],
+        "one opcode per row": [push + add + mul + dup + swap - 1],
+        "pc increments":      [pc2 - pc - 1],
+        "PUSH": [push * (t0 - imm), push * (t1 - s0), push * (t2 - s1)],
+        "ADD":  [add * (t0 - s0 - s1), add * (t1 - s2), add * t2],
+        "MUL":  [mul * (t0 - s0 * s1), mul * (t1 - s2), mul * t2],
+        "DUP":  [dup * (t0 - s0), dup * (t1 - s0), dup * (t2 - s1)],
+        "SWAP": [swap * (t0 - s1), swap * (t1 - s0), swap * (t2 - s2)],
+    }
+
+def check(rows, program, output):
+    errors = []
+    if rows[0][0] != 0 or rows[0][7:] != [0, 0, 0]:
+        errors.append("boundary: start state")
+    if rows[-1][7] != output:
+        errors.append("boundary: claimed output")
+    table = {(pc, OPS.index(op), imm) for pc, (op, imm) in enumerate(program)}
+    for t in range(len(rows) - 1):
+        cur = rows[t]
+        opcode = cur[1:6].index(1) if 1 in cur[1:6] else -1
+        if (cur[0], opcode, cur[6]) not in table:                  # a lookup into the program
+            errors.append(f"row {t}: instruction not in the program")
+        for name, values in constraints(cur, rows[t + 1]).items():
+            if any(v % p for v in values):
+                errors.append(f"row {t}: {name}")
+    return errors
+
+rows = run(program)
+print("pc PUSH ADD MUL DUP SWAP imm |  s0  s1  s2")
+for r in rows:
+    print(f"{r[0]:2} {r[1]:4} {r[2]:3} {r[3]:3} {r[4]:3} {r[5]:4} {r[6]:3} | {r[7]:3} {r[8]:3} {r[9]:3}")
+print("honest trace, output 51:", check(rows, program, 51) or "all constraints hold")
+
+forged = [list(r) for r in rows]           # claim output 52: change MUL's result, carry it forward
+forged[5][7], forged[6][8], forged[7][7] = 50, 50, 52
+print("forged MUL result, output 52:", check(forged, program, 52))
+
+swapped = [list(r) for r in rows]          # claim row 4 ran ADD, and keep every later row consistent
+swapped[4][1:6] = [0, 1, 0, 0, 0]
+swapped[5][7], swapped[6][8], swapped[7][7] = 14, 14, 16
+print("forged opcode, output 16:", check(swapped, program, 16))
+```
+
+The first forgery changes one multiplication result and carries the lie forward consistently; every row is locally fine except the one where MUL's equation fails. The second forgery is subtler: it claims that row 4 executed ADD, and every transition constraint holds *for the instruction claimed*. Only the program lookup notices that the program has MUL at address 4. Forgetting to bind the trace to the program is the zkVM version of an under-constrained circuit.
+
+<Narrator who="gideon">
+
+The selectors deserve the same suspicion as any witness. Without "selectors are bits" and "one opcode per row", a prover could set two selectors to $\tfrac12$ each and satisfy a blend of two instructions' equations that neither instruction allows. Each constraint in the table above closes a door that a real exploit could walk through.
+
+</Narrator>
+
+</Section>
+
+<Section id="memory" kind="computation" title="Memory checking">
+
+Registers fit in trace columns; memory does not. A RISC-V program may touch gigabytes, and a column per address is out of the question. Instead the zkVM records every memory access as a tuple $(\text{time}, \text{address}, \text{value}, \text{read or write})$ and must prove that the accesses are **consistent**: each read returns the latest value written to that address.
+
+Three families of solutions exist:
+
+- **Merkle trees.** Keep memory as a Merkle tree and prove a path for every access. Simple and stateless, but each access costs a few dozen hashes inside the proof.
+- **Offline memory checking**, an idea of Blum, Evans, Gemmell, Kannan and Naor (1991), adapted to proofs. The prover supplies a second copy of the access log **sorted by address, then time**. In the sorted copy, consistency is a local property between neighbouring rows: a read must return the value of the previous row if it has the same address, and the initial value otherwise. Then a **permutation argument** shows that the sorted copy is a rearrangement of the original log — for example by comparing $\prod_i (X - \mathrm{enc}(e_i))$ for both lists at a random $X$, as PLONK's copy constraints did.
+- **Sumcheck-native schemes** such as Spice and, in 2025, Twist and Shout (Setty and Thaler), used by Jolt, which avoid grand products and reduce memory checking to sumcheck over "one-hot" encodings of addresses.
+
+The program below implements the second method on a small log, and shows that each half of the check catches a different lie.
+
+```python run
+import random
+
+p = 2**61 - 1
+# A memory log in time order: (time, is_write, address, value). Reads report the value they saw.
+log = [(0, 1, 2, 10), (1, 1, 5, 7), (2, 0, 2, 10), (3, 1, 2, 11), (4, 0, 5, 7),
+       (5, 0, 2, 11), (6, 0, 9, 0), (7, 1, 5, 8), (8, 0, 5, 8)]
+
+def sorted_consistent(by_address):
+    """Given the log sorted by (address, time), every read must return the latest write to the
+    same address, or 0 if there was none. One pass, comparing neighbours only."""
+    for k, (t, w, a, v) in enumerate(by_address):
+        prev = by_address[k - 1] if k else None
+        if prev is not None and (prev[2], prev[0]) >= (a, t):
+            return False, f"not sorted by (address, time) at time {t}"
+        last = prev[3] if prev is not None and prev[2] == a else 0
+        if not w and v != last:
+            return False, f"read at time {t} of address {a} returned {v}, expected {last}"
+    return True, "consistent"
+
+def fingerprint(entries, alpha, X):
+    """prod (X - encode(entry)): equal for two lists iff (w.h.p.) they are the same multiset."""
+    out = 1
+    for t, w, a, v in entries:
+        enc = (t + alpha * a + alpha**2 * v + alpha**3 * w) % p
+        out = out * (X - enc) % p
+    return out
+
+rng = random.Random(1991)
+alpha, X = rng.randrange(p), rng.randrange(p)       # the verifier's challenges
+
+def verify(name, time_ordered, claimed_sorted):
+    ok, why = sorted_consistent(claimed_sorted)
+    same = fingerprint(time_ordered, alpha, X) == fingerprint(claimed_sorted, alpha, X)
+    print(f"{name:19} accepted: {ok and same!s:5}  sorted copy: {why};  same multiset: {same}")
+
+by_address = lambda entries: sorted(entries, key=lambda e: (e[2], e[0]))
+verify("honest", log, by_address(log))
+
+lie = [e if e[0] != 5 else (5, 0, 2, 99) for e in log]          # the read at time 5 returns 99
+verify("lying read", lie, by_address(lie))
+
+# Hide the lie in the sorted copy only: the copy is now consistent but is not a permutation.
+hidden = [e if e[0] != 5 else (5, 0, 2, 11) for e in by_address(lie)]
+verify("lie hidden in copy", lie, hidden)
+```
+
+<Narrator who="chloe">
+
+Sorting turns a global property ("the latest write, wherever it was in time") into a local one ("the row just above"), and local properties are what constraints can express. The permutation check then ties the convenient copy back to the real log — the same "prove it on a nicer representation, then prove the representations agree" pattern as the lookup and copy-constraint arguments.
+
+</Narrator>
+
+</Section>
+
+<Section id="landscape" kind="human" title="Real zkVMs: RISC-V, Cairo and the EVM">
+
+**RISC-V zkVMs.** RISC-V is a small, open, stable instruction set with mature compilers, so proving RISC-V lets developers write Rust or C with standard tool chains. As of 2026, actively developed open-source examples include [RISC Zero](https://github.com/risc0/risc0) (STARKs over BabyBear, with recursion and a Groth16 wrapper), Succinct's [SP1](https://github.com/succinctlabs/sp1) (built on Plonky3, and in 2025 a multilinear redesign called SP1 Hypercube), a16z crypto's [Jolt](https://github.com/a16z/jolt) (lookups and sumcheck), Axiom's [OpenVM](https://github.com/openvm-org/openvm), [ZisK](https://github.com/0xPolygonHermez/zisk), ZKsync's [Airbender](https://github.com/matter-labs/zksync-airbender) and Brevis's [Pico](https://github.com/brevis-network/pico). They differ in field, arithmetisation, memory argument and recursion, and they share two practical features. **Precompiles** (also called accelerators or chips) are hand-optimised circuits for hot operations — Keccak and SHA-256, elliptic-curve and signature verification, big-integer arithmetic — that the program calls instead of executing thousands of RISC-V instructions. **Continuations** split a long execution into segments of a fixed number of cycles, prove the segments independently and in parallel, and link them by committing to the machine state (including a commitment to memory) at each boundary.
+
+**Cairo and Starknet.** StarkWare took the opposite route: instead of proving an existing instruction set, it designed one for proving. [Cairo](https://eprint.iacr.org/2021/1063) (2020) is a minimal CPU whose instructions are cheap to express as AIR constraints over a prime field, with its own high-level language; Starknet, a validity rollup on Ethereum, runs Cairo programs and proves them with StarkWare's provers, the newest of which, Stwo, uses circle STARKs over Mersenne-31.
+
+**zkEVMs.** Ethereum's own virtual machine was not designed for proving: 256-bit words, Keccak hashing everywhere, and a Merkle–Patricia trie for state. Vitalik Buterin's [taxonomy](https://vitalik.eth.limo/general/2022/08/04/zkevm.html) (2022) sorts zkEVMs by how much they change to make proving easier: **Type 1** is fully Ethereum-equivalent and can prove real Ethereum blocks; **Type 2** keeps the EVM but changes data structures such as the state tree; **Type 3** drops hard-to-prove features; **Type 4** compiles Solidity or Vyper to a different, proving-friendly VM. The first zkEVM rollups (Scroll, Polygon zkEVM, Linea, ZKsync Era and others) built large custom circuits; since 2024 a growing alternative is to run an existing EVM implementation written in Rust inside a RISC-V zkVM, which turns "build a zkEVM" into "compile an Ethereum client".
+
+That alternative made a new goal plausible. In July 2025 the Ethereum Foundation set out a [plan](https://blog.ethereum.org/2025/07/10/realtime-proving) to let Ethereum validators verify proofs of each block instead of re-executing it, starting as an option, and defined **real-time proving**: proofs of at least 99% of mainnet blocks within 10 seconds, on hardware costing at most about USD 100,000 and drawing at most 10 kW (so that individuals could prove at home), with 128-bit security and proofs under 300 KiB. The public dashboard [Ethproofs](https://ethproofs.org/) tracks provers against this; its end-of-2025 review reported that several teams met the latency and power targets on clusters of consumer GPUs, while the security target became the focus for 2026 (<LessonLink slug="frontier-of-verifiable-computation">see the frontier</LessonLink>).
+
+<Narrator who="margaret">
+
+Continuations are easy to count. A run of $2^{30}$ cycles in segments of $2^{22}$ cycles gives $2^8 = 256$ segment proofs; combining them two at a time takes $255$ recursive proofs in a tree of depth 8. With 256 GPUs proving segments in parallel, the latency is about one segment proof plus eight aggregation steps, rather than 256 segment proofs in a row — which is how real-time proving is reached with many cheap GPUs instead of one enormous machine.
+
+</Narrator>
+
+**GPUs and prover markets.** Proving is dominated by number-theoretic transforms, hashing, multi-scalar multiplications and, in sumcheck-based systems, folding of large tables: all massively parallel and memory-bound, which suits GPUs. Most fast provers of 2026 run on consumer or data-centre GPUs. Because proof generation is a commodity — anyone can produce a proof and anyone can check it — several projects run open **prover networks** in which independent operators bid to generate proofs for applications, such as the [Succinct Prover Network](https://www.succinct.xyz/) (launched on mainnet in August 2025) and RISC Zero's [Boundless](https://boundless.network/). Their economic designs, token incentives and degrees of decentralisation vary and are still young; the cryptography guarantees only that a *wrong* proof is useless, not that someone will produce a proof on time.
+
+</Section>
+
+<Section id="coprocessors" kind="human" title="ZK coprocessors: proving facts about data">
+
+A smart contract can read only the current state of its own chain, and only cheaply in small amounts. It cannot afford to scan the last million blocks for a user's trading volume, average a price over a month, or join two tables of data. A **ZK coprocessor** does such a computation off-chain and returns the result with a proof, which the contract verifies.
+
+The essential part is the **anchor**: the proof must show that the input data are the real data. For historical chain data, the coprocessor proves that each value it used is in some block's state or receipts, by Merkle–Patricia proofs from that block's header, and that the header hashes link back to a block hash the contract can see (the EVM exposes recent block hashes directly; [EIP-2935](https://eips.ethereum.org/EIPS/eip-2935) makes a longer window available from state). Then it proves the computation over those values. The contract checks one proof and compares the anchor with its own view of the chain.
+
+Examples, described by what they prove: [Axiom](https://www.axiom.xyz/) built a coprocessor for historical Ethereum data and later developed the OpenVM zkVM; [Brevis](https://brevis.network/) offers a coprocessor for chain data alongside its Pico zkVM; [Lagrange](https://www.lagrange.dev/) offers a coprocessor and the zkML system DeepProve; [Herodotus](https://herodotus.dev/) focuses on storage proofs across chains. Space and Time's [Proof of SQL](https://github.com/spaceandtimefdn/sxt-proof-of-sql) proves that SQL queries were computed correctly over committed database tables, using sumcheck and polynomial commitments, so that a query result can be checked without trusting the database. The common pattern — commit to data once, then prove many queries over it — is the same idea as verifiable databases studied in the research literature, now packaged for contracts.
+
+**zkML: proving model inference.** Can a server prove that a given output came from running a specific neural network on a given input, without revealing the weights? In principle yes: a network is arithmetic. In practice, floating point must be replaced by fixed-point (quantised) arithmetic, non-linear functions (softmax, GELU, normalisation) become lookups, and sizes are enormous. Libraries such as [EZKL](https://github.com/zkonduit/ezkl) compile ONNX models to Halo2 circuits, practical for small models. Research systems have pushed much further: [zkLLM](https://arxiv.org/abs/2404.16109) (2024) reported proving inference of a 13-billion-parameter model in under 15 minutes on GPUs, and in 2025–2026 Lagrange reported end-to-end proofs of token generation for GPT-2 and Gemma 3 ([DeepProve](https://eprint.iacr.org/2026/1112)). These are per-inference costs many orders of magnitude above running the model, so zkML today suits high-value, low-volume checks; proving *training* is harder still. Be precise about what is proved: that this computation was run on these committed weights — not that the model is fair, safe or correct.
+
+</Section>
+
+<Section id="tee" kind="human" title="The alternative: trusted execution environments">
+
+A **trusted execution environment** (TEE) is a hardware-isolated region of a processor whose memory is encrypted and whose code can **attest** — prove with a signature chained to the manufacturer — that a specific program is running inside it. Examples: Intel SGX (enclaves, 2015), Intel TDX and AMD SEV-SNP (whole confidential virtual machines), AWS Nitro Enclaves, and confidential-computing modes on NVIDIA's data-centre GPUs. A TEE offers both **integrity** (the output came from this program) and **confidentiality** (the data stayed hidden), at close to native speed.
+
+The trust model is the difference. A ZK proof is trusted because of mathematics and a few public assumptions; anyone can check it, forever. A TEE attestation is trusted because of the manufacturer's keys and the chip's resistance to attack, and the history of attacks is long: speculative-execution leaks such as Foreshadow (2018), voltage manipulation (Plundervolt, 2019), attestation-key extraction (SGAxe, 2020), architectural leaks such as ÆPIC Leak (2022), and in 2025 cheap physical memory-bus interposers. WireTap and Battering RAM attacked DDR4 systems, and [TEE.Fail](https://tee.fail/) (October 2025) used a DDR5 interposer built for under USD 1,000 to extract Intel attestation keys — allowing forged SGX and TDX attestations — and secrets from AMD SEV-SNP machines, demonstrating the impact on blockchain systems that relied on TEEs. Intel and AMD consider physical attacks outside their threat models.
+
+| | Zero-knowledge proof | Trusted execution environment |
+| --- | --- | --- |
+| Trust rests on | mathematics, a hash, sometimes a setup ceremony | the chip vendor, its keys and its hardware's resistance to attack |
+| Prover overhead | thousands of times native, or more | close to native |
+| Verification | anyone, any time, cheaply | check an attestation chain to the vendor's root |
+| Confidentiality | only if the proof is zero-knowledge; the prover sees the data | data hidden even from the operator, unless the TEE is broken |
+| Failure mode | a bug in circuits or proof system; publicly checkable artefacts | a hardware or side-channel attack, often invisible |
+
+They are complementary as often as they are rivals. Some rollups require **multiple proofs** of each block from independent systems; Taiko's [Raiko](https://github.com/taikoxyz/raiko) supports SGX together with RISC Zero and SP1 proofs, so that a bug in any single prover is not enough to forge a state transition. TEEs are also used to keep inputs private while a ZK proof provides public verifiability.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A zkVM proof says the program is correct."** It says that *this* binary, run on *these* inputs, produced *this* output. A bug in the program, the compiler or the guest's dependencies is proved just as faithfully as correct behaviour.
+
+</Misconception>
+
+<Misconception>
+
+**"zkVMs make proofs private."** Most zkVM deployments, including rollups, use them for succinct verification, with inputs that are public anyway. Zero knowledge is an option that some zkVMs offer, and it must be enabled and checked.
+
+</Misconception>
+
+<Misconception>
+
+**"A TEE attestation is as good as a proof."** It is a signature by hardware, valid only as long as the hardware and the vendor's keys are uncompromised. After TEE.Fail, attestations from affected platforms could be forged by an attacker with physical access, and no one checking the attestation could tell.
+
+</Misconception>
+
+<Misconception>
+
+**"A ZK coprocessor's answer is correct."** It is correct *relative to its anchor and its query*. If the contract accepts an anchor it should not (a block hash from the wrong chain or fork), or asks the wrong query, the proof faithfully certifies the wrong thing.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

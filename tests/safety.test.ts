@@ -19,6 +19,10 @@ const SOURCES = [
   ...files("content/math/lessons", /\.(mdx|json)$/),
   ...files("content/math/trails", /\.mdx$/),
   ...files("content/pages", /\.mdx$/),
+  // Lumenary CS (with its programming languages and electives), EE and Robotics
+  ...files("content/cs", /\.(mdx|json)$/),
+  ...files("content/ee", /\.(mdx|json)$/),
+  ...files("content/robotics", /\.(mdx|json)$/),
   ...files("compute/experiments", /\.py$/),
   ...files("src/i18n/messages", /\.json$/),
   "content/math/graph/graph.json",
@@ -32,6 +36,8 @@ describe("safety of examples", () => {
     expect(safetyProblems("Look at the sun through the clouds.")).not.toEqual([]);
     expect(safetyProblems("Never drop anything from a bridge.")).toEqual([]);
     expect(safetyProblems("An apple falls from a tree.")).toEqual([]);
+    expect(safetyProblems("Touch the live wire to see what happens.")).not.toEqual([]);
+    expect(safetyProblems("Never touch a live wire or open a mains plug.")).toEqual([]);
   });
   for (const file of SOURCES)
     it(file, () => {

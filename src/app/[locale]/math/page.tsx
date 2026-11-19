@@ -16,7 +16,8 @@ const CONSTELLATION_PATH = ["counting", "fractions", "algebra", "calculus", "pro
 const CONSTELLATION_BRANCHES = ["infinities", "groups", "categories", "knots"];
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
-  return { title: (await getT(await resolveLocale(params)))("curriculum.title") };
+  const t = await getT(await resolveLocale(params));
+  return { title: t("curriculum.title"), description: t("meta.mathDescription") };
 }
 
 /** Lumenary Math's front page (Lumenary Academy's own front page lists its divisions). */
@@ -71,7 +72,7 @@ export default async function MathHomePage({ params }: { params: Promise<{ local
                 {t("home.explore")}
               </Link>
             </div>
-            <p className="mt-8 font-display text-xl italic text-ink-2">{t("meta.tagline")}</p>
+            <p className="mt-8 font-display text-xl italic text-ink-2">{t("meta.mathTagline")}</p>
           </div>
           <div className="relative mx-auto w-full max-w-xl" dir="ltr">
             <HeroConstellation path={CONSTELLATION_PATH.map((k) => t(`home.constellation.${k}`))} branches={CONSTELLATION_BRANCHES.map((k) => t(`home.constellation.${k}`))} />

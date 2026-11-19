@@ -82,4 +82,5 @@ if [ -z "$WANT" ] || want images; then
     docker pull -q "$img" >/dev/null 2>&1 && echo "image $img" || echo "image $img FAILED"
   done
   docker build -q -t lumenary/debian-toolchains -f "$(dirname "$0")/Dockerfile.debian" "$(dirname "$0")" >/dev/null && echo "image lumenary/debian-toolchains (fpc, gnat)"
+  docker build -q -t lumenary/eda-toolchains -f "$(dirname "$0")/Dockerfile.eda" "$(dirname "$0")" >/dev/null && echo "image lumenary/eda-toolchains (iverilog, ngspice)"
 fi

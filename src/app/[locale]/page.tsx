@@ -1,19 +1,25 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowRight, ArrowUpRight, Atom, GraduationCap, Languages } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Atom, Bot, Braces, Cog, Cpu, FlaskConical, Gem, GraduationCap, Languages, Sigma, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { getT, resolveLocale } from "@/i18n/server";
 import { href } from "@/lib/href";
+import { scientiaSubjects } from "@/lib/subjects";
 
 /** Lumenary Prep is its own site. */
 const PREP_URL = "https://prep.lumenary.academy";
 
-/** Lumenary Scientia's subjects: mathematics and computer science are open, the rest are pending. */
-const OPEN_SCIENCES = [
-  { key: "mathematics", path: "math" },
-  { key: "computerScience", path: "cs" },
-];
-const PENDING_SCIENCES = ["electricalEngineering", "physics", "chemistry", "biology", "otherSciences"];
+/** Each Scientia subject's icon and accent. */
+const SUBJECT_LOOK: Record<string, { Icon: LucideIcon; accent: string }> = {
+  mathematics: { Icon: Sigma, accent: "bg-gold" },
+  computerScience: { Icon: Cpu, accent: "bg-compute" },
+  programmingLanguages: { Icon: Braces, accent: "bg-compute" },
+  electricalEngineering: { Icon: Zap, accent: "bg-sky" },
+  robotics: { Icon: Bot, accent: "bg-human" },
+  chemistry: { Icon: FlaskConical, accent: "bg-formal" },
+  mechanicalEngineering: { Icon: Cog, accent: "bg-sky" },
+  materialsScience: { Icon: Gem, accent: "bg-human" },
+};
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
   return { description: (await getT(await resolveLocale(params)))("divisions.lead") };
@@ -45,6 +51,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   const locale = await resolveLocale(params);
   const t = await getT(locale);
   const arrow = <ArrowRight size={16} className="rtl:rotate-180" aria-hidden="true" />;
+  const { open, pending } = scientiaSubjects();
 
   return (
     <>
@@ -69,35 +76,20 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               badge={t("divisions.scientiaBadge")}
               text={t("divisions.scientiaText")}
               action={
-                <Link href={href(locale, "math")} className="btn btn-primary">
+                <a href="#subjects" className="btn btn-primary">
                   {t("divisions.scientiaCta")} {arrow}
-                </Link>
+                </a>
               }
             >
-              <div className="mt-5 space-y-3">
-                <div>
-                  <p className="text-xs font-semibold text-muted">{t("divisions.available")}</p>
-                  <ul className="mt-1.5 flex flex-wrap gap-1.5">
-                    {OPEN_SCIENCES.map((s) => (
-                      <li key={s.key}>
-                        <Link href={href(locale, s.path)} className="chip border-gold/50 bg-gold-soft text-gold-ink hover:border-gold">
-                          {t(`divisions.${s.key}`)}
-                        </Link>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div>
-                  <p className="text-xs font-semibold text-muted">{t("divisions.pending")}</p>
-                  <ul className="mt-1.5 flex flex-wrap gap-1.5">
-                    {PENDING_SCIENCES.map((s) => (
-                      <li key={s} className="chip">
-                        {t(`divisions.${s}`)}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
+              <ul className="mt-5 flex flex-wrap gap-1.5" aria-label={t("divisions.available")}>
+                {open.map((s) => (
+                  <li key={s.key}>
+                    <Link href={href(locale, s.path)} className="chip border-gold/50 bg-gold-soft text-gold-ink hover:border-gold">
+                      {t(`divisions.${s.key}`)}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
             </Division>
           </li>
           <li>
@@ -131,11 +123,55 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             />
           </li>
         </ul>
-        <p className="mt-10 text-center">
-          <Link href={href(locale, "divisions")} className="link font-semibold">
-            {t("divisions.more")}
-          </Link>
-        </p>
+      </section>
+
+      <section id="subjects" className="scroll-mt-20 border-t border-line bg-paper-2/40" aria-labelledby="subjects-title">
+        <div className="container-page py-14 sm:py-16">
+          <p className="eyebrow">Lumenary Scientia</p>
+          <h2 id="subjects-title" className="mt-3 text-3xl font-semibold text-ink sm:text-4xl">
+            {t("divisions.subjectsTitle")}
+          </h2>
+          <p className="mt-3 max-w-3xl leading-relaxed text-ink-2">{t("divisions.subjectsLead")}</p>
+          <ul className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {open.map((s) => {
+              const look = SUBJECT_LOOK[s.key] ?? { Icon: Atom, accent: "bg-gold" };
+              return (
+                <li key={s.key}>
+                  <Link href={href(locale, s.path)} className="card group relative flex h-full flex-col overflow-hidden p-5 hover:shadow-[var(--shadow-lg)]">
+                    <span className={`absolute inset-x-0 top-0 h-1 ${look.accent}`} aria-hidden="true" />
+                    <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-paper-2 text-ink">
+                      <look.Icon size={20} aria-hidden="true" />
+                    </span>
+                    <span className="mt-4 font-display text-xl font-semibold text-ink">{t(`divisions.${s.key}`)}</span>
+                    <span className="mt-1.5 text-sm leading-snug text-ink-2">{t(`divisions.${s.key}Text`)}</span>
+                    <span className="mt-auto flex items-center justify-between gap-2 pt-4 text-xs text-muted">
+                      <span>
+                        {s.courses ? `${t("divisions.coursesN", { n: s.courses })} · ` : ""}
+                        {t("divisions.lessonsN", { n: s.lessons })}
+                      </span>
+                      <ArrowRight size={14} className="text-muted transition-transform group-hover:translate-x-0.5 rtl:rotate-180" aria-hidden="true" />
+                    </span>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+          {pending.length > 0 && (
+            <div className="mt-8 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold text-muted">{t("divisions.pending")}:</span>
+              {pending.map((k) => (
+                <span key={k} className="chip">
+                  {t(`divisions.${k}`)}
+                </span>
+              ))}
+            </div>
+          )}
+          <p className="mt-10">
+            <Link href={href(locale, "divisions")} className="link font-semibold">
+              {t("divisions.more")}
+            </Link>
+          </p>
+        </div>
       </section>
     </>
   );

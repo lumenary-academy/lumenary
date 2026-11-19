@@ -1,0 +1,576 @@
+---
+title: Ethereum and smart contracts
+subtitle: A world computer with accounts, a stack machine metered by gas, contracts that cannot be changed, and the patterns and compromises built around them.
+minutes: 80
+objectives:
+  - Describe Ethereum's account model and the state an account holds
+  - Execute EVM bytecode in a small interpreter with gas accounting, and explain why gas exists
+  - Read a small Solidity contract line by line, and explain ERC-20 and ERC-721
+  - Encode calldata, compute function selectors and event topics, and locate a mapping entry in storage
+  - Explain deployment, immutability and upgradeable proxies, and the trust each implies
+  - Explain the oracle problem, and compare Ethereum's design with Solana, Move-based chains and Cardano
+prerequisites: [why-blockchains, hashes-and-merkle-trees, signatures-and-keys, proof-of-stake-and-finality, bitcoin-transactions]
+narrators: [chloe, margaret, gideon]
+related: [math.comp.computability, math.applied.cryptography, math.comp.formal-methods]
+references:
+  - title: "Ethereum: A Next-Generation Smart Contract and Decentralized Application Platform"
+    author: Vitalik Buterin
+    year: 2013
+    url: https://ethereum.org/en/whitepaper/
+  - title: "Ethereum Yellow Paper"
+    author: Gavin Wood and contributors
+    url: https://ethereum.github.io/yellowpaper/paper.pdf
+    note: The formal specification of the EVM and its gas costs.
+  - title: "Ethereum execution specifications"
+    url: https://github.com/ethereum/execution-specs
+    note: An executable Python specification of every Ethereum upgrade, readable alongside this lesson.
+  - title: "Solidity documentation"
+    url: https://docs.soliditylang.org/
+    note: See "Layout of State Variables in Storage" and the "Contract ABI Specification".
+  - title: "evm.codes"
+    url: https://www.evm.codes/
+    note: An interactive reference of EVM opcodes and their gas costs, with a playground.
+  - title: "EIP-20: Token Standard"
+    author: Fabian Vogelsteller and Vitalik Buterin
+    year: 2015
+    url: https://eips.ethereum.org/EIPS/eip-20
+  - title: "EIP-721: Non-Fungible Token Standard"
+    author: William Entriken, Dieter Shirley, Jacob Evans and Nastassia Sachs
+    year: 2018
+    url: https://eips.ethereum.org/EIPS/eip-721
+  - title: "EIP-1967: Proxy Storage Slots"
+    url: https://eips.ethereum.org/EIPS/eip-1967
+  - title: "OpenZeppelin Contracts documentation"
+    url: https://docs.openzeppelin.com/contracts/
+    note: Widely used, audited implementations of tokens, access control and proxies.
+  - title: "Solana documentation: core concepts"
+    url: https://solana.com/docs
+  - title: "The Move Book"
+    url: https://move-book.com/
+  - title: "The Extended UTXO Model"
+    author: Manuel M. T. Chakravarty et al.
+    year: 2020
+    url: https://doi.org/10.1007/978-3-030-54455-3_37
+---
+
+<Section id="motivation" kind="motivation" title="From a ledger of coins to a ledger of programs">
+
+Bitcoin's Script, as we saw in <LessonLink slug="bitcoin-transactions">the last lesson</LessonLink>, is deliberately small: a locking script can check signatures, hashes and times, and nothing else. In 2013 Vitalik Buterin proposed a different trade-off. Instead of a ledger of coins with small locks, keep a ledger of **accounts**, and let some accounts be *programs* that hold money and data and run whenever someone sends them a transaction. Ethereum launched on 30 July 2015 with that design, and the programs came to be called **smart contracts**: not smart, and not contracts in the legal sense, but code whose execution every validator repeats and agrees on.
+
+The idea makes a public blockchain programmable. A token, an exchange, an auction or an escrow can be written as a contract, and anyone can use it without asking permission from the people who wrote it. It also brings old problems of computer science into a hostile setting. How do you stop someone from submitting a program that never halts, when thousands of machines must run it? How do you fix a bug in code that, by design, cannot be changed? How does a program that can see only the blockchain learn the price of rice or the result of a football match?
+
+This lesson answers those questions by building a small Ethereum Virtual Machine with gas, reading a contract written in Solidity, decoding what a transaction actually sends to a contract, and looking at how upgrades, oracles and other chains' designs trade one kind of trust for another.
+
+</Section>
+
+<Section id="accounts" kind="definitions" title="Accounts, state and transactions">
+
+<Definition term="account">
+
+An Ethereum **account** is identified by a 20-byte **address** and has four fields: a **nonce**, a **balance** in wei ($10^{-18}$ ether), a **code hash**, and a **storage root**, the root of a Merkle trie holding the account's storage (a map from 32-byte keys to 32-byte values). An **externally owned account** (EOA) is controlled by a private key and has no code; a **contract account** has code and is controlled only by that code.
+
+</Definition>
+
+<Definition term="world state and transaction">
+
+The **world state** maps every address to its account, and its Merkle root is committed in each block header. A **transaction** is signed by an EOA and names a recipient, a value in wei, a **data** field (called **calldata** when the recipient is a contract), a **gas limit**, fee parameters and the sender's **nonce**, which must equal the number of transactions the sender has sent before. Executing it moves the world state to a new state, deterministically.
+
+</Definition>
+
+Compare this with Bitcoin. A Bitcoin transaction names specific outputs; an Ethereum transaction says "from my account, nonce 41", and the nonce does the job that unique outpoints did: a replayed transaction has a stale nonce and is invalid. Every node that executes the same transactions in the same order reaches the same state root, which is what consensus (since September 2022, the proof of stake of <LessonLink slug="proof-of-stake-and-finality">Proof of stake and finality</LessonLink>) agrees on.
+
+<Note>
+
+The line between the two kinds of account has blurred. ERC-4337 (2023) lets "smart accounts" (contracts) act as wallets with features such as social recovery and spending limits, and EIP-7702, part of the Pectra upgrade of May 2025, lets an EOA delegate to contract code. The four account fields above are unchanged.
+
+</Note>
+
+</Section>
+
+<Section id="evm" kind="intuition" title="The EVM: a stack machine with three kinds of memory">
+
+Contract code is bytecode for the **Ethereum Virtual Machine** (EVM), a stack machine with 256-bit words. Each call to a contract gets a fresh machine:
+
+<Figure caption="The state an EVM call works with. Code and calldata are read-only. The stack and memory are scratch space, discarded when the call ends. Storage belongs to the contract and persists between transactions. Every instruction draws on the gas counter.">
+<svg viewBox="0 0 540 240" role="img" aria-label="A central box labelled EVM execution with a program counter and a gas counter. On its left, read-only inputs: contract code and calldata. On its right, a stack of 256-bit words with at most 1024 items, and memory, a byte array, both marked as discarded after the call. Below, storage, a persistent map from 32-byte keys to 32-byte values, belonging to the contract, and logs, the events emitted, which are kept in the receipt but cannot be read by contracts.">
+  <defs>
+    <marker id="sc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="30" width="130" height="46" rx="4" />
+    <rect x="10" y="100" width="130" height="46" rx="4" />
+    <rect x="190" y="50" width="160" height="80" rx="6" />
+    <rect x="400" y="20" width="130" height="56" rx="4" />
+    <rect x="400" y="100" width="130" height="46" rx="4" />
+    <rect x="120" y="180" width="170" height="50" rx="4" />
+    <rect x="330" y="180" width="170" height="50" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" fillOpacity="0.5">
+    <rect x="190" y="50" width="160" height="80" rx="6" />
+  </g>
+  <g fill="var(--gold-soft)" fillOpacity="0.5">
+    <rect x="120" y="180" width="170" height="50" rx="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="75" y="50">code</text>
+    <text x="75" y="66" fontSize="10">read-only bytecode</text>
+    <text x="75" y="120">calldata</text>
+    <text x="75" y="136" fontSize="10">read-only input bytes</text>
+    <text x="270" y="78">EVM execution</text>
+    <text x="270" y="96" fontSize="10">program counter</text>
+    <text x="270" y="112" fontSize="10">gas remaining</text>
+    <text x="465" y="40">stack</text>
+    <text x="465" y="55" fontSize="10">256-bit words, max 1024</text>
+    <text x="465" y="69" fontSize="10">discarded after the call</text>
+    <text x="465" y="120">memory</text>
+    <text x="465" y="136" fontSize="10">byte array, discarded</text>
+    <text x="205" y="200">storage</text>
+    <text x="205" y="217" fontSize="10">persistent 32-byte key → value</text>
+    <text x="415" y="200">logs (events)</text>
+    <text x="415" y="217" fontSize="10">kept in receipts, unreadable by code</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#sc-arrow)">
+    <path d="M 140 53 L 188 75" />
+    <path d="M 140 123 L 188 105" />
+    <path d="M 350 70 L 398 50" />
+    <path d="M 350 110 L 398 122" />
+    <path d="M 245 130 L 220 178" />
+    <path d="M 300 130 L 380 178" />
+  </g>
+</svg>
+</Figure>
+
+- The **stack** holds up to 1024 words; most instructions pop their operands and push a result.
+- **Memory** is a byte array that starts empty for each call and grows as it is touched; it is cheap at first and becomes quadratically expensive.
+- **Storage** is the contract's persistent key–value store, part of the world state. It is by far the most expensive to write, because every node must keep it.
+- **Calldata** is the read-only input of the call, and **logs** are records the contract emits for the outside world (events); contracts cannot read logs back.
+
+Control flow uses `JUMP` and `JUMPI` (jump if non-zero) to positions marked `JUMPDEST`, so unlike Bitcoin's Script, the EVM can loop. That is exactly why it needs gas.
+
+</Section>
+
+<Section id="gas" kind="computation" title="Gas: paying for every step">
+
+Suppose anyone could submit a program and every validator had to run it to completion. One program `top: JUMP top` would freeze the whole network. Could validators reject non-terminating programs in advance? No: deciding whether an arbitrary program halts is the **halting problem**, which no algorithm solves (see <TopicLink id="math.comp.computability">computability</TopicLink>). Ethereum's answer is to sidestep the question. Every instruction has a price in **gas**; the sender sets a **gas limit** and pays for the gas used; if execution reaches the limit, it stops with an out-of-gas error, all its state changes are undone, and the gas is still paid for. Every computation halts, because every computation is bounded by the gas someone was willing to pay for.
+
+The program below is a small EVM. It uses the real opcode numbers and 256-bit arithmetic, and a simplified version of the real gas schedule: 3 gas for most arithmetic and stack operations, 8 or 10 for jumps, 2,100 to read a storage slot and 20,000 to write a non-zero value into an empty slot (5,000 to overwrite), plus the EVM's actual formula for growing memory. The contract sums $1 + 2 + \cdots + n$, with $n$ taken from calldata, stores the result in storage slot 0, and returns it.
+
+```python run
+# A tiny EVM: real opcode numbers, 256-bit words, and a simplified version of the real gas schedule.
+OPS = {  # name: (opcode, gas)
+    "STOP": (0x00, 0), "ADD": (0x01, 3), "MUL": (0x02, 5), "SUB": (0x03, 3), "LT": (0x10, 3),
+    "ISZERO": (0x15, 3), "CALLDATALOAD": (0x35, 3), "MSTORE": (0x52, 3), "SLOAD": (0x54, 2100),
+    "SSTORE": (0x55, None), "JUMP": (0x56, 8), "JUMPI": (0x57, 10), "JUMPDEST": (0x5B, 1),
+    "PUSH1": (0x60, 3), "DUP1": (0x80, 3), "DUP2": (0x81, 3), "SWAP1": (0x90, 3), "RETURN": (0xF3, 0),
+}
+NAME = {code: name for name, (code, _) in OPS.items()}
+WORD = 2**256
+
+def assemble(src):
+    """Every token is one byte. 'name:' emits a JUMPDEST; 'PUSH1 name' pushes that label's address."""
+    tokens = src.split()
+    labels = {t[:-1]: i for i, t in enumerate(tokens) if t.endswith(":")}
+    return bytes(OPS["JUMPDEST"][0] if t.endswith(":") else OPS[t][0] if t in OPS
+                 else labels[t] if t in labels else int(t) for t in tokens)
+
+def memory_cost(words):
+    return 3 * words + words * words // 512            # the EVM's memory-expansion formula
+
+def execute(code, storage, gas_limit, calldata=b""):
+    """On success return ('ok', output, gas used) and commit storage writes.
+    On failure return the error, leave storage unchanged and charge all the gas."""
+    stack, memory, pc, gas = [], bytearray(), 0, 0
+    writes = dict(storage)
+    jumpdests, i = set(), 0
+    while i < len(code):                               # valid targets: JUMPDESTs outside push data
+        if code[i] == 0x5B:
+            jumpdests.add(i)
+        i += 2 if code[i] == 0x60 else 1
+    try:
+        while True:
+            if pc < len(code) and code[pc] not in NAME:
+                raise RuntimeError("invalid opcode")
+            name = NAME[code[pc]] if pc < len(code) else "STOP"
+            cost = OPS[name][1]
+            if name == "SSTORE":                       # writing a fresh slot is the expensive case
+                cost = 20_000 if writes.get(stack[-1], 0) == 0 and stack[-2] != 0 else 5_000
+            if name in ("MSTORE", "RETURN"):           # pay for newly touched memory
+                end = stack[-1] + (32 if name == "MSTORE" else stack[-2])
+                words = max(len(memory) // 32, (end + 31) // 32)
+                cost += memory_cost(words) - memory_cost(len(memory) // 32)
+                memory.extend(bytes(32 * words - len(memory)))
+            gas += cost
+            if gas > gas_limit:
+                raise RuntimeError("out of gas")
+            pc += 1
+            if name == "STOP":
+                output = b""
+                break
+            if name == "PUSH1":
+                stack.append(code[pc])
+                pc += 1
+            elif name in ("ADD", "MUL", "SUB", "LT"):
+                a, b = stack.pop(), stack.pop()        # a was on top of the stack
+                stack.append({"ADD": a + b, "MUL": a * b, "SUB": a - b, "LT": int(a < b)}[name] % WORD)
+            elif name == "ISZERO":
+                stack.append(int(stack.pop() == 0))
+            elif name == "CALLDATALOAD":
+                i = stack.pop()
+                stack.append(int.from_bytes(calldata[i:i + 32].ljust(32, b"\0"), "big"))
+            elif name in ("DUP1", "DUP2"):
+                stack.append(stack[-1 if name == "DUP1" else -2])
+            elif name == "SWAP1":
+                stack[-1], stack[-2] = stack[-2], stack[-1]
+            elif name == "MSTORE":
+                offset, value = stack.pop(), stack.pop()
+                memory[offset:offset + 32] = value.to_bytes(32, "big")
+            elif name == "SLOAD":
+                stack.append(writes.get(stack.pop(), 0))
+            elif name == "SSTORE":
+                key, value = stack.pop(), stack.pop()
+                writes[key] = value
+            elif name in ("JUMP", "JUMPI"):
+                dest = stack.pop()
+                if name == "JUMP" or stack.pop() != 0:
+                    if dest not in jumpdests:
+                        raise RuntimeError("bad jump destination")
+                    pc = dest
+            elif name == "RETURN":
+                offset, size = stack.pop(), stack.pop()
+                output = bytes(memory[offset:offset + size])
+                break
+            if len(stack) > 1024:
+                raise RuntimeError("stack overflow")
+    except (RuntimeError, IndexError) as err:
+        return (str(err) or "stack underflow"), b"", gas_limit
+    storage.clear()
+    storage.update(writes)
+    return "ok", output, gas
+
+# Sum 1 + 2 + ... + n, with n read from the call data; store the result in slot 0 and return it.
+SUM = """
+    PUSH1 0 CALLDATALOAD PUSH1 0
+  loop:
+    DUP2 ISZERO PUSH1 done JUMPI
+    DUP2 ADD
+    SWAP1 PUSH1 1 SWAP1 SUB SWAP1
+    PUSH1 loop JUMP
+  done:
+    DUP1 PUSH1 0 SSTORE
+    PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+"""
+code = assemble(SUM)
+print("bytecode:", code.hex())
+arg = lambda n: n.to_bytes(32, "big")
+
+storage = {}
+for n, limit in [(10, 100_000), (100, 100_000), (1000, 20_000)]:
+    status, out, used = execute(code, storage, limit, arg(n))
+    result = int.from_bytes(out, "big") if out else "-"
+    print(f"n={n:<5} gas limit {limit:>7}: {status:10} returns {result!s:>5}  gas {used:>6}  storage {storage}")
+
+forever = assemble("top: PUSH1 top JUMP")              # a loop with no way out
+status, _, used = execute(forever, {}, 1_000_000)
+print(f"endless loop, gas limit 1000000: {status} after {used // 12} iterations of 12 gas")
+```
+
+Read the output carefully. With $n = 10$ the call uses 20,571 gas, of which 20,000 is the single storage write. With $n = 100$ the loop runs ten times as often, yet the call is *cheaper*, 10,251 gas, because the slot already holds a value and overwriting costs 5,000. With $n = 1000$ and a 20,000 gas limit, the loop runs out of gas: the status is an error, the stored value is still 5050, and all 20,000 gas is charged. The endless loop stops too, after 83,333 iterations, because it can only buy that many.
+
+<Narrator who="margaret">
+
+Each pass of the summing loop costs 52 gas: eleven instructions at 3 gas, 18 for the two jumps and 1 for the `JUMPDEST` (running the code with $n = 10$ and $n = 11$ on a non-empty slot gives 5,571 and 5,623 gas, which confirms it). One fresh storage write costs as much as about 385 passes of the loop. That ratio, not the speed of the CPU, is what shapes Ethereum programming: contract authors count storage slots the way embedded programmers count bytes.
+
+</Narrator>
+
+Gas prices are not arbitrary. They approximate the resources each operation consumes on every node: computation, memory, disk reads, and above all the permanent growth of the state. When prices drift from reality, attackers notice. In September and October 2016, transactions that repeatedly called underpriced operations (ones that read other accounts' data from disk) slowed nodes to a crawl, and the Tangerine Whistle upgrade raised those prices ([EIP-150](https://eips.ethereum.org/EIPS/eip-150)). Repricing has continued since, for example making the first access to a storage slot in a transaction ("cold") cost more than later ones ("warm"). A transaction also pays a base cost of 21,000 gas, and since the London upgrade of 2021 its fee per gas is a protocol-set **base fee**, which is burned, plus a **priority fee** to the block proposer ([EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)). A block has a total gas limit, raised several times by validators since 2025, which caps the work every node must do per block.
+
+<Narrator who="gideon">
+
+Two details of the simulation matter in the real EVM. A failed call charges *all* the gas but undoes *all* the state changes, including writes made before the failure; that atomicity is what makes complex contracts tractable. And jump targets are checked against `JUMPDEST`s that are real instructions, not bytes inside a `PUSH` operand, so code cannot jump into the middle of its own data.
+
+</Narrator>
+
+</Section>
+
+<Section id="solidity" kind="examples" title="A contract in Solidity, line by line">
+
+Nobody writes contracts in bytecode. The dominant language is **Solidity**, statically typed with a syntax reminiscent of JavaScript and C++, compiled to EVM bytecode; **Vyper** is a smaller, Python-like alternative. Here is an escrow: a buyer deposits ether for a seller, and either the buyer releases it or an arbiter both trust decides. The code is shown, not run; it is for learning and has not been audited.
+
+```solidity
+// SPDX-License-Identifier: Apache-2.0
+pragma solidity ^0.8.24;
+
+/// A one-off escrow between a buyer and a seller, with an arbiter.
+contract Escrow {
+    enum State { AwaitingDelivery, Released, Refunded }
+
+    address public immutable buyer;
+    address public immutable seller;
+    address public immutable arbiter;
+    uint256 public immutable amount;
+    State public state;
+
+    event Released(address indexed to, uint256 amount);
+    event Refunded(address indexed to, uint256 amount);
+
+    error NotAllowed();
+    error AlreadySettled();
+    error PaymentFailed();
+
+    constructor(address seller_, address arbiter_) payable {
+        require(msg.value > 0, "deposit required");
+        buyer = msg.sender;
+        seller = seller_;
+        arbiter = arbiter_;
+        amount = msg.value;
+    }
+
+    function release() external {
+        if (msg.sender != buyer && msg.sender != arbiter) revert NotAllowed();
+        _settle(State.Released, seller);
+        emit Released(seller, amount);
+    }
+
+    function refund() external {
+        if (msg.sender != seller && msg.sender != arbiter) revert NotAllowed();
+        _settle(State.Refunded, buyer);
+        emit Refunded(buyer, amount);
+    }
+
+    function _settle(State outcome, address to) private {
+        if (state != State.AwaitingDelivery) revert AlreadySettled();
+        state = outcome;                                // record the outcome first...
+        (bool ok, ) = to.call{value: amount}("");       // ...then send the ether
+        if (!ok) revert PaymentFailed();
+    }
+}
+```
+
+Line by line:
+
+- The **SPDX** comment states the licence, and `pragma` pins the compiler versions the code was written for. Since version 0.8, arithmetic that overflows reverts instead of wrapping silently, a change whose history we will meet in <LessonLink slug="contract-security">Smart-contract security</LessonLink>.
+- `enum State` names the three phases. `state` is a **state variable**, kept in storage; its default is the first value, `AwaitingDelivery`.
+- `immutable` variables are fixed in the constructor and written into the deployed code itself, so reading them costs no storage access. `public` makes the compiler generate a getter function for each.
+- `event` declarations define the logs the contract emits; `indexed` parameters become searchable **topics**. Custom `error`s give cheap, descriptive reasons when a call reverts.
+- The `constructor` runs once, at deployment. `payable` lets it receive ether, `msg.value` is the amount sent and `msg.sender` is the caller, here the buyer. `require` reverts the whole deployment if no deposit is made.
+- `release` and `refund` are `external` functions that anyone can call, so each first checks *who* is calling. Forgetting such a check is one of the commonest real bugs.
+- `_settle` is `private`. It checks the phase, **updates the state before sending ether**, and only then makes the external call. `to.call{value: amount}("")` sends ether and returns whether the recipient accepted it. The order of these lines, checks, then effects, then interactions, is the defence against the reentrancy attack of the next lesson.
+
+<Narrator who="gideon">
+
+There is a quiet failure mode here: if the seller is a contract that rejects ether, `release` reverts every time and the funds can only go back by `refund`. Contracts that pay many parties therefore usually prefer the **pull** pattern: record what each party is owed and let each withdraw it, so one recipient's misbehaviour cannot block the others.
+
+</Narrator>
+
+### Tokens: ERC-20 and ERC-721
+
+Much of Ethereum's activity is tokens, and tokens are just contracts that keep a table of balances and agree on a common interface. [ERC-20](https://eips.ethereum.org/EIPS/eip-20) (proposed in 2015) standardises **fungible** tokens, where every unit is interchangeable. Its interface, in Solidity (shown, not run):
+
+```solidity
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+    function approve(address spender, uint256 value) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+```
+
+`transfer` moves your own tokens. `approve` and `transferFrom` let you authorise another contract, such as an exchange, to move up to a set amount on your behalf; this two-step dance exists because a contract cannot see that tokens arrived unless it moves them itself. Approvals are also the root of much wallet-draining fraud, as the next lesson explains. [ERC-721](https://eips.ethereum.org/EIPS/eip-721) (2018) standardises **non-fungible** tokens (NFTs), where each token has a unique identifier and owner (`ownerOf(tokenId)`) and usually points to metadata stored elsewhere. A token is only as meaningful as what its issuer promises: an ERC-721 token records that an address controls an identifier, not that anyone owns a painting.
+
+</Section>
+
+<Section id="abi" kind="computation" title="Calldata, storage layout and events">
+
+What does a wallet actually send when you call `transfer(to, 2500)`? The **Application Binary Interface** (ABI) says: the first 4 bytes of calldata are a **function selector**, the first 4 bytes of the Keccak-256 hash of the function's signature, written without spaces or parameter names; then each argument is encoded, a static type taking one 32-byte word. Events work similarly: the first **topic** of a log is the hash of the event's signature. And storage has a layout too. State variables are assigned consecutive 32-byte **slots** from slot 0, with small variables packed together into one slot when they fit; a mapping occupies one slot $p$, and its entry for key $k$ lives at slot $\operatorname{keccak256}(k \,\|\, p)$, each padded to 32 bytes.
+
+Ethereum's hash is Keccak-256, the function that won the SHA-3 competition, but in the version submitted *before* NIST changed its padding. Python's `hashlib.sha3_256` is the standardised version and gives different answers, so the program implements Keccak itself, from the permutation (an original, unoptimised implementation for learning).
+
+```python run
+import hashlib
+
+# Keccak-256 as Ethereum uses it, written out from the Keccak-f[1600] permutation.
+MASK = 2**64 - 1
+def rol(v, n):
+    return ((v << n) | (v >> (64 - n))) & MASK
+
+def lfsr_bit(t):                         # round-constant bits come from a small LFSR
+    r = 1
+    for _ in range(t % 255):
+        r <<= 1
+        if r & 0x100:
+            r ^= 0x171
+    return r & 1
+
+RC = [sum(lfsr_bit(j + 7 * i) << (2**j - 1) for j in range(7)) for i in range(24)]
+ROT, (x, y) = [[0] * 5 for _ in range(5)], (1, 0)
+for t in range(24):                      # rotation offsets, walked out along (x, y) -> (y, 2x + 3y)
+    ROT[x][y] = (t + 1) * (t + 2) // 2 % 64
+    x, y = y, (2 * x + 3 * y) % 5
+
+def keccak_f(A):
+    for rc in RC:
+        C = [A[x][0] ^ A[x][1] ^ A[x][2] ^ A[x][3] ^ A[x][4] for x in range(5)]
+        D = [C[(x - 1) % 5] ^ rol(C[(x + 1) % 5], 1) for x in range(5)]
+        B = [[0] * 5 for _ in range(5)]
+        for x in range(5):
+            for y in range(5):
+                B[y][(2 * x + 3 * y) % 5] = rol(A[x][y] ^ D[x], ROT[x][y])
+        A = [[B[x][y] ^ (~B[(x + 1) % 5][y] & B[(x + 2) % 5][y]) for y in range(5)] for x in range(5)]
+        A[0][0] ^= rc
+    return A
+
+def keccak256(data: bytes) -> bytes:
+    rate = 136                                               # bytes absorbed per permutation
+    padded = bytearray(data) + b"\x01" + bytes((-len(data) - 1) % rate)
+    padded[-1] |= 0x80                                       # Keccak padding; NIST SHA-3 uses 0x06
+    A = [[0] * 5 for _ in range(5)]
+    for block in range(0, len(padded), rate):
+        for i in range(rate // 8):
+            A[i % 5][i // 5] ^= int.from_bytes(padded[block + 8 * i: block + 8 * i + 8], "little")
+        A = keccak_f(A)
+    return b"".join(A[i % 5][i // 5].to_bytes(8, "little") for i in range(4))
+
+print("keccak256('')  ", keccak256(b"").hex())
+print("NIST sha3_256('')", hashlib.sha3_256(b"").hexdigest())
+
+def selector(signature):                 # first 4 bytes of the hash of the function's signature
+    return keccak256(signature.encode())[:4]
+
+def word(n):                             # every ABI argument of a static type fills one 32-byte word
+    return n.to_bytes(32, "big")
+
+print("transfer(address,uint256)  ->", selector("transfer(address,uint256)").hex())
+print("balanceOf(address)         ->", selector("balanceOf(address)").hex())
+print("Transfer event topic       ->", keccak256(b"Transfer(address,address,uint256)").hex())
+
+to = int("5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4c", 16)       # a made-up address
+calldata = selector("transfer(address,uint256)") + word(to) + word(2_500)
+print("calldata:", calldata.hex()[:8], calldata.hex()[8:72], calldata.hex()[72:], sep="\n  ")
+
+# Where does a token keep balances[to], if `balances` is the first state variable (slot 0)?
+slot = keccak256(word(to) + word(0))
+print("storage slot of balances[to]:", slot.hex())
+```
+
+The hash of the empty string, `c5d24601…`, is the familiar Keccak-256 value, and it differs from the NIST SHA3-256 hash on the next line. The selector `a9059cbb` is the one you will find at the start of every ERC-20 transfer on any block explorer, and `ddf252ad…` is the first topic of every ERC-20 `Transfer` event. The calldata is 68 bytes: the selector, the address padded to 32 bytes, and 2,500 (hexadecimal `9c4`) padded to 32 bytes. Anyone can compute where an account's balance lives, which is how explorers and analytics read contract state directly.
+
+<Narrator who="chloe">
+
+Why hash the mapping key instead of storing entries in a list? Because storage is a sparse map of $2^{256}$ slots, hashing spreads the entries of every mapping in every contract uniformly across that enormous space, so two different keys or two different mappings collide only if someone finds a Keccak collision. The layout needs no allocator and no bookkeeping, only a hash function that behaves well.
+
+</Narrator>
+
+</Section>
+
+<Section id="deployment" kind="human" title="Deployment, immutability and upgradeable proxies">
+
+To **deploy** a contract you send a transaction with no recipient whose data is **init code**: bytecode that runs once (the constructor) and returns the **runtime code** to be stored. The new contract's address is derived from the deployer's address and nonce, or, with `CREATE2`, from the deployer, a chosen salt and the hash of the init code, so the address can be known before deployment. Once stored, the code cannot be edited. Since the Dencun upgrade (March 2024), even the old `SELFDESTRUCT` instruction no longer deletes a contract's code except within the transaction that created it.
+
+Immutability is a feature, since users can read exactly what will run, and a liability, since bugs cannot be patched. Projects therefore often deploy an **upgradeable proxy**.
+
+<Figure caption="An upgradeable proxy. Users always call the proxy, which keeps the storage and the balance. It forwards each call with DELEGATECALL to the current implementation, whose code runs against the proxy's storage. An administrator can point the proxy at a new implementation.">
+<svg viewBox="0 0 540 190" role="img" aria-label="Users on the left send calls to a proxy contract in the middle, which holds the storage and a pointer to the implementation. A solid arrow labelled DELEGATECALL goes from the proxy to implementation version 2 on the right; a dashed arrow goes to implementation version 1, no longer used. An administrator box at the bottom has an arrow to the proxy labelled upgrade: change the pointer.">
+  <defs>
+    <marker id="sc-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="60" width="90" height="44" rx="4" />
+    <rect x="170" y="40" width="160" height="84" rx="6" />
+    <rect x="400" y="20" width="130" height="44" rx="4" strokeDasharray="5 4" />
+    <rect x="400" y="100" width="130" height="44" rx="4" />
+    <rect x="190" y="150" width="120" height="34" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" fillOpacity="0.5">
+    <rect x="170" y="40" width="160" height="84" rx="6" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="55" y="86">users</text>
+    <text x="250" y="62">proxy</text>
+    <text x="250" y="80" fontSize="10">holds storage and balance</text>
+    <text x="250" y="96" fontSize="10">implementation = v2</text>
+    <text x="250" y="112" fontSize="10">admin = a multisig</text>
+    <text x="465" y="40">implementation v1</text>
+    <text x="465" y="55" fontSize="10">no longer used</text>
+    <text x="465" y="120">implementation v2</text>
+    <text x="465" y="135" fontSize="10">code only</text>
+    <text x="250" y="171">administrator</text>
+    <text x="365" y="98" fontSize="10">DELEGATECALL</text>
+    <text x="355" y="168" fontSize="10">upgrade: change pointer</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#sc-arrow2)">
+    <path d="M 100 82 L 168 82" />
+    <path d="M 330 105 L 398 120" />
+    <path d="M 250 150 L 250 126" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="4 4">
+    <path d="M 330 60 L 398 45" />
+  </g>
+</svg>
+</Figure>
+
+`DELEGATECALL` runs another contract's code *in the caller's context*: same storage, same balance, same `msg.sender`. A proxy stores the address of its implementation in a fixed, unlikely storage slot (standardised by [EIP-1967](https://eips.ethereum.org/EIPS/eip-1967)) and forwards every call to it; upgrading means writing a new address into that slot. Patterns differ in where the upgrade logic lives (the "transparent" proxy and UUPS, both implemented in [OpenZeppelin Contracts](https://docs.openzeppelin.com/contracts/)), but the trade-off is the same: **whoever can upgrade can change every rule**, including who owns the funds. A proxy turns "the code is the law" into "the code is the law until the administrator says otherwise". Responsible projects narrow that power with multi-signature administrators, **timelocks** that delay upgrades so users can leave first, and governance votes, and they publish all of it. Upgradeable code also brings its own bugs: a new implementation must keep the old storage layout exactly, and an implementation contract left uninitialised can sometimes be taken over directly.
+
+</Section>
+
+<Section id="oracles" kind="human" title="Oracles: how contracts learn about the world">
+
+A contract can read only the blockchain. Every node must reach the same result, so a contract cannot fetch a web page: two nodes fetching it a second apart might get different answers. Yet lending, insurance, stablecoins and derivatives all need outside facts such as exchange rates. An **oracle** is a mechanism that posts such facts on chain.
+
+The **oracle problem** is that the contract is now only as trustworthy as its oracle. Designs differ in how they spread that trust: networks of independent node operators that aggregate many sources and post a median (Chainlink is the largest such network); feeds signed by the market participants who produce the prices (Pyth Network); and "optimistic" oracles, where anyone may propose an answer and anyone may dispute it within a window, with disputes settled by a vote (UMA). A contract that reads the price of a thinly traded asset directly from a single on-chain exchange is the weakest design of all, as the oracle-manipulation attacks of the next lesson show.
+
+</Section>
+
+<Section id="other-designs" kind="human" title="Other designs">
+
+Ethereum's design is not the only one, and the alternatives are best understood by what they change.
+
+- **EVM-compatible chains.** Many chains run the EVM with different consensus, validator sets or fees, among them BNB Smart Chain, Avalanche's C-Chain and Polygon PoS, as do most of the rollups in <LessonLink slug="rollups-and-scaling">Scaling: rollups and data availability</LessonLink>. The code and tools carry over; the trust assumptions do not.
+- **Solana** (mainnet beta since 2020) separates code from data more sharply. Programs are stateless; all data lives in accounts that programs own, and every transaction must list in advance the accounts it will read and write. That list lets the runtime execute transactions that touch disjoint accounts **in parallel** across many cores, and Solana pairs this with fast blocks and demanding validator hardware. The network suffered several multi-hour outages in 2021 and 2022, and its developers have since worked on reliability, including a second, independently written validator client (Firedancer).
+- **Move-based chains.** Move was designed at Facebook (later Meta) for the Diem project, which was abandoned in 2022, and lives on in chains such as Aptos and Sui. Its central idea is the **resource** type: a value that the type system forbids from being copied or silently discarded, so a token cannot be duplicated or lost by a programming error, only moved. Sui also organises state as objects with owners, which lets transactions on independent objects run in parallel.
+- **Cardano** uses the **extended UTXO** model: like Bitcoin, value sits in outputs, but an output can carry a datum (data) and be locked by a validator script that sees the whole spending transaction. Because a transaction's effect depends only on its inputs, its validity and its fee can be checked off-chain before it is submitted. The cost is concurrency: an output can be spent only once, so an application with shared state has to be designed so that many users do not race for the same output. Smart contracts arrived on Cardano with the Alonzo upgrade in September 2021.
+
+None of these choices is free. Parallelism needs declared or detectable conflicts; resource types need a new language; EUTXO's determinism costs shared state. Throughput gained by raising hardware requirements is paid for with fewer people able to run a validator.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A smart contract is a legal contract."** It is a program. It may implement part of an agreement, but it knows nothing of intent, fairness or law, and courts in many countries are still working out how code-based arrangements relate to legal ones. "Code is law" is a slogan, not a legal principle.
+
+</Misconception>
+
+<Misconception>
+
+**"Gas limits make contracts slow; Ethereum just has a slow CPU."** Gas measures the cost to *every* node of storing and executing a transaction. The binding constraint is the state that all nodes must keep forever and the time that the slowest acceptable node needs to verify a block, not any single machine's speed.
+
+</Misconception>
+
+<Misconception>
+
+**"Deployed contracts can never change."** The bytecode at an address cannot change, but a proxy can point to new code, an administrator key can pause a contract or move funds if the code allows it, and the platform itself can change through hard forks. Always ask who holds which keys.
+
+</Misconception>
+
+<Misconception>
+
+**"If it's on the blockchain, it's true."** A contract faithfully records what it was told. An NFT's metadata, an oracle's price or a token's claim to represent a dollar are all only as good as whoever stands behind them off the chain.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

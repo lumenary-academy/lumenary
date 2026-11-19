@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run the code in Lumenary CS and Lumenary Lingua lessons and write the course code report.
 
-For every lesson (content/cs/lessons/<slug>, content/lingua/<course>/lessons/<slug>):
+For every lesson of every course (content/<course>/lessons/<slug>: Lumenary CS, its programming
+languages and electives, Lumenary EE, Lumenary Robotics and Lumenary Lingua; see docs/courses.md):
 
 * every fenced ```python run block in lesson.mdx runs in a fresh interpreter
   (``python -I -X utf8``), the way the browser runs it: top-level ``await`` is
@@ -104,8 +105,12 @@ RUNNERS = {
     "matlab": {"file": "main.m", "cmd": "octave --no-gui --no-window-system --quiet main.m", "image": "gnuoctave/octave:latest", "version": "octave --version | head -1"},
     "pascal": {"file": "main.pas", "cmd": "fpc -v0 main.pas >/dev/null && ./main", "image": "lumenary/debian-toolchains", "version": "fpc -iV"},
     "ada": {"file": "main.adb", "cmd": "gnatmake -q main.adb && ./main", "image": "lumenary/debian-toolchains", "version": "gnatmake --version | head -1"},
+    # Lumenary EE: a Verilog design with its testbench in one file (the testbench calls $finish, and
+    # $fatal on a failed self-check, which makes vvp exit non-zero), and a SPICE netlist run in batch mode.
+    "verilog": {"file": "main.v", "cmd": "iverilog -g2012 -o main main.v && vvp -n main", "image": "lumenary/eda-toolchains", "version": "iverilog -V 2>&1 | head -1"},
+    "spice": {"file": "main.cir", "cmd": "ngspice -b main.cir > out.log 2>&1; s=$?; cat out.log; [ $s -eq 0 ] && ! grep -qiE '^[[:space:]]*error|is not a valid|aborted' out.log", "image": "lumenary/eda-toolchains", "version": "ngspice -v 2>&1 | grep -m1 ngspice"},
 }
-ALIASES = {"lean4": "lean", "c++": "cpp", "cs": "csharp", "c#": "csharp", "f#": "fsharp", "visual-basic": "vb", "js": "javascript", "ts": "typescript", "sh": "bash", "octave": "matlab", "object-pascal": "pascal", "py": "python", "fortran-free-form": "fortran"}
+ALIASES = {"lean4": "lean", "c++": "cpp", "cs": "csharp", "c#": "csharp", "f#": "fsharp", "visual-basic": "vb", "js": "javascript", "ts": "typescript", "sh": "bash", "octave": "matlab", "object-pascal": "pascal", "py": "python", "fortran-free-form": "fortran", "systemverilog": "verilog", "sv": "verilog", "ngspice": "spice"}
 
 
 def runner_for(lang):
@@ -179,17 +184,26 @@ def lesson_dirs():
         yield key, path
 
 
+# Directories under content/ that are not courses, and the families of courses nested in a subject
+# (mirrors courseDirs() in src/lib/courses.ts).
+NOT_COURSES = {"math", "pages", "registry", "verification", "lingua"}
+COLLECTIONS = ("cs/languages", "cs/electives")
+
+
+def course_dirs():
+    """Every course directory under content/: subjects ("cs", "ee", "robotics"), the courses nested in
+    a subject ("cs/languages/rust", "cs/electives/<id>") and Lumenary Lingua's ("lingua/spanish")."""
+    courses = [d.name for d in sorted(CONTENT.iterdir()) if d.name not in NOT_COURSES and (d / "course.json").exists()]
+    for family in (*COLLECTIONS, "lingua"):
+        base = CONTENT / family
+        if base.exists():
+            courses += [f"{family}/{d.name}" for d in sorted(base.iterdir()) if (d / "course.json").exists()]
+    return courses
+
+
 def course_lessons():
-    """(course, key, path) for every lesson in a syllabus; course like "cs" or "cs/languages/rust"."""
-    courses = []
-    if (CONTENT / "cs" / "course.json").exists():
-        courses.append("cs")
-    languages = CONTENT / "cs" / "languages"
-    if languages.exists():
-        courses += [f"cs/languages/{d.name}" for d in sorted(languages.iterdir()) if (d / "course.json").exists()]
-    lingua = CONTENT / "lingua"
-    if lingua.exists():
-        courses += [f"lingua/{d.name}" for d in sorted(lingua.iterdir()) if (d / "course.json").exists()]
+    """(course, key, path) for every lesson in a syllabus; course like "cs", "ee" or "cs/languages/rust"."""
+    courses = course_dirs()
     for course in courses:
         syllabus = json.loads((CONTENT / course / "course.json").read_text(encoding="utf-8"))
         for level in syllabus["levels"]:

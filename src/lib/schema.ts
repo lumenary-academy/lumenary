@@ -309,6 +309,8 @@ export const CourseLessonFrontmatter = z.object({
   related: z.array(TopicId).default([]),
   /** Further reading and outside resources, by link only. */
   references: z.array(Reference).default([]),
+  /** The cat guides who speak in the lesson (<Narrator who="…">), as in Lumenary Math. */
+  narrators: z.array(z.enum(["chloe", "margaret", "gideon"])).default([]),
 });
 export type CourseLessonFrontmatter = z.infer<typeof CourseLessonFrontmatter>;
 

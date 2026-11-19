@@ -1,0 +1,561 @@
+---
+title: Digital filters
+subtitle: Filters made of nothing but multiplication, addition and delay. Difference equations, the z-transform, poles and zeros, and how to design, implement and test FIR and IIR filters.
+minutes: 70
+objectives:
+  - Write a digital filter as a difference equation and run it, and tell FIR from IIR filters
+  - Use the z-transform to find a filter's transfer function, poles, zeros and frequency response
+  - Decide stability from the poles, and read a frequency response from a pole–zero plot
+  - Design a linear-phase FIR low-pass by the window method and measure its ripple, transition and stopband
+  - Design an IIR biquad with the bilinear transform, and explain why high-order filters are built from biquads
+  - Describe the effects of fixed-point arithmetic, and filter a noisy signal and measure the improvement
+prerequisites: [signals-and-systems, fourier-analysis, sampling-and-the-fft]
+related: [math.analysis.sequences-series, math.algebra.polynomials, math.number.complex-numbers, math.analysis.complex-analysis]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: Introduction to Digital Filters with Audio Applications
+    author: Julius O. Smith III
+    url: https://ccrma.stanford.edu/~jos/filters/
+    note: A free online book on difference equations, the z-transform, and filter structures, with many worked examples.
+  - title: scipy.signal
+    author: SciPy
+    url: https://docs.scipy.org/doc/scipy/reference/signal.html
+    note: The Python library engineers use for filter design (firwin, remez, butter, cheby1, ellip) and filtering (lfilter, sosfilt, filtfilt).
+  - title: Audio EQ Cookbook
+    author: Robert Bristow-Johnson (W3C Working Group Note)
+    url: https://www.w3.org/TR/audio-eq-cookbook/
+    note: Widely used closed-form formulas for the biquad coefficients of equaliser filters, derived with the bilinear transform.
+  - title: CMSIS-DSP
+    author: Arm
+    url: https://github.com/ARM-software/CMSIS-DSP
+    note: An open-source library of filters (including fixed-point biquad cascades) and FFTs for Arm microcontrollers.
+  - title: Chebyshev approximation for nonrecursive digital filters with linear phase
+    author: Thomas W. Parks and James H. McClellan
+    year: 1972
+    note: The paper behind the Parks–McClellan (Remez) algorithm for optimal equiripple FIR filters.
+---
+
+<Section id="motivation" kind="motivation" title="Filters made of arithmetic">
+
+In <LessonLink slug="frequency-response-and-filters">Frequency response and filters</LessonLink> you built filters from resistors, capacitors and inductors. Their behaviour depends on component values that drift with temperature and age and come with tolerances of a few per cent. Once a signal has been sampled, as in <LessonLink slug="sampling-and-the-fft">Sampling and the FFT</LessonLink>, a filter can instead be a short program: multiply recent samples by fixed numbers and add them up. Such a **digital filter** behaves identically on every unit ever built, never drifts, can be changed by a software update, and can do things no practical analogue circuit can, such as a perfectly linear phase or a stopband 100 dB deep.
+
+Digital filters are everywhere. A smartwatch smooths its accelerometer readings before counting steps; an electrocardiograph removes mains hum and baseline wander from a heartbeat; a hearing aid splits sound into frequency bands and amplifies each to suit its wearer; a radio receiver selects one channel from a crowded band; the decimation stage of every oversampling converter is a sharp digital low-pass filter. This lesson gives you the theory to analyse such filters (difference equations, the z-transform, poles and zeros) and the practice to design them, run them and measure what they do.
+
+</Section>
+
+<Section id="difference-equations" kind="definitions" title="Difference equations: FIR and IIR">
+
+A digital filter computes each output sample from current and past inputs and, possibly, past outputs.
+
+<Definition term="Linear constant-coefficient difference equation">
+
+A causal digital filter of this kind computes
+$$y[n] = b_0 x[n] + b_1 x[n-1] + \cdots + b_M x[n-M] \;-\; a_1 y[n-1] - \cdots - a_N y[n-N],$$
+with fixed coefficients $b_k$ and $a_k$ (and $a_0 = 1$). If all $a_k$ with $k \ge 1$ are zero, the filter is **FIR** (finite impulse response): its impulse response is just $b_0, b_1, \dots, b_M$ and then zeros. If it feeds back past outputs, the filter is **IIR** (infinite impulse response): an impulse can echo for ever.
+
+</Definition>
+
+An FIR filter is a convolution with its coefficients, so everything in <LessonLink slug="signals-and-systems">Signals, systems and convolution</LessonLink> applies directly, including stability: a finite list of coefficients always has a finite absolute sum. An IIR filter can produce a long impulse response from a handful of coefficients, which makes it cheap, but its feedback can also make it unstable. The program runs the difference equation directly on an impulse for three small filters, finds their poles and zeros (explained in the next section), and evaluates the frequency response of the stable ones.
+
+```python run
+import numpy as np
+
+def lfilter(b, a, x):
+    """Run the difference equation a[0] y[n] = sum b[k] x[n-k] - sum_{k>=1} a[k] y[n-k]."""
+    y = np.zeros(len(x))
+    for n in range(len(x)):
+        acc = sum(b[k] * x[n - k] for k in range(len(b)) if n - k >= 0)
+        acc -= sum(a[k] * y[n - k] for k in range(1, len(a)) if n - k >= 0)
+        y[n] = acc / a[0]
+    return y
+
+def freq_response(b, a, f, fs):
+    """H(e^{jw}) = B(e^{jw}) / A(e^{jw}) with z^{-1} = e^{-jw}, w = 2 pi f / fs."""
+    zinv = np.exp(-2j * np.pi * np.asarray(f) / fs)
+    return np.polyval(b[::-1], zinv) / np.polyval(a[::-1], zinv)
+
+def show(roots):
+    """Roots as tidy strings, sorted, with -0 printed as 0."""
+    out = []
+    for r in sorted(roots, key=lambda z: (round(z.real, 6), round(z.imag, 6))):
+        re, im = round(r.real, 3) + 0.0, round(r.imag, 3) + 0.0
+        out.append(f"{re:g}{im:+g}j" if im else f"{re:g}")
+    return "[" + ", ".join(out) + "]"
+
+fs = 1000
+impulse = np.zeros(12)
+impulse[0] = 1
+filters = {
+    "4-point moving average (FIR)": ([0.25, 0.25, 0.25, 0.25], [1.0]),
+    "exponential smoother (IIR)":   ([0.2], [1.0, -0.8]),
+    "unstable: y = x + 1.1 y[n-1]": ([1.0], [1.0, -1.1]),
+}
+for name, (b, a) in filters.items():
+    h = lfilter(b, a, impulse)
+    poles = np.roots(a) if len(a) > 1 else np.array([])
+    zeros = np.roots(b) if len(b) > 1 else np.array([])
+    print(name)
+    print("  impulse response:", np.round(h[:8], 3))
+    print("  poles:", show(poles), "  zeros:", show(zeros))
+    if np.all(np.abs(poles) < 1):
+        H = freq_response(np.array(b), np.array(a), [0, 50, 125, 250, 500], fs)
+        print("  |H| at 0, 50, 125, 250, 500 Hz:", np.round(np.abs(H), 3))
+    else:
+        print("  a pole is outside the unit circle: the impulse response grows without bound")
+```
+
+The moving average's impulse response stops after four samples. The exponential smoother $y[n] = 0.2\,x[n] + 0.8\,y[n-1]$, a favourite for cleaning up sensor readings because it needs one multiplication and one stored value, has an impulse response $0.2 \times 0.8^n$ that decays for ever. Changing the feedback coefficient to 1.1 gives an impulse response $1.1^n$ that grows without limit. Both smoothers pass DC with gain 1 and attenuate higher frequencies, but differently: the moving average has exact zeros of gain at 250 Hz and 500 Hz, while the smoother just rolls off.
+
+</Section>
+
+<Section id="z-transform" kind="definitions" title="The z-transform, poles and zeros">
+
+The tool that turns difference equations into algebra is the z-transform, the discrete-time relative of the Laplace transform of <LessonLink slug="laplace-and-stability">the next lesson</LessonLink>.
+
+<Definition term="z-transform">
+
+The **z-transform** of a sequence $x[n]$ is the function of a complex variable $z$
+$$X(z) = \sum_{n=-\infty}^{\infty} x[n]\, z^{-n},$$
+defined for the $z$ where the sum converges, its **region of convergence** (ROC). For a sequence that is zero for $n < 0$ (a *causal* sequence) the ROC is the outside of a circle, $|z| > r$.
+
+</Definition>
+
+The key property is what a delay does. If $y[n] = x[n-1]$, then $Y(z) = \sum_n x[n-1] z^{-n} = z^{-1}\sum_m x[m] z^{-m} = z^{-1}X(z)$. **A delay of one sample is multiplication by $z^{-1}$.** Taking the z-transform of the whole difference equation therefore gives
+$$Y(z)\left(1 + a_1 z^{-1} + \cdots + a_N z^{-N}\right) = X(z)\left(b_0 + b_1 z^{-1} + \cdots + b_M z^{-M}\right),$$
+and so the filter's **transfer function**
+$$H(z) = \frac{Y(z)}{X(z)} = \frac{B(z)}{A(z)} = \frac{b_0 + b_1 z^{-1} + \cdots + b_M z^{-M}}{1 + a_1 z^{-1} + \cdots + a_N z^{-N}} .$$
+$H(z)$ is also the z-transform of the impulse response $h[n]$, and the convolution theorem holds in this form too: convolution of sequences is multiplication of their z-transforms.
+
+<Narrator who="chloe">
+
+The z-transform is a generating function, the device mathematicians use to turn a sequence into a polynomial or power series so that algebra can work on it (see <TopicLink id="math.analysis.sequences-series">Sequences and series</TopicLink>). Convolving two sequences is multiplying two polynomials, which you saw in the first lesson of this level; the z-transform simply makes that official, and lets the "polynomial" be infinite.
+
+</Narrator>
+
+**Frequency response.** Setting $z = e^{j\omega}$ with $\omega = 2\pi f/f_s$ turns the z-transform into the discrete-time Fourier transform, so the frequency response is $H(z)$ evaluated on the **unit circle**: $H(e^{j\omega})$. The point $z = 1$ ($\omega = 0$) is DC; going anticlockwise round the circle raises the frequency, reaching $z = -1$ at $f_s/2$, the Nyquist frequency. (Going on round the lower half gives the negative frequencies.)
+
+**Poles and zeros.** Multiply the numerator and denominator by a power of $z$ so they become polynomials in $z$. Their roots are the **zeros** (where $H = 0$) and the **poles** (where $H$ is infinite) of the filter. Factored,
+$$H(z) = b_0\, z^{N - M}\, \frac{(z - q_1)(z - q_2)\cdots(z - q_M)}{(z - p_1)(z - p_2)\cdots(z - p_N)} .$$
+This gives a picture of the frequency response. At a frequency $\omega$, each factor $|e^{j\omega} - q_i|$ is the distance from the point $e^{j\omega}$ on the unit circle to a zero, and each $|e^{j\omega} - p_k|$ the distance to a pole. So $|H|$ is small where the circle passes close to a zero (and exactly zero if the zero is *on* the circle) and large where it passes close to a pole.
+
+<Figure caption="The pole–zero plot of the second-order low-pass filter designed later in this lesson (cut-off 100 Hz, fs = 1 kHz). The unit circle carries the frequency axis, from 0 Hz at z = 1 to 500 Hz at z = −1. The double zero at z = −1 forces the gain to zero at 500 Hz; the poles near the low-frequency end of the circle make the gain high there.">
+<svg viewBox="0 0 360 300" role="img" aria-label="A pole-zero plot in the complex z-plane. A unit circle is centred on the origin. Two poles, drawn as crosses, sit inside the circle at radius 0.64 and angles plus and minus 27 degrees. A double zero, drawn as a circle marked 2, sits on the unit circle at minus one. The point plus one on the circle is labelled 0 hertz, the point j is 250 hertz, and minus one is 500 hertz, half the sampling rate.">
+  <defs>
+    <marker id="pz-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1" opacity="0.6">
+    <path d="M 20 150 L 345 150" markerEnd="url(#pz-arrow)" />
+    <path d="M 170 285 L 170 15" markerEnd="url(#pz-arrow)" />
+  </g>
+  <circle cx="170" cy="150" r="110" fill="var(--sky-soft)" fillOpacity="0.35" stroke="currentColor" strokeWidth="1.5" />
+  <path d="M 226.9 111.7 L 238.9 123.7 M 226.9 123.7 L 238.9 111.7" fill="none" stroke="var(--human)" strokeWidth="2.4" />
+  <path d="M 226.9 176.3 L 238.9 188.3 M 226.9 188.3 L 238.9 176.3" fill="none" stroke="var(--human)" strokeWidth="2.4" />
+  <circle cx="60" cy="150" r="7" fill="none" stroke="var(--formal)" strokeWidth="2.4" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="54" y="138" textAnchor="end">2</text>
+    <text x="285" y="144">0 Hz</text>
+    <text x="176" y="34">250 Hz (z = j)</text>
+    <text x="56" y="170" textAnchor="middle">500 Hz</text>
+    <text x="345" y="166" textAnchor="end">Re z</text>
+    <text x="162" y="22" textAnchor="end">Im z</text>
+    <text x="224.9" y="105.7" textAnchor="end">pole, radius 0.64</text>
+    <text x="178" y="282">unit circle |z| = 1</text>
+  </g>
+</svg>
+</Figure>
+
+The moving average illustrates this. Its zeros are at $-1$ and $\pm j$, all on the unit circle, at 500 Hz and 250 Hz, which is why the program found its gain exactly zero at those frequencies. A filter designer turns this round: to remove 50 Hz mains hum from an electrocardiogram sampled at 500 Hz, put a pair of zeros on the unit circle at angle $\pm 2\pi \cdot 50/500$, and a pair of poles just inside them at the same angle (radius 0.98, say), so that the gain recovers within a few hertz on either side. That is a **notch filter**, and an exercise below asks you to analyse one.
+
+<Theorem name="Stability of a causal digital filter">
+
+A causal filter with a rational transfer function $H(z) = B(z)/A(z)$ (with common factors cancelled) is BIBO stable if and only if all its poles lie strictly inside the unit circle, $|p_k| < 1$.
+
+</Theorem>
+
+<Proof>
+
+If the poles are distinct, a partial-fraction expansion writes $H(z)$ as a polynomial in $z^{-1}$ plus terms $c_k/(1 - p_k z^{-1})$, and the causal sequence with transform $1/(1 - p z^{-1})$ is $p^n$ for $n \ge 0$ (sum the geometric series). So for $n$ large enough, $h[n] = \sum_k c_k\, p_k^n$, with every $c_k \ne 0$ because no factor cancels. If every $|p_k| < 1$, then $\sum_n |h[n]| \le \sum_k |c_k| \sum_n |p_k|^n < \infty$, so the filter is stable by the absolute-summability criterion of the first lesson. If some $|p_k| \ge 1$, the term $c_k p_k^n$ does not decay, and $h[n]$ does not tend to zero (terms from poles of the same largest modulus cannot cancel for all $n$), so the sum diverges. Repeated poles add factors $n, n^2, \dots$, which change nothing: $n^m |p|^n$ is still summable when $|p| < 1$.
+
+</Proof>
+
+The exponential smoother's pole at 0.8 is inside: stable. The filter with feedback 1.1 has its pole at 1.1, outside: unstable, exactly as its growing impulse response showed. An FIR filter has all its poles at $z = 0$, so it is always stable.
+
+<Narrator who="gideon">
+
+"Strictly inside" matters. A pole exactly on the unit circle, such as the accumulator's pole at $z = 1$, gives an impulse response that neither grows nor decays, and the filter is *not* BIBO stable: a constant input makes its output climb for ever. In floating-point arithmetic a pole at radius 0.99999 is stable; after rounding its coefficients to fixed point it may land on or outside the circle, as the program on biquads shows.
+
+</Narrator>
+
+</Section>
+
+<Section id="fir-design" kind="computation" title="Designing an FIR low-pass filter by windowing">
+
+The ideal low-pass filter passes everything below a cut-off $f_c$ with gain 1 and nothing above. Its frequency response is a rectangle, so its impulse response, by the transform pairs of <LessonLink slug="fourier-analysis">Fourier analysis</LessonLink>, is a sinc:
+$$h_{\text{ideal}}[n] = \frac{2f_c}{f_s}\,\mathrm{sinc}\!\left(\frac{2f_c\, n}{f_s}\right), \qquad -\infty < n < \infty .$$
+It is infinitely long and non-causal. The **window method** makes it practical in three steps: keep only $N$ taps centred on $n = 0$; delay them by $(N-1)/2$ samples so the filter is causal; and multiply by a window that tapers the ends. Without the taper, the abrupt truncation produces exactly the Gibbs ripple of the Fourier series, now in the frequency response. The program designs a 51-tap low-pass with $f_c = 100$ Hz at $f_s = 1$ kHz using three windows.
+
+```python run
+import numpy as np
+
+def lowpass_fir(num_taps, fc, fs, window):
+    """Windowed-sinc low-pass: the ideal impulse response (2 fc / fs) sinc(2 fc n / fs), truncated and tapered."""
+    n = np.arange(num_taps) - (num_taps - 1) / 2          # symmetric about the middle tap
+    h = 2 * fc / fs * np.sinc(2 * fc * n / fs)
+    h *= window(num_taps)
+    return h / np.sum(h)                                  # exact gain 1 at DC
+
+def response_db(h, f, fs):
+    H = np.array([np.sum(h * np.exp(-2j * np.pi * fk * np.arange(len(h)) / fs)) for fk in f])
+    return 20 * np.log10(np.abs(H) + 1e-15)
+
+fs, fc, taps = 1000, 100, 51
+f = np.arange(0, 500.5, 0.5)
+print(f"{taps}-tap low-pass, cut-off {fc} Hz, fs = {fs} Hz")
+print("window        gain at 100 Hz   -1 dB at   first null at   worst stopband gain")
+for name, w in [("rectangular", np.ones), ("Hamming", np.hamming), ("Blackman", np.blackman)]:
+    h = lowpass_fir(taps, fc, fs, w)
+    db = response_db(h, f, fs)
+    f_1db = f[np.argmax(db < -1)]                            # first frequency below -1 dB
+    i = np.argmax(f > fc)
+    while db[i + 1] < db[i]:                                 # walk down to the first null
+        i += 1
+    print(f"{name:12}  {db[f == fc][0]:7.2f} dB     {f_1db:5.1f} Hz     {f[i]:5.1f} Hz        {db[i:].max():6.1f} dB")
+
+h = lowpass_fir(taps, fc, fs, np.hamming)
+print("\nHamming design: symmetric taps?", np.allclose(h, h[::-1]),
+      f"-> linear phase, delay {(taps - 1) // 2} samples = {(taps - 1) / 2 / fs * 1e3:.0f} ms")
+print("middle taps:", np.round(h[22:29], 4))
+db = response_db(h, f, fs)
+print("\n  f (Hz)   gain")
+for fk in (0, 50, 80, 100, 120, 140, 200, 300, 400):
+    level = round(db[f == fk][0], 1) + 0.0
+    bar = "#" * max(0, int(round((level + 80) / 2)))
+    print(f"{fk:7}   {level:7.1f} dB  {bar}")
+```
+
+The table shows the trade-off that governs all window designs. The rectangular window (plain truncation) gives the sharpest transition, from $-1$ dB at 90.5 Hz to the first null at 112.5 Hz, but its stopband is only 22 dB down, the Gibbs overshoot in disguise. The Hamming window holds the stopband below $-52$ dB with a transition about twice as wide, and the Blackman window reaches $-76$ dB with a wider transition still. To get a narrower transition with the same window, use more taps: the transition width is roughly $k\,f_s/N$, with $k$ about 1 for the rectangular, 3.3 for the Hamming and 5.5 for the Blackman window.
+
+<Figure caption="Measured gain of the two 51-tap designs. Truncating the ideal response (rectangular window) leaves stopband ripples starting about 22 dB down; tapering it with a Hamming window pushes the whole stopband below about −52 dB at the cost of a wider transition.">
+<svg viewBox="0 0 480 230" role="img" aria-label="Magnitude responses in decibels of two 51-tap low-pass FIR filters with a cut-off of 100 hertz, from 0 to 500 hertz. The rectangular-window design falls faster, but its stopband ripples start at about minus 22 decibels and fall only slowly. The Hamming-window design has a wider transition but keeps the whole stopband below about minus 52 decibels.">
+  <g fill="none" stroke="currentColor" strokeWidth="1" opacity="0.35">
+    <path d="M 50 15.0 L 465 15.0" />
+    <path d="M 50 55.0 L 465 55.0" />
+    <path d="M 50 95.0 L 465 95.0" />
+    <path d="M 50 135.0 L 465 135.0" />
+    <path d="M 50 175.0 L 465 175.0" />
+  </g>
+  <path d="M 50 15 L 50 195 L 465 195" fill="none" stroke="currentColor" strokeWidth="1" />
+  <polyline points="50.0,15.0 50.4,15.0 50.8,15.0 51.2,15.0 51.7,15.0 52.1,15.0 52.5,15.1 52.9,15.1 53.3,15.1 53.7,15.2 54.1,15.2 54.6,15.2 55.0,15.3 55.4,15.3 55.8,15.4 56.2,15.4 56.6,15.5 57.1,15.5 57.5,15.6 57.9,15.6 58.3,15.7 58.7,15.7 59.1,15.8 59.5,15.8 60.0,15.9 60.4,15.9 60.8,16.0 61.2,16.0 61.6,16.1 62.0,16.1 62.5,16.2 62.9,16.2 63.3,16.2 63.7,16.3 64.1,16.3 64.5,16.3 64.9,16.3 65.4,16.4 65.8,16.4 66.2,16.4 66.6,16.4 67.0,16.4 67.4,16.4 67.8,16.4 68.3,16.3 68.7,16.3 69.1,16.3 69.5,16.3 69.9,16.2 70.3,16.2 70.8,16.2 71.2,16.1 71.6,16.1 72.0,16.0 72.4,16.0 72.8,15.9 73.2,15.9 73.7,15.8 74.1,15.7 74.5,15.7 74.9,15.6 75.3,15.6 75.7,15.5 76.1,15.5 76.6,15.4 77.0,15.3 77.4,15.3 77.8,15.2 78.2,15.2 78.6,15.1 79.1,15.1 79.5,15.1 79.9,15.0 80.3,15.0 80.7,15.0 81.1,14.9 81.5,14.9 82.0,14.9 82.4,14.9 82.8,14.9 83.2,14.9 83.6,14.9 84.0,14.9 84.4,14.9 84.9,14.9 85.3,14.9 85.7,15.0 86.1,15.0 86.5,15.0 86.9,15.1 87.3,15.1 87.8,15.2 88.2,15.2 88.6,15.3 89.0,15.3 89.4,15.4 89.8,15.5 90.3,15.5 90.7,15.6 91.1,15.7 91.5,15.7 91.9,15.8 92.3,15.9 92.7,16.0 93.2,16.0 93.6,16.1 94.0,16.2 94.4,16.2 94.8,16.3 95.2,16.4 95.7,16.4 96.1,16.5 96.5,16.5 96.9,16.6 97.3,16.6 97.7,16.7 98.1,16.7 98.6,16.7 99.0,16.7 99.4,16.7 99.8,16.7 100.2,16.7 100.6,16.7 101.0,16.7 101.5,16.7 101.9,16.6 102.3,16.6 102.7,16.6 103.1,16.5 103.5,16.4 104.0,16.4 104.4,16.3 104.8,16.2 105.2,16.1 105.6,16.1 106.0,16.0 106.4,15.9 106.9,15.8 107.3,15.7 107.7,15.6 108.1,15.5 108.5,15.4 108.9,15.3 109.3,15.1 109.8,15.0 110.2,14.9 110.6,14.8 111.0,14.7 111.4,14.6 111.8,14.6 112.2,14.5 112.7,14.4 113.1,14.3 113.5,14.3 113.9,14.2 114.3,14.1 114.7,14.1 115.2,14.1 115.6,14.0 116.0,14.0 116.4,14.0 116.8,14.0 117.2,14.0 117.6,14.1 118.1,14.1 118.5,14.2 118.9,14.2 119.3,14.3 119.7,14.4 120.1,14.5 120.6,14.6 121.0,14.8 121.4,14.9 121.8,15.1 122.2,15.3 122.6,15.5 123.0,15.7 123.5,16.0 123.9,16.2 124.3,16.5 124.7,16.8 125.1,17.1 125.5,17.5 125.9,17.8 126.4,18.2 126.8,18.6 127.2,19.0 127.6,19.5 128.0,20.0 128.4,20.5 128.8,21.0 129.3,21.6 129.7,22.1 130.1,22.8 130.5,23.4 130.9,24.1 131.3,24.8 131.8,25.5 132.2,26.3 132.6,27.1 133.0,28.0 133.4,28.9 133.8,29.9 134.2,30.9 134.7,31.9 135.1,33.0 135.5,34.2 135.9,35.4 136.3,36.7 136.7,38.1 137.1,39.6 137.6,41.2 138.0,42.8 138.4,44.6 138.8,46.6 139.2,48.7 139.6,51.0 140.1,53.6 140.5,56.5 140.9,59.7 141.3,63.6 141.7,68.2 142.1,74.2 142.5,82.6 143.0,97.9 143.4,117.8 143.8,90.4 144.2,80.8 144.6,75.2 145.0,71.2 145.4,68.3 145.9,66.1 146.3,64.3 146.7,62.9 147.1,61.8 147.5,60.9 147.9,60.3 148.4,59.8 148.8,59.4 149.2,59.2 149.6,59.2 150.0,59.2 150.4,59.4 150.8,59.7 151.3,60.1 151.7,60.6 152.1,61.3 152.5,62.0 152.9,62.9 153.3,63.9 153.8,65.0 154.2,66.3 154.6,67.8 155.0,69.4 155.4,71.3 155.8,73.5 156.2,76.0 156.7,79.0 157.1,82.5 157.5,87.0 157.9,92.9 158.3,101.8 158.7,119.9 159.1,124.1 159.6,103.9 160.0,95.1 160.4,89.6 160.8,85.6 161.2,82.5 161.6,80.1 162.1,78.1 162.5,76.5 162.9,75.2 163.3,74.1 163.7,73.2 164.1,72.4 164.5,71.9 165.0,71.4 165.4,71.1 165.8,71.0 166.2,70.9 166.6,71.0 167.0,71.1 167.4,71.4 167.9,71.8 168.3,72.3 168.7,72.9 169.1,73.6 169.5,74.5 169.9,75.5 170.3,76.7 170.8,78.0 171.2,79.5 171.6,81.2 172.0,83.2 172.4,85.6 172.8,88.3 173.3,91.7 173.7,95.8 174.1,101.3 174.5,109.3 174.9,124.4 175.3,142.4 175.7,115.4 176.2,105.5 176.6,99.5 177.0,95.1 177.4,91.8 177.8,89.2 178.2,87.1 178.7,85.3 179.1,83.8 179.5,82.6 179.9,81.6 180.3,80.7 180.7,80.0 181.1,79.5 181.6,79.1 182.0,78.8 182.4,78.6 182.8,78.6 183.2,78.6 183.6,78.8 184.0,79.1 184.5,79.5 184.9,80.0 185.3,80.6 185.7,81.3 186.1,82.2 186.5,83.2 187.0,84.3 187.4,85.7 187.8,87.2 188.2,89.0 188.6,91.1 189.0,93.6 189.4,96.5 189.9,100.1 190.3,104.7 190.7,111.0 191.1,120.9 191.5,146.1 191.9,132.3 192.3,116.9 192.8,109.1 193.2,103.9 193.6,100.0 194.0,97.0 194.4,94.5 194.8,92.5 195.2,90.8 195.7,89.4 196.1,88.2 196.5,87.2 196.9,86.4 197.3,85.7 197.7,85.2 198.2,84.8 198.6,84.5 199.0,84.4 199.4,84.3 199.8,84.4 200.2,84.5 200.6,84.8 201.1,85.2 201.5,85.7 201.9,86.3 202.3,87.0 202.7,87.9 203.1,88.9 203.6,90.1 204.0,91.5 204.4,93.0 204.8,94.9 205.2,97.0 205.6,99.6 206.0,102.6 206.5,106.4 206.9,111.3 207.3,118.2 207.7,130.0 208.1,184.2 208.5,131.8 208.9,119.5 209.4,112.5 209.8,107.7 210.2,104.0 210.6,101.2 211.0,98.8 211.4,96.9 211.8,95.2 212.3,93.9 212.7,92.7 213.1,91.7 213.5,90.9 213.9,90.3 214.3,89.7 214.8,89.3 215.2,89.1 215.6,88.9 216.0,88.8 216.4,88.9 216.8,89.0 217.2,89.3 217.7,89.7 218.1,90.2 218.5,90.8 218.9,91.6 219.3,92.4 219.7,93.5 220.1,94.7 220.6,96.0 221.0,97.6 221.4,99.5 221.8,101.7 222.2,104.3 222.6,107.4 223.1,111.4 223.5,116.6 223.9,124.0 224.3,137.4 224.7,169.6 225.1,132.9 225.5,122.1 226.0,115.6 226.4,111.0 226.8,107.5 227.2,104.7 227.6,102.4 228.0,100.5 228.4,98.9 228.9,97.5 229.3,96.4 229.7,95.4 230.1,94.6 230.5,94.0 230.9,93.5 231.4,93.1 231.8,92.8 232.2,92.6 232.6,92.6 233.0,92.6 233.4,92.8 233.8,93.1 234.3,93.4 234.7,93.9 235.1,94.5 235.5,95.3 235.9,96.2 236.3,97.2 236.8,98.4 237.2,99.8 237.6,101.4 238.0,103.3 238.4,105.5 238.8,108.2 239.2,111.4 239.7,115.5 240.1,120.9 240.5,128.8 240.9,143.8 241.3,161.1 241.7,134.3 242.1,124.4 242.6,118.2 243.0,113.8 243.4,110.4 243.8,107.7 244.2,105.4 244.6,103.6 245.0,102.0 245.5,100.6 245.9,99.5 246.3,98.6 246.7,97.8 247.1,97.1 247.5,96.6 248.0,96.2 248.4,95.9 248.8,95.8 249.2,95.7 249.6,95.8 250.0,95.9 250.4,96.2 250.9,96.6 251.3,97.1 251.7,97.7 252.1,98.4 252.5,99.3 252.9,100.4 253.3,101.6 253.8,103.0 254.2,104.6 254.6,106.5 255.0,108.8 255.4,111.5 255.8,114.8 256.3,118.9 256.7,124.5 257.1,132.8 257.5,149.5 257.9,158.2 258.3,135.8 258.7,126.5 259.2,120.6 259.6,116.3 260.0,112.9 260.4,110.2 260.8,108.0 261.2,106.2 261.6,104.6 262.1,103.3 262.5,102.2 262.9,101.2 263.3,100.4 263.7,99.8 264.1,99.3 264.6,98.9 265.0,98.6 265.4,98.4 265.8,98.4 266.2,98.4 266.6,98.6 267.0,98.9 267.5,99.3 267.9,99.8 268.3,100.4 268.7,101.1 269.1,102.0 269.5,103.1 270.0,104.3 270.4,105.7 270.8,107.3 271.2,109.3 271.6,111.5 272.0,114.3 272.4,117.6 272.9,121.8 273.3,127.6 273.7,136.3 274.1,154.6 274.5,157.1 274.9,137.3 275.3,128.3 275.8,122.6 276.2,118.4 276.6,115.1 277.0,112.5 277.4,110.3 277.8,108.4 278.2,106.9 278.7,105.6 279.1,104.5 279.5,103.5 279.9,102.7 280.3,102.1 280.7,101.6 281.2,101.2 281.6,100.9 282.0,100.7 282.4,100.7 282.8,100.7 283.2,100.9 283.6,101.2 284.1,101.6 284.5,102.1 284.9,102.7 285.3,103.4 285.7,104.3 286.1,105.4 286.5,106.6 287.0,108.0 287.4,109.7 287.8,111.6 288.2,113.9 288.6,116.7 289.0,120.1 289.5,124.4 289.9,130.2 290.3,139.3 290.7,159.3 291.1,156.7 291.5,138.6 291.9,130.0 292.4,124.4 292.8,120.2 293.2,117.0 293.6,114.4 294.0,112.2 294.4,110.4 294.9,108.9 295.3,107.5 295.7,106.4 296.1,105.5 296.5,104.7 296.9,104.1 297.3,103.6 297.8,103.2 298.2,102.9 298.6,102.7 299.0,102.7 299.4,102.7 299.8,102.9 300.2,103.2 300.7,103.6 301.1,104.0 301.5,104.7 301.9,105.4 302.3,106.3 302.7,107.4 303.1,108.6 303.6,110.0 304.0,111.7 304.4,113.7 304.8,116.0 305.2,118.7 305.6,122.2 306.1,126.6 306.5,132.5 306.9,141.9 307.3,163.7 307.7,156.6 308.1,139.7 308.5,131.4 309.0,125.9 309.4,121.8 309.8,118.6 310.2,116.0 310.6,113.9 311.0,112.1 311.4,110.5 311.9,109.2 312.3,108.1 312.7,107.2 313.1,106.4 313.5,105.8 313.9,105.3 314.4,104.9 314.8,104.6 315.2,104.5 315.6,104.4 316.0,104.5 316.4,104.6 316.8,104.9 317.3,105.3 317.7,105.8 318.1,106.4 318.5,107.1 318.9,108.0 319.3,109.1 319.8,110.3 320.2,111.8 320.6,113.4 321.0,115.4 321.4,117.7 321.8,120.5 322.2,124.0 322.7,128.5 323.1,134.6 323.5,144.2 323.9,167.9 324.3,156.7 324.7,140.7 325.1,132.6 325.6,127.2 326.0,123.2 326.4,120.0 326.8,117.5 327.2,115.3 327.6,113.5 328.1,112.0 328.5,110.7 328.9,109.6 329.3,108.7 329.7,107.9 330.1,107.3 330.5,106.8 331.0,106.4 331.4,106.1 331.8,105.9 332.2,105.9 332.6,105.9 333.0,106.1 333.4,106.4 333.9,106.7 334.3,107.2 334.7,107.9 335.1,108.6 335.5,109.5 335.9,110.6 336.3,111.8 336.8,113.3 337.2,114.9 337.6,116.9 338.0,119.3 338.4,122.1 338.8,125.6 339.3,130.1 339.7,136.3 340.1,146.2 340.5,172.0 340.9,156.8 341.3,141.5 341.7,133.6 342.2,128.3 342.6,124.4 343.0,121.2 343.4,118.7 343.8,116.6 344.2,114.8 344.6,113.3 345.1,112.0 345.5,110.9 345.9,109.9 346.3,109.2 346.7,108.5 347.1,108.0 347.6,107.6 348.0,107.4 348.4,107.2 348.8,107.1 349.2,107.2 349.6,107.4 350.0,107.6 350.5,108.0 350.9,108.5 351.3,109.1 351.7,109.9 352.1,110.8 352.5,111.9 352.9,113.1 353.4,114.5 353.8,116.2 354.2,118.2 354.6,120.6 355.0,123.4 355.4,127.0 355.9,131.5 356.3,137.8 356.7,148.0 357.1,176.1 357.5,156.8 357.9,142.2 358.3,134.5 358.8,129.3 359.2,125.3 359.6,122.2 360.0,119.7 360.4,117.6 360.8,115.8 361.2,114.3 361.7,113.0 362.1,111.9 362.5,111.0 362.9,110.2 363.3,109.6 363.7,109.1 364.2,108.7 364.6,108.4 365.0,108.3 365.4,108.2 365.8,108.3 366.2,108.4 366.6,108.7 367.1,109.1 367.5,109.6 367.9,110.2 368.3,111.0 368.7,111.9 369.1,112.9 369.6,114.2 370.0,115.6 370.4,117.3 370.8,119.3 371.2,121.7 371.6,124.6 372.0,128.1 372.5,132.7 372.9,139.1 373.3,149.6 373.7,180.4 374.1,156.8 374.5,142.8 374.9,135.2 375.4,130.0 375.8,126.1 376.2,123.0 376.6,120.5 377.0,118.4 377.4,116.7 377.9,115.2 378.3,113.9 378.7,112.8 379.1,111.9 379.5,111.1 379.9,110.5 380.3,110.0 380.8,109.6 381.2,109.3 381.6,109.1 382.0,109.1 382.4,109.1 382.8,109.3 383.2,109.6 383.7,109.9 384.1,110.4 384.5,111.1 384.9,111.8 385.3,112.7 385.7,113.8 386.2,115.1 386.6,116.5 387.0,118.2 387.4,120.2 387.8,122.6 388.2,125.5 388.6,129.1 389.1,133.7 389.5,140.3 389.9,151.0 390.3,185.0 390.7,156.8 391.1,143.2 391.5,135.7 392.0,130.6 392.4,126.8 392.8,123.7 393.2,121.2 393.6,119.1 394.0,117.4 394.4,115.9 394.9,114.6 395.3,113.5 395.7,112.6 396.1,111.8 396.5,111.2 396.9,110.7 397.4,110.3 397.8,110.0 398.2,109.8 398.6,109.8 399.0,109.8 399.4,110.0 399.8,110.3 400.3,110.7 400.7,111.2 401.1,111.8 401.5,112.5 401.9,113.5 402.3,114.5 402.8,115.8 403.2,117.2 403.6,118.9 404.0,121.0 404.4,123.4 404.8,126.3 405.2,129.9 405.7,134.6 406.1,141.2 406.5,152.2 406.9,190.2 407.3,156.6 407.7,143.4 408.1,136.1 408.6,131.0 409.0,127.2 409.4,124.2 409.8,121.7 410.2,119.6 410.6,117.9 411.1,116.4 411.5,115.1 411.9,114.0 412.3,113.1 412.7,112.3 413.1,111.7 413.5,111.2 414.0,110.8 414.4,110.5 414.8,110.4 415.2,110.3 415.6,110.4 416.0,110.5 416.4,110.8 416.9,111.2 417.3,111.7 417.7,112.3 418.1,113.1 418.5,114.0 418.9,115.1 419.4,116.3 419.8,117.8 420.2,119.5 420.6,121.5 421.0,123.9 421.4,126.9 421.8,130.5 422.3,135.3 422.7,142.0 423.1,153.2 423.5,195.0 423.9,156.4 424.3,143.5 424.7,136.3 425.2,131.3 425.6,127.5 426.0,124.5 426.4,122.1 426.8,120.0 427.2,118.2 427.7,116.8 428.1,115.5 428.5,114.4 428.9,113.5 429.3,112.7 429.7,112.1 430.1,111.6 430.6,111.2 431.0,110.9 431.4,110.8 431.8,110.7 432.2,110.8 432.6,110.9 433.0,111.2 433.5,111.6 433.9,112.1 434.3,112.7 434.7,113.5 435.1,114.4 435.5,115.5 436.0,116.7 436.4,118.2 436.8,119.9 437.2,121.9 437.6,124.4 438.0,127.3 438.4,131.0 438.9,135.8 439.3,142.6 439.7,154.1 440.1,195.0 440.5,156.0 440.9,143.5 441.3,136.4 441.8,131.5 442.2,127.7 442.6,124.7 443.0,122.3 443.4,120.2 443.8,118.5 444.2,117.0 444.7,115.7 445.1,114.6 445.5,113.7 445.9,112.9 446.3,112.3 446.7,111.8 447.2,111.4 447.6,111.2 448.0,111.0 448.4,110.9 448.8,111.0 449.2,111.2 449.6,111.4 450.1,111.8 450.5,112.3 450.9,112.9 451.3,113.7 451.7,114.6 452.1,115.7 452.6,117.0 453.0,118.4 453.4,120.2 453.8,122.2 454.2,124.6 454.6,127.6 455.0,131.3 455.5,136.1 455.9,143.0 456.3,154.9 456.7,195.0 457.1,155.5 457.5,143.4 457.9,136.4 458.4,131.5 458.8,127.7 459.2,124.8 459.6,122.3 460.0,120.3 460.4,118.5 460.9,117.0 461.3,115.8 461.7,114.7 462.1,113.8 462.5,113.0 462.9,112.4 463.3,111.9 463.8,111.5 464.2,111.2 464.6,111.1 465.0,111.0" fill="none" stroke="var(--gold)" strokeWidth="1.5" />
+  <polyline points="50.0,15.0 50.4,15.0 50.8,15.0 51.2,15.0 51.7,15.0 52.1,15.0 52.5,15.0 52.9,15.0 53.3,15.0 53.7,15.0 54.1,15.0 54.6,15.0 55.0,15.0 55.4,15.0 55.8,15.0 56.2,15.0 56.6,15.0 57.1,15.0 57.5,15.0 57.9,15.0 58.3,15.0 58.7,15.0 59.1,15.0 59.5,15.1 60.0,15.1 60.4,15.1 60.8,15.1 61.2,15.1 61.6,15.1 62.0,15.1 62.5,15.1 62.9,15.1 63.3,15.1 63.7,15.1 64.1,15.1 64.5,15.1 64.9,15.1 65.4,15.1 65.8,15.1 66.2,15.1 66.6,15.1 67.0,15.1 67.4,15.1 67.8,15.1 68.3,15.1 68.7,15.1 69.1,15.1 69.5,15.1 69.9,15.1 70.3,15.1 70.8,15.1 71.2,15.1 71.6,15.1 72.0,15.1 72.4,15.1 72.8,15.1 73.2,15.1 73.7,15.1 74.1,15.0 74.5,15.0 74.9,15.0 75.3,15.0 75.7,15.0 76.1,15.0 76.6,15.0 77.0,15.0 77.4,15.0 77.8,15.0 78.2,15.0 78.6,15.0 79.1,15.0 79.5,15.0 79.9,15.0 80.3,15.0 80.7,15.0 81.1,15.0 81.5,15.0 82.0,15.0 82.4,15.0 82.8,15.0 83.2,15.0 83.6,15.0 84.0,15.0 84.4,15.0 84.9,15.0 85.3,15.0 85.7,15.0 86.1,15.0 86.5,15.0 86.9,15.0 87.3,15.0 87.8,15.0 88.2,15.0 88.6,15.0 89.0,15.0 89.4,15.0 89.8,15.0 90.3,15.0 90.7,15.0 91.1,15.0 91.5,15.0 91.9,15.0 92.3,15.0 92.7,15.0 93.2,15.0 93.6,15.0 94.0,15.0 94.4,15.0 94.8,15.0 95.2,15.0 95.7,15.0 96.1,15.0 96.5,15.0 96.9,15.0 97.3,15.0 97.7,15.0 98.1,15.0 98.6,15.0 99.0,15.0 99.4,15.0 99.8,15.0 100.2,15.0 100.6,15.0 101.0,15.0 101.5,15.0 101.9,15.0 102.3,15.0 102.7,15.0 103.1,15.0 103.5,15.0 104.0,15.0 104.4,15.1 104.8,15.1 105.2,15.1 105.6,15.1 106.0,15.1 106.4,15.1 106.9,15.1 107.3,15.2 107.7,15.2 108.1,15.2 108.5,15.2 108.9,15.3 109.3,15.3 109.8,15.3 110.2,15.4 110.6,15.4 111.0,15.5 111.4,15.5 111.8,15.6 112.2,15.6 112.7,15.7 113.1,15.7 113.5,15.8 113.9,15.9 114.3,16.0 114.7,16.0 115.2,16.1 115.6,16.2 116.0,16.3 116.4,16.4 116.8,16.5 117.2,16.7 117.6,16.8 118.1,16.9 118.5,17.1 118.9,17.2 119.3,17.3 119.7,17.5 120.1,17.7 120.6,17.8 121.0,18.0 121.4,18.2 121.8,18.4 122.2,18.6 122.6,18.8 123.0,19.0 123.5,19.2 123.9,19.5 124.3,19.7 124.7,20.0 125.1,20.2 125.5,20.5 125.9,20.8 126.4,21.1 126.8,21.4 127.2,21.7 127.6,22.0 128.0,22.3 128.4,22.7 128.8,23.0 129.3,23.4 129.7,23.7 130.1,24.1 130.5,24.5 130.9,24.9 131.3,25.3 131.8,25.8 132.2,26.2 132.6,26.6 133.0,27.1 133.4,27.6 133.8,28.1 134.2,28.6 134.7,29.1 135.1,29.6 135.5,30.2 135.9,30.7 136.3,31.3 136.7,31.9 137.1,32.5 137.6,33.1 138.0,33.7 138.4,34.4 138.8,35.0 139.2,35.7 139.6,36.4 140.1,37.1 140.5,37.8 140.9,38.6 141.3,39.3 141.7,40.1 142.1,40.9 142.5,41.7 143.0,42.6 143.4,43.4 143.8,44.3 144.2,45.2 144.6,46.1 145.0,47.1 145.4,48.1 145.9,49.1 146.3,50.1 146.7,51.1 147.1,52.2 147.5,53.3 147.9,54.4 148.4,55.6 148.8,56.8 149.2,58.0 149.6,59.3 150.0,60.6 150.4,61.9 150.8,63.2 151.3,64.7 151.7,66.1 152.1,67.6 152.5,69.2 152.9,70.8 153.3,72.4 153.8,74.1 154.2,75.9 154.6,77.8 155.0,79.7 155.4,81.7 155.8,83.8 156.2,86.0 156.7,88.4 157.1,90.8 157.5,93.5 157.9,96.3 158.3,99.4 158.7,102.7 159.1,106.4 159.6,110.6 160.0,115.5 160.4,121.5 160.8,129.4 161.2,141.5 161.6,179.7 162.1,148.8 162.5,136.8 162.9,130.6 163.3,126.8 163.7,124.2 164.1,122.3 164.5,121.0 165.0,120.1 165.4,119.6 165.8,119.3 166.2,119.2 166.6,119.3 167.0,119.5 167.4,119.9 167.9,120.4 168.3,121.0 168.7,121.8 169.1,122.6 169.5,123.6 169.9,124.6 170.3,125.7 170.8,126.9 171.2,128.1 171.6,129.4 172.0,130.8 172.4,132.2 172.8,133.6 173.3,135.1 173.7,136.6 174.1,138.0 174.5,139.5 174.9,140.9 175.3,142.3 175.7,143.6 176.2,144.8 176.6,145.9 177.0,146.8 177.4,147.7 177.8,148.3 178.2,148.8 178.7,149.2 179.1,149.4 179.5,149.5 179.9,149.6 180.3,149.5 180.7,149.4 181.1,149.3 181.6,149.2 182.0,149.1 182.4,149.0 182.8,149.0 183.2,149.0 183.6,149.1 184.0,149.3 184.5,149.6 184.9,150.1 185.3,150.6 185.7,151.4 186.1,152.3 186.5,153.5 187.0,154.9 187.4,156.6 187.8,158.7 188.2,161.4 188.6,164.9 189.0,169.5 189.4,176.4 189.9,188.6 190.3,195.0 190.7,185.9 191.1,174.2 191.5,167.1 191.9,162.1 192.3,158.2 192.8,155.0 193.2,152.4 193.6,150.1 194.0,148.2 194.4,146.5 194.8,145.0 195.2,143.7 195.7,142.6 196.1,141.6 196.5,140.8 196.9,140.1 197.3,139.5 197.7,139.0 198.2,138.7 198.6,138.4 199.0,138.3 199.4,138.2 199.8,138.3 200.2,138.4 200.6,138.7 201.1,139.1 201.5,139.6 201.9,140.2 202.3,140.9 202.7,141.8 203.1,142.9 203.6,144.1 204.0,145.6 204.4,147.3 204.8,149.3 205.2,151.7 205.6,154.6 206.0,158.3 206.5,163.1 206.9,169.8 207.3,181.2 207.7,195.0 208.1,183.7 208.5,171.0 208.9,163.9 209.4,158.9 209.8,155.1 210.2,152.1 210.6,149.6 211.0,147.6 211.4,145.8 211.8,144.4 212.3,143.1 212.7,142.0 213.1,141.1 213.5,140.3 213.9,139.7 214.3,139.2 214.8,138.8 215.2,138.5 215.6,138.4 216.0,138.3 216.4,138.4 216.8,138.5 217.2,138.8 217.7,139.2 218.1,139.7 218.5,140.3 218.9,141.0 219.3,141.9 219.7,143.0 220.1,144.2 220.6,145.6 221.0,147.3 221.4,149.3 221.8,151.6 222.2,154.3 222.6,157.8 223.1,162.1 223.5,168.1 223.9,177.5 224.3,195.0 224.7,192.3 225.1,175.3 225.5,167.0 226.0,161.5 226.4,157.4 226.8,154.2 227.2,151.6 227.6,149.5 228.0,147.7 228.4,146.1 228.9,144.8 229.3,143.7 229.7,142.8 230.1,142.0 230.5,141.4 230.9,140.9 231.4,140.5 231.8,140.2 232.2,140.0 232.6,140.0 233.0,140.0 233.4,140.2 233.8,140.5 234.3,140.9 234.7,141.4 235.1,142.0 235.5,142.7 235.9,143.6 236.3,144.7 236.8,145.9 237.2,147.3 237.6,149.0 238.0,150.9 238.4,153.2 238.8,156.0 239.2,159.3 239.7,163.6 240.1,169.5 240.5,178.5 240.9,195.0 241.3,195.0 241.7,177.8 242.1,169.3 242.6,163.6 243.0,159.5 243.4,156.3 243.8,153.7 244.2,151.5 244.6,149.7 245.0,148.1 245.5,146.8 245.9,145.7 246.3,144.8 246.7,144.0 247.1,143.4 247.5,142.8 248.0,142.5 248.4,142.2 248.8,142.0 249.2,142.0 249.6,142.0 250.0,142.2 250.4,142.5 250.9,142.8 251.3,143.3 251.7,144.0 252.1,144.7 252.5,145.6 252.9,146.6 253.3,147.9 253.8,149.3 254.2,151.0 254.6,152.9 255.0,155.2 255.4,157.9 255.8,161.3 256.3,165.7 256.7,171.5 257.1,180.6 257.5,195.0 257.9,195.0 258.3,179.7 258.7,171.2 259.2,165.6 259.6,161.4 260.0,158.2 260.4,155.6 260.8,153.4 261.2,151.6 261.6,150.1 262.1,148.8 262.5,147.7 262.9,146.7 263.3,145.9 263.7,145.3 264.1,144.8 264.6,144.4 265.0,144.1 265.4,144.0 265.8,143.9 266.2,144.0 266.6,144.1 267.0,144.4 267.5,144.8 267.9,145.3 268.3,145.9 268.7,146.6 269.1,147.5 269.5,148.6 270.0,149.8 270.4,151.2 270.8,152.9 271.2,154.9 271.6,157.2 272.0,159.9 272.4,163.4 272.9,167.7 273.3,173.7 273.7,182.9 274.1,195.0 274.5,195.0 274.9,181.2 275.3,172.8 275.8,167.3 276.2,163.2 276.6,160.0 277.0,157.4 277.4,155.2 277.8,153.4 278.2,151.9 278.7,150.6 279.1,149.5 279.5,148.5 279.9,147.7 280.3,147.1 280.7,146.6 281.2,146.2 281.6,145.9 282.0,145.8 282.4,145.7 282.8,145.8 283.2,145.9 283.6,146.2 284.1,146.6 284.5,147.1 284.9,147.7 285.3,148.5 285.7,149.4 286.1,150.4 286.5,151.6 287.0,153.1 287.4,154.7 287.8,156.7 288.2,159.0 288.6,161.8 289.0,165.2 289.5,169.6 289.9,175.7 290.3,185.1 290.7,195.0 291.1,195.0 291.5,182.5 291.9,174.3 292.4,168.8 292.8,164.7 293.2,161.6 293.6,159.0 294.0,156.8 294.4,155.0 294.9,153.5 295.3,152.2 295.7,151.1 296.1,150.2 296.5,149.4 296.9,148.7 297.3,148.2 297.8,147.8 298.2,147.6 298.6,147.4 299.0,147.4 299.4,147.4 299.8,147.6 300.2,147.8 300.7,148.2 301.1,148.7 301.5,149.3 301.9,150.1 302.3,151.0 302.7,152.1 303.1,153.3 303.6,154.7 304.0,156.4 304.4,158.4 304.8,160.7 305.2,163.5 305.6,167.0 306.1,171.4 306.5,177.5 306.9,187.2 307.3,195.0 307.7,195.0 308.1,183.6 308.5,175.5 309.0,170.1 309.4,166.1 309.8,163.0 310.2,160.4 310.6,158.3 311.0,156.5 311.4,154.9 311.9,153.6 312.3,152.5 312.7,151.6 313.1,150.8 313.5,150.2 313.9,149.7 314.4,149.3 314.8,149.0 315.2,148.9 315.6,148.8 316.0,148.9 316.4,149.0 316.8,149.3 317.3,149.7 317.7,150.2 318.1,150.8 318.5,151.6 318.9,152.5 319.3,153.5 319.8,154.8 320.2,156.2 320.6,157.9 321.0,159.9 321.4,162.2 321.8,165.0 322.2,168.5 322.7,173.0 323.1,179.2 323.5,189.1 323.9,195.0 324.3,195.0 324.7,184.5 325.1,176.6 325.6,171.3 326.0,167.3 326.4,164.2 326.8,161.6 327.2,159.5 327.6,157.7 328.1,156.2 328.5,154.9 328.9,153.8 329.3,152.9 329.7,152.1 330.1,151.5 330.5,151.0 331.0,150.6 331.4,150.3 331.8,150.1 332.2,150.1 332.6,150.1 333.0,150.3 333.4,150.6 333.9,151.0 334.3,151.5 334.7,152.1 335.1,152.8 335.5,153.7 335.9,154.8 336.3,156.0 336.8,157.5 337.2,159.2 337.6,161.2 338.0,163.5 338.4,166.4 338.8,169.9 339.3,174.4 339.7,180.7 340.1,190.8 340.5,195.0 340.9,195.0 341.3,185.3 341.7,177.5 342.2,172.3 342.6,168.4 343.0,165.2 343.4,162.7 343.8,160.6 344.2,158.8 344.6,157.3 345.1,156.0 345.5,154.9 345.9,154.0 346.3,153.2 346.7,152.6 347.1,152.1 347.6,151.7 348.0,151.4 348.4,151.3 348.8,151.2 349.2,151.3 349.6,151.4 350.0,151.7 350.5,152.1 350.9,152.6 351.3,153.2 351.7,154.0 352.1,154.9 352.5,155.9 352.9,157.2 353.4,158.6 353.8,160.3 354.2,162.3 354.6,164.7 355.0,167.5 355.4,171.1 355.9,175.7 356.3,182.1 356.7,192.4 357.1,195.0 357.5,195.0 357.9,186.0 358.3,178.3 358.8,173.1 359.2,169.2 359.6,166.1 360.0,163.6 360.4,161.5 360.8,159.8 361.2,158.2 361.7,157.0 362.1,155.9 362.5,154.9 362.9,154.2 363.3,153.5 363.7,153.0 364.2,152.6 364.6,152.4 365.0,152.2 365.4,152.2 365.8,152.2 366.2,152.4 366.6,152.6 367.1,153.0 367.5,153.5 367.9,154.2 368.3,154.9 368.7,155.8 369.1,156.9 369.6,158.1 370.0,159.6 370.4,161.3 370.8,163.3 371.2,165.7 371.6,168.5 372.0,172.1 372.5,176.7 372.9,183.2 373.3,193.8 373.7,195.0 374.1,195.0 374.5,186.5 374.9,179.0 375.4,173.8 375.8,170.0 376.2,166.9 376.6,164.4 377.0,162.3 377.4,160.5 377.9,159.0 378.3,157.7 378.7,156.7 379.1,155.7 379.5,155.0 379.9,154.3 380.3,153.8 380.8,153.4 381.2,153.2 381.6,153.0 382.0,152.9 382.4,153.0 382.8,153.2 383.2,153.4 383.7,153.8 384.1,154.3 384.5,154.9 384.9,155.7 385.3,156.6 385.7,157.7 386.2,158.9 386.6,160.4 387.0,162.1 387.4,164.1 387.8,166.5 388.2,169.4 388.6,173.0 389.1,177.7 389.5,184.2 389.9,195.0 390.3,195.0 390.7,195.0 391.1,186.9 391.5,179.5 392.0,174.4 392.4,170.5 392.8,167.5 393.2,165.0 393.6,162.9 394.0,161.2 394.4,159.7 394.9,158.4 395.3,157.3 395.7,156.4 396.1,155.6 396.5,155.0 396.9,154.5 397.4,154.1 397.8,153.8 398.2,153.6 398.6,153.6 399.0,153.6 399.4,153.8 399.8,154.1 400.3,154.5 400.7,155.0 401.1,155.6 401.5,156.3 401.9,157.3 402.3,158.3 402.8,159.6 403.2,161.0 403.6,162.8 404.0,164.8 404.4,167.2 404.8,170.1 405.2,173.7 405.7,178.4 406.1,185.1 406.5,195.0 406.9,195.0 407.3,195.0 407.7,187.1 408.1,179.8 408.6,174.8 409.0,171.0 409.4,167.9 409.8,165.5 410.2,163.4 410.6,161.6 411.1,160.1 411.5,158.9 411.9,157.8 412.3,156.9 412.7,156.1 413.1,155.5 413.5,155.0 414.0,154.6 414.4,154.3 414.8,154.1 415.2,154.1 415.6,154.1 416.0,154.3 416.4,154.6 416.9,155.0 417.3,155.5 417.7,156.1 418.1,156.8 418.5,157.8 418.9,158.8 419.4,160.1 419.8,161.5 420.2,163.3 420.6,165.3 421.0,167.7 421.4,170.6 421.8,174.3 422.3,179.0 422.7,185.8 423.1,195.0 423.5,195.0 423.9,195.0 424.3,187.2 424.7,180.0 425.2,175.0 425.6,171.3 426.0,168.2 426.4,165.8 426.8,163.7 427.2,162.0 427.7,160.5 428.1,159.2 428.5,158.1 428.9,157.2 429.3,156.4 429.7,155.8 430.1,155.3 430.6,154.9 431.0,154.6 431.4,154.5 431.8,154.4 432.2,154.5 432.6,154.6 433.0,154.9 433.5,155.3 433.9,155.8 434.3,156.4 434.7,157.2 435.1,158.1 435.5,159.2 436.0,160.4 436.4,161.9 436.8,163.6 437.2,165.7 437.6,168.1 438.0,171.0 438.4,174.7 438.9,179.5 439.3,186.3 439.7,195.0 440.1,195.0 440.5,195.0 440.9,187.2 441.3,180.1 441.8,175.2 442.2,171.4 442.6,168.4 443.0,166.0 443.4,163.9 443.8,162.2 444.2,160.7 444.7,159.4 445.1,158.3 445.5,157.4 445.9,156.6 446.3,156.0 446.7,155.5 447.2,155.1 447.6,154.9 448.0,154.7 448.4,154.6 448.8,154.7 449.2,154.9 449.6,155.1 450.1,155.5 450.5,156.0 450.9,156.6 451.3,157.4 451.7,158.3 452.1,159.4 452.6,160.7 453.0,162.1 453.4,163.9 453.8,165.9 454.2,168.3 454.6,171.3 455.0,175.0 455.5,179.9 455.9,186.8 456.3,195.0 456.7,195.0 457.1,195.0 457.5,187.0 457.9,180.0 458.4,175.2 458.8,171.4 459.2,168.4 459.6,166.0 460.0,164.0 460.4,162.2 460.9,160.7 461.3,159.5 461.7,158.4 462.1,157.5 462.5,156.7 462.9,156.1 463.3,155.6 463.8,155.2 464.2,154.9 464.6,154.8 465.0,154.7" fill="none" stroke="var(--formal)" strokeWidth="2" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10">
+    <text x="45" y="19.0" textAnchor="end">0</text>
+    <text x="45" y="59.0" textAnchor="end">−20</text>
+    <text x="45" y="99.0" textAnchor="end">−40</text>
+    <text x="45" y="139.0" textAnchor="end">−60</text>
+    <text x="45" y="179.0" textAnchor="end">−80</text>
+    <text x="50.0" y="209" textAnchor="middle">0</text>
+    <text x="133.0" y="209" textAnchor="middle">100</text>
+    <text x="216.0" y="209" textAnchor="middle">200</text>
+    <text x="299.0" y="209" textAnchor="middle">300</text>
+    <text x="382.0" y="209" textAnchor="middle">400</text>
+    <text x="465.0" y="209" textAnchor="middle">500</text>
+    <text x="465" y="223" textAnchor="end">frequency (Hz)</text>
+    <text x="12" y="19">dB</text>
+    <path d="M 290 21 L 310 21" stroke="var(--gold)" strokeWidth="2" />
+    <text x="315" y="25">rectangular window</text>
+    <path d="M 290 37 L 310 37" stroke="var(--formal)" strokeWidth="2" />
+    <text x="315" y="41">Hamming window</text>
+  </g>
+</svg>
+</Figure>
+
+**Linear phase.** The taps are symmetric, $h[n] = h[N-1-n]$, so the filter's frequency response is a real function times $e^{-j\omega(N-1)/2}$: every frequency is delayed by exactly $(N-1)/2$ samples, here 25 samples or 25 ms. A constant delay preserves the *shape* of a waveform, which matters for pulses in data communication, for heartbeat waveforms, and for audio crossovers. This is something an analogue filter cannot do exactly.
+
+The window method is simple and robust, but not optimal. In practice engineers more often use the **Parks–McClellan** algorithm (in SciPy, `scipy.signal.remez`), which finds the filter with the smallest maximum error for a given length, with equal-sized ripples across each band, or least-squares designs. All produce the same kind of object: a symmetric list of taps.
+
+</Section>
+
+<Section id="iir-design" kind="computation" title="IIR filters, biquads and the bilinear transform">
+
+An FIR filter needs many taps for a sharp transition. An IIR filter gets its sharpness from poles placed close to the unit circle, and needs far fewer coefficients; the price is phase that is not linear and the possibility of instability. The usual way to design one is to borrow a classic analogue design (Butterworth, Chebyshev, elliptic), whose properties are well understood, and convert it to discrete time.
+
+<Definition term="Bilinear transform">
+
+The **bilinear transform** converts an analogue transfer function $H_a(s)$ into a digital one by the substitution
+$$s = \frac{2}{T}\,\frac{z - 1}{z + 1} = 2f_s\,\frac{1 - z^{-1}}{1 + z^{-1}} .$$
+It maps the left half of the s-plane onto the inside of the unit circle, so a stable analogue filter always becomes a stable digital one, and it maps the imaginary axis $s = j\Omega$ onto the unit circle, with
+$$\Omega = 2f_s \tan\!\left(\frac{\omega}{2}\right).$$
+
+</Definition>
+
+The whole infinite analogue frequency axis is squeezed into the digital range from 0 to $f_s/2$, so frequencies are **warped**: the mapping is nearly linear at low frequencies and compressed near $f_s/2$. To make a critical frequency land where you want it, you **pre-warp**: design the analogue filter with its cut-off at $\Omega_c = 2f_s\tan(\pi f_c/f_s)$ instead of $2\pi f_c$.
+
+The workhorse of IIR filtering is the **biquad**, a second-order section with two poles and two zeros:
+$$H(z) = \frac{b_0 + b_1 z^{-1} + b_2 z^{-2}}{1 + a_1 z^{-1} + a_2 z^{-2}} .$$
+
+<Figure caption="A biquad in direct form I: two delays on the input side, two on the output side, five multiplications and one adder. Higher-order IIR filters are built as a cascade of such sections.">
+<svg viewBox="0 0 480 210" role="img" aria-label="Block diagram of a biquad in direct form one. The input x of n enters at the left and passes down a chain of two unit delays, labelled z to the minus one, giving x of n minus 1 and x of n minus 2. Each of the three is multiplied by b0, b1 or b2 and fed into a central adder. The adder output is y of n, which goes to the right and also down a chain of two unit delays, giving y of n minus 1 and y of n minus 2; these are multiplied by minus a1 and minus a2 and fed back into the adder.">
+  <defs>
+    <marker id="bq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.4">
+    <path d="M 10 35 L 130 35" markerEnd="url(#bq-arrow)" />
+    <path d="M 60 35 L 60 52" markerEnd="url(#bq-arrow)" />
+    <rect x="40" y="54" width="40" height="30" rx="3" />
+    <path d="M 60 84 L 60 105" />
+    <path d="M 60 105 L 130 105" markerEnd="url(#bq-arrow)" />
+    <path d="M 60 105 L 60 122" markerEnd="url(#bq-arrow)" />
+    <rect x="40" y="124" width="40" height="30" rx="3" />
+    <path d="M 60 154 L 60 175" />
+    <path d="M 60 175 L 130 175" markerEnd="url(#bq-arrow)" />
+    <path d="M 130 25 L 130 45 L 155 35 Z" />
+    <path d="M 155 35 L 224 35.0" />
+    <path d="M 130 95 L 130 115 L 155 105 Z" />
+    <path d="M 155 105 L 210 105 L 229 46" markerEnd="url(#bq-arrow)" />
+    <path d="M 130 165 L 130 185 L 155 175 Z" />
+    <path d="M 155 175 L 210 175 L 229 46" markerEnd="url(#bq-arrow)" />
+    <path d="M 155 35 L 223 35" markerEnd="url(#bq-arrow)" />
+    <circle cx="240" cy="35" r="15" />
+    <path d="M 255 35 L 472 35" markerEnd="url(#bq-arrow)" />
+    <path d="M 420 35 L 420 52" markerEnd="url(#bq-arrow)" />
+    <rect x="400" y="54" width="40" height="30" rx="3" />
+    <path d="M 420 84 L 420 105" />
+    <path d="M 420 105 L 350 105" markerEnd="url(#bq-arrow)" />
+    <path d="M 350 95 L 350 115 L 325 105 Z" />
+    <path d="M 325 105 L 270 105 L 251 46" markerEnd="url(#bq-arrow)" />
+    <path d="M 420 105 L 420 122" markerEnd="url(#bq-arrow)" />
+    <rect x="400" y="124" width="40" height="30" rx="3" />
+    <path d="M 420 154 L 420 175" />
+    <path d="M 420 175 L 350 175" markerEnd="url(#bq-arrow)" />
+    <path d="M 350 165 L 350 185 L 325 175 Z" />
+    <path d="M 325 175 L 270 175 L 251 46" markerEnd="url(#bq-arrow)" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="240" y="40" fontSize="16">+</text>
+    <text x="60" y="73">z<tspan dy="-5" fontSize="8">−1</tspan></text>
+    <text x="420" y="73">z<tspan dy="-5" fontSize="8">−1</tspan></text>
+    <text x="60" y="143">z<tspan dy="-5" fontSize="8">−1</tspan></text>
+    <text x="420" y="143">z<tspan dy="-5" fontSize="8">−1</tspan></text>
+    <text x="140" y="21" fontSize="10">b0</text>
+    <text x="140" y="91" fontSize="10">b1</text>
+    <text x="140" y="161" fontSize="10">b2</text>
+    <text x="338" y="91" fontSize="10">−a1</text>
+    <text x="338" y="161" fontSize="10">−a2</text>
+    <text x="22" y="27">x[n]</text>
+    <text x="455" y="27">y[n]</text>
+    <text x="26" y="109" fontSize="10">x[n−1]</text>
+    <text x="26" y="179" fontSize="10">x[n−2]</text>
+    <text x="456" y="109" fontSize="10">y[n−1]</text>
+    <text x="456" y="179" fontSize="10">y[n−2]</text>
+  </g>
+</svg>
+</Figure>
+
+The program designs a second-order Butterworth low-pass (cut-off 100 Hz at $f_s = 1$ kHz) as one biquad, by pre-warping and applying the bilinear transform to $H_a(s) = \Omega_c^2/(s^2 + \sqrt2\,\Omega_c s + \Omega_c^2)$. Then it asks what happens to a sixth-order filter when its coefficients are rounded to a fixed number of fractional bits, as they must be on a fixed-point processor.
+
+```python run
+import numpy as np
+
+fs = 1000.0
+
+def butterworth_biquad(fc, fs):
+    """Second-order Butterworth low-pass by the bilinear transform s = 2 fs (z - 1)/(z + 1).
+    Returns b = [b0, b1, b2], a = [1, a1, a2]."""
+    wa = 2 * fs * np.tan(np.pi * fc / fs)            # pre-warp so the -3 dB point lands at fc
+    K = wa / (2 * fs)                                # tan(pi fc / fs)
+    q = np.sqrt(2)                                   # H(s) = wa^2 / (s^2 + sqrt(2) wa s + wa^2)
+    d = 1 + q * K + K * K
+    b = np.array([K * K, 2 * K * K, K * K]) / d
+    a = np.array([1, 2 * (K * K - 1) / d, (1 - q * K + K * K) / d])
+    return b, a
+
+def gain_db(b, a, f):
+    zinv = np.exp(-2j * np.pi * f / fs)
+    return 20 * np.log10(abs(np.polyval(b[::-1], zinv) / np.polyval(a[::-1], zinv)))
+
+b, a = butterworth_biquad(100, fs)
+print("biquad b =", np.round(b, 6), " a =", np.round(a, 6))
+print("poles:", np.round(np.abs(np.roots(a)), 4), "in magnitude (inside the unit circle: stable)")
+for f in (0, 50, 100, 200, 400):
+    print(f"  {f:3} Hz: {round(gain_db(b, a, f), 2) + 0.0:7.2f} dB")
+
+# Coefficient quantisation: a 6th-order Butterworth low-pass at 20 Hz, as one big polynomial
+# (direct form) or as three biquads, with coefficients rounded to F fractional bits.
+order, fc = 6, 20.0
+wa = 2 * fs * np.tan(np.pi * fc / fs)
+s_poles = wa * np.exp(1j * np.pi * (0.5 + (2 * np.arange(order) + 1) / (2 * order)))
+z_poles = (1 + s_poles / (2 * fs)) / (1 - s_poles / (2 * fs))      # bilinear map of each pole
+a_direct = np.real(np.poly(z_poles))
+print(f"\n6th-order denominator (direct form): {np.round(a_direct, 3)}")
+print(f"true largest pole radius: {np.abs(z_poles).max():.4f}")
+print(" F bits   direct form: largest |pole|   three biquads: largest |pole|")
+for F in (8, 12, 14, 20, 24):
+    quant = lambda c: np.round(c * 2 ** F) / 2 ** F
+    r_direct = np.abs(np.roots(quant(a_direct))).max()
+    r_biquad = max(np.abs(np.roots(quant(np.array([1, -2 * p.real, abs(p) ** 2])))).max()
+                   for p in z_poles if p.imag > 0)
+    print(f"{F:6}   {r_direct:20.4f}          {r_biquad:20.4f}")
+```
+
+The biquad is exactly what was ordered: 0 dB at DC, $-3.01$ dB at the 100 Hz cut-off thanks to pre-warping, and steeper attenuation than an analogue Butterworth near 500 Hz, because the bilinear transform puts both zeros at $z = -1$. Five coefficients give a respectable low-pass, though with a far gentler roll-off than the 51-tap FIR design: $-14$ dB at 200 Hz, where the FIR filter reaches $-62$ dB.
+
+The second table is the reason IIR filters are almost never implemented as one high-order difference equation. The sixth-order filter's poles cluster near $z = 1$ with radius up to 0.968, and the coefficients of its denominator polynomial are large numbers (up to 15.6) that nearly cancel. Round them to 12 or 14 fractional bits and the poles move *outside* the unit circle: the filter is unstable. Even 20 bits leave the largest pole visibly displaced. The same filter built as three biquads keeps its poles in place at every precision tested. Roots of high-degree polynomials are extremely sensitive to their coefficients; roots of quadratics are not. So practical IIR filters are **cascades of biquads**, called second-order sections, which is why SciPy offers `sosfilt` and microcontroller libraries offer biquad-cascade functions.
+
+<Narrator who="margaret">
+
+Count the bits in the fixed-point case. A coefficient as large as 15.6 needs four integer bits and a sign bit, so a 16-bit word leaves it only 11 fractional bits, fewer than the 12 that already made the direct form unstable. Each biquad coefficient lies between $-2$ and $2$, so a 16-bit word gives it 14 fractional bits, and the cascade works.
+
+</Narrator>
+
+</Section>
+
+<Section id="fixed-point" kind="human" title="Fixed-point effects, in overview">
+
+Many filters run on processors without floating-point hardware, or in FPGAs and custom chips where every bit costs area and power. Numbers are then **fixed-point**: integers with an implied binary point, such as the Q15 format, which stores values from $-1$ to just under $+1$ in 16 bits. Four effects need attention.
+
+- **Coefficient quantisation.** As the program showed, rounding coefficients moves poles and zeros, changing the response and possibly destroying stability. Biquad cascades, and structures designed for low sensitivity, keep this under control.
+- **Round-off noise.** Every multiplication produces a longer result that must be rounded back to the word length, adding a tiny error, a noise source at every multiplier. In an IIR filter the noise passes through the feedback and can be amplified, especially when poles sit close to the unit circle. Wider accumulators help: DSP processors typically accumulate in 32 to 40 bits even when data are 16 bits.
+- **Overflow.** A sum can exceed the largest representable number. In two's-complement arithmetic it then wraps round to a large negative value, a violent error; **saturating** arithmetic clips instead, which is much gentler. Designers *scale* signals between sections so overflow is rare.
+- **Limit cycles.** With rounding inside a feedback loop, an IIR filter whose input has fallen to zero can keep producing a small oscillation for ever, instead of decaying to zero. It is usually tiny but can be audible in quiet passages of audio.
+
+An FIR filter has no feedback, so it cannot have limit cycles, and its round-off noise is not amplified by recursion. This robustness, together with linear phase, is why FIR filters dominate in FPGAs, communications and multirate systems, while IIR biquads dominate where cheapness and low latency matter: audio equalisers, sensor smoothing, control loops.
+
+</Section>
+
+<Section id="noisy-signal" kind="examples" title="Filtering a noisy signal">
+
+Here is a complete small task. A slow sensor signal, made of 2 Hz and 5 Hz components, is sampled at 1 kHz. It arrives buried in broadband noise and 50 Hz mains pickup. We compare a 201-tap FIR low-pass (Hamming window) with a fourth-order Butterworth IIR built from two biquads, both with a 20 Hz cut-off, and measure the signal-to-noise ratio against the known clean signal.
+
+```python run
+import numpy as np
+
+fs = 1000.0
+t = np.arange(0, 3.0, 1 / fs)
+clean = np.sin(2 * np.pi * 2 * t) + 0.5 * np.sin(2 * np.pi * 5 * t)      # the wanted slow signal
+rng = np.random.default_rng(42)
+noise = 0.5 * rng.standard_normal(len(t))                                # broadband sensor noise
+hum = 0.8 * np.sin(2 * np.pi * 50 * t)                                   # mains pickup at 50 Hz
+x = clean + noise + hum
+
+def snr_db(estimate, delay=0, skip=500):
+    """SNR of an estimate of `clean`, after undoing a delay and ignoring the start-up transient."""
+    e = estimate[skip + delay:]
+    c = clean[skip:len(clean) - delay]
+    return 10 * np.log10(np.mean(c ** 2) / np.mean((e - c) ** 2))
+
+# 1. FIR: 201-tap Hamming-windowed sinc, cut-off 20 Hz.  Linear phase, delay (201 - 1) / 2 = 100 samples.
+taps = 201
+n = np.arange(taps) - (taps - 1) / 2
+h = 2 * 20 / fs * np.sinc(2 * 20 * n / fs) * np.hamming(taps)
+h /= h.sum()
+y_fir = np.convolve(x, h)[:len(x)]
+
+# 2. IIR: two Butterworth biquads in cascade (4th order), cut-off 20 Hz, by the bilinear transform.
+def biquad_sections(order, fc):
+    wa = 2 * fs * np.tan(np.pi * fc / fs)
+    sections = []
+    for k in range(order // 2):
+        p = wa * np.exp(1j * np.pi * (0.5 + (2 * k + 1) / (2 * order)))        # analogue pole
+        zp = (1 + p / (2 * fs)) / (1 - p / (2 * fs))                            # digital pole
+        a = np.array([1.0, -2 * zp.real, abs(zp) ** 2])
+        b = np.array([1.0, 2.0, 1.0]) * a.sum() / 4                              # zeros at z = -1, gain 1 at DC
+        sections.append((b, a))
+    return sections
+
+def run_biquad(b, a, x):
+    y = np.zeros(len(x))
+    x1 = x2 = y1 = y2 = 0.0
+    for i, xi in enumerate(x):
+        yi = b[0] * xi + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2
+        x2, x1, y2, y1 = x1, xi, y1, yi
+        y[i] = yi
+    return y
+
+y_iir = x
+for b, a in biquad_sections(4, 20.0):
+    y_iir = run_biquad(b, a, y_iir)
+
+best = min(range(60), key=lambda d: -snr_db(y_iir, d))
+print(f"input SNR:                                    {snr_db(x):6.1f} dB")
+print(f"FIR (201 taps), its 100-sample delay removed:  {snr_db(y_fir, 100):6.1f} dB")
+print(f"IIR (4th order), no delay removed:             {snr_db(y_iir, 0):6.1f} dB")
+print(f"IIR, best whole-sample delay ({best}) removed:     {snr_db(y_iir, best):6.1f} dB")
+print(f"multiplications per sample: FIR {taps}, IIR {2 * 5}")
+
+print("\n t (s)   clean   noisy    FIR out (100 samples later)")
+for i in range(1000, 1400, 40):
+    bar = " " * int(round(20 + 12 * y_fir[i + 100])) + "*"
+    c, xn, yf = (round(v, 3) + 0.0 for v in (clean[i], x[i], y_fir[i + 100]))
+    print(f"{t[i]:5.2f}  {c:+.3f}  {xn:+.3f}  {yf:+.3f} {bar}")
+```
+
+The input SNR is about 0 dB: noise and hum together are as strong as the signal. Both filters lift it to about 17 dB, a fifty-fold reduction in error power, and the hum disappears entirely; what remains is the noise that lies *inside* the 0–20 Hz passband, which no low-pass filter can remove. The comparison of costs is the interesting part:
+
+- The FIR filter needs 201 multiplications per sample and delays everything by 100 ms, but every frequency by the same amount, so the output is an undistorted, delayed copy.
+- The IIR filter needs 10 multiplications per sample and delays the signal by only about 20 ms. But compared without correcting for its delay, it scores only 8.3 dB, and even at its best single delay it scores slightly less than the FIR, because its delay differs between the 2 Hz and 5 Hz components (its phase is not linear), which slightly distorts the waveform.
+
+For offline processing, where the whole record is available, there is a third option: run an IIR filter forwards and then backwards over the data (`scipy.signal.filtfilt`), which cancels the phase shift exactly. It cannot be done in real time, because the backward pass needs the future.
+
+<Narrator who="gideon">
+
+The 17 dB depends on the noise being spread evenly over all frequencies up to 500 Hz, so that a 20 Hz passband keeps only 4% of its power. If the noise were concentrated at low frequencies, near the signal, no filter of any kind could separate the two; filtering helps exactly as much as the signal and the noise differ in frequency.
+
+</Narrator>
+
+</Section>
+
+<Section id="practice" kind="human" title="Digital filters in industry">
+
+- **Audio.** Equalisers, crossovers and room correction in phones, cars and studios are mostly biquad cascades, often with coefficients from closed-form formulas such as the *Audio EQ Cookbook*; hearing aids run banks of filters within a few milliseconds of latency.
+- **Communications.** Software-defined radios, from hobbyists' receivers running GNU Radio to base stations, select channels and change sample rates with **multirate** FIR filters: polyphase structures that compute only the samples that will be kept, and very cheap cascaded integrator–comb (CIC) filters for large rate changes.
+- **Data conversion.** Every sigma-delta converter contains a digital decimation filter that removes the shaped quantisation noise and the out-of-band signals; <LessonLink slug="sensors-and-data-conversion">Sensors and data conversion</LessonLink> returns to this.
+- **Control and power.** Motor drives and power converters filter their current and voltage measurements with short IIR filters inside control loops that run tens of thousands of times a second, where every sample of delay erodes the stability margin (see <LessonLink slug="feedback-control">Feedback control</LessonLink>).
+- **Biomedical.** Electrocardiograph and EEG front ends use notch filters for 50 or 60 Hz hum and band-pass filters chosen so as not to distort clinically important waveform features, which is one reason linear-phase FIR filters are common there.
+
+On hardware, FPGAs contain hundreds or thousands of dedicated multiply-accumulate blocks that implement FIR filters at hundreds of millions of samples per second, and microcontrollers use libraries such as Arm's CMSIS-DSP. For design, `scipy.signal` (`firwin`, `remez`, `butter`, `ellip`, `sosfilt`) is the standard open-source toolkit, and the coefficients it produces are what gets loaded into the hardware.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"IIR filters are always better because they need fewer coefficients."** They are cheaper and have lower latency, but their phase is not linear, they can become unstable after quantisation, and they suffer limit cycles and amplified round-off noise. FIR filters cost more arithmetic and buy robustness and linear phase. The right choice depends on the application.
+
+</Misconception>
+
+<Misconception>
+
+**"A good filter removes the noise."** It removes the noise *outside* the passband. Noise at the same frequencies as the signal passes straight through, as the 17 dB ceiling in the example shows. To do better you need more information: averaging repeated measurements, a model of the signal (as in a Kalman filter), or a better sensor.
+
+</Misconception>
+
+<Misconception>
+
+**"If it is stable in floating point, it is stable in the product."** A sixth-order direct-form filter stable in double precision became unstable with 14-bit coefficients. Fixed-point implementations must be checked with the actual word lengths, usually by simulating them bit for bit.
+
+</Misconception>
+
+<Misconception>
+
+**"More taps (or higher order) is always better."** More taps sharpen the transition, but cost computation and, for an FIR filter, latency: a 2001-tap linear-phase filter at 1 kHz delays its output by a whole second, useless in a control loop. Choose the least demanding specification that does the job.
+
+</Misconception>
+
+<Misconception>
+
+**"The bilinear transform copies the analogue frequency response exactly."** It copies it with the frequency axis warped by $\Omega = 2f_s\tan(\omega/2)$. Only the frequencies you pre-warp land exactly where intended, and the warping is severe near $f_s/2$.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

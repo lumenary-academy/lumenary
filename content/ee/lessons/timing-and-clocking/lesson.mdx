@@ -1,0 +1,634 @@
+---
+title: Timing and clocking
+subtitle: How fast a synchronous design can run, why it sometimes fails at any speed, and how signals cross safely between clocks.
+minutes: 80
+objectives:
+  - Define propagation and contamination delay, clock-to-Q, setup and hold times
+  - Derive the setup and hold constraints, find the critical path of a circuit and compute its maximum clock frequency
+  - Include clock skew and jitter in timing budgets, and explain why hold violations cannot be fixed by slowing the clock
+  - Use pipelining to raise throughput, and quantify its cost in latency and register overhead
+  - Explain metastability, compute the mean time between failures of a synchroniser, and choose its depth
+  - Choose a safe clock-domain-crossing structure, including the asynchronous FIFO, and outline how static timing analysis is done in industry
+prerequisites: [verilog-and-fpgas]
+related: [math.analysis.exponential-logarithmic-functions, math.discrete.graph-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: OpenSTA
+    url: https://github.com/parallaxsw/OpenSTA
+    note: An open-source static timing analyser, used in the OpenROAD chip-design flow.
+  - title: The OpenROAD project
+    url: https://theopenroadproject.org/
+    note: An open-source flow from RTL to chip layout, including timing-driven placement and signoff-style timing analysis.
+  - title: "Metastability and synchronizers: a tutorial"
+    author: Ran Ginosar
+    year: 2011
+    note: A widely read tutorial (IEEE Design & Test of Computers) on metastability, MTBF and synchroniser design.
+  - title: Icarus Verilog
+    url: https://steveicarus.github.io/iverilog/
+    note: The simulator that runs this lesson's checks.
+---
+
+<Section id="motivation" kind="motivation" title="How fast can it go?">
+
+Every Verilog simulation so far has been *zero-delay*: when the clock rises, flip-flops update, and the logic after them settles instantly. Real gates take time. Each one in a modern process takes tens of picoseconds, wires add more, and a path through dozens of gates can take most of a nanosecond. The clock period has to leave room for the slowest path, and that sets how fast the chip can run. This is why the same processor design is sold at several clock speeds, and why an FPGA tool, after placing and routing your design, reports a maximum frequency that may be lower than you hoped.
+
+Timing is also where designs that pass every simulation fail on the bench. A path that is too *fast* can corrupt data at any clock speed. A signal arriving from another clock, or from a push-button, can catch a flip-flop mid-decision and leave it, briefly, neither 0 nor 1. This lesson gives you the vocabulary and arithmetic of timing (the setup and hold constraints, the critical path, skew and jitter), the main tool for going faster (pipelining), and the discipline for crossing between clocks safely (synchronisers and asynchronous FIFOs). It ends with how industry checks the timing of chips with billions of paths.
+
+</Section>
+
+<Section id="delays" kind="definitions" title="Delays, and the flip-flop's timing rules">
+
+A combinational block has two delays, not one.
+
+<Definition term="Propagation and contamination delay">
+
+The **propagation delay** $t_{pd}$ of a combinational path is the *maximum* time from an input change until the output has settled to its final value. The **contamination delay** $t_{cd}$ is the *minimum* time from an input change until the output starts to change. Between the two, the output may glitch.
+
+</Definition>
+
+Delays vary with the input that changes, with the direction of the change, with the load, and with process, voltage and temperature, so $t_{pd}$ and $t_{cd}$ are worst-case bounds, taken from the cell library or the FPGA vendor's timing model. A flip-flop has its own timing.
+
+<Definition term="Flip-flop timing">
+
+- **Clock-to-Q**: after a rising clock edge, the output $Q$ begins to change no sooner than $t_{ccq}$ (contamination) and has settled no later than $t_{pcq}$ (propagation).
+- **Setup time** $t_{setup}$: the input $D$ must be stable for at least this long *before* the clock edge.
+- **Hold time** $t_{hold}$: $D$ must remain stable for at least this long *after* the clock edge.
+
+</Definition>
+
+Setup and hold together define a small window around each clock edge during which $D$ must not change. If it does, the flip-flop may capture the old value, the new one, or, rarely, neither for a while: the metastability you will meet later in this lesson.
+
+</Section>
+
+<Section id="constraints" kind="definitions" title="The setup and hold constraints">
+
+Consider the basic situation of every synchronous design: a **launching** flip-flop, a block of combinational logic, and a **capturing** flip-flop, both on the same clock with period $T_c$.
+
+<Figure caption="Timing of one register-to-register path. After the launching edge, the new data at the capturing flip-flop's input settles at the latest after t_pcq + t_pd and must then be stable for t_setup before the next edge; what remains is the setup slack. The earliest change, t_ccq + t_cd after the edge, must not come before the capturing flip-flop's hold time has passed.">
+<svg viewBox="-50 0 490 210" role="img" aria-label="Timing diagram. A clock with rising edges at the left and right. Below it, the launching flip-flop's output Q changes in a short shaded window just after the first edge. Below that, the capturing flip-flop's input D is unstable during a long shaded window, from t_ccq plus t_cd to t_pcq plus t_pd after the first edge. It is then stable, with a setup window marked just before the second edge and a hold window just after it. A gap labelled slack separates the end of the unstable window from the start of the setup window.">
+  <g fill="var(--warn-soft)">
+    <rect x="100" y="66" width="20" height="24" />
+    <rect x="150" y="116" width="140" height="24" />
+  </g>
+  <g fill="var(--sky-soft)">
+    <rect x="330" y="112" width="30" height="32" />
+    <rect x="360" y="112" width="20" height="32" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <path d="M 30 44 H 80 V 22 H 220 V 44 H 360 V 22 H 430" />
+    <path d="M 30 66 H 100 L 120 90 H 430 M 30 90 H 100 L 120 66 H 430" />
+    <path d="M 30 116 H 150 M 30 140 H 150 M 290 116 H 430 M 290 140 H 430" />
+  </g>
+  <g stroke="currentColor" strokeWidth="0.7" strokeDasharray="3 3">
+    <line x1="80" y1="18" x2="80" y2="190" />
+    <line x1="360" y1="18" x2="360" y2="190" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <path d="M 80 160 H 290 M 80 156 V 164 M 290 156 V 164" />
+    <path d="M 290 160 H 330 M 330 156 V 164" />
+    <path d="M 80 182 H 150 M 150 178 V 186" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="end">
+    <text x="24" y="38">clk</text>
+    <text x="24" y="82">Q (launch)</text>
+    <text x="24" y="132">D (capture)</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="185" y="155">t_pcq + t_pd (latest)</text>
+    <text x="310" y="155">slack</text>
+    <text x="345" y="108">setup</text>
+    <text x="378" y="108">hold</text>
+    <text x="115" y="197">t_ccq + t_cd (earliest)</text>
+    <text x="80" y="14">launch edge</text>
+    <text x="360" y="14">capture edge, T_c later</text>
+  </g>
+</svg>
+</Figure>
+
+<Theorem name="Setup and hold constraints">
+
+With an ideal clock (no skew or jitter), the path works correctly at period $T_c$ if and only if
+
+$$T_c \ \ge\ t_{pcq} + t_{pd} + t_{setup} \qquad \text{(setup)}$$
+
+$$t_{ccq} + t_{cd} \ \ge\ t_{hold} \qquad \text{(hold)}$$
+
+where $t_{pd}$ and $t_{cd}$ are the propagation and contamination delays of the logic between the two flip-flops.
+
+</Theorem>
+
+<Proof>
+
+*Setup.* After the launching edge at time 0, the launching flip-flop's output has settled by $t_{pcq}$, so the logic's output has settled by $t_{pcq} + t_{pd}$. The capturing flip-flop samples at the next edge, time $T_c$, and needs its input stable from $T_c - t_{setup}$. That holds for every possible input change exactly when $t_{pcq} + t_{pd} \le T_c - t_{setup}$. *Hold.* The same edge at time 0 also makes the capturing flip-flop sample the *previous* value, which must stay stable until $t_{hold}$. The new value can begin to reach it as early as $t_{ccq} + t_{cd}$. So the old value is safe exactly when $t_{ccq} + t_{cd} \ge t_{hold}$. Both bounds are tight because the delays are themselves worst cases that some input change attains.
+
+</Proof>
+
+The two constraints are strikingly different. The setup constraint contains $T_c$: a setup violation can always be fixed by slowing the clock. The hold constraint does not contain $T_c$ at all: it compares two delays that both start at the *same* clock edge. **A hold violation fails at every clock frequency**, which is why it must be found before the chip is made. Tools fix hold violations by adding delay (buffers) on the short path, and fix setup violations by making the long path faster or the clock slower.
+
+<Example title="A shift register cannot violate setup, but it can violate hold">
+
+Connect two flip-flops directly, $Q$ to $D$, with no logic: $t_{pd} = t_{cd} = 0$. With $t_{pcq} = 50$ ps and $t_{setup} = 40$ ps, setup needs only $T_c \ge 90$ ps, which any realistic clock satisfies. Hold needs $t_{ccq} \ge t_{hold}$. Cell libraries are designed so that this holds for direct connections, with some margin, but only with a perfect clock. When the second flip-flop's clock arrives later than the first one's, that margin is eaten, as the next two sections show.
+
+</Example>
+
+</Section>
+
+<Section id="critical-path" kind="computation" title="Finding the critical path">
+
+A real design has thousands of flip-flops and millions of paths between them. The setup constraint must hold for the slowest of all, the **critical path**, and the hold constraint for the fastest. Fortunately we do not need to list every path: in a circuit without loops (and the logic between registers has none), the latest arrival time at each signal is the latest arrival at any of its gate's inputs plus the gate's delay, computed once per gate in topological order. This is the longest-path problem on a directed acyclic graph, and it runs in time linear in the size of the circuit. Static timing analysis tools are, at heart, this computation.
+
+<Figure caption="The small circuit analysed below, with each gate's contamination and propagation delays in picoseconds. Registers R1 to R3 launch on a clock edge; C1 and C2 capture on the next. The critical path, R2 through G2, G3 and G5 to C1, is drawn thick. The shortest path, R3 through the inverter G4 to C2, decides the hold check.">
+<svg viewBox="0 0 450 215" role="img" aria-label="A netlist. Three launch registers R1, R2 and R3 on the left. G1, a NAND gate with delay 30 to 45, takes R1 and R2. G2, an XOR gate with delay 40 to 70, takes R2 and R3. G4, an inverter with delay 15 to 20, takes R3. G3, a NOR gate with delay 35 to 55, takes G1 and G2. G5, an AND-OR-invert gate with delay 40 to 60, takes G3, G4 and R1. G5 drives capture register C1 and G4 drives capture register C2. The path from R2 through G2, G3 and G5 to C1 is drawn with thick lines.">
+  <g fill="var(--warn-soft)">
+    <rect x="110" y="100" width="50" height="30" rx="3" />
+    <rect x="200" y="70" width="50" height="30" rx="3" />
+    <rect x="290" y="100" width="50" height="40" rx="3" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.3">
+    <rect x="20" y="30" width="40" height="30" /><rect x="20" y="90" width="40" height="30" /><rect x="20" y="150" width="40" height="30" />
+    <rect x="110" y="40" width="50" height="30" rx="3" /><rect x="110" y="100" width="50" height="30" rx="3" />
+    <rect x="110" y="160" width="50" height="30" rx="3" /><rect x="200" y="70" width="50" height="30" rx="3" />
+    <rect x="290" y="100" width="50" height="40" rx="3" />
+    <rect x="380" y="105" width="40" height="30" /><rect x="380" y="160" width="40" height="30" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <path d="M 60 45 H 85 V 50 H 110" />
+    <path d="M 85 45 V 22 H 280 V 132 H 290" />
+    <path d="M 90 105 V 62 H 110" />
+    <path d="M 60 165 H 95 V 122 H 110" />
+    <path d="M 95 165 V 175 H 110" />
+    <path d="M 160 55 H 180 V 78 H 200" />
+    <path d="M 160 175 H 270 V 120 H 290" />
+    <path d="M 270 175 H 380" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="3">
+    <path d="M 60 105 H 90 V 108 H 110" />
+    <path d="M 160 115 H 180 V 92 H 200" />
+    <path d="M 250 85 H 265 V 108 H 290" />
+    <path d="M 340 120 H 380" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="85" cy="45" r="2.5" /><circle cx="90" cy="105" r="2.5" /><circle cx="95" cy="165" r="2.5" /><circle cx="270" cy="175" r="2.5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="40" y="49">R1</text><text x="40" y="109">R2</text><text x="40" y="169">R3</text>
+    <text x="400" y="124">C1</text><text x="400" y="179">C2</text>
+    <text x="135" y="53">G1 NAND</text><text x="135" y="113">G2 XOR</text><text x="135" y="173">G4 INV</text>
+    <text x="225" y="83">G3 NOR</text><text x="315" y="117">G5 AOI</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="8" textAnchor="middle">
+    <text x="135" y="65">30–45</text><text x="135" y="125">40–70</text><text x="135" y="185">15–20</text>
+    <text x="225" y="95">35–55</text><text x="315" y="131">40–60</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="9" textAnchor="middle">
+    <text x="225" y="208">flip-flops: t_ccq 30, t_pcq 50, t_setup 40, t_hold 25 (ps)</text>
+  </g>
+</svg>
+</Figure>
+
+The program computes, for every signal, the earliest and the latest time it can change after a clock edge, recovers the critical path by walking back along the latest inputs, and then checks hold with and without **clock skew**, a difference between the times the clock reaches different flip-flops.
+
+```python run
+# Static timing analysis of a small netlist, all times in picoseconds.
+T_CCQ, T_PCQ, T_SETUP, T_HOLD = 30, 50, 40, 25        # flip-flop timing
+
+# gate: (inputs, contamination delay, propagation delay), listed in topological order
+GATES = {
+    "G1": (["R1", "R2"], 30, 45),            # NAND2
+    "G2": (["R2", "R3"], 40, 70),            # XOR2
+    "G4": (["R3"], 15, 20),                  # inverter
+    "G3": (["G1", "G2"], 35, 55),            # NOR2
+    "G5": (["G3", "G4", "R1"], 40, 60),      # AOI21
+}
+CAPTURE = {"C1": "G5", "C2": "G4"}           # capturing flip-flop: the signal on its D input
+
+late = {r: T_PCQ for r in ("R1", "R2", "R3")}    # latest arrival: setup analysis
+early = {r: T_CCQ for r in ("R1", "R2", "R3")}   # earliest arrival: hold analysis
+worst_input = {}
+for g, (ins, t_cd, t_pd) in GATES.items():
+    worst_input[g] = max(ins, key=lambda i: late[i])
+    late[g] = late[worst_input[g]] + t_pd
+    early[g] = min(early[i] for i in ins) + t_cd
+
+print("signal  earliest  latest (ps)")
+for s in late:
+    print(f"{s:6} {early[s]:9} {late[s]:7}")
+
+# Walk back from the latest-arriving capture input to recover the critical path.
+end = max(CAPTURE, key=lambda c: late[CAPTURE[c]])
+path, s = [end], CAPTURE[end]
+while s in GATES:
+    path.append(s)
+    s = worst_input[s]
+path.append(s)
+t_min = late[CAPTURE[end]] + T_SETUP
+print("\ncritical path:", " -> ".join(reversed(path)))
+print(f"minimum period {t_min} ps, maximum clock frequency {1e3 / t_min:.2f} GHz")
+
+for skew in (0, 30):     # skew > 0: the capturing flip-flops' clock arrives later than the launching ones'
+    print(f"\nclock skew {skew} ps")
+    for c, d in CAPTURE.items():
+        hold_slack = early[d] - (T_HOLD + skew)
+        print(f"  {c}: hold slack {hold_slack:4} ps {'VIOLATED' if hold_slack < 0 else 'ok'}")
+    print(f"  minimum period now {t_min - skew} ps")
+```
+
+The critical path takes 235 ps to settle, so with 40 ps of setup the clock period must be at least 275 ps: about 3.6 GHz. (The path from R3 through G2 is equally long; ties are common, and tools report every path with negative or small slack, not just one.) Without skew, both hold checks pass. But if the capturing flip-flops' clock arrives 30 ps late, the short path through the inverter violates hold by 10 ps, while the *setup* check got easier. The fix is to add at least 10 ps of delay on that short path, typically a buffer or two, without lengthening any path that is setup-critical.
+
+</Section>
+
+<Section id="skew-jitter" kind="human" title="Clock skew and jitter">
+
+The clock reaches thousands or millions of flip-flops through a **clock distribution network**: a tree of buffers, often laid out as an H-tree or a grid, designed so that every leaf sees the edge at nearly the same time. "Nearly" is the problem.
+
+- **Skew** is a fixed difference in arrival times between two flip-flops' clocks. Let $\delta$ be how much later the capturing flip-flop's clock arrives than the launching one's. Then the setup constraint becomes $T_c \ge t_{pcq} + t_{pd} + t_{setup} - \delta$ and the hold constraint $t_{ccq} + t_{cd} \ge t_{hold} + \delta$. Positive skew helps setup and hurts hold; negative skew does the opposite. Designers must assume the worst sign for each check unless they control it, and some designs schedule skew deliberately ("useful skew") to borrow time between stages.
+- **Jitter** is the variation of the clock period from cycle to cycle, from noise in the oscillator or phase-locked loop (PLL) and in the supply of the clock buffers. It cannot be designed away, so it is subtracted from the period: a 1 GHz clock with ±10 ps of cycle-to-cycle jitter offers the logic only 980 ps in the worst case.
+
+Timing budgets lump these into a **clock uncertainty** that the analysis subtracts from every period. For an FPGA, the vendor's tools know the device's clock network and compute skew and jitter themselves; you supply only the clock's frequency and the jitter of its source.
+
+<Narrator who="margaret">
+
+How much skew is a lot? A signal crosses about 15 cm of circuit board per nanosecond, and on chip, through resistive wires and buffers, the clock covers a few millimetres per 100 ps. A 20 mm die with a naively routed clock could easily see 100 ps of skew, a tenth of a 1 GHz cycle. Balanced clock trees bring it down to around 10 to 20 ps, at the cost of much of the chip's power: the clock network switches every cycle, so it can use a large share of a processor's dynamic power.
+
+</Narrator>
+
+</Section>
+
+<Section id="pipelining" kind="computation" title="Pipelining">
+
+If the critical path is too long for the clock you need, you can split it with registers. A **pipeline** divides a long computation into stages, each finishing within one clock period, with a register between consecutive stages. Lumenary CS's [From logic gates to a processor](/en/cs/logic-to-processor/) showed the idea for instruction execution; here are the numbers from the hardware side. Splitting logic of delay $t$ into $k$ equal stages gives
+
+$$T_c = \frac{t}{k} + t_{pcq} + t_{setup} + t_{\text{uncertainty}},$$
+
+so throughput rises nearly $k$-fold while $t/k$ dominates, but every stage pays the register overhead, and **latency**, the time for one result, *grows*: $k \cdot T_c > t$. The program splits 2.4 ns of logic with 110 ps of overhead per stage.
+
+```python run
+# Split 2.4 ns of logic into k pipeline stages. Each stage adds a register:
+# clock-to-Q (50 ps) + setup (40 ps), and the clock loses 20 ps to skew and jitter.
+LOGIC = 2400          # ps
+OVERHEAD = 50 + 40 + 20
+WIDTH = 64            # flip-flops per pipeline register, for a 64-bit data path
+
+print("stages  period (ps)  results per ns  latency (ps)  flip-flops  time lost to overhead")
+for k in (1, 2, 4, 8, 16, 32):
+    period = LOGIC / k + OVERHEAD
+    print(f"{k:6} {period:12.0f} {1e3 / period:15.2f} {k * period:13.0f} {k * WIDTH:11} {OVERHEAD / period:16.0%}")
+```
+
+Two stages nearly double throughput (0.76 against 0.40 results per ns). At 32 stages, 59% of every cycle is register overhead, the latency has more than doubled, and the design has 2,048 flip-flops where it had 64, each costing area and clock power. Real stages are also never perfectly balanced; the slowest decides the period. Processor designers learned this the hard way in the early 2000s, when very deep pipelines (more than 30 stages in one well-known desktop design) reached high clock rates but spent too much power and lost too much work on every mispredicted branch, and the industry returned to shorter pipelines.
+
+In hardware, pipelining must also keep data *aligned*: any value that a later stage combines with a result must be delayed by the same number of registers. The check below pipelines $y = ab + cd + e$ into three stages: two multiplications side by side, then the first addition, then the second; $e$ travels through two registers to meet the right products. The testbench compares it with the one-step version, three edges later.
+
+```verilog check
+// y = a*b + c*d + e, computed in one long combinational step, and in a 3-stage pipeline.
+module mac_comb (input logic [15:0] a, b, c, d, e, output logic [33:0] y);
+  assign y = a * b + c * d + e;
+endmodule
+
+module mac_pipe (input  logic clk, input logic [15:0] a, b, c, d, e, output logic [33:0] y);
+  logic [31:0] p1, p2;            // stage 1: the two multiplications, side by side
+  logic [15:0] e1, e2;            // e travels alongside, so it meets the right products
+  logic [32:0] s2;                // stage 2: the first addition
+  always_ff @(posedge clk) begin
+    p1 <= a * b;   p2 <= c * d;   e1 <= e;     // stage 1
+    s2 <= p1 + p2;                e2 <= e1;    // stage 2
+    y  <= s2 + e2;                             // stage 3
+  end
+endmodule
+
+module tb;
+  logic clk = 0;
+  logic [15:0] a, b, c, d, e;
+  wire  [33:0] y_comb, y_pipe;
+  mac_comb u1 (.*, .y(y_comb));
+  mac_pipe u2 (.*, .y(y_pipe));
+  always #5 clk = ~clk;
+
+  logic [33:0] expected [$];      // a queue of results the pipeline still owes us
+  int seed = 7, checked = 0;
+
+  initial begin
+    for (int cycle = 0; cycle < 200; cycle++) begin
+      a = $random(seed); b = $random(seed); c = $random(seed); d = $random(seed); e = $random(seed);
+      #1 expected.push_back(y_comb);           // what the one-step circuit says right now
+      @(posedge clk); #1;
+      if (cycle >= 2) begin                    // from the third edge on, a result emerges every cycle
+        if (y_pipe !== expected.pop_front()) $fatal(1, "pipeline result wrong at cycle %0d", cycle);
+        checked++;
+      end
+      if (cycle < 5)
+        $display("edge %0d: this cycle's inputs -> %0d   pipeline y = %0d", cycle + 1, expected[$], y_pipe);
+    end
+    $display("%0d results checked: each emerges at the 3rd edge after its inputs, one per cycle", checked);
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+edge 1: this cycle's inputs -> 2352512211   pipeline y = x
+edge 2: this cycle's inputs -> 4276507378   pipeline y = x
+edge 3: this cycle's inputs -> 166636875   pipeline y = 2352512211
+edge 4: this cycle's inputs -> 5868249063   pipeline y = 4276507378
+edge 5: this cycle's inputs -> 2064913869   pipeline y = 166636875
+198 results checked: each emerges at the 3rd edge after its inputs, one per cycle
+```
+
+A result emerges at every edge from the third onwards, each belonging to the inputs presented three edges earlier: throughput of one per cycle, latency of three. Synthesis tools can also move registers across logic automatically to balance stages, a transformation called **retiming**, which is especially effective on FPGAs.
+
+</Section>
+
+<Section id="metastability" kind="definitions" title="Metastability and synchronisers">
+
+The setup and hold constraints can be guaranteed only for signals timed by the same clock. A push-button, a signal from another chip, or data from another clock domain can change at *any* moment, including inside the setup–hold window. What happens then?
+
+A flip-flop's storage element is a bistable loop, like a ball on a hilltop between two valleys. A clean input pushes the ball firmly into one valley. An input that changes at just the wrong moment can leave it balanced near the top, at a voltage in the forbidden band, a state called **metastability**. It cannot stay there forever, because noise and the loop's own gain push it off, but *how long* it takes to fall is random and has no upper bound. The probability that it is still unresolved after time $t$ falls off as $e^{-t/\tau}$, where $\tau$, the **resolution time constant**, is a property of the flip-flop's circuit, of the order of 10 to 30 ps in modern processes.
+
+This gives the classic estimate of the **mean time between failures** of a flip-flop sampling an asynchronous signal:
+
+$$\text{MTBF} = \frac{e^{t_r / \tau}}{T_0 \, f_{\text{clk}} \, f_{\text{data}}}$$
+
+where $t_r$ is the time allowed for resolution before the output is used, $f_{\text{clk}}$ the sampling clock frequency, $f_{\text{data}}$ the rate at which the asynchronous input changes, and $T_0$ a parameter of the flip-flop related to the width of its vulnerable window. The denominator counts how often the input lands in the window; the exponential is the chance of not resolving in time.
+
+The standard defence is the **two-flip-flop synchroniser**: sample the asynchronous signal with one flip-flop, and use only the output of a second flip-flop that samples the first. The first may go metastable; the second gives it almost a whole clock period to resolve before anything uses it.
+
+<Figure caption="A two-flip-flop synchroniser. The first flip-flop samples the asynchronous signal and may occasionally go metastable; the second samples the first a clock period later, by which time it has almost certainly resolved. Only the second flip-flop's output may be used by logic in the new clock domain.">
+<svg viewBox="0 0 440 130" role="img" aria-label="Block diagram. An asynchronous input from domain A enters flip-flop 1, whose output goes directly to flip-flop 2, whose output goes to the logic of domain B. Both flip-flops are clocked by the domain B clock, drawn along the bottom. Above flip-flop 1 a label says may go metastable; between the flip-flops a label says one clock period to resolve.">
+  <defs>
+    <marker id="tc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="120" y="40" width="50" height="45" rx="3" />
+    <rect x="240" y="40" width="50" height="45" rx="3" />
+    <path d="M 138 85 L 145 76 L 152 85" />
+    <path d="M 258 85 L 265 76 L 272 85" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#tc-arrow)">
+    <path d="M 20 62 H 118" />
+    <path d="M 170 62 H 238" />
+    <path d="M 290 62 H 420" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M 20 110 H 265 V 87 M 145 110 V 87" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="145" y="66">FF1</text>
+    <text x="265" y="66">FF2</text>
+    <text x="60" y="55">async input</text>
+    <text x="60" y="80">(domain A)</text>
+    <text x="145" y="30">may go metastable</text>
+    <text x="205" y="40">one period</text>
+    <text x="205" y="52">to resolve</text>
+    <text x="360" y="55">synchronised</text>
+    <text x="360" y="80">to domain B logic</text>
+    <text x="50" y="124">clk_B</text>
+  </g>
+</svg>
+</Figure>
+
+The program evaluates the formula with illustrative parameters ($\tau = T_0 = 20$ ps, an input changing $10^7$ times per second) for a flip-flop that feeds logic directly with 200 ps to spare, and for synchronisers of two and three flip-flops.
+
+```python run
+import math
+
+# Illustrative metastability parameters, of the right order for a modern process.
+TAU = 20e-12                 # resolution time constant
+T0 = 20e-12                  # the window around the clock edge that can cause metastability
+T_SETUP, T_PCQ = 40e-12, 50e-12
+F_DATA = 10e6                # the asynchronous input changes 10 million times a second
+YEAR = 3.156e7               # seconds
+
+def mtbf(t_resolve, f_clk):
+    """Mean time between synchroniser failures, in seconds."""
+    return math.exp(t_resolve / TAU) / (T0 * f_clk * F_DATA)
+
+def show(seconds):
+    if seconds < 60:
+        return f"{seconds:.3g} s"
+    if seconds < 3600:
+        return f"{seconds / 60:.3g} minutes"
+    if seconds < YEAR:
+        return f"{seconds / 3600:.3g} hours"
+    return f"{seconds / YEAR:.3g} years"
+
+print("clock     no synchroniser    two flip-flops    three flip-flops")
+for f_clk in (250e6, 500e6, 1e9, 2e9):
+    stage = 1 / f_clk - T_SETUP - T_PCQ        # resolution time one extra flip-flop provides
+    none = 200e-12                             # the flop feeds logic directly; 200 ps of slack is left
+    print(f"{f_clk / 1e6:5.0f} MHz {show(mtbf(none, f_clk)):>15} {show(mtbf(stage, f_clk)):>17}"
+          f" {show(mtbf(2 * stage, f_clk)):>19}")
+print("\n(the universe is about 1.38e10 years old)")
+```
+
+Without a synchroniser the design fails several times a second. With two flip-flops, at 500 MHz, the MTBF exceeds the age of the universe by many orders of magnitude, because $t_r$ appears in an exponent. But the margin shrinks quickly with frequency: at 2 GHz the resolution time is only 410 ps and two flip-flops fail every half-hour, so a third is needed. High-speed designs and FPGA tools (which report MTBF for synchronisers they recognise) make exactly this calculation.
+
+<Narrator who="gideon">
+
+Note what a synchroniser does *not* do: it never makes failure impossible, only improbable, and it says nothing about which value is captured when the input changes near the edge; the new value may arrive one cycle later than you hoped. And the formula assumes the two flip-flops are placed close together with no logic between them, which is why synthesis constraints mark synchroniser flip-flops so tools neither separate them nor optimise them away.
+
+</Narrator>
+
+<Narrator who="chloe">
+
+Why can't a cleverer circuit always decide in bounded time? It is a continuity argument, which Leslie Lamport called Buridan's principle: the output of any physical decision device depends continuously on the timing of its input, so between inputs that lead to 0 and inputs that lead to 1 there must be inputs that leave it undecided at any given deadline. Engineering can make that set of inputs exponentially small, but not empty.
+
+</Narrator>
+
+</Section>
+
+<Section id="cdc" kind="examples" title="Crossing clock domains">
+
+Large chips have many clocks: a processor core, a memory interface, a USB controller and a radio may each run from their own. Every signal that passes between two **clock domains** is a potential metastability and data-corruption bug, and the rules for crossing are among the most important in digital design:
+
+- **A single control bit**, held long enough for the receiving domain to see it: a two-flip-flop synchroniser in the receiving domain.
+- **A short pulse**: convert it to a level change (toggle a flip-flop in the sending domain), synchronise the level, and detect the change on the other side.
+- **A multi-bit value**: never synchronise the bits separately. They may resolve on different cycles, and the receiver may see a mixture of old and new bits that was never sent. Either send the value with a handshake (hold the data stable, synchronise a "valid" bit, and synchronise an acknowledgement back) or, for a counter, use **Gray code**, in which consecutive values differ in exactly one bit, so a sample caught mid-change is always either the old value or the new one.
+- **A stream of data**: an **asynchronous FIFO**.
+
+An asynchronous FIFO is a small dual-port memory with a write pointer in the writer's domain and a read pointer in the reader's. Each side needs the other's pointer to know whether the FIFO is full or empty, so the pointers cross the boundary, in Gray code, through synchronisers. The synchronised pointer is a few cycles out of date, but always on the *safe* side: the writer may think the FIFO is fuller than it is, and the reader that it is emptier, so data is never overwritten or read twice. The check below is a compact eight-entry version, with a 100 MHz writer and a reader clocked at about 71 MHz with an unrelated phase; the testbench sends forty words, checks every one arrives in order, and checks that the write pointer's Gray code never changes more than one bit at a time.
+
+```verilog check
+// An asynchronous FIFO: data written with one clock is read with another, unrelated clock.
+// Only Gray-coded pointers cross between the domains, each through a two-flip-flop synchroniser.
+module async_fifo #(parameter int W = 8, A = 3) (      // 2**A = 8 entries
+  input  logic         wclk, wrst_n, winc,
+  input  logic [W-1:0] wdata,
+  output logic         wfull,
+  input  logic         rclk, rrst_n, rinc,
+  output logic [W-1:0] rdata,
+  output logic         rempty
+);
+  logic [W-1:0] mem [0:(1 << A) - 1];
+  // Pointers have one extra bit, so "full" (writer a lap ahead) differs from "empty".
+  logic [A:0] wbin, wgray, rbin, rgray;
+  logic [A:0] rgray_w1, rgray_w2;           // read pointer, synchronised into the write domain
+  logic [A:0] wgray_r1, wgray_r2;           // write pointer, synchronised into the read domain
+  logic [A:0] wbin_next, wgray_next, rbin_next, rgray_next;
+  logic [A-1:0] waddr, raddr;
+
+  assign waddr      = wbin[A-1:0];
+  assign raddr      = rbin[A-1:0];
+  assign wbin_next  = wbin + (winc & ~wfull);
+  assign wgray_next = (wbin_next >> 1) ^ wbin_next;          // binary to Gray code
+  assign rbin_next  = rbin + (rinc & ~rempty);
+  assign rgray_next = (rbin_next >> 1) ^ rbin_next;
+  assign rdata      = mem[raddr];
+
+  // Write domain. Full: the write pointer is exactly one lap ahead of the (synchronised) read
+  // pointer, which in Gray code means the top two bits differ and the rest are equal.
+  always_ff @(posedge wclk or negedge wrst_n)
+    if (!wrst_n) begin
+      wbin <= '0; wgray <= '0; wfull <= 1'b0; rgray_w1 <= '0; rgray_w2 <= '0;
+    end else begin
+      if (winc && !wfull) mem[waddr] <= wdata;
+      wbin  <= wbin_next;
+      wgray <= wgray_next;
+      wfull <= (wgray_next == (rgray_w2 ^ {2'b11, {(A - 1){1'b0}}}));
+      {rgray_w2, rgray_w1} <= {rgray_w1, rgray};               // two-flip-flop synchroniser
+    end
+
+  // Read domain. Empty: the read pointer has caught up with the (synchronised) write pointer.
+  always_ff @(posedge rclk or negedge rrst_n)
+    if (!rrst_n) begin
+      rbin <= '0; rgray <= '0; rempty <= 1'b1; wgray_r1 <= '0; wgray_r2 <= '0;
+    end else begin
+      rbin   <= rbin_next;
+      rgray  <= rgray_next;
+      rempty <= (rgray_next == wgray_r2);
+      {wgray_r2, wgray_r1} <= {wgray_r1, wgray};               // two-flip-flop synchroniser
+    end
+endmodule
+
+module tb;
+  localparam int N = 40;
+  logic wclk = 0, rclk = 0, wrst_n = 0, rrst_n = 0, winc = 0, rinc = 0;
+  logic [7:0] wdata = 0;
+  wire  [7:0] rdata;
+  wire  wfull, rempty;
+  async_fifo dut (.*);
+  always #5 wclk = ~wclk;                   // 100 MHz writer
+  always #7 rclk = ~rclk;                   // about 71 MHz reader, unrelated phase
+
+  function automatic logic [7:0] word(input int i);
+    return 8'(i * 37 + 11);
+  endfunction
+
+  function automatic int bits_set(input logic [3:0] v);
+    int n = 0;
+    for (int i = 0; i < 4; i++) n += v[i];
+    return n;
+  endfunction
+
+  int sent = 0, got = 0, full_cycles = 0;
+  logic [3:0] last_wgray = 0;
+
+  always @(posedge wclk) if (wrst_n) begin   // writer: offer word number `sent` until accepted
+    if (winc && !wfull) sent++;
+    if (winc && wfull)  full_cycles++;
+    winc  <= (sent < N);
+    wdata <= word(sent);
+  end
+
+  always @(posedge rclk) if (rrst_n) begin   // reader: always ready, checks order and values
+    if (rinc && !rempty) begin
+      if (rdata !== word(got)) $fatal(1, "word %0d: got %h, expected %h", got, rdata, word(got));
+      got++;
+    end
+    rinc <= 1;
+  end
+
+  always @(negedge wclk)                     // the Gray pointer must change at most one bit at a time
+    if (wrst_n) begin
+      if (bits_set(dut.wgray ^ last_wgray) > 1) $fatal(1, "Gray pointer jumped by more than one bit");
+      last_wgray = dut.wgray;
+    end
+
+  initial begin
+    #23 wrst_n = 1; rrst_n = 1;
+    wait (got == N);
+    $display("%0d words crossed from the 100 MHz domain to the 71 MHz domain, in order", got);
+    $display("the writer was held off by 'full' for %0d of its cycles", full_cycles);
+    $display("write pointer after the run: binary %b, Gray %b", dut.wbin, dut.wgray);
+    $finish(0);
+  end
+  initial begin #100000 $fatal(1, "timeout"); end
+endmodule
+```
+
+It prints:
+
+```text
+40 words crossed from the 100 MHz domain to the 71 MHz domain, in order
+the writer was held off by 'full' for 14 of its cycles
+write pointer after the run: binary 1000, Gray 1100
+```
+
+Because the writer is faster, the FIFO fills and the writer is held off by `full` for some of its cycles; nothing is lost. A simulation like this one cannot show metastability (simulators have no notion of a half-resolved flip-flop), so it verifies the *logic* of the crossing, not its electrical safety. That is why industry adds dedicated **CDC verification** tools, which find every signal crossing between domains in a design and check that each passes through an approved structure.
+
+</Section>
+
+<Section id="sta" kind="human" title="Static timing analysis in practice">
+
+The Python program above was a toy **static timing analyser**: "static" because it computes worst cases from the circuit's structure, without simulating any input patterns. Industrial tools do the same on designs with billions of timing arcs, adding:
+
+- **Constraints** in the Synopsys Design Constraints (SDC) format, the industry's common language, which declare the clocks and the timing of the outside world:
+
+```text
+create_clock -name core_clk -period 1.000 [get_ports clk]        ;# 1 GHz
+set_clock_uncertainty 0.030 [get_clocks core_clk]                  ;# skew + jitter budget, ns
+set_input_delay  0.300 -clock core_clk [get_ports data_in*]
+set_output_delay 0.250 -clock core_clk [get_ports data_out*]
+set_false_path -from [get_clocks usb_clk] -to [get_clocks core_clk]  ;# handled by a synchroniser
+```
+
+- **Exceptions**: *false paths* (connections that exist but are never exercised in a timing-relevant way, such as clock-domain crossings handled by synchronisers) and *multicycle paths* (logic deliberately given two or more cycles).
+- **Corners**: delays depend on manufacturing variation (process), supply voltage and temperature, so timing is checked at several **PVT corners**: setup at the slow corner, hold at the fast one. Modern flows also model **on-chip variation**, the fact that two paths on the same die differ, statistically.
+- **Wires**: at advanced nodes, wire resistance and capacitance contribute as much delay as gates, so after layout the tools extract parasitics and recompute.
+
+Commercial signoff tools include Synopsys PrimeTime and Cadence Tempus; [OpenSTA](https://github.com/parallaxsw/OpenSTA) is the open-source analyser inside the [OpenROAD](https://theopenroadproject.org/) flow. FPGA vendors' tools run their own timing analysis after place and route and report *worst negative slack* (WNS) and *total negative slack* (TNS): a design is done when both are zero. Closing timing on a large chip is a project phase of its own, covered in <LessonLink slug="chip-design">Chip design</LessonLink>.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"If the design fails, just lower the clock frequency."** That fixes setup violations only. Hold violations involve no clock period and fail at every frequency, including 1 Hz.
+
+</Misconception>
+
+<Misconception>
+
+**"A two-flip-flop synchroniser eliminates metastability."** It makes failures exponentially rare, not impossible, and its MTBF depends steeply on the clock frequency. A synchroniser that is ample at 200 MHz may be inadequate at 2 GHz.
+
+</Misconception>
+
+<Misconception>
+
+**"Each bit of a bus can have its own synchroniser."** The bits may resolve on different cycles and produce a value that was never sent. Use Gray code, a handshake or an asynchronous FIFO.
+
+</Misconception>
+
+<Misconception>
+
+**"Pipelining makes the computation faster."** It raises throughput; the latency of each result grows, because every stage adds register overhead. A pipeline also needs every value that travels alongside to be delayed equally.
+
+</Misconception>
+
+<Misconception>
+
+**"Clock skew is always bad."** It hurts one of setup or hold and helps the other. Tools exploit "useful skew" deliberately to balance unequal pipeline stages.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

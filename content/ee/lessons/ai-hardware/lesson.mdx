@@ -1,0 +1,459 @@
+---
+title: Hardware for AI
+subtitle: Why AI runs on special chips — the energy of moving data, systolic arrays and tensor cores, high-bandwidth memory, 4-bit number formats, the networks that join tens of thousands of chips, and the packaging and power that hold it all together.
+minutes: 85
+objectives:
+  - Explain why the energy of moving data, not of arithmetic, shapes AI hardware, and quantify it
+  - Simulate a weight-stationary systolic array cycle by cycle, check it against NumPy, and explain its utilisation
+  - Compute the bandwidth of HBM from its interface, and the on-chip tile size a matrix multiply needs to be compute-bound
+  - Explain block-scaled number formats (MXFP4, NVFP4) and measure their error against BF16, FP8 and INT8
+  - Distinguish scale-up from scale-out networks and describe NVLink-class links, InfiniBand and Ethernet fabrics, and where optics enter
+  - Describe advanced packaging (silicon interposers, bridges, 3D stacking) and the power of a chip and a rack in 2026
+  - Survey the 2026 landscape of GPUs, TPUs and other accelerators fairly
+prerequisites: [logic-gates-and-boolean-algebra, designing-a-processor, transistor-scaling, chip-design]
+related: [math.algebra.linear-algebra, math.comp.numerical-analysis]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: Computing's energy problem (and what we can do about it)
+    author: Mark Horowitz
+    year: 2014
+    url: https://doi.org/10.1109/ISSCC.2014.6757323
+    note: The ISSCC keynote whose table of energy per operation and per memory access is still the standard reference.
+  - title: Why systolic architectures?
+    author: H. T. Kung
+    year: 1982
+    url: https://doi.org/10.1109/MC.1982.1653825
+  - title: In-Datacenter Performance Analysis of a Tensor Processing Unit
+    author: N. P. Jouppi et al.
+    year: 2017
+    url: https://arxiv.org/abs/1704.04760
+  - title: "TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings"
+    author: N. P. Jouppi et al.
+    year: 2023
+    url: https://arxiv.org/abs/2304.01433
+  - title: AI and Memory Wall
+    author: A. Gholami, Z. Yao, S. Kim, C. Hooper, M. W. Mahoney, K. Keutzer
+    year: 2024
+    url: https://arxiv.org/abs/2403.14123
+  - title: Microscaling Data Formats for Deep Learning
+    author: B. D. Rouhani et al.
+    year: 2023
+    url: https://arxiv.org/abs/2310.10537
+    note: The MX formats, later published as an Open Compute Project specification.
+  - title: Introducing NVFP4 for efficient and accurate low-precision inference
+    author: NVIDIA
+    year: 2025
+    url: https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+  - title: "Ironwood: the first Google TPU for the age of inference"
+    author: Google
+    year: 2025
+    url: https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/
+  - title: TPU system architecture
+    author: Google Cloud
+    url: https://cloud.google.com/tpu/docs/system-architecture-tpu-vm
+  - title: NVIDIA GB200 NVL72
+    author: NVIDIA
+    url: https://www.nvidia.com/en-us/data-center/gb200-nvl72/
+  - title: AMD Instinct accelerators
+    author: AMD
+    url: https://www.amd.com/en/products/accelerators/instinct.html
+  - title: AWS Trainium
+    author: Amazon Web Services
+    url: https://aws.amazon.com/ai/machine-learning/trainium/
+  - title: Cerebras
+    url: https://www.cerebras.ai/
+  - title: Tenstorrent
+    url: https://tenstorrent.com/
+  - title: UALink Consortium
+    url: https://ualinkconsortium.org/
+  - title: Ultra Ethernet Consortium
+    url: https://ultraethernet.org/
+---
+
+<Section id="motivation" kind="motivation" title="One operation, a whole industry">
+
+Almost all the arithmetic in a neural network, in training and in serving, is matrix multiplication. Lumenary CS's lesson on [accelerators and parallelism](/en/cs/accelerators-and-parallelism/) took that fact from the software side: the roofline model, BF16 and FP8, how a training run is split across thousands of chips. Its sequel, [inference at scale](/en/cs/inference-at-scale/), showed that generating text one token at a time is limited by memory bandwidth. This lesson opens the box. What is physically inside an AI accelerator, why is it built that way, and what limits the next one?
+
+The short answer is that **arithmetic is cheap and moving data is expensive**, and every feature of these chips — grids of multipliers, stacks of DRAM beside the die, 4-bit numbers, packages larger than any single die, liquid cooling at 100 kilowatts a rack — follows from that one fact and from the shape of the matrix multiply. You have the pieces already: the transistors of <LessonLink slug="transistor-scaling">Transistor scaling</LessonLink>, the design flow and chiplets of <LessonLink slug="chip-design">How chips are designed</LessonLink>, and the datapaths of <LessonLink slug="designing-a-processor">Designing a processor</LessonLink>.
+
+</Section>
+
+<Section id="energy" kind="definitions" title="Energy, not FLOPs">
+
+In 2014 Mark Horowitz tabulated what operations cost in energy on a 45 nm process ([Horowitz, 2014](https://doi.org/10.1109/ISSCC.2014.6757323)). The absolute numbers have fallen since, but the ratios have not changed much:
+
+| Operation (45 nm, roughly) | Energy |
+| --- | --- |
+| 8-bit integer add | 0.03 pJ |
+| 32-bit floating-point add | 0.9 pJ |
+| 32-bit floating-point multiply | 3.7 pJ |
+| read 64 bits from an 8 KB on-chip SRAM | 10 pJ |
+| read 64 bits from a 1 MB on-chip SRAM | 100 pJ |
+| read 64 bits from off-chip DRAM | 1,300–2,600 pJ |
+
+Fetching an operand from DRAM costs hundreds to thousands of times more than doing arithmetic on it, and even a large on-chip memory costs far more than a small one close by. A general-purpose CPU spends most of its energy not on arithmetic at all but on fetching and decoding instructions, renaming registers and moving data through caches. An AI accelerator is a machine designed to make each byte, once fetched, take part in as many operations as possible.
+
+<Definition term="Multiply–accumulate (MAC) and data reuse">
+
+A **MAC** computes $c \leftarrow c + a \times b$, two floating-point operations. In $C = AB$ with $A$ of size $M \times K$ and $B$ of size $K \times N$, there are $MKN$ MACs but only $MK + KN$ inputs: each element of $A$ is used $N$ times and each element of $B$ is used $M$ times. **Data reuse** is how many MACs a fetched operand takes part in before it is discarded; the arithmetic intensity of the CS lesson is the same idea measured in FLOPs per byte.
+
+</Definition>
+
+<Narrator who="chloe">
+
+This is the whole reason matrix multiplication suits special hardware: $n^3$ work on $n^2$ data, so reuse grows with $n$. An elementwise operation such as adding two vectors has $n$ work on $2n$ data, reuse below one, and no hardware cleverness can fix that — only fusing it into a neighbouring matrix multiply, so its data never leaves the chip.
+
+</Narrator>
+
+</Section>
+
+<Section id="architecture" kind="intuition" title="Two ways to build a matrix engine">
+
+**GPUs** began as graphics processors: many simple cores (NVIDIA's streaming multiprocessors, AMD's compute units) each running groups of 32 or 64 threads in lockstep. Since NVIDIA's Volta generation in 2017 they have included **tensor cores**: units that multiply small matrix tiles — say $16 \times 16$ by $16 \times 8$ — in a few cycles, feeding hundreds of MACs from registers at once. Each newer generation has widened them and added lower-precision formats. Around them sit a memory hierarchy (registers, a software-managed **shared memory** per core, a large L2 cache of tens of megabytes, then HBM) and hardware for copying tiles asynchronously while the tensor cores compute. A GPU stays programmable: anything expressible as many parallel threads runs on it, which is why it carried the field from 2012 onwards.
+
+**Systolic arrays** take the other road. H. T. Kung's 1982 paper ([Kung](https://doi.org/10.1109/MC.1982.1653825)) described a grid of identical processing elements (PEs), each connected only to its neighbours, through which data pulse rhythmically like blood through the heart. Google's first TPU, designed in about 15 months and deployed in 2015, was essentially a $256 \times 256$ array of 8-bit MACs — 65,536 of them, 92 tera-operations per second — beside a large on-chip buffer ([Jouppi et al., 2017](https://arxiv.org/abs/1704.04760)). Later TPUs use several $128 \times 128$ or $256 \times 256$ arrays per chip. Because each PE talks only to its neighbours, there are no long wires and no shared register file, and an operand fetched once is reused across a whole row or column of the array.
+
+<Figure caption="A weight-stationary systolic array computing Y = XW. Each processing element holds one weight W[k][n]. Rows of X enter from the left, skewed by one cycle per row, and move right; partial sums enter at the top as zero, move down, gain one product in each PE, and leave the bottom as finished outputs.">
+
+<svg viewBox="0 0 520 300" role="img" aria-label="A three by three grid of square processing elements labelled with weights W00 to W22. Arrows show activations x entering each row from the left with increasing delays, moving right through the row, and partial sums entering each column at the top as zero, moving down, and leaving at the bottom as outputs y.">
+  <defs>
+    <marker id="sys-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1.2" fill="var(--sky-soft)">
+    <rect x="170" y="60" width="60" height="50" rx="4" /><rect x="260" y="60" width="60" height="50" rx="4" /><rect x="350" y="60" width="60" height="50" rx="4" />
+    <rect x="170" y="140" width="60" height="50" rx="4" /><rect x="260" y="140" width="60" height="50" rx="4" /><rect x="350" y="140" width="60" height="50" rx="4" />
+    <rect x="170" y="220" width="60" height="50" rx="4" /><rect x="260" y="220" width="60" height="50" rx="4" /><rect x="350" y="220" width="60" height="50" rx="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="200" y="90">W00</text><text x="290" y="90">W01</text><text x="380" y="90">W02</text>
+    <text x="200" y="170">W10</text><text x="290" y="170">W11</text><text x="380" y="170">W12</text>
+    <text x="200" y="250">W20</text><text x="290" y="250">W21</text><text x="380" y="250">W22</text>
+    <text x="200" y="30">0</text><text x="290" y="30">0</text><text x="380" y="30">0</text>
+    <text x="200" y="295">y·0</text><text x="290" y="295">y·1</text><text x="380" y="295">y·2</text>
+    <text x="60" y="89">x·0 →</text>
+    <text x="45" y="169">(1 cycle later) x·1 →</text>
+    <text x="45" y="249">(2 cycles later) x·2 →</text>
+    <text x="465" y="170" fontSize="11">activations</text>
+    <text x="465" y="184" fontSize="11">flow right</text>
+    <text x="465" y="40" fontSize="11">partial sums</text>
+    <text x="465" y="54" fontSize="11">flow down</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.3" markerEnd="url(#sys-arrow)">
+    <line x1="120" y1="85" x2="168" y2="85" /><line x1="230" y1="85" x2="258" y2="85" /><line x1="320" y1="85" x2="348" y2="85" />
+    <line x1="120" y1="165" x2="168" y2="165" /><line x1="230" y1="165" x2="258" y2="165" /><line x1="320" y1="165" x2="348" y2="165" />
+    <line x1="120" y1="245" x2="168" y2="245" /><line x1="230" y1="245" x2="258" y2="245" /><line x1="320" y1="245" x2="348" y2="245" />
+    <line x1="200" y1="36" x2="200" y2="58" /><line x1="290" y1="36" x2="290" y2="58" /><line x1="380" y1="36" x2="380" y2="58" />
+    <line x1="200" y1="110" x2="200" y2="138" /><line x1="290" y1="110" x2="290" y2="138" /><line x1="380" y1="110" x2="380" y2="138" />
+    <line x1="200" y1="190" x2="200" y2="218" /><line x1="290" y1="190" x2="290" y2="218" /><line x1="380" y1="190" x2="380" y2="218" />
+    <line x1="200" y1="270" x2="200" y2="282" /><line x1="290" y1="270" x2="290" y2="282" /><line x1="380" y1="270" x2="380" y2="282" />
+  </g>
+</svg>
+
+</Figure>
+
+Here is the array of the figure as a cycle-by-cycle simulation. Each PE does one multiply–accumulate per cycle; all data move only between neighbours.
+
+```python run
+import numpy as np
+
+def systolic_matmul(X, W):
+    """Cycle-by-cycle model of a weight-stationary K x N systolic array computing X @ W.
+
+    PE (k, n) holds weight W[k, n]. Row k of activations enters from the left, skewed by k
+    cycles, and moves one PE right per cycle. Partial sums enter each column at the top as 0,
+    move one PE down per cycle, and leave the bottom as finished outputs.
+    """
+    M, K = X.shape
+    K2, N = W.shape
+    assert K == K2
+    x_reg = np.zeros((K, N))          # activation held in each PE after this cycle
+    p_reg = np.zeros((K, N))          # partial sum leaving each PE after this cycle
+    Y = np.zeros((M, N))
+    cycles = 0
+    for t in range(M + N + K - 2):
+        x_in = np.zeros((K, N))
+        x_in[:, 1:] = x_reg[:, :-1]                     # activations shift right
+        for k in range(K):                              # skewed feed on the left edge
+            m = t - k
+            if 0 <= m < M:
+                x_in[k, 0] = X[m, k]
+        p_in = np.zeros((K, N))
+        p_in[1:, :] = p_reg[:-1, :]                     # partial sums shift down
+        p_reg = p_in + x_in * W                         # every PE does one multiply-accumulate
+        x_reg = x_in
+        for n in range(N):                              # collect finished sums at the bottom
+            m = t - n - (K - 1)
+            if 0 <= m < M:
+                Y[m, n] = p_reg[K - 1, n]
+        cycles += 1
+    return Y, cycles
+
+rng = np.random.default_rng(0)
+X = rng.integers(-5, 6, size=(6, 4)).astype(float)    # 6 rows (tokens) of 4 features
+W = rng.integers(-5, 6, size=(4, 3)).astype(float)    # a 4 x 3 weight matrix, one per PE
+Y, cycles = systolic_matmul(X, W)
+print("systolic result equals numpy:", np.array_equal(Y, X @ W))
+print(f"cycles: {cycles} = M + N + K - 2 = {6 + 3 + 4 - 2}")
+print(Y.astype(int))
+
+# Utilisation of a 128 x 128 array: useful MACs / (PEs x cycles) for one pass of M rows.
+print("\n128 x 128 array, one weight tile, M rows streamed through:")
+K = N = 128
+for M in (1, 8, 64, 512, 4096):
+    util = (M * K * N) / (K * N * (M + N + K - 2))
+    print(f"  M = {M:5d}: utilisation {util:6.1%}")
+```
+
+The simulated array reproduces NumPy's product exactly, in $M + N + K - 2 = 11$ cycles. The second table is the hardware lesson. A $128 \times 128$ array needs about 254 cycles to fill and drain, whatever the work, so streaming a single row of activations through it (as when a model decodes one token for one user) uses 0.4% of the multipliers; streaming thousands of rows uses over 90%. Systolic arrays, and tensor cores for the same reason, want **large batches and large matrices**.
+
+<Narrator who="gideon">
+
+The utilisation table charges each pass with the full fill and drain. A real array overlaps them — the next tile's activations follow the last ones in, and the next weights are loaded into shadow registers while the current ones are in use — so long streams approach 100%. What cannot be hidden is a matrix whose dimensions are smaller than the array, or not a multiple of its size: a $130 \times 130$ problem on a $128 \times 128$ array needs four tiles, two of them almost empty, which is why model widths are chosen as multiples of 128 or 256.
+
+</Narrator>
+
+</Section>
+
+<Section id="memory" kind="computation" title="HBM and the memory wall">
+
+The arrays are useless if they wait for data. An accelerator's main memory is **high-bandwidth memory (HBM)**: stacks of DRAM dies, thinned to a few tens of micrometres, joined by thousands of **through-silicon vias** (TSVs) to a base die at the bottom, placed millimetres from the processor on a silicon interposer. Where a graphics card's GDDR chip talks over a 32-bit interface at very high per-pin speed, an HBM stack uses a **1,024-bit** interface (2,048 in HBM4) at moderate speed: wires inside a silicon interposer are short and dense enough to make that many connections practical and cheap in energy.
+
+<Figure caption="An accelerator package in cross-section (not to scale). The compute die and HBM stacks sit side by side on a silicon interposer, whose fine wiring carries thousands of signals between them. Each HBM stack is a base die plus eight to sixteen thinned DRAM dies joined by through-silicon vias.">
+
+<svg viewBox="0 0 600 230" role="img" aria-label="Cross-section of an accelerator package. A package substrate on solder balls at the bottom; a silicon interposer on it; on the interposer, a wide compute die in the middle with an HBM stack on each side. Each HBM stack is drawn as a base die with eight thin DRAM layers above it and vertical lines through them representing through-silicon vias.">
+  <g stroke="currentColor" strokeWidth="1.2">
+    <rect x="20" y="170" width="560" height="28" fill="var(--sky-soft)" />
+    <rect x="40" y="150" width="520" height="14" fill="var(--gold)" fillOpacity="0.35" />
+    <rect x="215" y="88" width="170" height="56" fill="var(--human)" fillOpacity="0.35" />
+    <rect x="70" y="128" width="100" height="16" fill="var(--formal)" fillOpacity="0.45" />
+    <rect x="430" y="128" width="100" height="16" fill="var(--formal)" fillOpacity="0.45" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1" fill="var(--formal)" fillOpacity="0.2">
+    <rect x="70" y="116" width="100" height="12" /><rect x="70" y="104" width="100" height="12" /><rect x="70" y="92" width="100" height="12" /><rect x="70" y="80" width="100" height="12" />
+    <rect x="70" y="68" width="100" height="12" /><rect x="70" y="56" width="100" height="12" /><rect x="70" y="44" width="100" height="12" /><rect x="70" y="32" width="100" height="12" />
+    <rect x="430" y="116" width="100" height="12" /><rect x="430" y="104" width="100" height="12" /><rect x="430" y="92" width="100" height="12" /><rect x="430" y="80" width="100" height="12" />
+    <rect x="430" y="68" width="100" height="12" /><rect x="430" y="56" width="100" height="12" /><rect x="430" y="44" width="100" height="12" /><rect x="430" y="32" width="100" height="12" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5">
+    <line x1="100" y1="32" x2="100" y2="144" /><line x1="120" y1="32" x2="120" y2="144" /><line x1="140" y1="32" x2="140" y2="144" />
+    <line x1="460" y1="32" x2="460" y2="144" /><line x1="480" y1="32" x2="480" y2="144" /><line x1="500" y1="32" x2="500" y2="144" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="60" cy="204" r="5" /><circle cx="120" cy="204" r="5" /><circle cx="180" cy="204" r="5" /><circle cx="240" cy="204" r="5" /><circle cx="300" cy="204" r="5" /><circle cx="360" cy="204" r="5" /><circle cx="420" cy="204" r="5" /><circle cx="480" cy="204" r="5" /><circle cx="540" cy="204" r="5" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="300" y="120">compute die</text>
+    <text x="120" y="22">HBM stack</text>
+    <text x="480" y="22">HBM stack</text>
+    <text x="120" y="140" fontSize="9">base die</text>
+    <text x="480" y="140" fontSize="9">base die</text>
+    <text x="300" y="161" fontSize="10">silicon interposer: thousands of short wires</text>
+    <text x="300" y="189" fontSize="10">package substrate</text>
+    <text x="300" y="80" fontSize="10">vertical lines in the stacks: through-silicon vias</text>
+  </g>
+</svg>
+
+</Figure>
+
+The **memory wall** is the observation that, across a decade of accelerators, peak arithmetic has grown far faster than memory bandwidth ([Gholami et al., 2024](https://arxiv.org/abs/2403.14123)), so more and more workloads are limited by bytes, not FLOPs. The program computes bandwidth from the interface, the ridge point of an illustrative 2025–26 accelerator, and what that demands of the chip's on-chip memory.
+
+```python run
+# 1. HBM bandwidth from the interface: width x data rate per pin.
+def stack_bw(width_bits, gbps_per_pin):
+    return width_bits * gbps_per_pin * 1e9 / 8          # bytes per second
+
+for name, width, rate in [("HBM2E", 1024, 3.6), ("HBM3", 1024, 6.4),
+                          ("HBM3E", 1024, 9.6), ("HBM4", 2048, 8.0)]:
+    print(f"{name:6s} {width}-bit interface at {rate} Gb/s per pin: {stack_bw(width, rate) / 1e12:5.2f} TB/s per stack")
+
+# 2. An illustrative accelerator of 2025-26: 8 HBM3E stacks, about 2 PFLOP/s dense BF16.
+PEAK = 2.0e15                         # FLOP/s, an assumed round number
+HBM = 8 * stack_bw(1024, 8.0)         # 8 stacks, run a little below the 9.6 Gb/s maximum
+print(f"\nchip: {PEAK / 1e15:.1f} PFLOP/s, {HBM / 1e12:.1f} TB/s of HBM -> ridge point {PEAK / HBM:.0f} FLOP per byte")
+
+# 3. Tiling: a matmul C = A @ B computed in b x b output tiles, streaming the K dimension.
+#    Per tile: read b*K of A and K*b of B (2 bytes each), do 2*b*b*K FLOPs  ->  intensity = b/2 FLOP/byte.
+print("\noutput tile b   intensity   on-chip buffer (A and B panels, k-step 512, BF16)   bound")
+for b in (32, 64, 128, 256, 512, 1024):
+    intensity = (2 * b * b) / (2 * 2 * b)            # FLOPs per byte from HBM, independent of K
+    buffer = 2 * (2 * b * 512) + 4 * b * b            # two input panels + an FP32 accumulator tile
+    bound = "compute" if intensity >= PEAK / HBM else "memory"
+    print(f"   {b:5d}        {intensity:6.0f}         {buffer / 2**20:8.2f} MiB                                  {bound}")
+
+# 4. Energy: moving a byte from HBM versus doing arithmetic on it (orders of magnitude).
+pj_per_flop = 0.5            # assumed: a low-precision multiply-accumulate in a modern tensor unit
+pj_per_byte_hbm = 4 * 8      # assumed: about 4 pJ per bit to read HBM
+print(f"\nenergy of one HBM byte = {pj_per_byte_hbm / pj_per_flop:.0f} FLOPs; "
+      f"at intensity 1 the chip spends {pj_per_byte_hbm / (pj_per_byte_hbm + pj_per_flop):.0%} of its energy moving data")
+```
+
+Three conclusions. An HBM3E stack delivers about 1.2 TB/s and an HBM4 stack about 2 TB/s, so a chip with eight stacks has 8–16 TB/s. Even so, our illustrative chip needs about 244 FLOPs per byte to be compute-bound. A matrix multiply tiled into $b \times b$ output blocks reaches intensity $b/2$, so the tile must be about 500 on a side, needing a couple of megabytes of fast on-chip storage for the tiles in flight — which is why accelerators carry tens to hundreds of megabytes of SRAM, and why their designers fight for every square millimetre of it. And at an intensity of 1, under these assumptions, 98% of the energy goes on moving data.
+
+HBM is made by three companies — SK hynix and Samsung in Korea and Micron in the United States — and through 2023–26 it has been one of the tightest supply constraints on AI hardware, alongside advanced packaging. JEDEC published the HBM4 standard in 2025, doubling the interface to 2,048 bits and allowing the base die to be made on a logic process, so that some of the memory controller, or even compute, can move into the stack.
+
+<Narrator who="margaret">
+
+Run the numbers for decoding a 70-billion-parameter model in 8-bit weights: every generated token must read 70 GB of weights. At 8 TB/s that takes about 8.75 ms, so a single stream tops out near 114 tokens per second however many FLOPs the chip has. Batching many users shares each weight read across all of them — the reason serving systems batch so aggressively.
+
+</Narrator>
+
+</Section>
+
+<Section id="formats" kind="computation" title="Number formats in silicon">
+
+The CS lesson explained BF16 and FP8. The hardware reason for going lower is area and energy: a multiplier's size grows roughly with the square of its mantissa width, so an FP8 multiplier is several times smaller than a BF16 one and an FP4 multiplier smaller again, and every halving of bits also halves the bytes moved. But 4 bits can represent only 16 values. The **E2M1** format used for FP4 has just $\pm\{0, 0.5, 1, 1.5, 2, 3, 4, 6\}$.
+
+The trick that makes such narrow formats usable is **block scaling**. Instead of one scale factor per tensor, every small block of consecutive values shares its own scale, chosen so that the block's largest value lands near the top of the format's range.
+
+<Definition term="Microscaling (MX) and NVFP4 formats">
+
+In the Open Compute Project's **MX** formats ([Rouhani et al., 2023](https://arxiv.org/abs/2310.10537)), each block of 32 elements shares an 8-bit scale that is a pure power of two (E8M0); the elements are FP8, FP6, FP4 or INT8, giving MXFP8, MXFP6, MXFP4 and MXINT8. NVIDIA's **NVFP4** ([NVIDIA, 2025](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)) uses blocks of 16 FP4 elements whose shared scale is an FP8 E4M3 number — a finer scale than a power of two — plus one FP32 scale per tensor. Hardware support arrived in 2024–25: NVIDIA's Blackwell GPUs support the MX formats and NVFP4, and AMD's MI350 series the MX formats.
+
+</Definition>
+
+The program rounds a synthetic weight matrix (Gaussian, with a few large outliers, as real weight matrices have) into each format and measures the relative error of the weights and of 64 dot products of length 4,096.
+
+```python run
+import numpy as np
+
+def round_float(x, man_bits, emin, max_val):
+    """Round to a binary float format with `man_bits` stored mantissa bits, smallest normal
+    exponent `emin` (subnormals below it) and largest finite value `max_val`; saturate on overflow."""
+    x = np.asarray(x, dtype=np.float64)
+    a = np.abs(x)
+    e = np.floor(np.log2(np.where(a > 0, a, 1.0)))
+    e = np.maximum(e, emin)                          # below emin the spacing stays fixed: subnormals
+    step = 2.0 ** (e - man_bits)
+    q = np.round(a / step) * step                     # round to nearest, ties to even
+    return np.sign(x) * np.minimum(q, max_val)
+
+def bf16(x):    return round_float(x, 7, -126, 3.39e38)
+def e4m3(x):    return round_float(x, 3, -6, 448.0)       # OCP FP8 E4M3
+def fp4(x):     return round_float(x, 1, 0, 6.0)          # E2M1: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+
+def fp8_per_tensor(x):
+    s = np.abs(x).max() / 448.0
+    return e4m3(x / s) * s
+
+def int8_per_tensor(x):
+    s = np.abs(x).max() / 127.0
+    return np.clip(np.round(x / s), -127, 127) * s
+
+def int8_per_block(x, block=32):
+    xb = x.reshape(-1, block)
+    s = np.abs(xb).max(axis=1, keepdims=True) / 127.0
+    return (np.clip(np.round(xb / s), -127, 127) * s).reshape(x.shape)
+
+def mxfp4(x, block=32):
+    """OCP MX: each block of 32 shares a power-of-two scale (E8M0); elements are FP4 E2M1."""
+    xb = x.reshape(-1, block)
+    amax = np.abs(xb).max(axis=1, keepdims=True)
+    scale = 2.0 ** (np.floor(np.log2(amax)) - 2)      # 2 = exponent of FP4's largest power of two (4)
+    return (fp4(xb / scale) * scale).reshape(x.shape)
+
+def nvfp4_like(x, block=16):
+    """Blocks of 16 share a scale stored in FP8 E4M3 (finer than a power of two); elements FP4."""
+    xb = x.reshape(-1, block)
+    amax = np.abs(xb).max(axis=1, keepdims=True)
+    t = np.abs(x).max() / (448.0 * 6.0)               # per-tensor factor keeps block scales in E4M3 range
+    scale = e4m3(amax / 6.0 / t) * t
+    return (fp4(xb / scale) * scale).reshape(x.shape)
+
+rng = np.random.default_rng(7)
+w = rng.normal(0.0, 0.02, size=4096 * 64)
+w[rng.choice(w.size, 64, replace=False)] *= 25        # a few large outliers, as real weights have
+a = rng.normal(0.0, 1.0, size=4096)
+
+def rel_err(q, x):
+    return np.linalg.norm(q - x) / np.linalg.norm(x)
+
+print("format                         bits/value  weight error   error of 64 dot products (length 4096)")
+W, ref = w.reshape(64, 4096), w.reshape(64, 4096) @ a
+for name, f, bits in [("BF16", bf16, 16),
+                      ("FP8 E4M3, one scale per tensor", fp8_per_tensor, 8),
+                      ("INT8, one scale per tensor", int8_per_tensor, 8),
+                      ("INT8, one scale per block of 32", int8_per_block, 8 + 16 / 32),
+                      ("MXFP4 (blocks of 32, 2^k scale)", mxfp4, 4 + 8 / 32),
+                      ("NVFP4-like (blocks of 16, FP8 scale)", nvfp4_like, 4 + 8 / 16)]:
+    q = f(w)
+    print(f"{name:37s} {bits:5.2f}      {rel_err(q, w):7.2%}       {rel_err(q.reshape(64, 4096) @ a, ref):7.2%}")
+```
+
+Read it row by row. BF16's error is about 0.2%. FP8 E4M3 with one scale per tensor is about 2.6%: its exponent bits give it enough dynamic range to cope with the outliers. INT8 with one scale per tensor is far worse, about 12%, because the outliers force a large scale and the ordinary small weights fall into a handful of levels; give INT8 one scale per block of 32 and its error drops to under 1%. At 4 bits even block scaling leaves errors of roughly 10%, with NVFP4's smaller blocks and finer scales doing better than MXFP4's. Notice too that dot products of length 4,096 do not average the error away: rounding errors here are random but the relative error of the sum stays about the same as that of the weights.
+
+<Narrator who="gideon">
+
+These percentages describe one synthetic matrix, not a model's quality. What matters is the accuracy of the trained network on real tasks, and models tolerate rounding very unevenly: some layers and some tensors (attention softmax inputs, the final layers, gradients in training) are far more sensitive than others. So 4-bit inference and training use mixed recipes — sensitive parts in higher precision, rotations that spread out outliers before rounding, accumulation in FP32 — and claims should always be checked on task benchmarks.
+
+</Narrator>
+
+</Section>
+
+<Section id="interconnect" kind="human" title="Interconnect: joining tens of thousands of chips">
+
+A frontier training run uses tens of thousands of accelerators, and they spend a large part of their time exchanging data: all-reduces of gradients, the all-to-all of mixture-of-experts layers, pipeline transfers (the CS lesson describes the patterns). Two tiers of network serve them.
+
+**Scale-up** links join a few dozen to a few thousand accelerators into one domain with memory-like semantics — any chip can load from or store to another's HBM — at bandwidths of order a terabyte per second per chip. NVIDIA's NVLink is the best-known example: its GB200 NVL72 rack joins 72 GPUs through NVLink switch trays, each GPU with 1.8 TB/s of NVLink bandwidth, over thousands of short copper cables in the rack's spine ([NVIDIA](https://www.nvidia.com/en-us/data-center/gb200-nvl72/)). Google's TPUs use their own inter-chip interconnect in a 3D torus, with **optical circuit switches** — arrays of tiny steerable mirrors — reconnecting blocks of chips into whatever shape a job needs ([Jouppi et al., 2023](https://arxiv.org/abs/2304.01433)); Google describes Ironwood pods of 9,216 chips ([Google](https://blog.google/products/google-cloud/ironwood-tpu-age-of-inference/)). AMD, Intel, Broadcom, Google, Meta, Microsoft and others formed the **UALink** consortium, which published an open scale-up specification in 2025 ([UALink](https://ualinkconsortium.org/)).
+
+**Scale-out** networks join those domains into clusters of tens or hundreds of thousands of chips. The two main fabrics are **InfiniBand**, long dominant in supercomputing, and **Ethernet** with RDMA (RoCE), which the hyperscalers prefer; the **Ultra Ethernet Consortium** published its 1.0 specification in 2025 to adapt Ethernet's transport and congestion control to AI traffic ([UEC](https://ultraethernet.org/)). Switch chips from Broadcom, NVIDIA, Cisco, Marvell and others reached 51.2 and then 102.4 Tb/s per chip in 2023–25.
+
+Within a rack, copper wins: it is cheap and needs no power-hungry conversion. Beyond a couple of metres at 200 Gb/s per lane, copper's losses are too high, and links become optical: pluggable transceivers at 800 Gb/s and 1.6 Tb/s, and increasingly **co-packaged optics**, with the optical engines inside the switch package. That is a subject of <LessonLink slug="photonics">Photonics</LessonLink>.
+
+</Section>
+
+<Section id="packaging" kind="examples" title="Packaging and power">
+
+An accelerator is now a package, not a die. TSMC's **CoWoS** family puts compute dies and HBM stacks on a silicon interposer (CoWoS-S) or on an organic interposer with embedded silicon bridges (CoWoS-L), and interposers of several times the 26 × 33 mm reticle area are in production, with larger ones announced. Intel's EMIB embeds small silicon bridges in the package substrate instead, and its Foveros stacks dies vertically; Samsung and the large outsourced assembly-and-test companies (ASE, Amkor, JCET and others) offer their own 2.5D and 3D processes. Through 2023–25, CoWoS capacity was one of the binding limits on how many AI accelerators the world could build.
+
+<Example title="Power, from chip to rack">
+
+A Hopper-generation H100 module in 2022–23 was rated at up to 700 W. Blackwell-generation GPUs of 2025–26 draw roughly 1 to 1.4 kW each, and a GB200 NVL72 rack — 72 GPUs, 36 CPUs, switches and power conversion — draws about 120 kW and is liquid-cooled. Ten years earlier, a typical data-centre rack drew 5–10 kW. At a supply of about 0.8 V, a 1 kW chip draws over 1,000 A, delivered through thousands of package pins from voltage regulators centimetres away. NVIDIA and others have described rack designs for 2027 of several hundred kilowatts, which is driving a move to higher-voltage DC distribution. The next lesson, <LessonLink slug="powering-data-centres">Powering the AI data centre</LessonLink>, follows that power from the grid to the transistor.
+
+</Example>
+
+</Section>
+
+<Section id="landscape" kind="human" title="The landscape in 2026">
+
+A fair summary, dated late 2026 — this changes every few months, and every vendor's headline figures use the precision and sparsity that flatter them, so compare like with like:
+
+- **NVIDIA** GPUs (Hopper, then Blackwell and Blackwell Ultra, with the Rubin generation scheduled for 2026) have the largest share and, as important, the most mature software stack (CUDA and its libraries). Its rack-scale NVLink systems are sold as a unit.
+- **AMD** Instinct GPUs (the MI300 and MI350 series, with MI400-series rack systems announced for 2026) compete on memory capacity — up to 288 GB of HBM per GPU in the MI350 series — with an open-source software stack, ROCm.
+- **Google** TPUs, now in their seventh generation (Ironwood), used inside Google and rented through Google Cloud. Google's figures for Ironwood are 4,614 dense FP8 TFLOP/s and 192 GB of HBM at 7.37 TB/s per chip.
+- **Custom accelerators of other cloud companies**: Amazon's Trainium and Inferentia, Microsoft's Maia, Meta's MTIA — often designed with partners such as Broadcom, Marvell or Alchip.
+- **China**: Huawei's Ascend accelerators, built into large optically connected clusters, and others including Cambricon, developed under export controls that restrict access to the most advanced chips, fabs and HBM.
+- **Different architectures**: Cerebras (wafer-scale chips with tens of gigabytes of on-chip SRAM), Groq (SRAM-only inference chips spread across many dies), SambaNova (reconfigurable dataflow), Tenstorrent (RISC-V cores with tensor units, with open-source software), and others in Korea, Japan, the UK and elsewhere.
+
+What will matter next is still open: whether 4-bit and lower formats hold up across models, how much HBM capacity and bandwidth can grow (HBM4 and beyond), whether optics move into the package, and whether inference — by many accounts now a larger share of AI computing than training — favours different chips.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The chip with the most TFLOP/s is the fastest."** For decoding, recommendation models and many other workloads the limit is memory bandwidth or capacity, or the network; for training at scale it is often communication. Compare chips on the workload you care about, at the precision you will use, at the cluster size you will run.
+
+</Misconception>
+
+<Misconception>
+
+**"TPUs and GPUs are fundamentally different machines."** Both are arrays of matrix engines fed by on-chip SRAM and HBM, with fast chip-to-chip links. They differ in how the matrix engine is organised (large systolic arrays versus many smaller tensor cores inside programmable cores), in programming model and software, and in how the chips are networked — differences that matter, but of degree.
+
+</Misconception>
+
+<Misconception>
+
+**"Lower precision is free speed."** Each halving of bits roughly doubles throughput and halves memory traffic, but adds error that must be managed with scaling, outlier handling and mixed precision, and that some layers cannot tolerate. The format is a choice per tensor, not per chip.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

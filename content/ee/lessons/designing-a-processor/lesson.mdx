@@ -1,0 +1,753 @@
+---
+title: Designing a processor
+subtitle: A real instruction set, a datapath and its control, a single-cycle RISC-V processor in Verilog that runs a program, and the road from there to the cores in your phone.
+minutes: 90
+objectives:
+  - Read and encode RV32I instructions in their six formats, and explain why the immediates are laid out as they are
+  - Build a single-cycle datapath (program counter, register file, immediate generator, ALU, memories) and derive its control signals
+  - Implement and verify a single-cycle RISC-V processor in Verilog against an instruction-set simulator
+  - Compute processor performance with the iron law, and compare single-cycle and pipelined designs
+  - Design the forwarding and load-use hazard logic of a five-stage pipeline
+  - Describe how real cores differ (caches, branch prediction, superscalar and out-of-order execution) and survey open RISC-V cores and the ecosystem
+prerequisites: [timing-and-clocking]
+related: [math.comp.computability, math.comp.formal-methods]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: RISC-V ratified specifications
+    author: RISC-V International
+    url: https://riscv.org/specifications/ratified/
+    note: The unprivileged ISA manual defines RV32I and every format used in this lesson; free to read and to implement.
+  - title: RISC-V International
+    url: https://riscv.org/
+    note: The non-profit that maintains the ISA, with its members, working groups and profiles.
+  - title: "Spike, the RISC-V ISA simulator"
+    url: https://github.com/riscv-software-src/riscv-isa-sim
+    note: The reference instruction-set simulator that hardware teams compare their designs against.
+  - title: riscv-formal
+    url: https://github.com/YosysHQ/riscv-formal
+    note: A framework for formally verifying RISC-V processors against the ISA specification.
+  - title: An efficient algorithm for exploiting multiple arithmetic units
+    author: Robert M. Tomasulo
+    year: 1967
+    url: https://doi.org/10.1147/rd.111.0025
+    note: The IBM paper behind out-of-order execution with register renaming.
+  - title: PicoRV32
+    url: https://github.com/YosysHQ/picorv32
+    note: A small, readable RISC-V core in a single Verilog file.
+  - title: Ibex
+    url: https://github.com/lowRISC/ibex
+    note: lowRISC's small, carefully verified two-stage RISC-V core.
+  - title: CVA6
+    url: https://github.com/openhwfoundation/cva6
+    note: A configurable six-stage, application-class RISC-V core from the OpenHW Foundation, able to boot Linux.
+  - title: XiangShan
+    url: https://github.com/OpenXiangShan/XiangShan
+    note: A high-performance open-source out-of-order RISC-V core from the Chinese Academy of Sciences and partners.
+---
+
+<Section id="motivation" kind="motivation" title="From a simulator to a processor">
+
+Lumenary CS's [From logic gates to a processor](/en/cs/logic-to-processor/) built a processor for a made-up instruction set, T16, as a Python program: fetch, decode, execute, in a loop. That captured what a processor *does*. This lesson builds one the way hardware engineers do: for a real instruction set, RISC-V, as a Verilog description that could be synthesised for an FPGA, from the blocks of the previous lessons: the register of <LessonLink slug="sequential-logic-and-state-machines">Sequential logic</LessonLink>, the ALU of <LessonLink slug="combinational-logic">Combinational logic</LessonLink>, and the timing rules of <LessonLink slug="timing-and-clocking">Timing and clocking</LessonLink>.
+
+We start with the simplest organisation that works, a **single-cycle** processor, in which every instruction completes in one long clock cycle. It is easy to understand and easy to verify, and it runs a real program, a function call that sums an array, to the right answer in its testbench. Then we measure why nobody ships one, sketch the pipelined design that replaces it, with the hardware that resolves its hazards, and survey how the cores in phones, laptops and data centres go further. The lesson ends with the open RISC-V cores and tools you can study and run yourself.
+
+</Section>
+
+<Section id="isa" kind="definitions" title="The instruction set: a RISC-V subset">
+
+**RISC-V** is an open instruction-set architecture (ISA), started at the University of California, Berkeley, in 2010 and governed since 2015 by RISC-V International, now based in Switzerland. Its base integer ISA for 32-bit machines, **RV32I**, has about forty instructions. Its architectural state is small:
+
+- 32 registers `x0` to `x31`, each 32 bits wide. `x0` always reads as zero and ignores writes. The software convention gives the others names by role: `ra` (`x1`, return address), `sp` (stack pointer), `a0`–`a7` (arguments and results), `t0`–`t6` (temporaries), `s0`–`s11` (saved across calls).
+- A program counter, `pc`.
+- A byte-addressed, little-endian memory.
+
+Every instruction is 32 bits long, in one of six formats:
+
+| Format | bits 31–25 | 24–20 | 19–15 | 14–12 | 11–7 | 6–0 | Used by |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R | funct7 | rs2 | rs1 | funct3 | rd | opcode | `add`, `sub`, `and`, `slt`, `sll` … |
+| I | imm[11:5] | imm[4:0] | rs1 | funct3 | rd | opcode | `addi`, `lw`, `jalr` … |
+| S | imm[11:5] | rs2 | rs1 | funct3 | imm[4:0] | opcode | `sw` |
+| B | imm[12, 10:5] | rs2 | rs1 | funct3 | imm[4:1, 11] | opcode | `beq`, `bne`, `blt` … |
+| U | imm[31:25] | imm[24:20] | imm[19:15] | imm[14:12] | rd | opcode | `lui`, `auipc` |
+| J | imm[20, 10:5] | imm[4:1, 11] | imm[19:15] | imm[14:12] | rd | opcode | `jal` |
+
+The layout looks odd at first, especially the shuffled immediates of B and J. It is designed for the hardware. The register fields `rs1`, `rs2` and `rd` are always in the same place, so the register file can be read *before* the instruction is decoded. The sign of every immediate is always bit 31, so sign extension starts at once. And the shuffling keeps each immediate bit in the same instruction position across formats wherever possible, so the multiplexers that assemble immediates are as small as they can be. Branch and jump offsets are multiples of 2, so their bit 0 is not stored.
+
+<Narrator who="chloe">
+
+Why is it "reduced"? Because a load–store architecture separates two concerns: only loads and stores touch memory, and every arithmetic instruction works on registers. That makes every instruction the same length and nearly the same shape, which is exactly what lets a single fixed datapath, and later a pipeline, handle them all.
+
+</Narrator>
+
+Our processor implements RV32I except the byte and halfword loads and stores, the memory-ordering instruction `fence`, and the system instructions (`ecall`, `ebreak` and the control-and-status registers): all register–register and register–immediate arithmetic, `lw` and `sw`, the six conditional branches, `jal`, `jalr`, `lui` and `auipc`. Here is the program it will run: a function that sums an array of words, called from a main routine that stores the result after the array.
+
+An **assembler** turns that text into machine code. The one below is complete for our subset and takes two passes, one to find the address of each label and one to encode, with each format a few shifts and masks. Its output was checked word by word against the LLVM project's RISC-V assembler.
+
+```python run
+# A two-pass assembler for the RV32I subset our processor implements.
+ABI = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+       "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"]
+REG = {name: i for i, name in enumerate(ABI)} | {f"x{i}": i for i in range(32)}
+
+R_OPS = {"add": (0, 0), "sub": (0, 0x20), "sll": (1, 0), "slt": (2, 0), "sltu": (3, 0),
+         "xor": (4, 0), "srl": (5, 0), "sra": (5, 0x20), "or": (6, 0), "and": (7, 0)}   # funct3, funct7
+I_OPS = {"addi": 0, "slti": 2, "sltiu": 3, "xori": 4, "ori": 6, "andi": 7}
+SHIFT_I = {"slli": (1, 0), "srli": (5, 0), "srai": (5, 0x20)}
+BRANCHES = {"beq": 0, "bne": 1, "blt": 4, "bge": 5, "bltu": 6, "bgeu": 7}
+
+def bits(value, hi, lo):
+    """Bits hi..lo of a (possibly negative) integer, as an unsigned field."""
+    return (value >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+def r_type(f7, rs2, rs1, f3, rd, op):  return f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+def i_type(imm, rs1, f3, rd, op):      return bits(imm, 11, 0) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+def s_type(imm, rs2, rs1, f3, op):
+    return bits(imm, 11, 5) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | bits(imm, 4, 0) << 7 | op
+def b_type(imm, rs2, rs1, f3, op):     # the offset's bits are scattered so that bit 31 is always the sign
+    return (bits(imm, 12, 12) << 31 | bits(imm, 10, 5) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12
+            | bits(imm, 4, 1) << 8 | bits(imm, 11, 11) << 7 | op)
+def u_type(imm, rd, op):               return bits(imm, 19, 0) << 12 | rd << 7 | op
+def j_type(imm, rd, op):
+    return (bits(imm, 20, 20) << 31 | bits(imm, 10, 1) << 21 | bits(imm, 11, 11) << 20
+            | bits(imm, 19, 12) << 12 | rd << 7 | op)
+
+def assemble(source):
+    lines = [l.split("#")[0].strip() for l in source.splitlines()]
+    labels, program = {}, []
+    for line in lines:                          # pass 1: the address of every label
+        if ":" in line:
+            label, line = line.split(":")
+            labels[label.strip()] = 4 * len(program)
+            line = line.strip()
+        if line:
+            program.append(line)
+    words = []
+    for addr, line in enumerate(program):       # pass 2: encode
+        pc = 4 * addr
+        op, *args = line.replace(",", " ").replace("(", " ").replace(")", " ").split()
+        val = lambda a: labels[a] - pc if a in labels else int(a, 0)
+        if op in R_OPS:
+            f3, f7 = R_OPS[op]
+            words.append(r_type(f7, REG[args[2]], REG[args[1]], f3, REG[args[0]], 0b0110011))
+        elif op in I_OPS:
+            words.append(i_type(val(args[2]), REG[args[1]], I_OPS[op], REG[args[0]], 0b0010011))
+        elif op in SHIFT_I:
+            f3, f7 = SHIFT_I[op]
+            words.append(i_type(f7 << 5 | val(args[2]), REG[args[1]], f3, REG[args[0]], 0b0010011))
+        elif op == "lw":                        # lw rd, offset(rs1)
+            words.append(i_type(val(args[1]), REG[args[2]], 2, REG[args[0]], 0b0000011))
+        elif op == "sw":                        # sw rs2, offset(rs1)
+            words.append(s_type(val(args[1]), REG[args[0]], REG[args[2]], 2, 0b0100011))
+        elif op in BRANCHES:
+            words.append(b_type(val(args[2]), REG[args[1]], REG[args[0]], BRANCHES[op], 0b1100011))
+        elif op == "jal":
+            words.append(j_type(val(args[1]), REG[args[0]], 0b1101111))
+        elif op == "jalr":                      # jalr rd, offset(rs1)
+            words.append(i_type(val(args[1]), REG[args[2]], 0, REG[args[0]], 0b1100111))
+        elif op in ("lui", "auipc"):
+            words.append(u_type(val(args[1]), REG[args[0]], 0b0110111 if op == "lui" else 0b0010111))
+        else:
+            raise ValueError(f"unknown instruction {op}")
+    return words, program, labels
+
+PROGRAM = """
+main:   lui   s0, 0x1           # s0 = 0x1000, where the array starts in data memory
+        addi  a0, s0, 0         # first argument: the array's address
+        addi  a1, zero, 8       # second argument: its length
+        jal   ra, sum           # call sum; the result comes back in a0
+        sw    a0, 32(s0)        # store it just after the array
+done:   jal   zero, done        # finished: jump to itself forever
+sum:    addi  t0, zero, 0       # t0 = running total
+loop:   lw    t1, 0(a0)         # load the next element
+        add   t0, t0, t1
+        addi  a0, a0, 4         # advance the pointer by one 4-byte word
+        addi  a1, a1, -1        # one fewer to go
+        bne   a1, zero, loop
+        addi  a0, t0, 0         # return the total in a0
+        jalr  zero, 0(ra)       # return to the caller
+"""
+words, program, labels = assemble(PROGRAM)
+print("labels:", {k: hex(v) for k, v in labels.items()})
+for i, (w, text) in enumerate(zip(words, program)):
+    print(f"{4 * i:04x}:  {w:08x}   {text}")
+```
+
+Look at the `bne` at address `0x2c`. Its target, `loop`, is 16 bytes back, so the offset is $-16$, which is `1 1111 1111 0000` in 13-bit two's complement. Scattered into the B format, its sign and bits 10 to 5 fill the top seven bits of `fe0598e3` (all ones), and bits 4 to 1 and 11 fill bits 11 to 7 (`1000` and `1`); bit 0, always zero, is not stored.
+
+</Section>
+
+<Section id="datapath" kind="definitions" title="The datapath">
+
+A **datapath** is the hardware that holds and transforms data; **control** is the logic that tells it what to do for each instruction. For a single-cycle RISC-V processor the datapath needs:
+
+- the **program counter** register, and an adder computing `pc + 4`;
+- an **instruction memory**, read at address `pc` (a separate memory, so that an instruction and its data can be accessed in the same cycle);
+- a **register file** with two read ports (for `rs1` and `rs2`) and one write port (for `rd`), reads combinational and the write at the clock edge;
+- an **immediate generator**, which builds the sign-extended immediate for the instruction's format;
+- the **ALU**, whose second operand is either `rs2` or the immediate, chosen by a multiplexer;
+- a **data memory**, addressed by the ALU's result, for loads and stores;
+- a **write-back multiplexer** choosing what goes into `rd`: the ALU result, the loaded word, or `pc + 4` (the return address of `jal` and `jalr`);
+- **next-PC logic**: `pc + 4`, or a branch or jump target.
+
+<Figure caption="The single-cycle datapath. An instruction flows left to right: the PC addresses the instruction memory; its register fields read the register file and its immediate is generated; the ALU computes; the data memory is read or written; the write-back multiplexer returns a result to the register file (the loop along the bottom). The next PC is PC + 4 or a branch or jump target. The control unit decodes the opcode and drives every multiplexer and write enable; its wires are omitted for clarity.">
+<svg viewBox="0 0 560 305" role="img" aria-label="Datapath block diagram. From left: the PC register feeds an instruction memory and a plus-4 adder. The instruction memory's output is a bus that goes to a control unit, to the rs1, rs2 and rd ports of the register file, and to an immediate generator. The register file's first output feeds the ALU; its second output feeds a multiplexer whose other input is the immediate, and also the data memory's write-data input. The multiplexer feeds the ALU's second input. The ALU result addresses the data memory and also goes to a write-back multiplexer, together with the data memory's output and PC plus 4. The write-back multiplexer's output loops along the bottom back to the register file's write-data port. A target adder adds the PC and the immediate, and a next-PC multiplexer above the PC chooses between PC plus 4 and the target.">
+  <defs>
+    <marker id="dp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" fillOpacity="0.6" stroke="currentColor" strokeWidth="1.4">
+    <rect x="20" y="140" width="40" height="50" rx="3" />
+    <rect x="85" y="120" width="80" height="90" rx="3" />
+    <rect x="200" y="65" width="100" height="33" rx="3" />
+    <rect x="205" y="115" width="90" height="100" rx="3" />
+    <rect x="205" y="235" width="90" height="30" rx="3" />
+    <rect x="430" y="135" width="70" height="80" rx="3" />
+    <rect x="85" y="60" width="40" height="25" rx="3" />
+    <rect x="355" y="60" width="50" height="25" rx="3" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.4">
+    <path d="M 22 95 H 58 L 52 110 H 28 Z" />
+    <path d="M 320 150 L 335 158 V 207 L 320 215 Z" />
+    <path d="M 355 120 L 405 140 V 190 L 355 210 V 172 L 363 165 L 355 158 Z" />
+    <path d="M 520 120 L 535 128 V 212 L 520 220 Z" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.1" markerEnd="url(#dp-arrow)">
+    <path d="M 40 110 V 138" />
+    <path d="M 60 165 H 83" />
+    <path d="M 72 165 V 72 H 83" />
+    <path d="M 72 72 V 52 H 345 V 66 H 353" />
+    <path d="M 125 72 H 140 V 45 H 32 V 93" />
+    <path d="M 405 72 H 420 V 35 H 48 V 93" />
+    <path d="M 165 165 H 185 V 82 H 198" />
+    <path d="M 185 135 H 203" />
+    <path d="M 185 155 H 203" />
+    <path d="M 185 175 H 203" />
+    <path d="M 185 250 H 203" />
+    <path d="M 185 165 V 250" />
+    <path d="M 295 140 H 353" />
+    <path d="M 295 180 H 310 V 170 H 318" />
+    <path d="M 310 180 V 228 H 420 V 195 H 428" />
+    <path d="M 315 250 V 200 H 318" />
+    <path d="M 295 250 H 345 V 79 H 353" />
+    <path d="M 335 182 H 353" />
+    <path d="M 405 165 H 428" />
+    <path d="M 415 165 V 115 H 510 V 140 H 518" />
+    <path d="M 500 175 H 518" />
+    <path d="M 527 245 V 218" />
+    <path d="M 535 170 H 548 V 290 H 195 V 195 H 203" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="72" cy="165" r="2.2" /><circle cx="72" cy="72" r="2.2" /><circle cx="185" cy="165" r="2.2" />
+    <circle cx="310" cy="180" r="2.2" /><circle cx="315" cy="250" r="2.2" /><circle cx="415" cy="165" r="2.2" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="10" textAnchor="middle">
+    <text x="40" y="169">PC</text>
+    <text x="125" y="162">instruction</text>
+    <text x="125" y="175">memory</text>
+    <text x="250" y="85">control</text>
+    <text x="255" y="162">register</text>
+    <text x="255" y="175">file</text>
+    <text x="250" y="254">immediate</text>
+    <text x="383" y="168">ALU</text>
+    <text x="465" y="172">data</text>
+    <text x="465" y="185">memory</text>
+    <text x="105" y="77">+4</text>
+    <text x="380" y="77">target</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="8">
+    <text x="208" y="138">rs1</text>
+    <text x="208" y="158">rs2</text>
+    <text x="208" y="178">rd</text>
+    <text x="208" y="198">wd</text>
+    <text x="433" y="168">addr</text>
+    <text x="433" y="198">wdata</text>
+    <text x="527" y="256" textAnchor="middle">PC+4</text>
+    <text x="64" y="104">next PC</text>
+    <text x="440" y="285">write-back</text>
+  </g>
+</svg>
+</Figure>
+
+<Example title="Tracing two instructions through the datapath">
+
+**`lw t1, 0(a0)`** (I format). The register file reads `a0`; the immediate generator produces 0; the ALU-source multiplexer chooses the immediate, and the ALU adds: the address. The data memory reads that word; the write-back multiplexer chooses the memory's output, and at the clock edge it is written into `t1` while the PC becomes `pc + 4`. This is the longest path through the datapath: instruction memory, register file, ALU, data memory, multiplexer, register file.
+
+**`bne a1, zero, loop`** (B format). The register file reads `a1` and `x0`; a comparator decides whether they differ; the immediate generator produces $-16$ and the target adder computes `pc - 16`. If the branch is taken the next-PC multiplexer selects the target, otherwise `pc + 4`. Nothing is written to the register file or the data memory: their write enables are off.
+
+</Example>
+
+</Section>
+
+<Section id="control" kind="definitions" title="Control">
+
+The control unit is combinational logic from the opcode (and, for the ALU, `funct3` and bit 30) to the datapath's select and enable signals:
+
+| Opcode | Register write | ALU operand B | ALU operation | Memory write | Write-back source | Next PC |
+| --- | --- | --- | --- | --- | --- | --- |
+| R-type (`add` …) | yes | `rs2` | from funct3, funct7 | no | ALU | `pc + 4` |
+| I-type (`addi` …) | yes | immediate | from funct3 (and bit 30 for `srai`) | no | ALU | `pc + 4` |
+| `lw` | yes | immediate | add | no | memory | `pc + 4` |
+| `sw` | no | immediate | add | yes | – | `pc + 4` |
+| branches | no | `rs2` | (comparator) | no | – | target if taken |
+| `jal` | yes | – | – | no | `pc + 4` | `pc + imm` |
+| `jalr` | yes | immediate | add | no | `pc + 4` | `(rs1 + imm)` with bit 0 cleared |
+| `lui`, `auipc` | yes | immediate | add (to 0, or to `pc`) | no | ALU | `pc + 4` |
+
+RISC-V makes the ALU decoding easy: `funct3` *is* the operation (000 add or subtract, 001 shift left, 010 set-less-than, 011 unsigned set-less-than, 100 XOR, 101 shift right, 110 OR, 111 AND), and instruction bit 30 chooses subtract over add and arithmetic over logical shift. So the ALU in the Verilog below is driven directly by `funct3`, a small improvement on the separate operation code of the previous ALU.
+
+</Section>
+
+<Section id="single-cycle" kind="computation" title="A single-cycle RISC-V processor in Verilog">
+
+Before building hardware, build a **golden model**: an instruction-set simulator, written as simply as possible and directly from the specification, whose results the hardware must reproduce. The one below decodes the machine code from the assembler (each format's immediate built from its scattered bits), runs the program on an array that includes negative numbers, and reports the result.
+
+```python run
+# An instruction-set simulator: the "golden model" the hardware must agree with.
+CODE = [0x00001437, 0x00040513, 0x00800593, 0x00c000ef, 0x02a42023, 0x0000006f, 0x00000293,
+        0x00052303, 0x006282b3, 0x00450513, 0xfff58593, 0xfe0598e3, 0x00028513, 0x00008067]
+ARRAY = [12, -5, 7, 30, 1, -9, 4, 2]            # in data memory at 0x1000
+MASK = 0xFFFFFFFF
+
+def signed(x, width=32):
+    return x - (1 << width) if x >> (width - 1) & 1 else x
+
+def field(w, hi, lo):
+    return (w >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+def immediates(w):
+    """The five immediate formats, each sign-extended from instruction bit 31."""
+    return {
+        "I": signed(field(w, 31, 20), 12),
+        "S": signed(field(w, 31, 25) << 5 | field(w, 11, 7), 12),
+        "B": signed(field(w, 31, 31) << 12 | field(w, 7, 7) << 11 | field(w, 30, 25) << 5 | field(w, 11, 8) << 1, 13),
+        "U": signed(field(w, 31, 12) << 12),
+        "J": signed(field(w, 31, 31) << 20 | field(w, 19, 12) << 12 | field(w, 20, 20) << 11 | field(w, 30, 21) << 1, 21),
+    }
+
+def alu(f3, alt, a, b):
+    sh = b & 31
+    return {0: a - b if alt else a + b, 1: a << sh, 2: int(signed(a) < signed(b)), 3: int(a < b),
+            4: a ^ b, 5: (signed(a) >> sh) if alt else a >> sh, 6: a | b, 7: a & b}[f3] & MASK
+
+def run(code, data, max_steps=1000):
+    x = [0] * 32
+    mem = {0x1000 + 4 * i: v & MASK for i, v in enumerate(data)}
+    pc, steps = 0, 0
+    while steps < max_steps:
+        w = code[pc // 4]
+        op, rd, f3 = field(w, 6, 0), field(w, 11, 7), field(w, 14, 12)
+        rs1, rs2, alt = x[field(w, 19, 15)], x[field(w, 24, 20)], field(w, 30, 30)
+        imm = immediates(w)
+        nxt, result = pc + 4, None
+        if op == 0b0110011:   result = alu(f3, alt, rs1, rs2)                       # R-type
+        elif op == 0b0010011: result = alu(f3, alt and f3 == 5, rs1, imm["I"] & MASK)  # I-type ALU
+        elif op == 0b0000011: result = mem[(rs1 + imm["I"]) & MASK]                  # lw
+        elif op == 0b0100011: mem[(rs1 + imm["S"]) & MASK] = rs2                     # sw
+        elif op == 0b1100011:                                                         # branches
+            taken = {0: rs1 == rs2, 1: rs1 != rs2, 4: signed(rs1) < signed(rs2),
+                     5: signed(rs1) >= signed(rs2), 6: rs1 < rs2, 7: rs1 >= rs2}[f3]
+            if taken:
+                nxt = pc + imm["B"]
+        elif op == 0b1101111: result, nxt = pc + 4, pc + imm["J"]                    # jal
+        elif op == 0b1100111: result, nxt = pc + 4, (rs1 + imm["I"]) & ~1 & MASK     # jalr
+        elif op == 0b0110111: result = imm["U"] & MASK                                # lui
+        elif op == 0b0010111: result = (pc + imm["U"]) & MASK                         # auipc
+        if result is not None and rd != 0:
+            x[rd] = result
+        steps += 1
+        if steps <= 6 or nxt == pc:
+            print(f"step {steps:2}: pc={pc:04x} word={w:08x} -> a0={signed(x[10])} a1={signed(x[11])} t0={signed(x[5])}")
+        if nxt == pc:                                                                  # jump to self: done
+            return x, mem, steps
+        pc = nxt
+
+x, mem, steps = run(CODE, ARRAY)
+print(f"a0 = {signed(x[10])}, memory[0x1020] = {signed(mem[0x1020])}, sum(ARRAY) = {sum(ARRAY)}")
+print(f"{steps} instructions, the last being the jump-to-self at 'done'")
+print("immediates of the bne at 0x2c:", immediates(0xfe0598e3)["B"], "(back 16 bytes to 'loop')")
+```
+
+The hardware follows the datapath figure section by section. All the state, the PC, the register file and the data memory, changes only at the clock edge; everything between is combinational, as in every synchronous design. The testbench loads the machine code and the array into the memories, releases reset, prints the first few cycles, and runs until the PC reaches `done`, then checks the sum, the stored result, the cycle count and the return address that `jal` saved.
+
+```verilog check
+// A single-cycle processor for RV32I without byte/halfword memory access or system instructions.
+// Every instruction is fetched, decoded, executed and written back in one clock cycle.
+module rv32_single_cycle (input logic clk, rst_n);
+  logic [31:0] imem [0:63];                 // instruction memory: 64 words from address 0
+  logic [31:0] dmem [0:255];                // data memory: 256 words, at 0x1000 in the programs here
+  logic [31:0] x    [0:31];                 // the register file (x0 is never written)
+  logic [31:0] pc, instr;
+
+  // ---- fetch and decode -------------------------------------------------------------
+  logic [6:0] opcode, funct7;
+  logic [4:0] rd, rs1, rs2;
+  logic [2:0] funct3;
+  logic [5:0] iaddr;
+  assign iaddr  = pc[7:2];
+  assign instr  = imem[iaddr];
+  assign opcode = instr[6:0];
+  assign rd     = instr[11:7];
+  assign funct3 = instr[14:12];
+  assign rs1    = instr[19:15];
+  assign rs2    = instr[24:20];
+  assign funct7 = instr[31:25];
+
+  localparam logic [6:0] OP = 7'b0110011, OP_IMM = 7'b0010011, LOAD = 7'b0000011, STORE = 7'b0100011,
+                         BRANCH = 7'b1100011, JAL = 7'b1101111, JALR = 7'b1100111,
+                         LUI = 7'b0110111, AUIPC = 7'b0010111;
+
+  // Immediate generator: five formats, all sign-extended from instruction bit 31.
+  logic [31:0] imm_i, imm_s, imm_b, imm_u, imm_j;
+  assign imm_i = {{20{instr[31]}}, instr[31:20]};
+  assign imm_s = {{20{instr[31]}}, instr[31:25], instr[11:7]};
+  assign imm_b = {{19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
+  assign imm_u = {instr[31:12], 12'b0};
+  assign imm_j = {{11{instr[31]}}, instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
+
+  // Register file: two read ports, one write port; x0 always reads as zero.
+  logic [31:0] rv1, rv2;
+  assign rv1 = (rs1 == 5'd0) ? 32'd0 : x[rs1];
+  assign rv2 = (rs2 == 5'd0) ? 32'd0 : x[rs2];
+
+  // ---- control: what each opcode needs from the datapath --------------------------------
+  logic        reg_write, mem_write, alt;
+  logic [31:0] alu_a, alu_b, imm;
+  always_comb begin
+    reg_write = (opcode == OP) || (opcode == OP_IMM) || (opcode == LOAD) || (opcode == JAL)
+             || (opcode == JALR) || (opcode == LUI) || (opcode == AUIPC);
+    mem_write = (opcode == STORE);
+    case (opcode)
+      STORE:      imm = imm_s;
+      BRANCH:     imm = imm_b;
+      JAL:        imm = imm_j;
+      LUI, AUIPC: imm = imm_u;
+      default:    imm = imm_i;
+    endcase
+    alu_a = (opcode == AUIPC) ? pc : (opcode == LUI) ? 32'd0 : rv1;
+    alu_b = (opcode == OP || opcode == BRANCH) ? rv2 : imm;
+  end
+  // funct7 bit 5 selects sub and sra; for immediates it only matters for srai.
+  assign alt = (opcode == OP && funct7[5]) || (opcode == OP_IMM && funct3 == 3'b101 && funct7[5]);
+
+  // ---- execute: the ALU, using RISC-V's own funct3 encoding of operations --------------------
+  logic [2:0]  alu_f3;
+  logic [4:0]  shamt;
+  logic [31:0] alu_y;
+  assign alu_f3 = (opcode == OP || opcode == OP_IMM) ? funct3 : 3'b000;   // everything else adds
+  assign shamt  = alu_b[4:0];
+  always_comb
+    case (alu_f3)
+      3'b000: alu_y = alt ? alu_a - alu_b : alu_a + alu_b;
+      3'b001: alu_y = alu_a << shamt;
+      3'b010: alu_y = {31'd0, $signed(alu_a) < $signed(alu_b)};
+      3'b011: alu_y = {31'd0, alu_a < alu_b};
+      3'b100: alu_y = alu_a ^ alu_b;
+      3'b101: alu_y = alt ? $signed(alu_a) >>> shamt : alu_a >> shamt;
+      3'b110: alu_y = alu_a | alu_b;
+      3'b111: alu_y = alu_a & alu_b;
+    endcase
+
+  // Branch comparator.
+  logic taken;
+  always_comb
+    case (funct3)
+      3'b000:  taken = (rv1 == rv2);
+      3'b001:  taken = (rv1 != rv2);
+      3'b100:  taken = ($signed(rv1) <  $signed(rv2));
+      3'b101:  taken = ($signed(rv1) >= $signed(rv2));
+      3'b110:  taken = (rv1 <  rv2);
+      3'b111:  taken = (rv1 >= rv2);
+      default: taken = 1'b0;
+    endcase
+
+  // ---- memory and write-back -----------------------------------------------------------------
+  logic [7:0]  daddr;
+  logic [31:0] load_data, wb, pc_plus4, pc_next;
+  assign daddr     = alu_y[9:2];                   // word address within data memory
+  assign load_data = dmem[daddr];
+  assign pc_plus4  = pc + 32'd4;
+  assign wb        = (opcode == LOAD) ? load_data : (opcode == JAL || opcode == JALR) ? pc_plus4 : alu_y;
+  assign pc_next   = (opcode == JAL)                ? pc + imm_j
+                   : (opcode == JALR)               ? (rv1 + imm_i) & ~32'd1
+                   : (opcode == BRANCH && taken)    ? pc + imm_b
+                   :                                  pc_plus4;
+
+  // ---- the only state: PC, registers and data memory, all updated at the clock edge ----------
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n) pc <= 32'd0;
+    else        pc <= pc_next;
+
+  always_ff @(posedge clk) begin
+    if (rst_n && reg_write && rd != 5'd0) x[rd] <= wb;
+    if (rst_n && mem_write)               dmem[daddr] <= rv2;
+  end
+endmodule
+
+module tb;
+  logic clk = 0, rst_n = 0;
+  rv32_single_cycle cpu (.clk(clk), .rst_n(rst_n));
+  always #5 clk = ~clk;
+
+  // Machine code from the lesson's assembler (checked against LLVM's RISC-V assembler).
+  int cycles = 0;
+  localparam logic [31:0] DONE = 32'h14;
+
+  initial begin
+    cpu.imem[0]  = 32'h00001437;  cpu.imem[1]  = 32'h00040513;  cpu.imem[2]  = 32'h00800593;
+    cpu.imem[3]  = 32'h00c000ef;  cpu.imem[4]  = 32'h02a42023;  cpu.imem[5]  = 32'h0000006f;
+    cpu.imem[6]  = 32'h00000293;  cpu.imem[7]  = 32'h00052303;  cpu.imem[8]  = 32'h006282b3;
+    cpu.imem[9]  = 32'h00450513;  cpu.imem[10] = 32'hfff58593;  cpu.imem[11] = 32'hfe0598e3;
+    cpu.imem[12] = 32'h00028513;  cpu.imem[13] = 32'h00008067;
+    // The array 12, -5, 7, 30, 1, -9, 4, 2 at 0x1000 (word addresses 0 to 7 of data memory).
+    cpu.dmem[0] = 12;  cpu.dmem[1] = -5;  cpu.dmem[2] = 7;  cpu.dmem[3] = 30;
+    cpu.dmem[4] = 1;   cpu.dmem[5] = -9;  cpu.dmem[6] = 4;  cpu.dmem[7] = 2;
+
+    #12 rst_n = 1;
+    while (cpu.pc != DONE && cycles < 1000) begin
+      if (cycles < 6)
+        $display("cycle %0d: pc=%h instr=%h  a0=%0d a1=%0d t0=%0d", cycles + 1, cpu.pc, cpu.instr,
+                 $signed(cpu.x[10]), $signed(cpu.x[11]), $signed(cpu.x[5]));
+      @(posedge clk); #1;
+      cycles++;
+    end
+    $display("reached 'done' after %0d cycles: a0 = %0d, memory[0x1020] = %0d, ra = %h",
+             cycles, $signed(cpu.x[10]), $signed(cpu.dmem[8]), cpu.x[1]);
+    if (cpu.x[10] !== 32'd42 || cpu.dmem[8] !== 32'd42) $fatal(1, "wrong sum");
+    if (cycles != 48)                                   $fatal(1, "expected 48 instructions before 'done'");
+    if (cpu.x[1] !== 32'h10)                            $fatal(1, "jal should have saved the return address 0x10");
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+cycle 1: pc=00000000 instr=00001437  a0=x a1=x t0=x
+cycle 2: pc=00000004 instr=00040513  a0=x a1=x t0=x
+cycle 3: pc=00000008 instr=00800593  a0=4096 a1=x t0=x
+cycle 4: pc=0000000c instr=00c000ef  a0=4096 a1=8 t0=x
+cycle 5: pc=00000018 instr=00000293  a0=4096 a1=8 t0=x
+cycle 6: pc=0000001c instr=00052303  a0=4096 a1=8 t0=0
+reached 'done' after 48 cycles: a0 = 42, memory[0x1020] = 42, ra = 00000010
+```
+
+The hardware agrees with the golden model: 42 in `a0` and in memory, after 48 instructions in 48 cycles (the ISS's 49th step was the jump-to-self at `done`, where the testbench stops). The trace shows each cycle's state *before* its clock edge, so `a0` becomes 4096 (`0x1000`) one line after the `addi` that computes it; the `x` values are registers that have not been written yet, which a real register file would leave just as undefined at power-up. At cycle 5 the PC jumps from `0x0c` to `0x18`: that was `jal ra, sum`.
+
+<Narrator who="gideon">
+
+Agreement on one program is not correctness. Industrial teams run thousands of directed and random programs on the hardware and on a reference model such as Spike, comparing every register write as it retires ("lock-step co-simulation"), and the riscv-formal project can *prove* that a core matches the ISA for all programs, up to a bounded number of cycles. A single-cycle core is the easiest case for both, which is one reason it is a good first design.
+
+</Narrator>
+
+</Section>
+
+<Section id="performance" kind="computation" title="Performance: why single-cycle is slow">
+
+The time a program takes is the **iron law** of processor performance:
+
+$$\text{time} = \text{instructions} \times \frac{\text{cycles}}{\text{instruction}} \times \frac{\text{seconds}}{\text{cycle}}.$$
+
+The single-cycle design has the best possible cycles per instruction (CPI = 1) and the worst possible clock period: every instruction is given as long as the slowest, the load, needs. With illustrative component delays:
+
+```python run
+# Delays of the datapath's parts, in picoseconds (illustrative, for a modest process).
+D = {"clk-to-Q": 30, "instr mem": 200, "reg read": 100, "mux": 25, "ALU": 150,
+     "data mem": 200, "setup": 50}
+
+# Single-cycle: the period must fit the slowest instruction, a load, end to end.
+load_path = ["clk-to-Q", "instr mem", "reg read", "mux", "ALU", "data mem", "mux", "setup"]
+t_single = sum(D[p] for p in load_path)
+print("load path:", " + ".join(f"{p} {D[p]}" for p in load_path), f"= {t_single} ps")
+
+# Five-stage pipeline: the period must fit the slowest stage plus the register overhead.
+stages = {"IF": D["instr mem"], "ID": D["reg read"], "EX": D["mux"] + D["ALU"],
+          "MEM": D["data mem"], "WB": D["mux"]}
+t_pipe = max(stages.values()) + D["clk-to-Q"] + D["setup"]
+print("stage delays:", stages, f"-> pipelined period {t_pipe} ps")
+
+# Iron law: time = instructions x cycles per instruction x period.
+# A typical mix: 25% loads, 40% of them followed at once by a user (1 stall each);
+# 15% branches, 10% mispredicted, resolved in EX (2 cycles lost each).
+cpi = 1 + 0.25 * 0.40 * 1 + 0.15 * 0.10 * 2
+print(f"\npipelined CPI {cpi:.2f}: {t_pipe * cpi:.0f} ps per instruction against {t_single} single-cycle,"
+      f" speed-up {t_single / (t_pipe * cpi):.2f}")
+
+# The lesson's program: 48 instructions, 8 load-use stalls (lw then add in each iteration), and
+# 9 taken control transfers (jal, jalr, 7 taken bne) costing 2 cycles each without prediction.
+cycles = 48 + 4 + 8 + 9 * 2        # + 4 to fill the pipeline
+print(f"sum program: single-cycle {48 * t_single / 1000:.1f} ns, pipelined {cycles} cycles"
+      f" = {cycles * t_pipe / 1000:.1f} ns")
+```
+
+A load needs 780 ps from clock edge to clock edge, so even an `add`, which needs neither the data memory nor most of the time, waits 780 ps. Pipelining into five stages cuts the period to the slowest stage plus register overhead, 280 ps, at the cost of a CPI slightly above 1. On a typical mix the pipeline is about 2.5 times faster; on our small program, with its tight loop of a load immediately used and a branch taken every iteration, 1.7 times. Both figures depend on how well the hazards are handled.
+
+<Narrator who="margaret">
+
+The 2.5 is far from the ideal 5 for a five-stage pipeline. The stages are unbalanced (memory stages take 200 ps, write-back only 25), each stage pays 80 ps of register overhead, and stalls add 13% to the CPI. Real designs rebalance work between stages, hide memory latency with caches, and predict branches, which is where most of the remaining factor goes.
+
+</Narrator>
+
+</Section>
+
+<Section id="pipelining" kind="examples" title="From single-cycle to pipelined: hazards and forwarding">
+
+The CS lesson introduced the five classic stages, **IF** (fetch), **ID** (decode and read registers), **EX** (execute), **MEM** (memory) and **WB** (write-back), and the three kinds of hazard. In hardware, pipelining means inserting a **pipeline register** between consecutive stages, holding everything the rest of the instruction needs: its operands, its immediate, its destination register number and its control signals, which travel down the pipeline with it. Each hazard then has a hardware answer.
+
+**Data hazards and forwarding.** In `add x5, x1, x2` followed by `sub x6, x5, x3`, the `sub` reads `x5` in ID while the `add` is still in EX; the register file holds the old value. But the new value already exists, at the ALU's output. A **forwarding unit** compares the source registers of the instruction in EX with the destination registers of the two instructions ahead of it (now in MEM and WB) and, on a match, steers a multiplexer in front of each ALU input to take the newer value instead of the register file's. Two details matter: if both instructions ahead write the same register, the *newer* one (in MEM) wins; and `x0` must never be forwarded, since writes to it are discarded.
+
+**The load-use hazard.** A load's data appears only at the end of MEM, too late to forward into the very next instruction's EX. A **hazard detection unit** in ID spots a load in EX whose destination matches a source of the instruction being decoded, and **stalls**: it holds the PC and the IF/ID register for one cycle and sends a bubble (a do-nothing instruction) into EX. Compilers reorder code to put an independent instruction after each load, so the stall is rare in optimised code; our summing loop, written by hand, pays it every iteration.
+
+The check below verifies both units on the situations just described.
+
+```verilog check
+// The forwarding unit and load-use hazard detector of a classic five-stage RISC-V pipeline.
+module forwarding_unit (
+  input  logic [4:0] ex_rs1, ex_rs2,             // source registers of the instruction in EX
+  input  logic [4:0] mem_rd, wb_rd,              // destinations of the two instructions ahead of it
+  input  logic       mem_reg_write, wb_reg_write,
+  output logic [1:0] fwd_a, fwd_b                // 00: register file, 10: from MEM, 01: from WB
+);
+  always_comb begin
+    fwd_a = 2'b00;
+    fwd_b = 2'b00;
+    if (wb_reg_write  && wb_rd  != 5'd0 && wb_rd  == ex_rs1) fwd_a = 2'b01;
+    if (mem_reg_write && mem_rd != 5'd0 && mem_rd == ex_rs1) fwd_a = 2'b10;   // newer value wins
+    if (wb_reg_write  && wb_rd  != 5'd0 && wb_rd  == ex_rs2) fwd_b = 2'b01;
+    if (mem_reg_write && mem_rd != 5'd0 && mem_rd == ex_rs2) fwd_b = 2'b10;
+  end
+endmodule
+
+module hazard_unit (
+  input  logic [4:0] id_rs1, id_rs2,             // sources of the instruction being decoded
+  input  logic [4:0] ex_rd,
+  input  logic       ex_is_load,                 // the instruction in EX is a load
+  output logic       stall                       // hold PC and IF/ID; send a bubble into EX
+);
+  assign stall = ex_is_load && ex_rd != 5'd0 && (ex_rd == id_rs1 || ex_rd == id_rs2);
+endmodule
+
+module tb;
+  logic [4:0] ex_rs1, ex_rs2, mem_rd, wb_rd, id_rs1, id_rs2, ex_rd;
+  logic       mem_rw, wb_rw, ex_load;
+  wire  [1:0] fa, fb;
+  wire        stall;
+  forwarding_unit fu (.ex_rs1(ex_rs1), .ex_rs2(ex_rs2), .mem_rd(mem_rd), .wb_rd(wb_rd),
+                      .mem_reg_write(mem_rw), .wb_reg_write(wb_rw), .fwd_a(fa), .fwd_b(fb));
+  hazard_unit hu (.id_rs1(id_rs1), .id_rs2(id_rs2), .ex_rd(ex_rd), .ex_is_load(ex_load), .stall(stall));
+
+  task automatic fwd(input string what, input logic [4:0] s1, s2, m, w, input logic mw, ww,
+                     input logic [1:0] want_a, want_b);
+    ex_rs1 = s1; ex_rs2 = s2; mem_rd = m; wb_rd = w; mem_rw = mw; wb_rw = ww; #1;
+    $display("%-46s fwd_a=%b fwd_b=%b", what, fa, fb);
+    if (fa !== want_a || fb !== want_b) $fatal(1, "forwarding wrong: %s", what);
+  endtask
+
+  task automatic haz(input string what, input logic [4:0] s1, s2, d, input logic load, want);
+    id_rs1 = s1; id_rs2 = s2; ex_rd = d; ex_load = load; #1;
+    $display("%-46s stall=%b", what, stall);
+    if (stall !== want) $fatal(1, "hazard detection wrong: %s", what);
+  endtask
+
+  initial begin
+    //    situation                                       rs1 rs2 MEM.rd WB.rd MEM.w WB.w  expect a, b
+    fwd("add x5,x1,x2 then sub x6,x5,x3",                  5,  3,  5,    0,   1,    0,    2'b10, 2'b00);
+    fwd("add x5,... two ahead of or x7,x4,x5",             4,  5,  9,    5,   1,    1,    2'b00, 2'b01);
+    fwd("x5 written by both: the newer (MEM) wins",        5,  5,  5,    5,   1,    1,    2'b10, 2'b10);
+    fwd("addi x0,x0,1 ahead: x0 is never forwarded",       0,  0,  0,    0,   1,    1,    2'b00, 2'b00);
+    fwd("sw ahead: an rd field, but no register write",    5,  6,  5,    6,   0,    0,    2'b00, 2'b00);
+    //    situation                                       rs1 rs2 EX.rd load  expect stall
+    haz("lw x5,0(a0) then add x6,x5,x7",                   5,  7,  5,    1,   1);
+    haz("lw x5,0(a0) then add x6,x8,x7",                   8,  7,  5,    1,   0);
+    haz("add x5 then add x6,x5,x7: forwarding suffices",   5,  7,  5,    0,   0);
+    $display("all forwarding and stall decisions as expected");
+    $finish(0);
+  end
+endmodule
+```
+
+It prints:
+
+```text
+add x5,x1,x2 then sub x6,x5,x3                 fwd_a=10 fwd_b=00
+add x5,... two ahead of or x7,x4,x5            fwd_a=00 fwd_b=01
+x5 written by both: the newer (MEM) wins       fwd_a=10 fwd_b=10
+addi x0,x0,1 ahead: x0 is never forwarded      fwd_a=00 fwd_b=00
+sw ahead: an rd field, but no register write   fwd_a=00 fwd_b=00
+lw x5,0(a0) then add x6,x5,x7                  stall=1
+lw x5,0(a0) then add x6,x8,x7                  stall=0
+add x5 then add x6,x5,x7: forwarding suffices  stall=0
+all forwarding and stall decisions as expected
+```
+
+**Control hazards.** The pipeline fetches the next instruction before it knows whether a branch is taken. The simplest design predicts "not taken", keeps fetching sequentially, and if the branch turns out to be taken in EX, **flushes** the two wrongly fetched instructions (turns them into bubbles), losing two cycles. Better designs resolve branches earlier and, above all, predict.
+
+**Structural hazards** disappear by design: separate instruction and data memories (in practice, separate first-level caches) and a register file that writes in the first half of a cycle and reads in the second.
+
+</Section>
+
+<Section id="real-cores" kind="human" title="How real cores differ">
+
+A modern high-performance core is to this lesson's processor what an airliner is to the first powered aeroplane: the same principles, transformed by decades of engineering. The main additions, as of 2026:
+
+- **Caches.** Main memory (DRAM) takes on the order of 100 ns to answer, hundreds of clock cycles. Small, fast SRAM caches close to the core (typically 32–64 KiB for each of instructions and data at level 1, a megabyte or more at level 2, many megabytes shared at level 3) catch most accesses. Lumenary CS's [The memory hierarchy](/en/cs/memory-hierarchy/) explains why locality makes this work.
+- **Branch prediction.** Predictors learn each branch's behaviour from history. Simple **bimodal** predictors keep a 2-bit counter per branch; **gshare** combines the branch address with the recent global history; **TAGE**-style predictors, proposed by André Seznec and Pierre Michaud in 2006 and used in many high-end cores since, combine tables indexed by histories of geometrically increasing length. Accuracies well above 95% are normal, and they matter more as pipelines get deeper and wider.
+- **Superscalar execution.** Fetching, decoding and executing several instructions per cycle. The widest cores of the mid-2020s decode eight or more instructions per cycle and have many execution units.
+- **Out-of-order execution.** Instructions wait in queues until their operands are ready and then execute in whatever order they can, while a **reorder buffer** retires them in program order so that exceptions remain precise. **Register renaming** maps the architectural registers onto a larger physical register file, removing false dependences. The core ideas go back to Robert Tomasulo's 1967 design for the IBM System/360 Model 91; today's large cores keep several hundred instructions in flight.
+- **Speculation** of many kinds (branches, memory dependences, values), which the security attacks of 2018 showed can leak secrets through caches; hardware and software mitigations followed.
+- **Many cores**, with cache coherence protocols keeping their views of memory consistent, and power management that changes each core's voltage and frequency many times a second.
+
+Smaller cores choose differently. Microcontroller cores, the subject of <LessonLink slug="microcontrollers">Microcontrollers</LessonLink>, often have two to five in-order stages and no caches at all, because predictability and energy per instruction matter more than peak speed. The ISA lets the same software run on both.
+
+</Section>
+
+<Section id="ecosystem" kind="human" title="Open RISC-V cores and the ecosystem">
+
+Because the ISA is open, RISC-V has become the place to study real processor designs. As of 2026 there are open-source cores across the whole range, most of them free to read, simulate and put on an FPGA:
+
+- **Tiny**: [SERV](https://github.com/olofk/serv), a bit-serial core that processes one bit per cycle and fits in a few hundred FPGA logic cells; and [PicoRV32](https://github.com/YosysHQ/picorv32), a compact multi-cycle core in one readable Verilog file.
+- **Microcontroller class**: lowRISC's [Ibex](https://github.com/lowRISC/ibex), a small, carefully verified two-stage core used in security chips, and the OpenHW Foundation's CV32E40P.
+- **Application class**: Berkeley's Rocket (in-order, written in Chisel), and the OpenHW Foundation's [CVA6](https://github.com/openhwfoundation/cva6), six stages, able to run Linux.
+- **High performance**: Berkeley's BOOM, an out-of-order design for research, and [XiangShan](https://github.com/OpenXiangShan/XiangShan), from the Chinese Academy of Sciences and partners, an out-of-order core whose generations are taped out as real chips.
+
+Around the cores is a full ecosystem: compilers (GCC and LLVM), Linux and other operating systems, the reference simulator Spike and fast emulators such as QEMU, verification suites, and **profiles**, such as RVA23 (ratified in 2024), that fix which extensions general-purpose software can assume, so that, for example, a Linux distribution can target one baseline. Commercial RISC-V processors come from many companies in many countries: SiFive in the United States, Andes Technology in Taiwan, Codasip in Europe, and several Chinese and Indian firms and research institutes among them; they appear in microcontrollers, storage controllers, AI accelerators and a growing number of application processors. RISC-V International's website at [riscv.org](https://riscv.org/) lists members, specifications and working groups.
+
+If you want to go further, take this lesson's processor and add byte and halfword memory access, then a five-stage pipeline with the forwarding and hazard units above, and verify each step against the instruction-set simulator. Then read PicoRV32 or Ibex to see how professionals made the same decisions. An FPGA board powered by USB is enough to run your core on real hardware.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A single-cycle processor is fast because it completes an instruction every cycle."** Its cycle must fit the slowest instruction, so every instruction is as slow as a load. Time per instruction, not CPI alone, is what counts.
+
+</Misconception>
+
+<Misconception>
+
+**"Pipelining is free throughput."** It adds registers, forwarding paths, hazard logic, flushes and stalls, and every stage pays register overhead. The speed-up is always less than the number of stages.
+
+</Misconception>
+
+<Misconception>
+
+**"The ISA decides how fast a processor is."** The same ISA is implemented by bit-serial cores and by eight-wide out-of-order cores, differing in speed by more than a thousand times. The microarchitecture and the process technology decide speed; the ISA decides what software runs.
+
+</Misconception>
+
+<Misconception>
+
+**"`x0` is just another register that happens to start at zero."** It is wired to zero: writes are discarded. Hardware must enforce this in the register file *and* in the forwarding logic, or an instruction writing `x0` could forward a non-zero value.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,628 @@
+---
+title: "Bitcoin's transactions: UTXOs and Script"
+subtitle: Coins as unspent outputs, ownership as a small program, and the fees, upgrades, channels and chain analysis built on top.
+minutes: 75
+objectives:
+  - Contrast the UTXO model with the account model, and trace a transaction's inputs, outputs, change and fee
+  - Execute Bitcoin Script by hand and in a small interpreter, and explain P2PKH, P2WPKH and P2TR at the level of ideas
+  - Build a UTXO-set simulator that validates signed transactions and rejects double spends and overspends
+  - Explain what SegWit (2017) and Taproot (2021) changed, and why
+  - Reason about fee rates, the mempool, replace-by-fee and child-pays-for-parent
+  - Describe payment channels and the Lightning Network, and the limits of Bitcoin's privacy under chain analysis
+prerequisites: [why-blockchains, hashes-and-merkle-trees, signatures-and-keys, proof-of-work]
+narrators: [chloe, margaret, gideon]
+related: [math.applied.cryptography, math.discrete.graph-theory, math.number.modular-arithmetic]
+references:
+  - title: "Bitcoin: A Peer-to-Peer Electronic Cash System"
+    author: Satoshi Nakamoto
+    year: 2008
+    url: https://bitcoin.org/bitcoin.pdf
+    note: Sections 2, 9 and 10 describe transactions, combining and splitting value, and privacy.
+  - title: "Mastering Bitcoin (3rd edition)"
+    author: Andreas M. Antonopoulos and David A. Harding
+    year: 2023
+    url: https://github.com/bitcoinbook/bitcoinbook
+    note: An openly licensed book with detailed chapters on transactions, scripts, SegWit and Taproot.
+  - title: "BIP 141: Segregated Witness (Consensus layer)"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki
+  - title: "BIP 340: Schnorr Signatures for secp256k1"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+  - title: "BIP 341: Taproot: SegWit version 1 spending rules"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki
+  - title: "BIP 125: Opt-in Full Replace-by-Fee Signaling"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki
+  - title: "The Bitcoin Lightning Network: Scalable Off-Chain Instant Payments"
+    author: Joseph Poon and Thaddeus Dryja
+    year: 2016
+    url: https://lightning.network/lightning-network-paper.pdf
+  - title: "Lightning Network specifications (BOLTs)"
+    url: https://github.com/lightning/bolts
+    note: The specifications that the independent Lightning implementations follow.
+  - title: "A Fistful of Bitcoins: Characterizing Payments Among Men with No Names"
+    author: Sarah Meiklejohn et al.
+    year: 2013
+    url: https://doi.org/10.1145/2504730.2504747
+    note: The study that showed how much clustering heuristics reveal about Bitcoin users.
+  - title: "Bitcoin Optech"
+    url: https://bitcoinops.org/
+    note: A weekly technical newsletter and topic index on Bitcoin protocol and wallet engineering.
+---
+
+<Section id="motivation" kind="motivation" title="Where is my bitcoin, exactly?">
+
+Ask a bank where your money is and it will point at a row in a database: your account number and a balance. Ask the same question of Bitcoin and there is no such row. There is no account, no balance field and no name anywhere in the protocol. What there is instead is a large set of **unspent transaction outputs**: little packets of value, each locked by a small program that says what it takes to spend it. "Your balance" is just the total of the packets whose locks your wallet knows how to open.
+
+This design, sketched in the 2008 whitepaper and running since January 2009, sounds odd at first and turns out to be elegant. It makes double spending easy to detect, lets independent transactions be checked in parallel, and turns ownership into a question a computer can answer: *can you produce data that makes this program succeed?* It also has costs, which we will meet honestly: every payment is public forever, fees fluctuate, the base layer handles only a handful of payments per second, and clever analysis can often recover who paid whom.
+
+In this lesson you will take a transaction apart, run its scripting language, build a ledger that rejects double spends, and see how fees, upgrades, payment channels and privacy work in practice. Signatures come from <LessonLink slug="signatures-and-keys">Signatures and keys</LessonLink>, Merkle trees from <LessonLink slug="hashes-and-merkle-trees">Hashes and Merkle trees</LessonLink>, and agreement on order from <LessonLink slug="proof-of-work">Proof of work</LessonLink>; here we look at what the blocks contain.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Coins as outputs">
+
+<Analogy>
+
+Picture a jar of sealed envelopes, each holding money and each sealed so that only one person can open it. To pay someone, you open some of *your* envelopes and seal the money into new ones: one for the person you are paying and usually one back to yourself as **change**. Whatever you do not reseal is left for whoever builds the next block: the **fee**. The envelopes are outputs, the seals are locking scripts, and the jar is the UTXO set.
+
+</Analogy>
+
+The figure shows a concrete transaction. Amara owns two outputs, worth 120,000 and 80,000 satoshis (a satoshi is $10^{-8}$ bitcoin, the smallest unit the protocol counts). She wants to pay Bao 150,000. Neither output is enough alone, so the transaction spends both, creates an output of 150,000 locked to Bao, and returns 49,000 to a fresh address of her own as change. The two new outputs add up to 199,000; the missing 1,000 is the fee.
+
+<Figure caption="One Bitcoin transaction. It consumes two earlier outputs in full (dashed: once spent they leave the UTXO set) and creates two new ones. The fee is not written anywhere: it is whatever the inputs hold that the outputs do not claim.">
+<svg viewBox="0 0 540 210" role="img" aria-label="Two spent outputs on the left, 120,000 and 80,000 satoshis owned by Amara, feed into a transaction box in the middle signed by Amara. The transaction creates two outputs on the right: 150,000 satoshis to Bao and 49,000 satoshis of change to Amara. A note below says the fee is 200,000 minus 199,000, which is 1,000 satoshis, claimed by the miner.">
+  <defs>
+    <marker id="btx-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="25" width="155" height="48" rx="4" strokeDasharray="5 4" />
+    <rect x="10" y="115" width="155" height="48" rx="4" strokeDasharray="5 4" />
+    <rect x="215" y="55" width="110" height="80" rx="6" />
+    <rect x="375" y="25" width="155" height="48" rx="4" />
+    <rect x="375" y="115" width="155" height="48" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" fillOpacity="0.5">
+    <rect x="215" y="55" width="110" height="80" rx="6" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="87" y="45">120,000 sat</text>
+    <text x="87" y="62" fontSize="10">locked to Amara</text>
+    <text x="87" y="135">80,000 sat</text>
+    <text x="87" y="152" fontSize="10">locked to Amara</text>
+    <text x="270" y="88">transaction</text>
+    <text x="270" y="106" fontSize="10">2 inputs, 2 outputs</text>
+    <text x="270" y="121" fontSize="10">signed by Amara</text>
+    <text x="452" y="45">150,000 sat</text>
+    <text x="452" y="62" fontSize="10">locked to Bao</text>
+    <text x="452" y="135">49,000 sat</text>
+    <text x="452" y="152" fontSize="10">change, locked to Amara</text>
+    <text x="270" y="195" fontSize="11">fee = 200,000 − 199,000 = 1,000 sat, collected by the block's miner</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#btx-arrow)">
+    <path d="M 165 49 L 213 80" />
+    <path d="M 165 139 L 213 110" />
+    <path d="M 325 80 L 373 49" />
+    <path d="M 325 110 L 373 139" />
+  </g>
+</svg>
+</Figure>
+
+Notice what the transaction does *not* say. It never says "Amara's balance falls by 151,000". It names two specific earlier outputs by their position, *output 0 of transaction fd90…* for instance, and proves the right to spend them. If someone later presents another transaction that names the same output, every node can see at once that it has already been spent.
+
+<Narrator who="chloe">
+
+The key idea is that a coin has no owner field: it has a *predicate*. Ownership means "I can supply a witness that makes this predicate true", and everything else in this lesson, from multisignature vaults to Lightning channels, is a choice of predicate.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Definitions">
+
+<Definition term="transaction output and outpoint">
+
+A **transaction output** is a pair (*value*, *locking script*): an amount in satoshis and a program, called the `scriptPubKey`, stating the condition for spending it. An output is identified by an **outpoint**: the identifier (txid) of the transaction that created it and its index in that transaction's output list.
+
+</Definition>
+
+<Definition term="transaction">
+
+A **transaction** has a list of **inputs** and a list of **outputs** (plus a version number and a lock time). Each input names an outpoint to spend and supplies the data that unlocks it: historically an unlocking script (`scriptSig`) and, since SegWit, a separate **witness**. A transaction's **txid** is the double SHA-256 hash of its serialisation, excluding the witness. A **coinbase** transaction, the first in every block, has no real inputs; it creates the block subsidy plus the block's fees and pays them to the miner.
+
+</Definition>
+
+<Definition term="UTXO set">
+
+The **UTXO set** is the set of outputs that exist and have not yet been spent. A node validating a new transaction needs only the UTXO set, not the whole history: it checks that every input names a member of the set, that each input's unlocking data satisfies the output's locking script, and that the outputs do not claim more value than the inputs hold.
+
+</Definition>
+
+<Definition term="fee and fee rate">
+
+The **fee** of a transaction is the sum of its input values minus the sum of its output values; it is implicit. Since block space is limited by **weight** (below), miners compare transactions by **fee rate**, usually in satoshis per virtual byte (sat/vB).
+
+</Definition>
+
+<Definition term="account model">
+
+In the **account model** (used by Ethereum and most later chains, <LessonLink slug="smart-contracts">next lesson</LessonLink>), the state is a map from account to balance (and other data), and a transaction says "move $v$ from account $A$ to account $B$". Replays are prevented by a per-account counter, the **nonce**, rather than by spending unique outputs.
+
+</Definition>
+
+The two models make different things easy:
+
+| | UTXO model (Bitcoin, Cardano, Litecoin…) | Account model (Ethereum, Solana…) |
+| --- | --- | --- |
+| State | set of unspent outputs | map from account to balance, code, storage |
+| A payment | consumes whole outputs, creates new ones, returns change | debits one balance, credits another |
+| Double-spend check | is each outpoint still unspent? | is the nonce next in sequence and is the balance enough? |
+| Independent transactions | touch disjoint outputs, so can be checked in parallel | may touch the same account, so order matters |
+| Wallet's job | choose which outputs to spend ("coin selection") | track one balance and one nonce |
+| Programmability | each output's script sees only its own spending | contracts read and write shared state |
+| Privacy | a fresh address per output is natural | one long-lived address accumulates history |
+
+Neither is strictly better; the account model is simpler for programs that share state, while the UTXO model is simpler to validate and reason about locally.
+
+</Section>
+
+<Section id="script" kind="computation" title="Script: a deliberately small stack language">
+
+A locking script is written in **Script**, a stack language in the family of Forth. A program is a sequence of items: *data pushes*, which put bytes on the stack, and *opcodes*, which pop operands and push results. To spend an output, a node runs the input's unlocking script, then runs the output's locking script on the stack that is left. The spend is valid if nothing fails along the way and the top of the stack at the end is true (non-zero).
+
+Script has no loops and no way to jump backwards, so every script finishes in time proportional to its length; there is no need for anything like the gas metering we will meet in <LessonLink slug="smart-contracts">Ethereum</LessonLink>. It cannot read the blockchain, the time of day or other outputs, apart from a few opcodes that compare against the transaction's lock time. This weakness is deliberate: a validator must evaluate scripts quickly and get exactly the same answer as every other validator.
+
+The classic locking script is **pay-to-public-key-hash** (P2PKH). The output stores the 20-byte hash of the owner's public key:
+
+```text
+locking:    OP_DUP OP_HASH160 <20-byte public-key hash> OP_EQUALVERIFY OP_CHECKSIG
+unlocking:  <signature> <public key>
+```
+
+Run it in your head. The unlocking script pushes a signature and a public key. `OP_DUP` copies the key; `OP_HASH160` replaces the copy by its hash; the script pushes the expected hash; `OP_EQUALVERIFY` checks the two hashes match and aborts if not; finally `OP_CHECKSIG` pops the key and the signature and pushes true if the signature is valid for this transaction. The program below runs a few opcodes of Script on a Python list. Its signature scheme is a toy Schnorr scheme with a 63-bit group, in the spirit of <LessonLink slug="signatures-and-keys">Signatures and keys</LessonLink>: it shows the logic and is in no way secure.
+
+```python run
+import hashlib
+
+# Toy Schnorr signatures: a 63-bit "safe" prime P = 2Q + 1. Far too small to be secure.
+P = 9223372036854771239
+Q = (P - 1) // 2
+G = 4                                   # generates the subgroup of order Q
+
+def H(*parts):
+    data = b"|".join(p if isinstance(p, bytes) else str(p).encode() for p in parts)
+    return int.from_bytes(hashlib.sha256(data).digest(), "big") % Q
+
+def keypair(name):                      # derived from a name: a toy, never do this for real keys
+    x = H(b"toy-secret", name)
+    return x, pow(G, x, P).to_bytes(8, "big")
+
+def sign(x, msg):
+    k = H(b"toy-nonce", x, msg)         # deterministic nonce, so the demo is reproducible
+    R = pow(G, k, P)
+    e = H(R, pow(G, x, P), msg)
+    return R.to_bytes(8, "big") + ((k + e * x) % Q).to_bytes(8, "big")
+
+def verify(pub, msg, sig):
+    y, R, s = int.from_bytes(pub, "big"), int.from_bytes(sig[:8], "big"), int.from_bytes(sig[8:], "big")
+    return pow(G, s, P) == R * pow(y, H(R, y, msg), P) % P
+
+def hash160(data):
+    # Bitcoin uses RIPEMD-160(SHA-256(data)); not every Python build has RIPEMD-160,
+    # so this toy keeps the first 20 bytes of a double SHA-256 instead.
+    return hashlib.sha256(hashlib.sha256(data).digest()).digest()[:20]
+
+def show(item):
+    return item.hex()[:8] + ".." if isinstance(item, bytes) else str(item)
+
+def run(script, stack, sighash, trace=False):
+    """Execute one script on a stack. Returns the stack, or raises ValueError if the script fails."""
+    for op in script:
+        if isinstance(op, bytes):
+            stack.append(op)                                   # push data
+        elif op.startswith("OP_") and op[3:].isdigit():
+            stack.append(int(op[3:]))                          # OP_0 .. OP_16 push a small number
+        elif op == "OP_DUP":
+            stack.append(stack[-1])
+        elif op == "OP_ADD":
+            b, a = stack.pop(), stack.pop()
+            stack.append(a + b)
+        elif op in ("OP_EQUAL", "OP_EQUALVERIFY"):
+            b, a = stack.pop(), stack.pop()
+            stack.append(1 if a == b else 0)
+            if op == "OP_EQUALVERIFY" and stack.pop() == 0:
+                raise ValueError("OP_EQUALVERIFY failed")
+        elif op == "OP_HASH160":
+            stack.append(hash160(stack.pop()))
+        elif op == "OP_CHECKSIG":
+            pub, sig = stack.pop(), stack.pop()
+            stack.append(1 if verify(pub, sighash, sig) else 0)
+        else:
+            raise ValueError("unknown opcode " + op)
+        if trace:
+            print(f"   {op if isinstance(op, str) else 'push ' + show(op):15} stack: {[show(s) for s in stack]}")
+    return stack
+
+def spend(unlocking, locking, sighash=b"", trace=False):
+    """Run the unlocking script, then the locking script on the stack it leaves (as Bitcoin has since 2010)."""
+    try:
+        stack = run(locking, run(unlocking, [], sighash, trace), sighash, trace)
+    except (ValueError, IndexError) as err:
+        return f"invalid ({err})" if str(err) else "invalid (stack underflow)"
+    return "valid" if stack and stack[-1] not in (0, b"") else "invalid (false on top)"
+
+# 1. A puzzle: anyone who can find two numbers that add up to 7 may spend.
+puzzle = ["OP_ADD", "OP_7", "OP_EQUAL"]
+print("3 + 4 :", spend(["OP_3", "OP_4"], puzzle))
+print("2 + 2 :", spend(["OP_2", "OP_2"], puzzle))
+
+# 2. Pay-to-public-key-hash: the coin is locked to the hash of Amara's public key.
+amara_secret, amara_pub = keypair("Amara")
+bao_secret, bao_pub = keypair("Bao")
+tx_digest = b"spend coin 7 to Bao, 49000 sat change to Amara"
+p2pkh = ["OP_DUP", "OP_HASH160", hash160(amara_pub), "OP_EQUALVERIFY", "OP_CHECKSIG"]
+
+print("Amara signs, trace:")
+print("result:", spend([sign(amara_secret, tx_digest), amara_pub], p2pkh, tx_digest, trace=True))
+print("Bao tries with his own key :", spend([sign(bao_secret, tx_digest), bao_pub], p2pkh, tx_digest))
+print("Amara's signature, changed transaction:",
+      spend([sign(amara_secret, tx_digest), amara_pub], p2pkh, b"spend coin 7 to Mallory"))
+```
+
+The trace shows the stack after each step, ending with a single `1`. Bao's key hashes to the wrong value, so `OP_EQUALVERIFY` aborts. And Amara's valid signature does not transfer to a *different* transaction: what she signs is a digest of the transaction itself (the **sighash**), so changing the recipient breaks `OP_CHECKSIG`.
+
+<Narrator who="gideon">
+
+Look again at the "add up to 7" puzzle: it is valid Script, but it is not a lock. The moment someone broadcasts the answer, anyone who sees it can copy `OP_3 OP_4` into a transaction paying themselves and outbid the original with a higher fee. A script protects a coin only if the unlocking data is bound to the spending transaction, which is exactly what a signature over the sighash does.
+
+</Narrator>
+
+Real Script differs from this toy in details that matter to implementers: every stack item is a byte string, numbers have their own little-endian encoding, script size and stack depth are limited, and several opcodes (string concatenation among them) were disabled in 2010 after bugs were found.
+
+### The script types you will meet
+
+- **P2PKH** (addresses starting with `1`): the script above. The public key appears only when the coin is spent.
+- **P2SH**, pay-to-script-hash (2012, BIP 16; addresses starting with `3`): the output stores the hash of a script, and the spender reveals the script and satisfies it. This made multi-signature wallets practical: the payer only needs a short address.
+- **P2WPKH**, pay-to-witness-public-key-hash (2017, SegWit version 0; addresses starting with `bc1q`): the same check as P2PKH, but the output is just `OP_0 <20-byte hash>` and the signature and key move into the witness.
+- **P2TR**, pay-to-Taproot (2021, SegWit version 1; addresses starting with `bc1p`): the output is `OP_1 <32-byte key>`. It can be spent by a single Schnorr signature for that key, or by revealing one script from a hidden tree of alternatives.
+
+</Section>
+
+<Section id="ledger" kind="computation" title="A UTXO ledger in Python">
+
+Now put scripts aside and build the ledger itself. Our simulator keeps the UTXO set as a dictionary from outpoint to (value, address), where a toy address is a hash of a public key. A transaction lists outpoints and new outputs, and carries one (public key, signature) pair per input. Validation checks exactly the rules in the definitions: every outpoint unspent, no outpoint twice, keys matching addresses, signatures valid over the transaction's digest, and value conserved up to a non-negative fee.
+
+```python run
+import hashlib
+
+# The same toy Schnorr signatures as above (63-bit group: for learning only, not secure).
+P = 9223372036854771239
+Q = (P - 1) // 2
+G = 4
+
+def H(*parts):
+    data = b"|".join(p if isinstance(p, bytes) else str(p).encode() for p in parts)
+    return int.from_bytes(hashlib.sha256(data).digest(), "big") % Q
+
+def keypair(name):
+    x = H(b"toy-secret", name)
+    return x, pow(G, x, P)
+
+def sign(x, msg):
+    k = H(b"toy-nonce", x, msg)
+    R = pow(G, k, P)
+    return R, (k + H(R, pow(G, x, P), msg) * x) % Q
+
+def verify(y, msg, sig):
+    R, s = sig
+    return pow(G, s, P) == R * pow(y, H(R, y, msg), P) % P
+
+def address(y):                            # a toy address: a hash of the public key
+    return hashlib.sha256(str(y).encode()).hexdigest()[:10]
+
+class Tx:
+    def __init__(self, inputs, outputs):
+        self.inputs = inputs               # list of outpoints (txid, index)
+        self.outputs = outputs             # list of (value in satoshis, address)
+        self.witness = []                  # one (public key, signature) per input
+
+    def digest(self):                      # what is signed: everything except the signatures
+        return repr((self.inputs, self.outputs)).encode()
+
+    def txid(self):
+        return hashlib.sha256(hashlib.sha256(self.digest()).digest()).hexdigest()[:12]
+
+    def sign_all(self, *secrets):
+        self.witness = [(pow(G, x, P), sign(x, self.digest())) for x in secrets]
+        return self
+
+class Ledger:
+    def __init__(self):
+        self.utxos = {}                    # (txid, index) -> (value, address): the UTXO set
+
+    def coinbase(self, value, addr, tag):
+        tx = Tx([], [(value, addr)])
+        tx.inputs = [("coinbase", tag)]    # so that every coinbase has a different txid
+        self.utxos[(tx.txid(), 0)] = (value, addr)
+        return tx.txid()
+
+    def validate(self, tx):
+        """Return the fee if tx is valid against the current UTXO set; raise ValueError otherwise."""
+        if not tx.inputs or not tx.outputs:
+            raise ValueError("needs inputs and outputs")
+        if len(set(tx.inputs)) != len(tx.inputs):
+            raise ValueError("spends the same output twice")
+        if len(tx.witness) != len(tx.inputs):
+            raise ValueError("one signature per input")
+        total_in = 0
+        for outpoint, (pub, sig) in zip(tx.inputs, tx.witness):
+            if outpoint not in self.utxos:
+                raise ValueError(f"{outpoint[0]}:{outpoint[1]} is missing or already spent")
+            value, addr = self.utxos[outpoint]
+            if address(pub) != addr:
+                raise ValueError("public key does not match the output's address")
+            if not verify(pub, tx.digest(), sig):
+                raise ValueError("bad signature")
+            total_in += value
+        if any(v <= 0 for v, _ in tx.outputs):
+            raise ValueError("output values must be positive")
+        total_out = sum(v for v, _ in tx.outputs)
+        if total_out > total_in:
+            raise ValueError(f"spends {total_out} but inputs hold only {total_in}")
+        return total_in - total_out
+
+    def submit(self, label, tx):
+        try:
+            fee = self.validate(tx)
+        except ValueError as err:
+            print(f"REJECT {label:34} {err}")
+            return
+        for outpoint in tx.inputs:
+            del self.utxos[outpoint]
+        for i, out in enumerate(tx.outputs):
+            self.utxos[(tx.txid(), i)] = out
+        print(f"accept {label:34} txid {tx.txid()}  fee {fee} sat")
+
+    def balances(self, names):
+        return {n: sum(v for v, a in self.utxos.values() if a == address(y)) for n, (_, y) in names.items()}
+
+people = {n: keypair(n) for n in ["Amara", "Bao", "Chen", "Mallory"]}
+(xa, ya), (xb, yb), (xc, yc), (xm, ym) = people.values()
+A, B, C, M = (address(y) for _, y in people.values())
+
+ledger = Ledger()
+c1 = ledger.coinbase(120_000, A, "block 1")
+c2 = ledger.coinbase(80_000, A, "block 2")
+
+pay = Tx([(c1, 0), (c2, 0)], [(150_000, B), (49_000, A)]).sign_all(xa, xa)
+ledger.submit("Amara pays Bao, with change", pay)
+ledger.submit("Amara re-spends coin 1 to Chen", Tx([(c1, 0)], [(119_000, C)]).sign_all(xa))
+ledger.submit("Bao spends Amara's change", Tx([(pay.txid(), 1)], [(48_000, B)]).sign_all(xb))
+
+forged = Tx([(pay.txid(), 0)], [(149_000, C)]).sign_all(xb)
+forged.outputs = [(149_000, M)]            # Mallory edits the output after Bao signed
+ledger.submit("Mallory redirects Bao's payment", forged)
+ledger.submit("Bao overspends", Tx([(pay.txid(), 0)], [(100_000, C), (60_000, B)]).sign_all(xb))
+ledger.submit("Bao pays Chen", Tx([(pay.txid(), 0)], [(100_000, C), (48_500, B)]).sign_all(xb))
+
+print("UTXO set:", len(ledger.utxos), "outputs;", ledger.balances(people))
+```
+
+Six submissions, two accepted. The double spend fails because the first payment *removed* coin 1 from the set; Mallory's edit fails because the signature covers the outputs; the overspend fails on value. At the end three outputs hold 49,000 + 48,500 + 100,000 = 197,500 satoshis: the 200,000 created by the two coinbases minus 2,500 in fees, which in a real block would reappear in the miner's coinbase.
+
+<Theorem name="Validation bounds the supply">
+
+Suppose every block contains one coinbase transaction whose outputs total at most the block subsidy plus the fees of the block's other transactions, and every other transaction satisfies the validity rules above. Then after any number of blocks, the total value of the UTXO set is at most the sum of the subsidies of those blocks.
+
+</Theorem>
+
+<Proof>
+
+Track $S$, the total value in the UTXO set. A valid non-coinbase transaction removes its inputs, worth $I$, and adds its outputs, worth $O \le I$, so it changes $S$ by $O - I = -\text{fee} \le 0$. The coinbase adds at most $\text{subsidy} + \sum \text{fees}$. Over one block, then, $S$ grows by at most the subsidy. Summing over blocks proves the claim by induction on the number of blocks.
+
+</Proof>
+
+The bound is an inequality for real reasons: some miners have claimed less than they were allowed, some outputs are provably unspendable, and coins whose keys are lost still count in $S$ though nobody can move them. The theorem is also only as good as the code that enforces it. In August 2010 an integer overflow in the output-sum check let a transaction create about 184 billion bitcoins; developers released a fix within hours and the network abandoned that branch of the chain. The arithmetic of money is the first place to be paranoid, as <LessonLink slug="contract-security">Smart-contract security</LessonLink> will show again.
+
+</Section>
+
+<Section id="segwit-taproot" kind="human" title="SegWit and Taproot">
+
+Bitcoin's rules change rarely and only by **soft forks**: changes that make some previously valid transactions invalid, so that old nodes still accept the new chain. Two upgrades shaped today's transactions.
+
+### SegWit (2017)
+
+Before 2017, a transaction's txid covered its unlocking scripts, including the signatures. But a signature can be re-encoded in slightly different ways that remain valid, so a third party could change a transaction's txid in flight without invalidating it. This **malleability** was a nuisance for exchanges tracking withdrawals and a serious obstacle for protocols that build chains of unconfirmed transactions, which must refer to a parent's txid before it is mined.
+
+**Segregated Witness** ([BIP 141](https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki)), activated on 24 August 2017, moved the unlocking data into a separate **witness** structure that the txid does not cover. It also introduced a new signature digest that commits to the amounts being spent (which helps hardware wallets) and avoids quadratic hashing in large transactions, and replaced the 1 MB block size limit with a limit of 4 million **weight units**: each non-witness byte costs 4 units and each witness byte 1. A transaction's **virtual size** is its weight divided by 4, which is why fees are quoted per vB. The years before activation saw a bitter dispute over how to scale Bitcoin; one outcome was a separate chain, Bitcoin Cash, which split off on 1 August 2017 with larger blocks.
+
+### Taproot (2021)
+
+Taproot activated on 14 November 2021, bundling three proposals: **Schnorr signatures** ([BIP 340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki)), **Taproot** ([BIP 341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki)) and **Tapscript** (BIP 342). A Taproot output commits to a single 32-byte public key $Q$, which is an internal key $P$ "tweaked" by the root of a Merkle tree of scripts: $Q = P + t\,G$ with $t$ a hash of $P$ and the root.
+
+<Figure caption="A Taproot output and its two ways to be spent. The key path looks like any single-signature payment. The script path reveals one leaf and the Merkle branch linking it to the committed root; the other leaves stay hidden.">
+<svg viewBox="0 0 540 250" role="img" aria-label="At the top, a box labelled Taproot output with one 32-byte key Q equal to P plus t times G. An arrow to the left leads to key path: one Schnorr signature for Q, for example made jointly by Amara and Bao. An arrow to the right leads to script path, which reveals P, one leaf script and its Merkle branch. Below it a Merkle tree has a root, a leaf saying Amara alone after one year, and an internal node with two leaves: Bao plus an arbiter, and Amara plus an arbiter. The leaf Amara plus arbiter is highlighted as the one revealed.">
+  <defs>
+    <marker id="btx-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="170" y="10" width="200" height="44" rx="6" />
+    <rect x="15" y="90" width="200" height="50" rx="4" />
+    <rect x="300" y="90" width="225" height="50" rx="4" />
+    <circle cx="412" cy="170" r="9" />
+    <circle cx="470" cy="205" r="9" />
+  </g>
+  <g fill="var(--gold-soft)" fillOpacity="0.6" stroke="currentColor" strokeWidth="1.2">
+    <rect x="455" y="225" width="80" height="22" rx="3" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="300" y="190" width="100" height="22" rx="3" />
+    <rect x="375" y="225" width="75" height="22" rx="3" />
+    <path d="M 406 177 L 360 190" />
+    <path d="M 418 177 L 464 197" />
+    <path d="M 465 213 L 425 225" />
+    <path d="M 476 213 L 492 225" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="270" y="29">Taproot output</text>
+    <text x="270" y="45" fontSize="10">one 32-byte key Q = P + t·G</text>
+    <text x="115" y="110">key path</text>
+    <text x="115" y="128" fontSize="10">one Schnorr signature for Q</text>
+    <text x="412" y="110">script path</text>
+    <text x="412" y="128" fontSize="10">reveal P, one leaf and its Merkle branch</text>
+    <text x="412" y="174" fontSize="9">root</text>
+    <text x="350" y="205" fontSize="9">Amara, after 1 year</text>
+    <text x="412" y="240" fontSize="9">Bao + arbiter</text>
+    <text x="495" y="240" fontSize="9">Amara + arbiter</text>
+    <text x="115" y="165" fontSize="10">e.g. Amara and Bao together,</text>
+    <text x="115" y="180" fontSize="10">aggregated into one key (MuSig2)</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#btx-arrow2)">
+    <path d="M 210 54 L 150 88" />
+    <path d="M 330 54 L 390 88" />
+  </g>
+</svg>
+</Figure>
+
+If all parties agree, they spend by the **key path**: one Schnorr signature, which can be produced jointly by several people with a multi-signature protocol such as MuSig2 (BIP 327), so a two-of-two contract looks on chain exactly like an ordinary single-key payment. If they disagree, one of them uses the **script path**: reveal $P$, the one script being used and its Merkle branch (exactly the inclusion proof from <LessonLink slug="hashes-and-merkle-trees">Hashes and Merkle trees</LessonLink>), and satisfy that script. Unused alternatives are never revealed. The result is cheaper complex spending and better privacy, since cooperative cases leave no trace of the contract behind them.
+
+Since 2023 some users have also stored arbitrary data, such as images, in Taproot witnesses ("inscriptions"), which raised fees for a time and renewed an old debate in the Bitcoin community about what block space is for.
+
+</Section>
+
+<Section id="fees" kind="human" title="Fees, the mempool and replace-by-fee">
+
+A transaction is not sent to "the network" as a whole. It is relayed from node to node, and each node keeps the valid, unconfirmed transactions it has heard about in its own **mempool**. There is no single global mempool, and nodes can differ about what is in it. Miners build block templates from their mempools, and since a block's weight is capped, they favour the highest fee rates.
+
+Two layers of rules are at work. **Consensus rules** say which blocks are valid, and every node must agree on them. **Policy** (or standardness) rules say which unconfirmed transactions a node will relay and keep, and each node may choose its own: minimum fee rates, maximum sizes, which script types it relays. A transaction that breaks policy may still be valid if a miner includes it.
+
+The program builds a block template from a small mempool by fee rate, then tries two replacements of a stuck transaction.
+
+```python run
+# A toy mempool. Sizes are in virtual bytes (vB) and fees in satoshis.
+INCREMENTAL_RELAY = 1      # sat/vB: a node policy, the minimum extra a replacement must pay per vB
+
+mempool = {   # txid: (vsize, fee, the outpoints it spends)
+    "ines":   (140, 2_800, {"a:0"}),
+    "kofi":   (225, 450,   {"b:0"}),            # 2 sat/vB: likely to wait
+    "lucia":  (300, 4_500, {"c:0", "c:1"}),
+    "ravi":   (110, 3_300, {"d:0"}),
+    "sione":  (250, 1_250, {"e:1"}),
+    "yuki":   (180, 2_160, {"f:0"}),
+}
+
+def rate(txid):
+    vsize, fee, _ = mempool[txid]
+    return fee / vsize
+
+def build_block(capacity):
+    """Greedy block template: highest fee rate first, while it fits."""
+    chosen, used, fees = [], 0, 0
+    for txid in sorted(mempool, key=rate, reverse=True):
+        vsize, fee, _ = mempool[txid]
+        if used + vsize <= capacity:
+            chosen.append(txid)
+            used, fees = used + vsize, fees + fee
+    return chosen, used, fees
+
+def try_replace(new_id, vsize, fee, spends):
+    """Simplified replace-by-fee: the new transaction conflicts with old ones and must outbid them."""
+    conflicts = [t for t, (_, _, s) in mempool.items() if s & spends]
+    old_fees = sum(mempool[t][1] for t in conflicts)
+    if fee < old_fees + INCREMENTAL_RELAY * vsize:
+        return f"rejected: pays {fee}, needs at least {old_fees + INCREMENTAL_RELAY * vsize}"
+    if any(fee / vsize <= rate(t) for t in conflicts):
+        return "rejected: fee rate must beat every transaction it replaces"
+    for t in conflicts:
+        del mempool[t]
+    mempool[new_id] = (vsize, fee, spends)
+    return f"accepted, replacing {conflicts}"
+
+print("fee rates (sat/vB):", {t: round(rate(t), 1) for t in mempool})
+block, used, fees = build_block(capacity=900)
+print("block of 900 vB:", block, f"({used} vB, {fees} sat in fees)")
+
+print("kofi-v2, 225 vB, fee 600 :", try_replace("kofi-v2", 225, 600, {"b:0"}))
+print("kofi-v2, 225 vB, fee 3600:", try_replace("kofi-v2", 225, 3_600, {"b:0"}))
+block, used, fees = build_block(capacity=900)
+print("block of 900 vB:", block, f"({used} vB, {fees} sat in fees)")
+```
+
+At 2 sat/vB, Kofi's payment does not make the first block. His wallet then signs a new version that spends the same input with a higher fee: **replace-by-fee** (RBF). A replacement must pay more in total than what it evicts, plus enough extra to pay for relaying itself again (otherwise anyone could flood the network with endless one-satoshi bumps), so the first attempt is refused. The second, at 16 sat/vB, is accepted and makes the next block, displacing Yuki's 12 sat/vB transaction. Notice also that greedy selection by fee rate is a heuristic: filling a block optimally is a knapsack problem, and the last 125 vB of the second template go unused because nothing left in the mempool fits. Real block templates also have to respect dependencies, because a child transaction cannot be mined before its parent.
+
+That dependency gives a second way to unstick a payment: **child-pays-for-parent** (CPFP). The *recipient* spends the unconfirmed output in a new transaction with a high fee; a miner who wants that fee must include the parent too, so it evaluates the pair by their combined fee rate. RBF was first specified as an opt-in signal ([BIP 125](https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki)); since Bitcoin Core 28.0 (2024), the most widely run node software relays replacements whether or not the original signalled. For merchants, an unconfirmed transaction is a promise, not a payment.
+
+<Narrator who="margaret">
+
+How many payments fit? A block allows 4 million weight units, about 1,000,000 vB. A typical payment with one or two inputs and two outputs is roughly 140 to 250 vB, so a block holds a few thousand payments; at one block every ten minutes on average, that is on the order of 5 to 10 transactions per second for the whole world. That single estimate explains why fees spike when demand does, and why the next section exists.
+
+</Narrator>
+
+</Section>
+
+<Section id="lightning" kind="human" title="Payment channels and the Lightning Network">
+
+If every coffee had to be a transaction on the base layer, Bitcoin could serve only a few people. A **payment channel** lets two parties make many payments with only two on-chain transactions.
+
+1. **Open.** Amara and Bao lock, say, 1,000,000 satoshis into an output that needs both of their signatures (2-of-2).
+2. **Update.** Each payment is a new, fully signed but *unbroadcast* **commitment transaction** that would split the locked funds in the new proportion. Paying Bao 20,000 means both sign a new split. Old commitments are revoked: each party hands over a secret that lets the other take *all* the funds if an old state is ever broadcast, so cheating is punished.
+3. **Close.** Either party broadcasts the latest commitment (or both sign a clean closing transaction). Only the final balance appears on chain.
+
+The **Lightning Network** ([Poon and Dryja, 2016](https://lightning.network/lightning-network-paper.pdf)) connects channels into a network. To pay someone she has no channel with, Amara routes the payment through intermediaries using **hashed time-locked contracts** (HTLCs): the recipient chooses a secret $r$ and gives out its hash $H(r)$; each hop promises "you get this amount if you show me a preimage of $H(r)$ before a deadline". When the recipient reveals $r$ to claim the last hop, it flows back along the path and every hop is paid; if not, the time locks expire and everyone is refunded. The protocol is specified in the open [BOLTs](https://github.com/lightning/bolts), with several independent implementations.
+
+Lightning works, and is used for fast small payments. Its limits are real too:
+
+- **Liquidity.** You can only receive as much as your channel partners have committed on their side, and large payments often fail to find a route.
+- **Being online.** A party must watch the chain to punish an old state being broadcast, or delegate that to a "watchtower".
+- **On-chain costs.** Opening and closing channels are base-layer transactions, so high base-layer fees hurt.
+- **Custody.** Many users avoid these problems with custodial wallets, in which a company holds the keys: convenient, but it reintroduces the trusted third party.
+- **Subtle attacks.** Attacks on HTLCs, such as "replacement cycling" (reported in 2023), keep developers busy with mitigations.
+
+We will come back to channels as one family of scaling designs in <LessonLink slug="rollups-and-scaling">Scaling: rollups and data availability</LessonLink>.
+
+</Section>
+
+<Section id="privacy" kind="human" title="Privacy and chain analysis">
+
+Bitcoin is often called anonymous. It is **pseudonymous**: addresses are not names, but every transaction is public forever, and patterns link addresses together. The whitepaper itself admits (in its section 10) that multi-input transactions reveal common ownership. The main heuristics are:
+
+- **Common-input ownership.** The inputs of one transaction are usually controlled by one wallet, since it needed all their keys. Applied transitively, this merges addresses into clusters.
+- **Change detection.** In a two-output payment, one output is usually change: often the one with the less round amount, a script type matching the inputs, or an address never seen before.
+- **Address reuse.** Receiving many payments to one address links them all.
+- **Off-chain data.** Exchanges that verify customers' identity, IP addresses seen by nodes, public donation addresses and posts online attach names to clusters.
+
+[Meiklejohn and colleagues](https://doi.org/10.1145/2504730.2504747) showed in 2013 how far these heuristics go, by buying goods from services and tracing where the money went. Today chain-analysis companies (Chainalysis, Elliptic and TRM Labs among them) sell such tools to exchanges and law enforcement, and they have helped trace stolen funds and ransomware payments. The same techniques can expose ordinary users' salaries, donations and spending to anyone curious.
+
+Countermeasures exist, each with costs. A fresh address for every payment is basic hygiene. **CoinJoin** transactions combine many users' inputs into one transaction with equal-valued outputs, breaking the common-input heuristic, and **PayJoin** (BIP 78) has the recipient add an input, making it give wrong answers. Other systems were built for privacy from the start: Monero hides senders among decoys and hides amounts, and Zcash uses the zero-knowledge proofs of <LessonLink slug="zero-knowledge">Zero knowledge</LessonLink>. Privacy tools also raise legal questions about money laundering, which <LessonLink slug="applications-limits-and-regulation">the last lesson of this level</LessonLink> touches on.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"My wallet holds my bitcoin."** The coins are outputs recorded on the blockchain; the wallet holds the *keys* that can satisfy their locking scripts (and, usually, a seed phrase from which those keys are derived). Lose the keys and the outputs stay on chain, unspendable. Give the seed phrase to anyone, and they can spend everything; no genuine support service will ever ask for it.
+
+</Misconception>
+
+<Misconception>
+
+**"Bitcoin addresses have balances."** The protocol only knows outputs. Block explorers and wallets add up the outputs locked to an address for your convenience, but a transaction never debits an address; it consumes specific outputs whole.
+
+</Misconception>
+
+<Misconception>
+
+**"Bitcoin cannot be double spent."** Within one chain, the UTXO rule makes a second spend of the same output invalid. But two conflicting transactions can both be valid on their own, and which one wins is decided by consensus: a payment in a block can be undone by a reorganisation, which is why recipients wait for confirmations (see <LessonLink slug="proof-of-work">Proof of work</LessonLink>), and an unconfirmed payment can be replaced.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

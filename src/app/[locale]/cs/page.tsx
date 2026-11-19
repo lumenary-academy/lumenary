@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { resolveLocale } from "@/i18n/server";
 import { getCourse } from "@/lib/courses";
 import { CourseOverview } from "@/components/course/CoursePages";
+import { CsTracks } from "@/components/course/CsTracks";
 
 export const dynamicParams = false;
 
@@ -21,5 +22,5 @@ export default async function CsPage({ params }: { params: Promise<{ locale: str
   const locale = await resolveLocale(params);
   const c = getCourse("cs", "scientia");
   if (!c || c.course.locale !== locale) notFound();
-  return <CourseOverview c={c} locale={locale} />;
+  return <CourseOverview c={c} locale={locale} extra={<CsTracks locale={locale} />} />;
 }

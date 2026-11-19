@@ -1,0 +1,553 @@
+---
+title: Arithmetisation and SNARKs
+subtitle: Turning a computation into polynomial equations over a finite field, committing to polynomials, and the proof systems — Groth16 and PLONK — built from them.
+minutes: 90
+objectives:
+  - Express a computation as an arithmetic circuit and a rank-1 constraint system (R1CS) over a prime field, and check a witness against it
+  - Turn constraints into a single polynomial divisibility claim (the QAP idea) using Lagrange interpolation
+  - Explain polynomial commitments, KZG with pairings, trusted setups and powers-of-tau ceremonies
+  - Describe Groth16 and PLONK (gates, selectors and the permutation argument) at the level of their main ideas
+  - Use the framing "polynomial IOP + polynomial commitment + Fiat–Shamir = SNARK" to compare proof systems by proof size, prover cost and verifier cost
+  - Recognise under-constrained circuits, the most common soundness bug in practice, and demonstrate one
+narrators: [chloe, margaret, gideon]
+prerequisites: [hashes-and-merkle-trees, rollups-and-scaling, interactive-proofs-and-sumcheck, zero-knowledge]
+related: [math.algebra.polynomials, math.algebra.fields-galois, math.algebra.linear-algebra, math.number.arithmetic-geometry, math.comp.complexity-theory]
+references:
+  - title: "Proofs, Arguments, and Zero-Knowledge"
+    author: Justin Thaler
+    url: https://people.cs.georgetown.edu/jthaler/ProofsArgsAndZK.html
+    note: Chapters on front ends, polynomial commitments, Groth16 and PLONK-style arguments.
+  - title: Quadratic span programs and succinct NIZKs without PCPs
+    author: Rosario Gennaro, Craig Gentry, Bryan Parno and Mariana Raykova
+    year: 2013
+    url: https://eprint.iacr.org/2012/215
+    note: Introduced quadratic arithmetic programs (QAPs).
+  - title: "Pinocchio: nearly practical verifiable computation"
+    author: Bryan Parno, Jon Howell, Craig Gentry and Mariana Raykova
+    year: 2013
+    url: https://eprint.iacr.org/2013/279
+  - title: On the size of pairing-based non-interactive arguments
+    author: Jens Groth
+    year: 2016
+    url: https://eprint.iacr.org/2016/260
+    note: Groth16.
+  - title: Constant-size commitments to polynomials and their applications
+    author: Aniket Kate, Gregory M. Zaverucha and Ian Goldberg
+    year: 2010
+    url: https://doi.org/10.1007/978-3-642-17373-8_11
+    note: KZG commitments.
+  - title: "PLONK: permutations over Lagrange-bases for oecumenical noninteractive arguments of knowledge"
+    author: Ariel Gabizon, Zachary J. Williamson and Oana Ciobotaru
+    year: 2019
+    url: https://eprint.iacr.org/2019/953
+  - title: "Marlin: preprocessing zkSNARKs with universal and updatable SRS"
+    author: Alessandro Chiesa, Yuncong Hu, Mary Maller, Pratyush Mishra, Psi Vesely and Nicholas Ward
+    year: 2020
+    url: https://eprint.iacr.org/2019/1047
+  - title: Transparent SNARKs from DARK compilers
+    author: Benedikt Bünz, Ben Fisch and Alan Szepieniec
+    year: 2020
+    url: https://eprint.iacr.org/2019/1229
+    note: Together with Marlin, the source of the "polynomial IOP + polynomial commitment" framing.
+  - title: "Bulletproofs: short proofs for confidential transactions and more"
+    author: Benedikt Bünz, Jonathan Bootle, Dan Boneh, Andrew Poelstra, Pieter Wuille and Greg Maxwell
+    year: 2018
+    url: https://eprint.iacr.org/2017/1066
+  - title: "KZG ceremony wrap-up"
+    author: Ethereum Foundation
+    year: 2024
+    url: https://blog.ethereum.org/2024/01/23/kzg-wrap
+    note: The 2023 ceremony for EIP-4844, with 141,416 contributions.
+  - title: "SoK: what don't we know? Understanding security vulnerabilities in SNARKs"
+    author: Stefanos Chaliasos, Jens Ernstberger, David Theodore, David Wong, Mohammad Jahanara and Benjamin Livshits
+    year: 2024
+    url: https://arxiv.org/abs/2402.15293
+  - title: zk-bug-tracker
+    author: 0xPARC
+    url: https://github.com/0xPARC/zk-bug-tracker
+    note: A community list of real bugs in zero-knowledge circuits and proof systems.
+---
+
+<Section id="motivation" kind="motivation" title="A proof the size of a tweet">
+
+A validity rollup executes thousands of transactions off-chain and posts to Ethereum a new state root together with a proof that the transition was computed correctly. With the Groth16 proof system that proof is three elliptic-curve points, 128 bytes in compressed form on the BN254 curve, and a smart contract checks it with a few pairing operations costing a couple of hundred thousand gas, whether the batch held ten transactions or ten thousand. Zcash's shielded payments are checked with SNARKs too.
+
+Such proof systems are **SNARKs**: Succinct, Non-interactive ARguments of Knowledge. The previous two lessons gave us two of the ingredients: random evaluation of polynomials makes cheating detectable (<LessonLink slug="interactive-proofs-and-sumcheck">sumcheck</LessonLink>), and Fiat–Shamir removes interaction (<LessonLink slug="zero-knowledge">zero knowledge</LessonLink>). This lesson adds the remaining two: a way to turn an arbitrary computation into polynomials (**arithmetisation**), and a way for a prover to commit to a huge polynomial with a short message and later prove its value at a point (**polynomial commitments**). It ends with the bug that causes more real SNARK failures than any broken cryptography: a circuit that forgets to say something.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="SNARKs and constraint systems">
+
+<Definition term="SNARK">
+
+A **SNARK** for a relation $R(x, w)$ (public statement $x$, secret witness $w$) is a non-interactive proof system in which:
+
+- **Succinct:** the proof has size polylogarithmic in (often independent of) the size of the computation that checks $R$, and verification takes time polylogarithmic in it plus time linear in $|x|$;
+- **Argument:** soundness holds against provers that run in polynomial time, under a cryptographic assumption;
+- **of Knowledge:** a prover that convinces the verifier must "know" a valid $w$ (an extractor exists).
+
+A **zkSNARK** is additionally zero-knowledge. Some SNARKs need a **setup** that produces public parameters (a *structured reference string*, SRS); if the setup uses no secrets, the SNARK is **transparent**.
+
+</Definition>
+
+Proof systems do not run programs; they check equations. So the first step is to express "the computation was done correctly" as a set of equations over a finite field $\mathbb{F}_p$.
+
+<Definition term="arithmetic circuit">
+
+An **arithmetic circuit** over $\mathbb{F}_p$ is a directed acyclic graph whose inputs are field elements and whose gates add or multiply two field elements. A computation is *expressed* by a circuit whose output is 0 (or some public value) exactly when the computation was correct, given the witness as extra input.
+
+</Definition>
+
+<Definition term="rank-1 constraint system (R1CS)">
+
+An **R1CS** consists of three $m \times n$ matrices $A$, $B$, $C$ over $\mathbb{F}_p$. A vector $z \in \mathbb{F}_p^{\,n}$ with $z_0 = 1$, containing the public inputs and the witness, **satisfies** it if
+
+$$
+(Az) \circ (Bz) = Cz,
+$$
+
+where $\circ$ is the entrywise product. Each of the $m$ rows says: (a linear combination of variables) times (a linear combination) equals (a linear combination). One multiplication per row, any number of additions for free.
+
+</Definition>
+
+Everything must be phrased in field arithmetic, and that shapes what is cheap. Addition and multiplication by constants are free inside the linear combinations; each multiplication of two variables costs a constraint. A bit $b$ is a variable with the constraint $b \cdot b = b$, whose only solutions in a field are 0 and 1. A comparison such as "$x < 16$" has no direct field meaning (fields are not ordered), so it is done by decomposing $x$ into bits and checking each one. A hash function designed for CPUs, like SHA-256, is all bit operations and costs tens of thousands of R1CS constraints per compression; "arithmetisation-friendly" hashes such as [Poseidon](https://eprint.iacr.org/2019/458) are built from field operations and cost a few hundred. Choosing what to prove, and how, is the largest lever on prover cost.
+
+</Section>
+
+<Section id="r1cs" kind="computation" title="Building an R1CS by hand">
+
+Our statement: *"I know two 4-bit numbers $x$ and $y$ with $x \cdot y = N$"*, for a public $N$. For $N = 143$ this is a claim to know a factorisation of 143 into two small factors. The variables are $z = (1, N, x, y, x_0, \ldots, x_3, y_0, \ldots, y_3)$ and the constraints are:
+
+- $x_i \cdot x_i = x_i$ and $y_i \cdot y_i = y_i$ for $i = 0, \ldots, 3$: each $x_i, y_i$ is a bit (8 constraints);
+- $(x_0 + 2x_1 + 4x_2 + 8x_3) \cdot 1 = x$, and the same for $y$: the bits represent $x$ and $y$, so both are below 16 (2 constraints);
+- $x \cdot y = N$ (1 constraint).
+
+Since $x, y < 16$, the product is below 256, far smaller than $p$, so the field equation $x \cdot y = N$ is the integer equation. The program builds the three matrices row by row, prints one row, and checks three assignments.
+
+```python run
+p = 2**31 - 1        # a toy prime field; production SNARKs use primes of about 255 bits
+
+# The statement: "I know 4-bit numbers x and y with x * y = N", for a public N.
+# Variables z = [one, N, x, y, x0..x3, y0..y3]; one is always 1, N is public, the rest are secret.
+NAMES = ["one", "N", "x", "y"] + [f"x{i}" for i in range(4)] + [f"y{i}" for i in range(4)]
+
+def vec(**coeffs):
+    return [coeffs.get(name, 0) % p for name in NAMES]
+
+def factor_r1cs():
+    rows, labels = [], []
+    for v in "xy":
+        for i in range(4):                                   # b * b = b forces b in {0, 1}
+            b = f"{v}{i}"
+            rows.append((vec(**{b: 1}), vec(**{b: 1}), vec(**{b: 1})))
+            labels.append(f"{b} is a bit")
+        rows.append((vec(**{f"{v}{i}": 2**i for i in range(4)}), vec(one=1), vec(**{v: 1})))
+        labels.append(f"{v} = {v}0 + 2*{v}1 + 4*{v}2 + 8*{v}3")
+    rows.append((vec(x=1), vec(y=1), vec(N=1)))
+    labels.append("x * y = N")
+    return rows, labels
+
+def violated(rows, labels, z):
+    dot = lambda r: sum(a * b for a, b in zip(r, z)) % p
+    return [lab for (a, b, c), lab in zip(rows, labels) if dot(a) * dot(b) % p != dot(c)]
+
+def assignment(N, x, y):
+    return [1, N, x, y] + [(x >> i) & 1 for i in range(4)] + [(y >> i) & 1 for i in range(4)]
+
+rows, labels = factor_r1cs()
+print(f"{len(rows)} constraints over {len(NAMES)} variables; constraint 5 (x as a sum of its bits) is")
+for name, r in zip("ABC", rows[4]):
+    print(f"  {name}: {r}")
+print("x=11, y=13, N=143 -> violated:", violated(rows, labels, assignment(143, 11, 13)))
+print("x=3,  y=5,  N=143 -> violated:", violated(rows, labels, assignment(143, 3, 5)))
+z = assignment(143, 11, 13)
+z[NAMES.index("x1")] = 0                                     # tamper with one bit of x
+print("one bit of x changed -> violated:", violated(rows, labels, z))
+```
+
+A checker that names the violated constraints is also how circuit developers debug: a "proof generation failed" error usually means a witness that violates some row.
+
+</Section>
+
+<Section id="qap" kind="computation" title="From many constraints to one polynomial identity">
+
+Checking $m$ constraints one by one is not succinct. The **quadratic arithmetic program** (QAP) of Gennaro, Gentry, Parno and Raykova (2013) packs them into one statement about polynomials. Assign constraint $i$ to the point $X = i$. For each variable $j$, let $A_j(X)$ be the polynomial of degree less than $m$ with $A_j(i) = A_{ij}$ for every row $i$, found by **Lagrange interpolation**:
+
+$$
+A_j(X) = \sum_{i=1}^{m} A_{ij} \prod_{k \neq i} \frac{X - k}{i - k},
+$$
+
+and define $B_j$ and $C_j$ in the same way. For an assignment $z$, set $A_z(X) = \sum_j z_j A_j(X)$, and similarly $B_z$ and $C_z$. Then $A_z(i)B_z(i) - C_z(i)$ is exactly the left side minus the right side of constraint $i$, so
+
+$$
+z \text{ satisfies the R1CS} \iff A_z(X)\,B_z(X) - C_z(X) \text{ vanishes at } 1, \ldots, m \iff Z(X) \text{ divides } A_z(X)B_z(X) - C_z(X),
+$$
+
+where $Z(X) = (X - 1)(X - 2)\cdots(X - m)$ is the **vanishing polynomial**. The prover can exhibit the quotient $H(X)$ with $A_zB_z - C_z = H \cdot Z$, and by Schwartz–Zippel it suffices to check this identity at one random point $\tau$: if it is false, the two sides are different polynomials of degree at most $2m - 2$, which agree at no more than $2m - 2$ points.
+
+```python run
+import random
+
+p = 2**31 - 1
+NAMES = ["one", "N", "x", "y"] + [f"x{i}" for i in range(4)] + [f"y{i}" for i in range(4)]
+
+def vec(**coeffs):
+    return [coeffs.get(name, 0) % p for name in NAMES]
+
+def factor_r1cs():                     # the same 11 constraints as before, as (a, b, c) rows
+    rows = []
+    for v in "xy":
+        rows += [(vec(**{f"{v}{i}": 1}),) * 3 for i in range(4)]
+        rows.append((vec(**{f"{v}{i}": 2**i for i in range(4)}), vec(one=1), vec(**{v: 1})))
+    rows.append((vec(x=1), vec(y=1), vec(N=1)))
+    return rows
+
+def assignment(N, x, y):
+    return [1, N, x, y] + [(x >> i) & 1 for i in range(4)] + [(y >> i) & 1 for i in range(4)]
+
+# --- Polynomials over F_p as coefficient lists, lowest degree first -------------------------
+def trim(f):
+    while len(f) > 1 and f[-1] == 0:
+        f = f[:-1]
+    return f
+
+def add(f, g, sign=1):
+    n = max(len(f), len(g))
+    f, g = f + [0] * (n - len(f)), g + [0] * (n - len(g))
+    return trim([(a + sign * b) % p for a, b in zip(f, g)])
+
+def mul(f, g):
+    out = [0] * (len(f) + len(g) - 1)
+    for i, a in enumerate(f):
+        for j, b in enumerate(g):
+            out[i + j] = (out[i + j] + a * b) % p
+    return trim(out)
+
+def divmod_poly(f, g):
+    f, q = list(f), [0] * max(1, len(f) - len(g) + 1)
+    inv = pow(g[-1], -1, p)
+    for k in range(len(f) - len(g), -1, -1):
+        q[k] = f[k + len(g) - 1] * inv % p
+        for j, b in enumerate(g):
+            f[k + j] = (f[k + j] - q[k] * b) % p
+    return trim(q), trim(f[:len(g) - 1] or [0])
+
+def evaluate(f, x):
+    acc = 0
+    for c in reversed(f):
+        acc = (acc * x + c) % p
+    return acc
+
+def interpolate(xs, ys):
+    """Lagrange: the unique polynomial of degree < len(xs) through the points (xs[i], ys[i])."""
+    total = [0]
+    for i, (xi, yi) in enumerate(zip(xs, ys)):
+        basis, denom = [1], 1
+        for j, xj in enumerate(xs):
+            if j != i:
+                basis = mul(basis, [-xj % p, 1])
+                denom = denom * (xi - xj) % p
+        total = add(total, mul(basis, [yi * pow(denom, -1, p) % p]))
+    return total
+
+# --- From R1CS to QAP: one polynomial per column of A, B and C ------------------------------
+rows = factor_r1cs()
+m = len(rows)
+points = list(range(1, m + 1))                 # constraint i is checked at the point X = i
+cols = [[interpolate(points, [rows[i][k][j] for i in range(m)]) for j in range(len(NAMES))]
+        for k in range(3)]                     # cols[0][j] is A_j(X), and so on
+Z = [1]
+for i in points:
+    Z = mul(Z, [-i % p, 1])                    # Z(X) = (X - 1)(X - 2)...(X - m)
+
+def qap_check(z):
+    A_z, B_z, C_z = [[0], [0], [0]]
+    for j, zj in enumerate(z):
+        A_z = add(A_z, mul(cols[0][j], [zj]))
+        B_z = add(B_z, mul(cols[1][j], [zj]))
+        C_z = add(C_z, mul(cols[2][j], [zj]))
+    P = add(mul(A_z, B_z), C_z, sign=-1)       # vanishes at 1..m iff every constraint holds
+    H, R = divmod_poly(P, Z)
+    return P, H, R
+
+for x, y in [(11, 13), (3, 5)]:
+    P, H, R = qap_check(assignment(143, x, y))
+    print(f"x={x:2}, y={y:2}: deg(A*B - C) = {len(P) - 1}, deg Z = {len(Z) - 1}, "
+          f"deg H = {len(H) - 1}, Z divides A*B - C: {R == [0]}")
+
+# The SNARK idea: instead of comparing polynomials, compare them at ONE secret random point tau.
+tau = random.Random(1).randrange(p)
+P, H, R = qap_check(assignment(143, 11, 13))
+print("at a random tau: P(tau) == H(tau) * Z(tau):", evaluate(P, tau) == evaluate(H, tau) * evaluate(Z, tau) % p)
+```
+
+<Narrator who="margaret">
+
+Eleven constraints became a degree-20 polynomial and a degree-9 quotient. For a circuit with a million constraints the polynomials have a million coefficients, and computing them by the quadratic-time interpolation above would take about $10^{12}$ operations. Real provers place the constraints at the $m$-th roots of unity instead of at $1, \ldots, m$, so that interpolation and evaluation become fast Fourier transforms (number-theoretic transforms) costing $O(m \log m)$, about $2 \times 10^7$ operations (<LessonLink slug="frontier-of-verifiable-computation">the frontier lesson</LessonLink> implements one).
+
+</Narrator>
+
+The remaining problem is that the verifier must not see the polynomials, which are as large as the computation and contain the witness. It needs to check $A_z(\tau)B_z(\tau) - C_z(\tau) = H(\tau)Z(\tau)$ at a point the prover cannot anticipate, using values the prover has bound itself to in advance. That is what polynomial commitments provide.
+
+</Section>
+
+<Section id="commitments" kind="human" title="Polynomial commitments and KZG">
+
+<Definition term="polynomial commitment scheme">
+
+A **polynomial commitment scheme** lets a prover publish a short **commitment** $C$ to a polynomial $f$ of degree less than $D$, and later, for any point $z$ the verifier names, send a value $y$ with a short **opening proof** that $f(z) = y$. It is **binding** (no efficient prover can open $C$ to values of two different polynomials) and, if needed, **hiding**.
+
+</Definition>
+
+**KZG** (Kate, Zaverucha and Goldberg, 2010) is the scheme behind many deployed SNARKs and Ethereum's data blobs. It needs a **pairing**: a map $e : \mathbb{G}_1 \times \mathbb{G}_2 \to \mathbb{G}_T$ between groups of prime order $p$ on a pairing-friendly elliptic curve (BN254 or BLS12-381) that is **bilinear**, $e(g^a, h^b) = e(g, h)^{ab}$. A pairing lets the verifier check one multiplication "in the exponent" without knowing the exponents (see <TopicLink id="math.number.arithmetic-geometry">elliptic curves</TopicLink> for the geometry behind it).
+
+1. **Setup.** Someone picks a secret $\tau \in \mathbb{F}_p$ and publishes $g, g^{\tau}, g^{\tau^2}, \ldots, g^{\tau^{D-1}}$ and $h, h^{\tau}$. Then $\tau$ must be destroyed.
+2. **Commit.** For $f(X) = \sum_i f_i X^i$, the prover computes $C = \prod_i (g^{\tau^i})^{f_i} = g^{f(\tau)}$: a **multi-scalar multiplication** (MSM) over the public powers. The commitment is one group element, whatever the degree.
+3. **Open at $z$.** If $f(z) = y$, then $X - z$ divides $f(X) - y$; the prover computes the quotient $q(X) = (f(X) - y)/(X - z)$ and sends $\pi = g^{q(\tau)}$, again one group element.
+4. **Verify.** Check $e(C \cdot g^{-y},\ h) = e(\pi,\ h^{\tau} \cdot h^{-z})$, which says $f(\tau) - y = q(\tau)(\tau - z)$ in the exponent.
+
+If $f(z) \neq y$, no polynomial $q$ makes that identity hold, and producing a fake $\pi$ is believed infeasible (under the "$q$-strong Diffie–Hellman" assumption) as long as nobody knows $\tau$. Commitments and proofs are constant-size (48 bytes each on BLS12-381) and verification costs two pairings. This is exactly the QAP check of the last section: commit to the polynomials, let Fiat–Shamir pick the point, open there.
+
+<Narrator who="gideon">
+
+Everything rests on nobody knowing $\tau$. Whoever knows it can open any commitment to any value and prove false statements, while proofs still look perfect — the "toxic waste" of the setup. A **multi-party ceremony** mitigates this: each participant multiplies the secret by their own random contribution and discards it, so the final $\tau$ is unknown unless *every* participant kept or leaked their share. One honest participant suffices.
+
+</Narrator>
+
+**Ceremonies in practice.** Zcash's first ceremony in 2016 had six participants; its "Powers of Tau" ceremony of 2017–2018 accepted 87 contributions, and anyone can verify the transcript. Ethereum's [KZG ceremony](https://blog.ethereum.org/2024/01/23/kzg-wrap), run from January to August 2023 for the data blobs of [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844), received **141,416** contributions, many from people in a web browser, so that the 1-of-N trust assumption is spread over an enormous N. Setups have failed in other ways. In 2019 Zcash disclosed that a subtle error in the key-generation procedure of the paper behind its original 2016 proof system produced extra elements, unused by honest provers but present in the public ceremony transcript, that would have allowed undetectable counterfeiting (CVE-2019-7167). A company cryptographer found it in March 2018; it was quietly removed by the Sapling upgrade that October and disclosed in February 2019, with no evidence of exploitation ([disclosure](https://electriccoin.co/blog/zcash-counterfeiting-vulnerability-successfully-remediated/)).
+
+</Section>
+
+<Section id="groth16-plonk" kind="human" title="Groth16 and PLONK">
+
+**Groth16** (Jens Groth, 2016) compiles a QAP into a proof of exactly three group elements, $A, C \in \mathbb{G}_1$ and $B \in \mathbb{G}_2$, which the verifier checks with one pairing equation (a product of pairings, four in a typical implementation, one of which can be precomputed). The setup encodes the specific circuit's polynomials at the secret $\tau$, so it is **circuit-specific**: change one constraint and you need a new ceremony. In exchange Groth16 has the smallest proofs and fastest verification of any widely used SNARK. On Ethereum, the pairing precompile costs $45{,}000 + 34{,}000k$ gas for $k$ pairings, so a Groth16 check costs roughly 180,000–250,000 gas depending on the number of public inputs. Many systems use other proof systems for speed and then **wrap** the final proof in Groth16 for cheap on-chain verification.
+
+**PLONK** (Gabizon, Williamson and Ciobotaru, 2019) changed the setup and the constraint format.
+
+- **Universal, updatable setup.** One powers-of-tau ceremony serves every circuit up to a maximum size, and anyone can add a fresh contribution later.
+- **Gates with selectors.** Each row of the circuit has three wires $a_i, b_i, c_i$ and fixed **selector** values, with the gate equation
+  $$
+  q_{L,i}\, a_i + q_{R,i}\, b_i + q_{O,i}\, c_i + q_{M,i}\, a_i b_i + q_{C,i} = 0.
+  $$
+  Selectors $(1, 1, -1, 0, 0)$ make an addition gate and $(0, 0, -1, 1, 0)$ a multiplication gate.
+- **Copy constraints by a permutation argument.** Gates are independent rows; wiring says that certain cells must hold equal values (the output of gate 1 is the left input of gate 3). Number the cells and let $\sigma$ be a permutation that cycles through each group of cells that must be equal. Then for random challenges $\beta, \gamma$,
+  $$
+  \prod_i \frac{w_i + \beta \cdot i + \gamma}{w_i + \beta \cdot \sigma(i) + \gamma} = 1
+  $$
+  holds when the values $w$ respect the wiring, and fails with high probability otherwise (two different multisets give different polynomials in $\beta$ and $\gamma$). PLONK proves this product with a running-product polynomial, committed and checked at a random point.
+
+```python run
+import random
+
+p = 2**31 - 1
+
+# A PLONK-style circuit for out = (x + y) * (x * y): one row per gate, wires a, b, c, and
+# selectors (qL, qR, qO, qM, qC) with the gate equation qL*a + qR*b + qO*c + qM*a*b + qC = 0.
+gates = [
+    ("add", (1, 1, -1, 0, 0)),     # c0 = a0 + b0
+    ("mul", (0, 0, -1, 1, 0)),     # c1 = a1 * b1
+    ("mul", (0, 0, -1, 1, 0)),     # c2 = a2 * b2
+]
+n = len(gates)
+# Wire positions are numbered a0..a2 = 0..2, b0..b2 = 3..5, c0..c2 = 6..8.
+# Copy constraints: a0 = a1 (both x), b0 = b1 (both y), c0 = a2, c1 = b2.
+sigma = list(range(3 * n))
+for i, j in [(0, 1), (3, 4), (6, 2), (7, 5)]:
+    sigma[i], sigma[j] = j, i          # each pair forms a 2-cycle of the permutation
+
+def gates_ok(w):
+    a, b, c = w[:n], w[n:2 * n], w[2 * n:]
+    return all((qL * a[i] + qR * b[i] + qO * c[i] + qM * a[i] * b[i] + qC) % p == 0
+               for i, (_, (qL, qR, qO, qM, qC)) in enumerate(gates))
+
+def grand_product(w, beta, gamma):
+    """prod (w_i + beta*i + gamma) / (w_i + beta*sigma(i) + gamma): equals 1 if w is constant
+    on every cycle of sigma, and (by Schwartz-Zippel in beta, gamma) almost surely not otherwise."""
+    num = den = 1
+    for i, wi in enumerate(w):
+        num = num * (wi + beta * i + gamma) % p
+        den = den * (wi + beta * sigma[i] + gamma) % p
+    return num * pow(den, -1, p) % p
+
+x, y = 3, 4
+honest = [x, x, x + y,  y, y, x * y,  x + y, x * y, (x + y) * (x * y)]
+# A cheat: feed gate 2 the value 8 instead of x + y = 7, and fix its output so the gate holds.
+cheat = list(honest)
+cheat[2] = 8
+cheat[8] = 8 * cheat[5]
+
+rng = random.Random(9)
+beta, gamma = rng.randrange(p), rng.randrange(p)       # the verifier's random challenges
+for name, w in [("honest", honest), ("cheat ", cheat)]:
+    print(f"{name}: output {w[8]:3}, every gate holds: {gates_ok(w)}, "
+          f"grand product = {grand_product(w, beta, gamma)}")
+```
+
+The cheating table satisfies every gate equation, because each gate on its own is fine; only the wiring is broken, and only the grand product notices. **Custom gates** generalise the selectors: a gate can be any low-degree polynomial in a row's wires, so a whole round of a hash function, or an elliptic-curve addition, can be one row instead of dozens. This "PLONKish" arithmetisation, with lookup tables (<LessonLink slug="starks-and-folding">next lesson</LessonLink>), underlies systems such as Zcash's [Halo 2](https://zcash.github.io/halo2/), Plonky2 and many zkEVM circuits. A PLONK proof with KZG is around half a kilobyte, and verification needs two pairings plus a few dozen group and field operations.
+
+</Section>
+
+<Section id="framing" kind="human" title="The modern framing: polynomial IOP + polynomial commitment">
+
+By 2020 a clean decomposition had emerged (in the Marlin and DARK papers, among others). A **polynomial interactive oracle proof** (polynomial IOP) is an interactive proof in which the prover's messages are polynomials that the verifier may query at points of its choice, as if it had oracle access to them. Its soundness is information-theoretic, like sumcheck's. Replacing each oracle by a **polynomial commitment** gives an interactive argument, and Fiat–Shamir makes it non-interactive.
+
+<Figure caption="How a SNARK is assembled. Each arrow is a separate design choice: the arithmetisation, the polynomial IOP and the commitment scheme can be mixed and matched, and the security of the result rests on the IOP's soundness, the commitment's binding and the Fiat–Shamir hash.">
+
+<svg viewBox="0 0 460 330" role="img" aria-label="A vertical flow of five boxes. Computation, arrow labelled arithmetise, constraint system over a finite field, arrow labelled encode as polynomial identities, polynomial IOP, arrow labelled replace oracles with a polynomial commitment, public-coin interactive argument, arrow labelled Fiat-Shamir, SNARK.">
+  <defs>
+    <marker id="pf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="10" width="200" height="36" rx="6" fill="var(--card)" />
+    <rect x="20" y="80" width="200" height="36" rx="6" fill="var(--card)" />
+    <rect x="20" y="150" width="200" height="36" rx="6" fill="var(--sky-soft)" />
+    <rect x="20" y="220" width="200" height="36" rx="6" fill="var(--card)" />
+    <rect x="20" y="290" width="200" height="36" rx="6" fill="var(--gold-soft)" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#pf-arrow)">
+    <path d="M 120 46 L 120 78" />
+    <path d="M 120 116 L 120 148" />
+    <path d="M 120 186 L 120 218" />
+    <path d="M 120 256 L 120 288" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="120" y="33">computation or statement</text>
+    <text x="120" y="103">constraint system over 𝔽ₚ</text>
+    <text x="120" y="173">polynomial IOP</text>
+    <text x="120" y="243">public-coin interactive argument</text>
+    <text x="120" y="313">SNARK</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="135" y="66">arithmetise: R1CS, PLONKish, AIR</text>
+    <text x="135" y="136">encode as polynomial identities</text>
+    <text x="232" y="168">sound with no cryptography</text>
+    <text x="135" y="206">commit: KZG, IPA, FRI, multilinear PCS</text>
+    <text x="135" y="276">Fiat–Shamir: challenges are hashes</text>
+  </g>
+</svg>
+
+</Figure>
+
+The commitment scheme determines most of a SNARK's engineering profile:
+
+| Commitment | Setup | Proof size | Verifier | Assumption | Post-quantum? |
+| --- | --- | --- | --- | --- | --- |
+| KZG | trusted (powers of tau) | constant, about 48 bytes per opening | constant: 2 pairings | pairings, $q$-SDH | no |
+| IPA / Bulletproofs | transparent | logarithmic | linear in degree | discrete log | no |
+| FRI (Merkle trees of codewords) | transparent | polylogarithmic, tens to hundreds of KB per proof | polylogarithmic, hashes only | collision-resistant hash | plausibly yes |
+| Multilinear schemes (Hyrax, Dory, Ligero/Brakedown-style, Basefold, WHIR) | mostly transparent | from logarithmic to square-root | varies | varies | some |
+
+And whole systems, roughly, as of 2026 (sizes for about a million constraints; prover times vary by orders of magnitude with hardware and implementation, so compare designs, not marketing numbers):
+
+| System | Proof size | Verify | Prover dominated by | Setup |
+| --- | --- | --- | --- | --- |
+| Groth16 | 128–192 bytes | 3–4 pairings, about 1 ms | MSMs, FFTs | per circuit |
+| PLONK + KZG | about 0.5–1 KB | 2 pairings | MSMs, FFTs | universal |
+| STARK (FRI) | about 50–200 KB | hashes, a few ms | FFTs, hashing | none |
+| Bulletproofs | about 1–2 KB | linear in circuit size | MSMs | none |
+
+**Prover cost** is the price of all this. Generating a proof typically takes thousands to millions of times longer than running the computation natively, and memory use is large; the next three lessons are largely about bringing that factor down.
+
+<Narrator who="chloe">
+
+The framing explains why the field moves so fast: an advance in any one layer — a better arithmetisation, a new IOP, a faster commitment — can be combined with the best of the others. It also tells you where to look for bugs: in the constraints, in the IOP's soundness analysis, in the commitment's assumptions, and in the transcript fed to Fiat–Shamir.
+
+</Narrator>
+
+</Section>
+
+<Section id="under-constrained" kind="examples" title="The classic bug: an under-constrained circuit">
+
+A circuit is **under-constrained** if it accepts some witness that does not correspond to a correct computation. The proof system then works perfectly — and proves a false statement. Unlike a broken cryptographic assumption, nothing about this bug is exotic: it is a missing line.
+
+Take our factoring circuit and delete the eight booleanity constraints, as a hurried author might ("the bits are computed from $x$, so of course they are bits"). The bits are computed by the *honest* prover's witness generator; the constraints are all that bind a *malicious* one. Without $b \cdot b = b$, the "bits" can be any field elements, the range check disappears, and the field's wrap-around does the rest.
+
+```python run
+p = 2**31 - 1
+NAMES = ["one", "N", "x", "y"] + [f"x{i}" for i in range(4)] + [f"y{i}" for i in range(4)]
+
+def vec(**coeffs):
+    return [coeffs.get(name, 0) % p for name in NAMES]
+
+def factor_r1cs(check_bits=True):
+    rows = []
+    for v in "xy":
+        if check_bits:                                       # the line a hurried author forgets
+            rows += [(vec(**{f"{v}{i}": 1}),) * 3 for i in range(4)]
+        rows.append((vec(**{f"{v}{i}": 2**i for i in range(4)}), vec(one=1), vec(**{v: 1})))
+    rows.append((vec(x=1), vec(y=1), vec(N=1)))
+    return rows
+
+def satisfied(rows, z):
+    dot = lambda r: sum(a * b for a, b in zip(r, z)) % p
+    return all(dot(a) * dot(b) % p == dot(c) for a, b, c in rows)
+
+# A malicious "witness" claiming that 2 divides 143: y = 2 and x = 143 / 2 in the field.
+x_fake = 143 * pow(2, -1, p) % p
+fake = [1, 143, x_fake, 2] + [x_fake, 0, 0, 0] + [0, 1, 0, 0]   # x0 is not a bit at all
+print("x_fake =", x_fake, "  check: x_fake * 2 mod p =", x_fake * 2 % p)
+for name, check_bits in [("sound", True), ("under-constrained", False)]:
+    print(f"{name:>17} circuit accepts the fake witness: {satisfied(factor_r1cs(check_bits), fake)}")
+
+# How many accepted "factorisations" of 143 does the buggy circuit allow with y < 16?
+count = 0
+for y in range(16):
+    if y == 0:
+        continue
+    x = 143 * pow(y, -1, p) % p
+    z = [1, 143, x, y] + [x, 0, 0, 0] + [(y >> i) & 1 for i in range(4)]
+    count += satisfied(factor_r1cs(False), z)
+print("values of y from 1 to 15 with an accepted fake witness:", count, "(the honest answers are 11 and 13)")
+```
+
+The buggy circuit "proves" that $2 \times 1073741895 = 143$, which is true in $\mathbb{F}_p$ and nonsense as a statement about factoring. Every $y$ from 1 to 15 now has an accepted partner.
+
+<Example title="Real under-constrained bugs">
+
+- **Tornado Cash, 2019.** In the MiMC hash template of the circomlib library, an output was *assigned* with `=` instead of *assigned and constrained* with `<==`, so the hash output was unconstrained and a prover could fake a Merkle root. The team discovered it, used it to move the deposits to a fixed contract before anyone else could, and disclosed it ([Trail of Bits discussion](https://blog.trailofbits.com/2022/09/15/it-pays-to-be-circomspect/)).
+- **Range checks without bit-length checks.** A comparison gadget assumed its inputs had at most $k$ bits without enforcing it, so oversized field elements passed (an early version of the game Dark Forest, among others).
+- **zkEVM arithmetic.** An audit of Polygon's zkEVM found a division routine that did not constrain the remainder to be smaller than the divisor, so a prover could choose a wrong quotient.
+
+These and dozens more are collected in 0xPARC's [zk-bug-tracker](https://github.com/0xPARC/zk-bug-tracker), and the [SoK by Chaliasos et al.](https://arxiv.org/abs/2402.15293) (USENIX Security 2024) classified 141 vulnerabilities in SNARK systems found between 2018 and 2024, with circuit-layer bugs, under-constrained circuits above all, as the largest group.
+
+</Example>
+
+The defences: write witness generation and constraints in a language where assigning without constraining is hard (Noir, or typed Rust APIs, rather than raw `<--` in Circom); test circuits with **negative** tests that try malicious witnesses, not only valid ones; use static analysers such as Circomspect and solvers that check whether outputs are uniquely determined by inputs (Veridise's Picus, 0xPARC's Ecne); and, increasingly, formal verification (<LessonLink slug="frontier-of-verifiable-computation">the frontier lesson</LessonLink>).
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"If the cryptography is sound, the proof is sound."** The proof certifies that *the constraints* are satisfied. If the constraints do not capture the intended computation, the proof is valid and the statement false. Most real SNARK failures are in the constraints or the Fiat–Shamir transcript, not in the elliptic curves.
+
+</Misconception>
+
+<Misconception>
+
+**"A trusted setup means you must trust the organiser."** A multi-party ceremony needs only one honest participant among all contributors, and you can be that participant. The residual risks are implementation bugs in the ceremony software and the parameter files, as Zcash's 2019 disclosure showed.
+
+</Misconception>
+
+<Misconception>
+
+**"SNARK proofs are slow to verify because the computation is big."** Verification is the cheap part: constant time for Groth16, polylogarithmic for STARKs. *Proving* is expensive, typically by factors of thousands or more over native execution.
+
+</Misconception>
+
+<Misconception>
+
+**"Field arithmetic behaves like integer arithmetic."** Numbers wrap around modulo $p$, there is no "less than", and every nonzero element has an inverse, so $x \cdot y = N$ has a solution for every nonzero $y$. Any circuit that means integers must say so with range constraints.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

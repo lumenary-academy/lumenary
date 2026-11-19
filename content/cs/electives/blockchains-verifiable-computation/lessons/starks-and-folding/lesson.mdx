@@ -1,0 +1,481 @@
+---
+title: STARKs, FRI, lookups and folding
+subtitle: Proof systems built from hashes and error-correcting codes, the small fields that make them fast, and the tricks — lookups, recursion and folding — that let them scale.
+minutes: 90
+objectives:
+  - Explain Reed–Solomon codes, proximity testing, and why a Merkle root of a codeword is a transparent polynomial commitment
+  - Implement the folding rounds of a toy FRI protocol and watch it reject a word far from low degree
+  - Describe how a STARK combines an execution trace, transition constraints and FRI, and what its proofs cost
+  - Explain why provers moved to small fields (Goldilocks, BabyBear, Mersenne-31, binary towers) and how extension fields restore soundness
+  - Check a lookup with the LogUp identity, and place Plookup, LogUp and Lasso
+  - Describe recursion, proof composition and folding schemes, and fold relaxed R1CS instances as in Nova
+  - Assess the post-quantum claims of hash-based proofs
+narrators: [chloe, margaret, gideon]
+prerequisites: [hashes-and-merkle-trees, interactive-proofs-and-sumcheck, zero-knowledge, snarks-and-polynomial-commitments]
+related: [math.algebra.fields-galois, math.algebra.polynomials, math.applied.information-theory, math.algebra.linear-algebra, math.analysis.harmonic-analysis]
+references:
+  - title: "Scalable, transparent, and post-quantum secure computational integrity"
+    author: Eli Ben-Sasson, Iddo Bentov, Yinon Horesh and Michael Riabzev
+    year: 2018
+    url: https://eprint.iacr.org/2018/046
+    note: The STARK paper.
+  - title: Fast Reed–Solomon interactive oracle proofs of proximity
+    author: Eli Ben-Sasson, Iddo Bentov, Yinon Horesh and Michael Riabzev
+    year: 2018
+    url: https://doi.org/10.4230/LIPIcs.ICALP.2018.14
+    note: FRI.
+  - title: Proximity gaps for Reed–Solomon codes
+    author: Eli Ben-Sasson, Dan Carmon, Yuval Ishai, Swastik Kopparty and Shubhangi Saraf
+    year: 2020
+    url: https://eprint.iacr.org/2020/654
+  - title: Circle STARKs
+    author: Ulrich Haböck, David Levit and Shahar Papini
+    year: 2024
+    url: https://eprint.iacr.org/2024/278
+  - title: Succinct arguments over towers of binary fields
+    author: Benjamin E. Diamond and Jim Posen
+    year: 2023
+    url: https://eprint.iacr.org/2023/1784
+    note: Binius.
+  - title: "plookup: a simplified polynomial protocol for lookup tables"
+    author: Ariel Gabizon and Zachary J. Williamson
+    year: 2020
+    url: https://eprint.iacr.org/2020/315
+  - title: Multivariate lookups based on logarithmic derivatives
+    author: Ulrich Haböck
+    year: 2022
+    url: https://eprint.iacr.org/2022/1530
+    note: LogUp.
+  - title: Unlocking the lookup singularity with Lasso
+    author: Srinath Setty, Justin Thaler and Riad Wahby
+    year: 2023
+    url: https://eprint.iacr.org/2023/1216
+  - title: Recursive proof composition without a trusted setup
+    author: Sean Bowe, Jack Grigg and Daira Hopwood
+    year: 2019
+    url: https://eprint.iacr.org/2019/1021
+    note: Halo.
+  - title: "Nova: recursive zero-knowledge arguments from folding schemes"
+    author: Abhiram Kothapalli, Srinath Setty and Ioanna Tzialla
+    year: 2022
+    url: https://eprint.iacr.org/2021/370
+  - title: "HyperNova: recursive arguments for customizable constraint systems"
+    author: Abhiram Kothapalli and Srinath Setty
+    year: 2023
+    url: https://eprint.iacr.org/2023/573
+  - title: "ProtoStar: generic efficient accumulation/folding for special-sound protocols"
+    author: Benedikt Bünz and Binyi Chen
+    year: 2023
+    url: https://eprint.iacr.org/2023/620
+  - title: "LatticeFold: a lattice-based folding scheme and its applications to succinct proof systems"
+    author: Dan Boneh and Binyi Chen
+    year: 2024
+    url: https://eprint.iacr.org/2024/257
+  - title: Succinct arguments in the quantum random oracle model
+    author: Alessandro Chiesa, Peter Manohar and Nicholas Spooner
+    year: 2019
+    url: https://eprint.iacr.org/2019/834
+  - title: Plonky3
+    url: https://github.com/Plonky3/Plonky3
+    note: An open-source toolkit for FRI-based proof systems over small fields.
+---
+
+<Section id="motivation" kind="motivation" title="Proofs from hashes alone">
+
+The SNARKs of <LessonLink slug="snarks-and-polynomial-commitments">the previous lesson</LessonLink> rest on elliptic-curve pairings and, for the smallest proofs, on a trusted setup. Both are uncomfortable. A setup is a ceremony that must be trusted; pairings are slow, need fields of about 255 bits, and would be broken by a large quantum computer. In 2018 Eli Ben-Sasson, Iddo Bentov, Yinon Horesh and Michael Riabzev described **STARKs** — *scalable, transparent arguments of knowledge* — that need nothing but a hash function: no setup secrets, no number-theoretic assumptions, and plausible security against quantum computers. The cost is larger proofs, tens to hundreds of kilobytes instead of hundreds of bytes.
+
+STARK-style systems now carry a large share of production proving: StarkWare's StarkEx and Starknet, and many of the zkVMs of 2026 (<LessonLink slug="zkvms-and-coprocessors">next lesson</LessonLink>) commit with hashes and test low degree with **FRI**. This lesson builds FRI, explains why these provers compute over surprisingly small fields, and then covers the three ideas that make large proofs practical: **lookups** (cheap table membership), **recursion** (proofs that verify proofs) and **folding** (combining many statements into one before proving anything).
+
+</Section>
+
+<Section id="codes" kind="definitions" title="Reed–Solomon codes and proximity">
+
+A polynomial of degree less than $k$ is determined by $k$ values, but evaluating it at many more points, $n > k$, produces a highly redundant **codeword**: if two polynomials of degree less than $k$ differ, they agree on at most $k - 1$ points, so their codewords differ in at least $n - k + 1$ positions.
+
+<Definition term="Reed–Solomon code">
+
+For a field $\mathbb{F}$, an evaluation **domain** $D \subseteq \mathbb{F}$ with $|D| = n$, and $k < n$, the **Reed–Solomon code** $\mathrm{RS}[\mathbb{F}, D, k]$ is the set of vectors $(f(x))_{x \in D}$ for polynomials $f$ of degree less than $k$. Its **rate** is $\rho = k/n$. A word $w \in \mathbb{F}^D$ is **$\delta$-far** from the code if every codeword differs from $w$ in at least a fraction $\delta$ of positions.
+
+</Definition>
+
+The STARK idea in one paragraph: the prover encodes its computation as polynomials, evaluates them on a domain several times larger than their degree (a **low-degree extension**), and commits to each resulting codeword with a **Merkle tree** (<LessonLink slug="hashes-and-merkle-trees">Hashes and Merkle trees</LessonLink>). The verifier then needs to know two things. First, that the committed words really are codewords — or at least *close* to codewords, since checking every position is too expensive; this is a **proximity test**, and FRI is one. Second, that the polynomials satisfy the computation's constraints, which it checks at a few random positions, each opened with a Merkle path. A Merkle root of a codeword, plus a proximity test, is a polynomial commitment built from hashing alone: **transparent**, because there is nothing secret in it.
+
+Why "close" is enough: if a committed word is close to a unique codeword, the prover is effectively bound to that polynomial; and if it is far from every codeword, a few random spot checks catch it with high probability. Large distance is what makes spot checks meaningful, which is why the rate is kept low (commonly between $1/2$ and $1/16$).
+
+</Section>
+
+<Section id="fri" kind="computation" title="FRI: folding a function down to a constant">
+
+FRI (*Fast Reed–Solomon Interactive oracle proof of proximity*, Ben-Sasson, Bentov, Horesh and Riabzev, 2018) tests proximity with a divide-and-conquer trick reminiscent of the fast Fourier transform. Split any polynomial into its even and odd parts,
+
+$$
+f(X) = f_{\mathrm{e}}(X^2) + X\, f_{\mathrm{o}}(X^2),
+$$
+
+where $f_{\mathrm{e}}$ and $f_{\mathrm{o}}$ have half the degree. Given a random challenge $\beta$ from the verifier, define the **folded** polynomial $f'(Y) = f_{\mathrm{e}}(Y) + \beta f_{\mathrm{o}}(Y)$. If the domain $D$ is a multiplicative subgroup of even size, then $x$ and $-x$ are both in $D$, they have the same square, and
+
+$$
+f'(x^2) = \frac{f(x) + f(-x)}{2} + \beta\,\frac{f(x) - f(-x)}{2x},
+$$
+
+so each value of $f'$ on the squared domain $D' = \{x^2\}$, half the size of $D$, is computed from **two** values of $f$. Halving the degree and the domain at once keeps the rate the same.
+
+1. **Commit phase.** The prover commits to $f_0 = f$ on $D$; receives $\beta_1$; commits to $f_1$ on $D'$; and so on, until the degree is 0 and the last layer is a constant, which it sends in the clear.
+2. **Query phase.** The verifier picks random positions $x$ and checks every fold along the path: from $f_0(x)$ and $f_0(-x)$ it computes what $f_1(x^2)$ must be and compares with the committed value, then continues down to the constant. Each check needs two Merkle openings per layer.
+
+<Figure caption="FRI folds a word on 128 points down to a constant on 8 points, each layer half the size of the one before and committed by its own Merkle root. A query follows one path: the values at x and −x in a layer determine one value in the next.">
+
+<svg viewBox="0 0 460 250" role="img" aria-label="Five horizontal bars of decreasing length, labelled f0 on 128 points, f1 on 64, f2 on 32, f3 on 16 and f4 on 8, a constant. In the top bar two marked cells, at x and at minus x, are joined by lines to one marked cell in the second bar, which together with its partner leads to one cell in the third bar, and so on down to the constant.">
+  <g stroke="currentColor" strokeWidth="1.3" fill="var(--sky-soft)">
+    <rect x="20" y="20" width="400" height="22" />
+    <rect x="20" y="70" width="200" height="22" />
+    <rect x="20" y="120" width="100" height="22" />
+    <rect x="20" y="170" width="50" height="22" />
+    <rect x="20" y="220" width="25" height="22" fill="var(--gold-soft)" />
+  </g>
+  <g fill="var(--gold)" stroke="currentColor">
+    <rect x="80" y="20" width="10" height="22" />
+    <rect x="280" y="20" width="10" height="22" />
+    <rect x="80" y="70" width="10" height="22" />
+    <rect x="180" y="70" width="10" height="22" />
+    <rect x="80" y="120" width="10" height="22" />
+    <rect x="30" y="120" width="10" height="22" />
+    <rect x="30" y="170" width="8" height="22" />
+    <rect x="55" y="170" width="8" height="22" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.2" fill="none">
+    <path d="M 85 42 L 85 70" />
+    <path d="M 285 42 L 90 70" />
+    <path d="M 85 92 L 85 120" />
+    <path d="M 185 92 L 90 120" />
+    <path d="M 85 142 L 40 170" />
+    <path d="M 35 142 L 36 170" />
+    <path d="M 34 192 L 32 220" />
+    <path d="M 59 192 L 36 220" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11">
+    <text x="78" y="15">x</text>
+    <text x="276" y="15">−x</text>
+    <text x="230" y="86">f₁ on 64 points (root 1)</text>
+    <text x="130" y="136">f₂ on 32 points (root 2)</text>
+    <text x="80" y="186">f₃ on 16 points (root 3)</text>
+    <text x="55" y="236">f₄: a constant, sent in the clear</text>
+    <text x="300" y="60">f₀ on 128 points (root 0)</text>
+  </g>
+</svg>
+
+</Figure>
+
+The program runs FRI over the toy field $\mathbb{F}_{257}$, whose multiplicative group has order $256 = 2^8$ and so contains subgroups of every power-of-two size. It encodes a random polynomial of degree less than 16 on 128 points (rate $1/8$), folds four times, and checks the folds at random queries. The verifier reads the layers directly, standing in for Merkle openings. A random word, folded honestly, does not end in a constant; and a prover who corrupts about 10% of a real codeword and then *lies* in the first fold to hide it is caught by the consistency checks, at a rate that grows with the number of queries.
+
+```python run
+import random
+
+p = 257                       # toy field: p - 1 = 256 = 2^8, so F_257 has subgroups of every size 2^j
+N, K = 128, 16                # evaluate polynomials of degree < 16 on 128 points: rate 1/8
+omega = pow(3, (p - 1) // N, p)                 # 3 generates F_257^*, so omega has order 128
+domain = [pow(omega, i, p) for i in range(N)]
+inv2 = pow(2, -1, p)
+
+def evaluate(coeffs, x):
+    acc = 0
+    for c in reversed(coeffs):
+        acc = (acc * x + c) % p
+    return acc
+
+def fold(layer, beta, size):
+    """f(x) = fe(x^2) + x fo(x^2)  ->  f'(y) = fe(y) + beta fo(y), on the squared domain."""
+    w = pow(omega, N // size, p)                # generator of the current domain
+    half = size // 2
+    out = []
+    for i in range(half):
+        x = pow(w, i, p)
+        a, b = layer[i], layer[i + half]        # f(x) and f(-x): -x is x * w^(size/2)
+        even = (a + b) * inv2 % p
+        odd = (a - b) * inv2 * pow(x, -1, p) % p
+        out.append((even + beta * odd) % p)
+    return out
+
+def commit_phase(word, rng, cheat=None):
+    layers, betas, size = [word], [], N
+    while size > N // K:                        # 4 folds take degree < 16 down to a constant
+        beta = rng.randrange(p)                 # verifier's challenge (Fiat-Shamir in practice)
+        nxt = fold(layers[-1], beta, size)
+        if cheat is not None and len(layers) == 1:
+            nxt = cheat(beta)                   # a cheating prover may send any next layer
+        layers.append(nxt); betas.append(beta); size //= 2
+    return layers, betas
+
+def query_phase(layers, betas, queries, rng):
+    if len(set(layers[-1])) != 1:
+        return False                            # the last layer must be a constant
+    for _ in range(queries):
+        i, size = rng.randrange(N), N
+        for j, beta in enumerate(betas):
+            i %= size
+            half = size // 2
+            x = pow(pow(omega, N // size, p), i % half, p)
+            a, b = layers[j][i % half], layers[j][i % half + half]
+            expected = ((a + b) * inv2 + beta * (a - b) * inv2 * pow(x, -1, p)) % p
+            if layers[j + 1][i % half] != expected:
+                return False                    # folding was not done consistently
+            size = half
+    return True
+
+rng = random.Random(2018)
+poly = [rng.randrange(p) for _ in range(K)]
+codeword = [evaluate(poly, x) for x in domain]
+layers, betas = commit_phase(codeword, rng)
+print("honest codeword: layer sizes", [len(L) for L in layers], " last layer", layers[-1],
+      " accepted:", query_phase(layers, betas, 20, rng))
+
+noise = [rng.randrange(p) for _ in range(N)]    # a word far from every low-degree polynomial
+layers, betas = commit_phase(noise, rng)
+print("random word, folded honestly: last layer", layers[-1], " accepted:", query_phase(layers, betas, 20, rng))
+
+# A subtler cheat: corrupt 13 of the 128 values of a real codeword (about 10%), then hide the
+# damage by sending the fold of the ORIGINAL codeword as layer 1. Only queries that touch a
+# corrupted position can notice.
+bad = list(codeword)
+for i in rng.sample(range(N), 13):
+    bad[i] = (bad[i] + 1 + rng.randrange(p - 1)) % p
+print("\ncorrupted codeword, cheating prover; acceptance rate over 2000 runs:")
+for q in [1, 5, 20, 60]:
+    wins = 0
+    for _ in range(2000):
+        layers, betas = commit_phase(bad, rng, cheat=lambda beta: fold(codeword, beta, N))
+        wins += query_phase(layers, betas, q, rng)
+    print(f"  {q:2} quer{'y' if q == 1 else 'ies'}: {wins / 2000:.3f}")
+```
+
+<Narrator who="margaret">
+
+Each query that touches a corrupted pair catches the cheat; here about one query in six does, so acceptance falls like $(1 - 0.165)^q$: $0.835^5 \approx 0.41$ and $0.835^{20} \approx 0.027$, matching the measured rates. For a word that is $\delta$-far, $s$ queries leave a cheater roughly $(1 - \delta)^s$. Proven bounds let $\delta$ approach $1 - \sqrt{\rho}$, worth about $\tfrac12\log_2(1/\rho)$ bits per query, so 100 bits at rate $1/8$ needs about 67 queries; the more aggressive conjectures that many systems relied on until 2025 would give a full $\log_2(1/\rho) = 3$ bits per query, and about 34 queries.
+
+</Narrator>
+
+<Narrator who="gideon">
+
+The toy hides a second weakness: the folding challenges $\beta$ come from a field of only 257 elements, so a cheater has a non-negligible chance that an unlucky $\beta$ folds a far word into a close one. The soundness analysis of FRI (the "proximity gaps" theorems) bounds that chance by something proportional to $n/|\mathbb{F}|$; with real domain sizes of $2^{20}$ or more, $\beta$ must come from a field of well over 100 bits.
+
+</Narrator>
+
+</Section>
+
+<Section id="stark" kind="human" title="From FRI to a STARK">
+
+A STARK proves that a computation ran correctly, described as an **algebraic intermediate representation** (AIR):
+
+1. **Trace.** The prover writes the computation as a table, the **execution trace**: one row per step, one column per register. A trace with $T$ rows becomes one polynomial per column, interpolated over a subgroup of size $T$ (with a generator $g$, row $i$ sits at $g^i$).
+2. **Constraints.** Correct execution is a set of polynomial identities between a row and the next: for example $P(\text{col}(X), \text{col}(gX)) = 0$ for every row, plus **boundary constraints** on the first and last rows. "Holds on every row" means "is divisible by the vanishing polynomial $X^T - 1$" — the same trick as the QAP.
+3. **Commit and test.** The prover evaluates the trace polynomials and the quotient of the constraints by the vanishing polynomial on a larger domain (a low-degree extension, typically 2 to 16 times larger), Merkle-commits them, and proves with FRI that the quotient is close to a low-degree polynomial. If any constraint failed on any row, the "quotient" would not be a polynomial at all, and FRI would reject.
+4. **Spot checks.** At random points, the verifier checks that the committed trace and quotient values satisfy the constraint equation, using Merkle openings (refined by the DEEP technique, which samples outside the domain).
+
+Everything is public-coin and made non-interactive by hashing the Merkle roots into the challenges. The verifier does only hashing and a little field arithmetic, polylogarithmic in $T$. Proofs are typically tens to a couple of hundred kilobytes, too large to post on Ethereum cheaply, so many systems end by **wrapping**: a final, small SNARK (Groth16 or PLONK) proves "I verified this STARK". <LessonLink slug="zkvms-and-coprocessors">The next lesson</LessonLink> builds a trace and its transition constraints for a small stack machine.
+
+</Section>
+
+<Section id="small-fields" kind="human" title="Why small fields?">
+
+Pairing-based SNARKs must work over a field of about 255 bits, the scalar field of the curve. Hash-based systems have no such constraint, and since 2022 they have moved to **small fields** whose elements fit in a machine word:
+
+| Field | Size | Where used (examples) | Why it is convenient |
+| --- | --- | --- | --- |
+| Goldilocks | $p = 2^{64} - 2^{32} + 1$ | Plonky2 | 64-bit words; $2^{32}$ divides $p - 1$, so FFTs up to $2^{32}$ points; fast reduction |
+| BabyBear | $p = 2^{31} - 2^{27} + 1 = 15 \cdot 2^{27} + 1$ | RISC Zero, Plonky3-based provers | 31 bits fit in 32-bit lanes of CPUs and GPUs; FFTs up to $2^{27}$ points |
+| KoalaBear | $p = 2^{31} - 2^{24} + 1$ | some Plonky3-based provers | similar; $x^3$ is a permutation, so algebraic hashes need fewer multiplications |
+| Mersenne-31 | $p = 2^{31} - 1$ | StarkWare's Stwo prover | the fastest reduction of all; FFTs use the "circle" group of order $2^{31}$ ([Circle STARKs](https://eprint.iacr.org/2024/278)) |
+| Binary towers | $\mathbb{F}_{2^{2^k}}$ | [Binius](https://eprint.iacr.org/2023/1784) | addition is XOR; bits cost one bit, not a whole field element |
+
+Small fields make every operation several times cheaper, use memory and bandwidth better, and map onto GPU and vector instructions. They also match computation: a 32-bit register of a RISC-V program is stored as two 16-bit limbs or four bytes, each in a 31-bit element, instead of one value padded into a 254-bit element.
+
+The catch is soundness. Every random challenge must come from a set large enough that luck is negligible, and $2^{31}$ is not. So the **data** stay in the base field while **challenges** come from an **extension field**: for BabyBear, the degree-4 extension $\mathbb{F}_{p^4}$ has about $2^{124}$ elements. Only the values that mix in challenges (folds, random linear combinations) need extension arithmetic, which costs several times more per operation but touches far fewer values. (Extension fields are polynomials modulo an irreducible polynomial; see <TopicLink id="math.algebra.fields-galois">fields and Galois theory</TopicLink>.)
+
+</Section>
+
+<Section id="lookups" kind="computation" title="Lookup arguments">
+
+Arithmetic constraints are bad at non-arithmetic facts: "this value is a byte", "this is the XOR of those two bytes", "this 32-bit word is that instruction's encoding". The bit decomposition of the previous lesson costs nine constraints per byte. A **lookup argument** proves instead that every value in a witness column $a$ appears in a fixed **table** $t$, at a cost of roughly one committed value per lookup plus one per table entry, however complex the relation the table encodes.
+
+- **Plookup** (Gabizon and Williamson, 2020) sorts the witness values together with the table and checks, with a grand product like PLONK's, that consecutive entries of the sorted list either repeat or follow the table.
+- **LogUp** (Haböck, 2022) uses logarithmic derivatives. The multiset $\{a_i\}$ is contained in the set $\{t_j\}$, with $t_j$ used $m_j$ times, exactly when
+  $$
+  \sum_i \frac{1}{X - a_i} = \sum_j \frac{m_j}{X - t_j}
+  $$
+  as rational functions, which the verifier tests at a random $X$. Sums are easier to prove than products, especially with sumcheck.
+- **Lasso** (Setty, Thaler and Wahby, 2023) handles tables far too large to write down, such as all $2^{64}$ results of a 64-bit addition, by requiring the tables to be **decomposable** into small subtables, and pays only for the entries actually looked up. The zkVM Jolt builds a whole processor from such lookups.
+
+```python run
+import random
+from collections import Counter
+
+p = 2**61 - 1                                   # a toy-sized prime field for the challenge
+
+def inv(a):
+    return pow(a % p, -1, p)
+
+def logup_sides(values, table, mult, X):
+    """LogUp: the multiset 'values' lies in 'table' (with multiplicities 'mult') iff
+       sum_i 1/(X - values_i) == sum_j mult_j/(X - table_j) as rational functions of X."""
+    lhs = sum(inv(X - a) for a in values) % p
+    rhs = sum(m * inv(X - t) for t, m in zip(table, mult)) % p
+    return lhs, rhs
+
+table = list(range(256))                        # an 8-bit range-check table
+rng = random.Random(4)
+values = [rng.randrange(256) for _ in range(1000)]      # 1000 witness values to range-check
+counts = Counter(values)
+mult = [counts[t] for t in table]               # the prover supplies how often each entry is used
+X = rng.randrange(p)                            # the verifier's random challenge
+lhs, rhs = logup_sides(values, table, mult, X)
+print("all values are bytes:      sides equal:", lhs == rhs)
+
+values_bad = values[:-1] + [300]                # one value out of range
+counts = Counter(v for v in values_bad if v < 256)
+mult_bad = [counts[t] for t in table]           # the best the prover can do with this table
+lhs, rhs = logup_sides(values_bad, table, mult_bad, X)
+print("one value is 300:          sides equal:", lhs == rhs)
+
+# Even choosing the multiplicities freely does not help: 1/(X - 300) has a pole that no
+# combination of the table's terms has. For example, put the extra weight on entry 255:
+mult_try = list(mult_bad); mult_try[255] += 1
+lhs, rhs = logup_sides(values_bad, table, mult_try, X)
+print("300 counted as 255 instead: sides equal:", lhs == rhs)
+print(f"LogUp terms: {len(values)} + {len(table)};  bit decomposition: {9 * len(values)} constraints")
+```
+
+The cheating prover cannot balance the identity, because $\frac{1}{X - 300}$ has a pole at 300 that no combination of $\frac{1}{X - t_j}$ with $t_j \le 255$ can produce; at a random $X$ the two sides differ except with probability about (number of terms)$/p$. A phrase from the Ethereum research community captures the ambition: the **lookup singularity**, the point at which a circuit is mostly lookups into precomputed tables, so that writing a proof system's front end feels like writing ordinary code.
+
+</Section>
+
+<Section id="recursion" kind="human" title="Recursion and proof composition">
+
+A proof verifier is itself a computation, so it can be proved. **Recursion** proves the statement "I verified proof $\pi$, and it was valid", which opens three doors:
+
+- **Compression.** Prove with a fast system that produces large proofs (a STARK), then prove the verification of that proof with a system whose proofs are small (Groth16). Many zkVMs end exactly this way for Ethereum.
+- **Aggregation.** One proof that $n$ proofs verified, so a blockchain checks one proof instead of $n$; a tree of aggregations handles thousands.
+- **Incrementally verifiable computation (IVC)**, defined by Paul Valiant in 2008, and its generalisation **proof-carrying data** (Chiesa and Tromer, 2010): at each step of a long computation, prove "this step was correct, and so was the proof of everything before". A blockchain whose every block carries a proof of the entire history can be checked from a single, constant-size proof; Mina is designed this way.
+
+Recursion is expensive when the verifier's arithmetic does not match the proof system's field. A pairing check involves arithmetic in the curve's *base* field while the circuit computes in its *scalar* field, so simulating it means emulating one field inside another, costing hundreds of constraints per multiplication. Solutions include **cycles of curves** (two curves, each with base field equal to the other's scalar field, like the Pasta curves used by Zcash's Halo 2), recursion-friendly hashes such as Poseidon2 inside FRI verifiers over the same small field, and Halo's **accumulation** idea (Bowe, Grigg and Hopwood, 2019): postpone the expensive part of each verification and batch all of them into one check at the end.
+
+</Section>
+
+<Section id="folding" kind="computation" title="Folding: Nova and its successors">
+
+Accumulation taken to its logical end gives **folding schemes**. Nova (Kothapalli, Setty and Tzialla, first posted in 2021) observed that for IVC you do not need to *prove* each step at all: you can **fold** the statement "step $i$ is correct" into a running statement "steps $1, \ldots, i - 1$ are correct" so that one satisfying the folded statement implies (with high probability) both. Only at the end is one SNARK produced, for the final folded statement.
+
+Plain R1CS does not fold: the constraints are quadratic, so a random combination $z_1 + r z_2$ of two solutions is not a solution. Nova uses **relaxed R1CS**, which adds a scalar $u$ (stored in the constant slot of $z$) and an error vector $E$:
+
+$$
+(Az) \circ (Bz) = u \cdot (Cz) + E.
+$$
+
+A fresh instance has $u = 1$ and $E = 0$. To fold two instances, the prover sends the **cross term** $T = Az_1 \circ Bz_2 + Az_2 \circ Bz_1 - u_1 Cz_2 - u_2 Cz_1$, the verifier picks a random $r$, and both compute
+
+$$
+z = z_1 + r z_2, \qquad u = u_1 + r u_2, \qquad E = E_1 + rT + r^2 E_2.
+$$
+
+Expanding $(Az) \circ (Bz)$ shows that the folded instance is satisfied whenever both inputs are, and if either is not, the folded one fails except with probability about $2/|\mathbb{F}|$ (a degree-2 polynomial in $r$). In real Nova, $z$'s witness part and $E$ are never sent: they are hidden in Pedersen commitments, which are additively homomorphic, so the verifier folds the commitments with a few group operations, and that tiny folding verifier is all that each step's circuit must contain. The program folds ten steps of the iteration $x \mapsto (x + 3)^5$ (a toy version of a hash round) and then one incorrect step.
+
+```python run
+import random
+
+p = 2**61 - 1                      # toy prime field; real Nova uses the scalar field of a curve
+
+# One step of an iterated computation: x_next = (x + 3)^5, as an R1CS with Z = (u, x, y, s1, s2):
+#   (x + 3u)(x + 3u) = s1,   s1 * s1 = s2,   s2 * (x + 3u) = y
+A = [[3, 1, 0, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 1]]
+B = [[3, 1, 0, 0, 0], [0, 0, 0, 1, 0], [3, 1, 0, 0, 0]]
+C = [[0, 0, 0, 1, 0], [0, 0, 0, 0, 1], [0, 0, 1, 0, 0]]
+
+def mv(M, Z):
+    return [sum(a * z for a, z in zip(row, Z)) % p for row in M]
+
+def satisfied(inst):
+    """Relaxed R1CS: (A Z) o (B Z) == u (C Z) + E, where Z[0] = u."""
+    Z, E = inst
+    u = Z[0]
+    return all(a * b % p == (u * c + e) % p for a, b, c, e in zip(mv(A, Z), mv(B, Z), mv(C, Z), E))
+
+def step(x):
+    s1 = (x + 3) ** 2 % p
+    s2 = s1 * s1 % p
+    return ([1, x, s2 * (x + 3) % p, s1, s2], [0, 0, 0])     # a fresh instance: u = 1, E = 0
+
+def fold(inst1, inst2, r):
+    (Z1, E1), (Z2, E2) = inst1, inst2
+    u1, u2 = Z1[0], Z2[0]
+    AZ1, BZ1, CZ1 = mv(A, Z1), mv(B, Z1), mv(C, Z1)
+    AZ2, BZ2, CZ2 = mv(A, Z2), mv(B, Z2), mv(C, Z2)
+    T = [(a1 * b2 + a2 * b1 - u1 * c2 - u2 * c1) % p              # the cross term
+         for a1, b1, c1, a2, b2, c2 in zip(AZ1, BZ1, CZ1, AZ2, BZ2, CZ2)]
+    Z = [(z1 + r * z2) % p for z1, z2 in zip(Z1, Z2)]
+    E = [(e1 + r * t + r * r * e2) % p for e1, t, e2 in zip(E1, T, E2)]
+    return Z, E
+
+rng = random.Random(7)
+# Fold ten steps of the computation, one after another, into a single running instance.
+x, acc = 5, None
+for i in range(10):
+    inst = step(x)
+    acc = inst if acc is None else fold(acc, inst, rng.randrange(p))
+    x = inst[0][2]                                             # this step's output feeds the next
+print("10 steps folded; the accumulator is still", len(acc[0]), "variables and", len(acc[1]),
+      "constraints; satisfied:", satisfied(acc))
+
+# A wrong step poisons the accumulator: folding cannot hide it.
+wrong = step(x)
+wrong[0][2] = (wrong[0][2] + 1) % p                            # a step with an incorrect output
+print("one wrong step folded in; satisfied:", satisfied(fold(acc, wrong, rng.randrange(p))))
+```
+
+<Narrator who="chloe">
+
+Folding replaces "prove, then verify inside the next proof" by "combine first, prove once". The per-step overhead becomes a handful of group operations instead of a SNARK verifier, which is why folding suits very long, repetitive computations — a hash chain, a sequence of blocks, the layers of a neural network — and why it depends on the commitment being homomorphic.
+
+</Narrator>
+
+The successors broaden what can be folded: **SuperNova** (2022) lets each step run a different circuit (a different instruction), **HyperNova** (2023) folds higher-degree constraint systems (CCS, which captures R1CS, PLONKish and AIR) and many instances at once, **ProtoStar** and **ProtoGalaxy** (2023) fold any special-sound protocol, and **CycleFold** reduces the cost of the curve cycle. Since 2024, lattice-based folding (**LatticeFold**, Boneh and Chen; **Neo**, 2025) replaces Pedersen commitments with lattice commitments over small fields, aiming at folding that is both fast and plausibly post-quantum. As of 2026, folding libraries serve long, repetitive computations, while the fastest zkVMs mostly rely on FRI-style STARKs or sumcheck-based designs with recursion; which approach wins where is an open, empirical question.
+
+</Section>
+
+<Section id="post-quantum" kind="human" title="Are hash-based proofs post-quantum?">
+
+Shor's algorithm would break every scheme whose security rests on discrete logarithms or factoring: KZG, Groth16, Bulletproofs and the Pedersen commitments inside Nova. Hash-based systems rest on **collision resistance** and on modelling the hash as a random oracle for Fiat–Shamir. Against quantum computers, the best known generic attacks on hashes give only polynomial speed-ups (Grover's square-root speed-up for search, smaller ones for collisions), so doubling hash output sizes is believed to compensate, and FRI-based SNARKs have been proven secure in the *quantum* random oracle model (Chiesa, Manohar and Spooner, 2019). Hence the usual phrase: STARKs are **plausibly post-quantum**. "Plausibly" is honest: the security proofs are in idealised models, concrete parameters often rely on conjectures about Reed–Solomon codes (some of which were refuted in late 2025, <LessonLink slug="frontier-of-verifiable-computation">see the frontier</LessonLink>), and a STARK wrapped in Groth16 for cheap verification is only as post-quantum as Groth16, which is not at all.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Transparent means the proofs reveal everything."** Transparent refers to the *setup*: no secret randomness is needed to create the public parameters. Whether proofs hide the witness (zero knowledge) is a separate property; STARKs add it by masking the trace with random values.
+
+</Misconception>
+
+<Misconception>
+
+**"FRI proves the committed polynomial has low degree."** It proves the committed *word* is close to a low-degree codeword, with some probability of error; the protocol is designed so that closeness is all that the rest of the proof needs. Exact degree checking would mean reading every position.
+
+</Misconception>
+
+<Misconception>
+
+**"A 31-bit field gives 31-bit security."** Security depends on the field the *challenges* come from and on the number of queries, not on the base field. BabyBear provers take challenges from a degree-4 or degree-5 extension. Conversely, a 256-bit field with too few FRI queries is insecure.
+
+</Misconception>
+
+<Misconception>
+
+**"Folding is a proof system."** A folding scheme reduces two statements to one; it proves nothing until the final folded statement is proved with an ordinary SNARK. Its soundness also depends on the commitments: folded witnesses must stay bound to the original ones.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

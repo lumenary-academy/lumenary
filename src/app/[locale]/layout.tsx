@@ -6,6 +6,7 @@ import { CORE_NAMESPACES, getMessages, makeT, pickMessages } from "@/i18n/dictio
 import { I18nProvider } from "@/i18n/client";
 import { resolveLocale } from "@/i18n/server";
 import { SiteHeader } from "@/components/site/SiteHeader";
+import { COLLECTIONS, getCourses } from "@/lib/courses";
 import { SiteFooter } from "@/components/site/SiteFooter";
 import { initScript } from "@/components/site/init-scripts";
 
@@ -42,6 +43,9 @@ export default async function LocaleLayout({ children, params }: { children: Rea
   const messages = await getMessages(locale);
   const t = makeT(messages);
   const fonts = [inter, sourceSerif, jetbrains, notoArabic, notoDeva].map((f) => f.variable).join(" ");
+  // Course paths with pages, so the header lists a subject only once its course is published.
+  const courses = getCourses();
+  const available = [...courses.map((c) => c.path), ...Object.keys(COLLECTIONS).filter((k) => courses.some((c) => c.collection === k))];
   return (
     <html lang={locale} dir={LOCALE_META[locale].dir} className={fonts} suppressHydrationWarning>
       <head>
@@ -52,7 +56,7 @@ export default async function LocaleLayout({ children, params }: { children: Rea
           <a href="#main" className="sr-only z-50 rounded-full bg-ink px-4 py-2 text-paper focus:not-sr-only focus:fixed focus:start-4 focus:top-3">
             {t("nav.skip")}
           </a>
-          <SiteHeader />
+          <SiteHeader available={available} />
           <main id="main" tabIndex={-1} className="outline-none">
             {children}
           </main>

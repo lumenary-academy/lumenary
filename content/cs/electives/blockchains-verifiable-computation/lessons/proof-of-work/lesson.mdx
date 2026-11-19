@@ -1,0 +1,396 @@
+---
+title: Proof of work and Nakamoto consensus
+subtitle: How a hash puzzle turns computing power into votes, why the chain with the most work wins, how safe "six confirmations" really is — and what it all costs in electricity.
+minutes: 80
+objectives:
+  - Describe a block header and the proof-of-work puzzle, and mine blocks at adjustable difficulty with a toy miner
+  - Explain difficulty adjustment and simulate Bitcoin's retargeting rule
+  - State the heaviest-chain rule and explain forks, stale blocks and confirmations
+  - Reproduce Nakamoto's calculation of an attacker's chance of catching up, and compare it with the exact answer
+  - Explain selfish mining, 51% attacks and real incidents on smaller chains, mining pools and hardware
+  - State Bitcoin's issuance schedule precisely and estimate proof of work's energy use from hash rate and machine efficiency
+narrators: [chloe, margaret, gideon]
+prerequisites: [why-blockchains, hashes-and-merkle-trees, signatures-and-keys]
+related: [math.prob.probability-theory, math.prob.markov-chains, math.prob.stochastic-processes, math.discrete.recurrences-generating-functions]
+references:
+  - title: "Bitcoin: A Peer-to-Peer Electronic Cash System"
+    author: Satoshi Nakamoto
+    year: 2008
+    url: https://bitcoin.org/bitcoin.pdf
+    note: Sections 4–6 describe proof of work and the network; section 11 is the calculation reproduced here.
+  - title: "Majority is not Enough: Bitcoin Mining is Vulnerable"
+    author: Ittay Eyal and Emin Gün Sirer
+    year: 2013
+    url: https://arxiv.org/abs/1311.0243
+    note: The selfish-mining paper.
+  - title: "Analysis of hashrate-based double spending"
+    author: Meni Rosenfeld
+    year: 2014
+    url: https://arxiv.org/abs/1402.2009
+    note: A more careful version of Nakamoto's calculation, with the exact distribution of the attacker's progress.
+  - title: "The Bitcoin Backbone Protocol: Analysis and Applications"
+    author: Juan Garay, Aggelos Kiayias and Nikos Leonardos
+    year: 2015
+    url: https://eprint.iacr.org/2014/765
+    note: The first rigorous proof of the properties of Nakamoto consensus.
+  - title: "Cambridge Bitcoin Electricity Consumption Index"
+    author: Cambridge Centre for Alternative Finance
+    url: https://ccaf.io/cbnsi/cbeci
+    note: Continuously updated estimates, with lower and upper bounds, of the electricity used by Bitcoin mining, and the method behind them.
+  - title: "BIP 50: March 2013 Chain Fork Post-Mortem"
+    url: https://github.com/bitcoin/bips/blob/master/bip-0050.mediawiki
+  - title: "Bitcoin developer documentation: block chain"
+    url: https://developer.bitcoin.org/devguide/block_chain.html
+  - title: "Stratum V2"
+    url: https://stratumprotocol.org/
+    note: A mining protocol that lets individual miners, not only pool operators, choose the transactions in a block.
+---
+
+<Section id="motivation" kind="motivation" title="Making votes expensive">
+
+In <LessonLink slug="why-blockchains">the first lesson</LessonLink> we met two problems an open ledger must solve. Copies of the ledger must agree on **one order** of transactions, which is consensus; and because anyone may join, votes cannot be counted per participant, since an attacker can create unlimited identities (the Sybil attack). We also saw that a hash chain is tamper-*evident* but not tamper-*resistant*: rewriting history costs a few hash computations.
+
+**Proof of work** solves both problems with one idea. Make the right to add a block cost real resources — computation, and so electricity and hardware — and let the history with the most accumulated work win. Rewriting the past then means redoing all of its work, faster than everyone else is extending it. Votes are counted in work, which an attacker cannot fake by making identities.
+
+This lesson builds the mechanism piece by piece, mines a toy chain, and reproduces the probability calculation in the Bitcoin paper. It also looks plainly at what proof of work costs and how it has failed.
+
+</Section>
+
+<Section id="puzzle" kind="definitions" title="Blocks, headers and the hash puzzle">
+
+A Bitcoin block is a list of transactions plus an 80-byte **header** containing: a version number; the hash of the previous block's header; the Merkle root of the block's transactions (<LessonLink slug="hashes-and-merkle-trees">previous lesson</LessonLink>); a timestamp; the current **target**, in a compact encoding; and a 32-bit **nonce**, a field with no meaning except that miners may set it to anything.
+
+<Definition term="Proof of work">
+
+A block is valid only if the double SHA-256 hash of its header, read as a 256-bit number, is **at most the target** $T$. Finding such a header requires trying header variants (nonces, timestamps and other fields) until one succeeds; checking it takes one hash.
+
+</Definition>
+
+If SHA-256 behaves like a random function, each attempt succeeds independently with probability $T / 2^{256}$, so the number of attempts is geometric with mean $2^{256}/T$. A target of $2^{256-b}$ means "the hash starts with $b$ zero bits" and needs $2^b$ attempts on average. Two consequences matter. **Progress-free**: past failures do not bring success closer, so a miner with 1% of the hash power finds about 1% of the blocks, rather than the fastest miner winning every time. **Asymmetry**: a block costs about $2^{256}/T$ hashes to find but one to check, so every node can verify every block cheaply.
+
+Here is a toy miner over Bitcoin-shaped headers. Difficulty is set by the number of leading zero bits required, and the program mines five chained blocks at each difficulty:
+
+```python run
+import hashlib, struct, time
+
+def header_bytes(prev_hash, merkle_root, timestamp, bits, nonce):
+    """A Bitcoin-shaped 80-byte header: version, previous hash, Merkle root, time, difficulty, nonce."""
+    return struct.pack("<I32s32sIII", 2, prev_hash, merkle_root, timestamp, bits, nonce)
+
+def pow_hash(header):
+    return hashlib.sha256(hashlib.sha256(header).digest()).digest()   # SHA-256d, as in Bitcoin
+
+def mine(prev_hash, merkle_root, timestamp, zero_bits):
+    """Find a nonce whose header hash, read as a 256-bit number, is below 2**(256 - zero_bits)."""
+    target = 1 << (256 - zero_bits)
+    nonce = 0
+    while True:
+        h = pow_hash(header_bytes(prev_hash, merkle_root, timestamp, zero_bits, nonce))
+        if int.from_bytes(h, "big") < target:      # (Bitcoin compares the bytes in reverse order)
+            return nonce, h
+        nonce += 1
+
+merkle_root = hashlib.sha256(b"transactions of this toy block").digest()
+print("zero bits   attempts per block (5 blocks)                  mean    expected 2^bits")
+total_hashes, start = 0, time.perf_counter()
+for zero_bits in [4, 8, 12, 16]:
+    prev, tries = bytes(32), []
+    for height in range(5):
+        nonce, h = mine(prev, merkle_root, 1_700_000_000 + 600 * height, zero_bits)
+        tries.append(nonce + 1)
+        prev = h
+    total_hashes += sum(tries)
+    print(f"{zero_bits:9}   {str(tries):45} {sum(tries) / 5:8.0f} {2**zero_bits:12,}")
+elapsed = time.perf_counter() - start
+rate = total_hashes / elapsed
+print(f"\n{total_hashes:,} double hashes in {elapsed:.2f} s: about {rate:,.0f} per second here (varies by machine)")
+print(f"at that rate, one block at 32 zero bits would take about {2**32 / rate / 3600:.1f} hours")
+print("last block hash:", prev.hex())
+```
+
+The mean number of attempts tracks $2^b$, but individual blocks vary enormously: at 16 bits, one block took about 9,000 attempts and another over 100,000. That spread is the geometric distribution at work. The hash rate printed is for the machine running the code (Python in a browser is slow); at the same rate, a block at 32 zero bits — the difficulty of Bitcoin's first blocks in 2009 — would take hours.
+
+<Narrator who="margaret">
+
+Scale it to Bitcoin. Block explorers and the Cambridge index put the network's hash rate on the order of $10^{21}$ double hashes per second in 2025. At ten minutes per block, that is about $600 \times 10^{21} = 6 \times 10^{23}$ attempts per block, roughly $2^{79}$: a block hash starts with about 79 zero bits.
+
+</Narrator>
+
+</Section>
+
+<Section id="difficulty" kind="computation" title="Difficulty adjustment">
+
+Miners join and leave, and hardware gets faster, so a fixed target would make blocks arrive ever faster or slower. Bitcoin therefore **retargets**: every 2016 blocks, each node compares how long those blocks took with the intended two weeks (2016 × 10 minutes) and scales the target by the ratio, so that the next period should take two weeks at the current hash rate. To limit manipulation, the change is clamped to a factor of 4 either way. Block timestamps are only loosely checked — each must exceed the median of the previous 11 and be no more than two hours ahead of a node's clock — and that looseness has been exploited on smaller chains to distort the difficulty.
+
+Block times behave like a Poisson process: with hash rate $h$ (attempts per second) and difficulty $D$ (expected attempts per block), the time to the next block is exponentially distributed with mean $D/h$. The simulation below follows a made-up history in which the hash rate grows by 0.5% a day, then halves for two weeks — as it did, for real, when China banned mining in 2021 — and recovers:
+
+```python run
+import random
+
+rng = random.Random(2009)
+INTERVAL, TARGET_SPACING = 2016, 600          # Bitcoin's rules: retarget every 2016 blocks, aim for 10 minutes
+
+def hashrate_at(day):
+    """A made-up history: steady growth, then half the miners switch off on day 70 and return slowly."""
+    base = 100.0 * 1.005 ** day
+    return base * (0.5 if 70 <= day < 85 else 1.0)
+
+difficulty = 100.0 * TARGET_SPACING           # expected hashes per block, in arbitrary units
+t, height = 0.0, 0
+print("period  days   difficulty   mean block time (min)   hash rate at end")
+for period in range(9):
+    start = t
+    for _ in range(INTERVAL):
+        rate = hashrate_at(t / 86400)
+        t += rng.expovariate(rate / difficulty)  # time to the next block: exponential, mean difficulty / rate
+    spent = t - start
+    mean_min = spent / INTERVAL / 60
+    print(f"{period:6} {t / 86400:6.1f} {difficulty:12,.0f} {mean_min:15.2f} {hashrate_at(t / 86400):17.1f}")
+    factor = (INTERVAL * TARGET_SPACING) / spent
+    difficulty *= min(4.0, max(0.25, factor))  # adjust, at most a factor of 4 either way
+```
+
+While the hash rate grows, blocks come slightly faster than ten minutes, because the difficulty always lags behind; that is visible in Bitcoin's real history too. The period containing the outage averaged about 14.5 minutes per block; the next one, retargeted for the reduced hash rate, overshot to about 6 minutes once the miners returned; and the rule then pulled block times back towards ten minutes.
+
+<Narrator who="chloe">
+
+Why exponential? Each attempt is an independent coin toss with a tiny success probability, made billions of times a second, and the waiting time for the first success in such a process is memoryless. That is also why "a block is overdue" is a fallacy: twenty minutes after the last block, the expected wait for the next is still ten minutes.
+
+</Narrator>
+
+</Section>
+
+<Section id="nakamoto-consensus" kind="intuition" title="The heaviest chain wins">
+
+Every node follows a simple rule: among all valid chains it knows, it treats as authoritative the one with the most **accumulated work**, the sum over its blocks of $2^{256}/T$, and miners build on that chain's tip. This is often called the "longest chain rule", but length is the wrong measure: an attacker could otherwise build a long chain of easy, low-difficulty blocks. Bitcoin compares total work.
+
+Forks happen naturally. Two miners on different continents may find blocks at nearly the same time; for a few seconds, part of the network builds on one and part on the other. As soon as one branch gets a further block, it becomes heavier and everyone switches to it. The losing block is called **stale** (often, loosely, an orphan); its transactions return to the pool of waiting transactions. Such one-block reorganisations happen from time to time; deeper ones on Bitcoin are very rare.
+
+<Figure caption="A fork. Blocks 4a and 4b were found almost simultaneously. Block 5 extended 4a, so the branch through 4a carries more work and every node adopts it; 4b becomes stale. A transaction in block 4a has three confirmations: block 4a and the two blocks built on top of it.">
+<svg viewBox="0 0 560 200" role="img" aria-label="A row of blocks numbered 1, 2, 3, 4a, 5 and 6, each linked to the one before. A second block, 4b, branches off block 3 below the main row and has no blocks after it; it is drawn dashed and labelled stale. A bracket over blocks 4a, 5 and 6 is labelled three confirmations, and an arrow at block 6 is labelled tip of the heaviest chain.">
+  <defs>
+    <marker id="pow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="70" width="60" height="40" rx="4" />
+    <rect x="110" y="70" width="60" height="40" rx="4" />
+    <rect x="200" y="70" width="60" height="40" rx="4" />
+    <rect x="290" y="70" width="60" height="40" rx="4" />
+    <rect x="380" y="70" width="60" height="40" rx="4" />
+    <rect x="470" y="70" width="60" height="40" rx="4" />
+  </g>
+  <rect x="290" y="140" width="60" height="40" rx="4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 4" />
+  <g fill="currentColor" fillOpacity="0.15">
+    <rect x="290" y="70" width="60" height="40" rx="4" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#pow-arrow)">
+    <path d="M 110 90 L 82 90" />
+    <path d="M 200 90 L 172 90" />
+    <path d="M 290 90 L 262 90" />
+    <path d="M 380 90 L 352 90" />
+    <path d="M 470 90 L 442 90" />
+    <path d="M 290 160 L 240 160 L 240 112" />
+  </g>
+  <path d="M 290 52 L 290 44 L 530 44 L 530 52" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="13" textAnchor="middle">
+    <text x="50" y="95">1</text>
+    <text x="140" y="95">2</text>
+    <text x="230" y="95">3</text>
+    <text x="320" y="95">4a</text>
+    <text x="410" y="95">5</text>
+    <text x="500" y="95">6</text>
+    <text x="320" y="165">4b</text>
+    <text x="410" y="38" fontSize="12">3 confirmations for a transaction in 4a</text>
+    <text x="445" y="165" fontSize="12">stale: no work built on it</text>
+    <text x="500" y="130" fontSize="12">tip</text>
+  </g>
+</svg>
+</Figure>
+
+A transaction in a block with $z - 1$ blocks on top of it has $z$ **confirmations**. Each confirmation makes reversing it harder, because a rival branch that leaves it out would have to overtake ever more work. But reversal never becomes strictly impossible: finality in proof of work is **probabilistic**. How probable? That is the calculation in section 11 of Nakamoto's paper.
+
+</Section>
+
+<Section id="catch-up" kind="computation" title="How likely is an attacker to catch up?">
+
+Suppose an attacker controls a fraction $q$ of the hash power and honest miners the rest, $p = 1 - q$. The attacker pays a merchant, waits until the merchant sees $z$ confirmations and hands over the goods, while secretly mining a rival branch in which the payment never happened. If the rival branch ever catches up with the honest one, the attacker publishes it and the payment disappears: a **double spend**.
+
+Nakamoto's argument has two steps. First, once the attacker is $d$ blocks behind, the race is a random walk: each new block moves the gap one step towards the attacker with probability $q$ and away with probability $p$. By the classical gambler's-ruin result, the probability of ever closing a gap of $d$ is $(q/p)^d$ if $q < p$, and 1 if $q \ge p$. Second, while the honest chain adds its $z$ blocks, the attacker makes some progress $k$; Nakamoto approximates $k$ by a Poisson distribution with mean $\lambda = z q / p$. So
+$$P(q, z) = 1 - \sum_{k=0}^{z} \frac{\lambda^k e^{-\lambda}}{k!}\left(1 - \left(\frac{q}{p}\right)^{z-k}\right).$$
+
+The program evaluates this formula, reproduces both tables in the paper, and then checks the approximation against the exact distribution of $k$ (negative binomial) and a direct simulation of the race:
+
+```python run
+import math, random
+
+def nakamoto(q, z):
+    """Section 11 of the Bitcoin paper: probability that an attacker with share q of the
+    hash power ever catches up after the merchant has waited for z confirmations."""
+    p = 1.0 - q
+    lam = z * q / p                      # expected attacker progress while the honest chain adds z blocks
+    total, poisson = 1.0, math.exp(-lam)
+    for k in range(z + 1):
+        if k > 0:
+            poisson *= lam / k           # Poisson probability of exactly k attacker blocks
+        total -= poisson * (1 - (q / p) ** (z - k))
+    return total
+
+print("q = 0.1                    q = 0.3")
+for z1, z2 in zip(range(0, 11), range(0, 55, 5)):
+    print(f"z={z1:<3} P={nakamoto(0.1, z1):.7f}       z={z2:<3} P={nakamoto(0.3, z2):.7f}")
+
+print("\nconfirmations needed for P < 0.1%:")
+for q in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]:
+    z = 0
+    while nakamoto(q, z) >= 0.001:
+        z += 1
+    print(f"  q={q:.2f}  z={z}")
+
+# Nakamoto approximates the attacker's progress by a Poisson distribution. Its exact distribution
+# (a negative binomial) and a direct simulation of the race give a somewhat larger risk.
+def exact(q, z):
+    p = 1.0 - q
+    total = 1.0
+    for k in range(z + 1):
+        prob_k = math.comb(k + z - 1, k) * p**z * q**k if z > 0 else float(k == 0)
+        total -= prob_k * (1 - (q / p) ** (z - k))
+    return total
+
+def simulate(q, z, trials, rng):
+    wins = 0
+    for _ in range(trials):
+        honest = attacker = 0
+        while honest < z:                         # the merchant waits for z blocks
+            if rng.random() < q:
+                attacker += 1
+            else:
+                honest += 1
+        lead = honest - attacker                  # then the attacker races to catch up
+        while 0 < lead < 60:                      # 60 behind: give up (probability negligible)
+            lead += 1 if rng.random() >= q else -1
+        wins += lead <= 0
+    return wins / trials
+
+rng = random.Random(11)
+print("\n  q    z   Nakamoto   exact      simulated (50,000 races)")
+for q, z in [(0.1, 2), (0.3, 5), (0.3, 10)]:
+    print(f"{q:5} {z:3}   {nakamoto(q, z):.5f}    {exact(q, z):.5f}    {simulate(q, z, 50_000, rng):.5f}")
+```
+
+The first two tables agree with the Bitcoin paper digit for digit: with 10% of the hash power, an attacker's chance after five confirmations is 0.09%, and with 30% it takes 24 confirmations to push the risk below 0.1%. The last table shows that the Poisson step is an approximation, and an optimistic one: the exact distribution and the simulation agree with each other and give the attacker noticeably more, about 6.5% rather than 4.2% at $q = 0.3$, $z = 10$. Meni Rosenfeld (2014) and later Cyril Grunspan and Ricardo Pérez-Marco worked out these corrections in detail.
+
+<Narrator who="gideon">
+
+Every row of these tables assumes things that real attackers may break: that the attacker starts mining the rival branch only when the payment is sent (pre-mining a few blocks helps), that block propagation is instant, and that the attacker's hash power is fixed. And it holds only for $q < 1/2$: at $q \ge 1/2$ the attacker catches up with probability 1, however many confirmations the merchant waits for.
+
+</Narrator>
+
+The calculation also shows why "six confirmations" became Bitcoin's folk standard: against an attacker with 10% of the hash power it leaves a risk of about 0.02%. Exchanges set their own rules, and they demand far more confirmations on chains with little hash power, for reasons the next section makes clear.
+
+</Section>
+
+<Section id="attacks" kind="examples" title="Selfish mining, 51% attacks and real incidents">
+
+**Selfish mining.** Ittay Eyal and Emin Gün Sirer showed in 2013 that following the protocol is not always a miner's best strategy. A **selfish miner** keeps the blocks it finds secret, building a private lead, and publishes them just in time to make honest miners' blocks stale. Honest miners then waste work, and the selfish miner earns more than its share of rewards. In their model the strategy pays off when the miner's share $\alpha$ exceeds $(1 - \gamma)/(3 - 2\gamma)$, where $\gamma$ is the fraction of honest miners that build on the selfish miner's block during a tie: $1/3$ when $\gamma = 0$, $1/4$ when $\gamma = 1/2$. Hence the title of their paper, *Majority is not Enough*: Nakamoto consensus is incentive-compatible only for miners well below half the hash power. Whether large pools have mined selfishly in practice is debated; the analysis changed how researchers model blockchain incentives.
+
+**51% attacks.** A miner with more than half the hash power can rewrite recent history at will, double-spending its own payments and censoring others'. It cannot steal coins whose keys it lacks or create coins beyond the rules, because every node checks every block. On Bitcoin, buying or building such hash power would cost billions of US dollars in hardware and electricity. On smaller proof-of-work chains it can cost little, especially when the chain shares its hash function with a larger one, so that hash power can be rented by the hour from marketplaces. Real incidents include:
+
+- **Bitcoin Gold** (May 2018, and again in January 2020): attackers reorganised the chain and double-spent deposits at exchanges.
+- **Ethereum Classic** (January 2019, and several attacks in August 2020, one reorganising more than 7,000 blocks): exchanges lost funds to double spends, and some raised their confirmation requirements for the chain to thousands of blocks.
+- **Verge** (2018): attackers manipulated block timestamps to exploit its difficulty algorithm and mine blocks at very low difficulty.
+
+**Bugs, not attacks.** Bitcoin's own worst incidents came from software. In August 2010 an integer overflow let one transaction create about 184 billion bitcoins; developers released a fix within hours, and the network moved to a chain without it. In March 2013 a database change in one version made it accept a block that older versions rejected, splitting the network until miners coordinated to fall back to the old version's chain ([BIP 50](https://github.com/bitcoin/bips/blob/master/bip-0050.mediawiki)). Both show that "the protocol" is in practice the code that the nodes run.
+
+</Section>
+
+<Section id="industry" kind="human" title="Pools, hardware and issuance">
+
+**Pools.** A single machine finding a Bitcoin block on its own might wait years, so miners join **pools** that share rewards. Members prove their contribution by submitting **shares**: headers that meet a much easier target, which a pool can count cheaply. The pool operator usually chooses which transactions go into the block, which concentrates power: as of 2025, a handful of pools found most blocks, and the largest two together often found around half. Miners can switch pools within minutes, which limits what an operator can get away with; protocols such as [Stratum V2](https://stratumprotocol.org/) let individual miners choose the transactions themselves.
+
+**Hardware.** Bitcoin mining moved from CPUs to graphics cards around 2010 and to **ASICs**, chips built only to compute SHA-256d, from 2013. A few manufacturers, most of them in China, make nearly all of them, and each generation makes the previous one unprofitable within a few years. Some projects chose hash functions to resist ASICs: Monero's RandomX, introduced in 2019, is designed to run best on ordinary CPUs. Ethereum used proof of work with graphics cards until it moved to proof of stake in 2022 (<LessonLink slug="proof-of-stake-and-finality">next lesson</LessonLink>). Mining moves to wherever electricity is cheapest and rules allow it; after China banned mining in 2021, much of it moved to the United States, Kazakhstan, Russia and elsewhere.
+
+**Issuance.** A block's first transaction may pay its miner the transaction fees plus a fixed **subsidy** of new coins. The subsidy began at 50 BTC and halves every 210,000 blocks, about every four years: the halvings came in 2012, 2016, 2020 and April 2024, when it fell to 3.125 BTC. Because Bitcoin Core computes it in integer satoshis (hundred-millionths of a bitcoin) by shifting right, the total supply is not quite 21 million:
+
+```python run
+SAT = 100_000_000                 # satoshis per bitcoin
+HALVING = 210_000                 # blocks between halvings, about four years at 10 minutes per block
+
+def subsidy(height):
+    """The new coins a block may create, in satoshis, following Bitcoin Core's integer rule."""
+    era = height // HALVING
+    return 0 if era >= 64 else (50 * SAT) >> era
+
+total, era = 0, 0
+print("era  first block   subsidy (BTC)   supply at end of era (BTC)")
+while subsidy(era * HALVING) > 0:
+    total += subsidy(era * HALVING) * HALVING
+    if era < 6 or era % 8 == 0 or subsidy((era + 1) * HALVING) == 0:
+        print(f"{era:3} {era * HALVING:12,} {subsidy(era * HALVING) / SAT:15.8f} {total / SAT:28,.8f}")
+    era += 1
+print(f"subsidy first reaches zero in era {era}, at block {era * HALVING:,}")
+print(f"years from 2009 at 10 minutes per block: about {era * HALVING * 10 / 60 / 24 / 365.25:.0f}")
+print(f"final supply: {total:,} satoshis = {total / SAT:.8f} BTC, short of 21 million by {21_000_000 * SAT - total:,} satoshis")
+```
+
+The subsidy reaches zero after 33 halvings, in about 2140, and the maximum supply is 20,999,999.9769 BTC. The real figure will be slightly lower, since the coins of the very first block cannot be spent and some miners claimed less than they could. As the subsidy shrinks, the security of the chain must increasingly be paid for by fees, and whether fees alone will pay for enough hash power is a long-standing open question among researchers.
+
+</Section>
+
+<Section id="energy" kind="human" title="Energy, measured honestly">
+
+Proof of work is secure *because* it is costly: the electricity spent is what an attacker must outspend. That cost is real and large, and it should be measured rather than asserted.
+
+The basic estimate needs two numbers: the network's hash rate, which can be inferred from the difficulty and the rate at which blocks appear, and the energy efficiency of the machines, in joules per terahash (J/TH). The [Cambridge Bitcoin Electricity Consumption Index](https://ccaf.io/cbnsi/cbeci) does this continuously, with a lower bound (everyone uses the most efficient machine), an upper bound (the least efficient machine that is still profitable) and a best guess, and it publishes its method.
+
+<Narrator who="margaret">
+
+With illustrative round numbers — a hash rate of $10^{21}$ hashes per second, which is $10^9$ terahashes per second, and a fleet averaging 20 J/TH — the power draw is $2 \times 10^{10}$ W, 20 gigawatts. Over a year of about 8,766 hours that is roughly 175 terawatt-hours, comparable to the annual electricity use of a mid-sized country. Change the efficiency to 30 J/TH and the answer grows by half; compare your estimate with the Cambridge index's current range rather than trusting any single figure.
+
+</Narrator>
+
+Points on which careful people disagree, and on which the evidence is still developing:
+
+- **Energy sources.** Estimates of the share of mining powered by renewables vary widely and are disputed, because miners' locations and contracts are only partly known.
+- **Effects on grids.** Miners can switch off within seconds, and in some places, such as Texas, they are paid to do so when demand peaks; some mining uses energy that would otherwise be wasted, such as gas flared at oil wells or curtailed hydro power. Critics answer that mining also raises demand and prices elsewhere, and that new fossil-fuel plants have been run for it.
+- **Electronic waste.** ASICs become obsolete within a few years and cannot be repurposed, producing a steady stream of e-waste (studied by Alex de Vries and Christian Stoll in 2021).
+- **Local effects.** Large mining sites have drawn complaints about noise and water use.
+
+Proof of stake, the subject of the next lesson, removes nearly all of this energy use; when Ethereum switched in 2022, its consumption fell by more than 99.9%. It also replaces the physical cost of work with an economic one, with its own trade-offs.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Miners solve hard maths problems."** They compute the same hash function over and over, guessing. The puzzle has no structure to exploit — that is the point — and its solutions have no use outside the protocol.
+
+</Misconception>
+
+<Misconception>
+
+**"The longest chain wins."** The chain with the most accumulated *work* wins. A chain with more blocks of lower difficulty loses to a shorter chain with more total work.
+
+</Misconception>
+
+<Misconception>
+
+**"After six confirmations a transaction is final."** It is very unlikely to be reversed against an attacker with a modest share of hash power. Finality in proof of work is probabilistic, and on a chain where an attacker can rent a majority of the hash power, no number of confirmations is safe.
+
+</Misconception>
+
+<Misconception>
+
+**"A 51% attacker can steal anyone's coins."** It can reverse its own recent payments and exclude other people's transactions, but it cannot sign for keys it does not hold or break the validity rules that every node checks.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
