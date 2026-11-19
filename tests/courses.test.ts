@@ -29,9 +29,9 @@ const courseDirs = [
 ];
 const topics = new Set(GraphFile.parse(json("content/math/graph/graph.json")).topics.map((t) => t.id));
 
-/** Lines outside fenced code blocks (where JSX and `$` mean something to MDX). */
+/** The body outside fenced code blocks and inline code spans (where JSX and `$` mean something to MDX). */
 function prose(body: string): string {
-  return body.replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1\s*$/gm, "");
+  return body.replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1\s*$/gm, "").replace(/(`+)(?!`)[\s\S]*?[^`]\1(?!`)/g, "");
 }
 
 /** ```python run blocks, as the code report counts them. */
