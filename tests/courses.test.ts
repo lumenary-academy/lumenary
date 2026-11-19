@@ -10,7 +10,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { katexOptions } from "@/lib/markdown";
 import { rehypeKatexHtml } from "@/lib/rehype-katex-html";
-import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, ExercisesFile, GraphFile, type Exercise } from "@/lib/schema";
+import { CourseCodeReport, CourseFile, CourseLessonFrontmatter, ExercisesFile, GraphFile, type CourseLessonFrontmatter as CourseLessonFrontmatterType, type Exercise } from "@/lib/schema";
 import { SECTION_KINDS } from "@/components/lesson/kinds";
 // @ts-expect-error -- plain ESM script without type declarations
 import { contentLocales } from "../scripts/gen-content-locales.mjs";
@@ -74,10 +74,17 @@ describe.each(courseDirs)("course %s", (dir) => {
     const present = exists(`${base}/lesson.mdx`) && exists(`${base}/exercises.json`);
     it("has a lesson.mdx and an exercises.json", () => expect(present).toBe(true));
     if (!present) return;
-    const doc = fm(`${base}/lesson.mdx`);
-    const front = CourseLessonFrontmatter.parse(doc.data);
-    const body = doc.content;
-    const exercises: Exercise[] = ExercisesFile.parse(json(`${base}/exercises.json`)).exercises;
+    // A lesson whose files don't parse fails its own test, not the whole suite's collection.
+    let loaded: { front: CourseLessonFrontmatterType; body: string; exercises: Exercise[] } | Error;
+    try {
+      const doc = fm(`${base}/lesson.mdx`);
+      loaded = { front: CourseLessonFrontmatter.parse(doc.data), body: doc.content, exercises: ExercisesFile.parse(json(`${base}/exercises.json`)).exercises };
+    } catch (err) {
+      loaded = err instanceof Error ? err : new Error(String(err));
+    }
+    it("has frontmatter and exercises that parse", () => expect(loaded instanceof Error ? loaded.message : "ok").toBe("ok"));
+    if (loaded instanceof Error) return;
+    const { front, body, exercises } = loaded;
 
     it("has valid frontmatter and builds only on earlier lessons and real math topics", () => {
       for (const p of front.prerequisites) {
