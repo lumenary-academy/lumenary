@@ -1,0 +1,353 @@
+---
+title: Numerical precision and input/output
+subtitle: Kind parameters and iso_fortran_env for portable precision, the behaviour of floating-point arithmetic, and formatted, file and namelist I/O with proper error handling.
+minutes: 60
+objectives:
+  - Choose integer and real precision portably with kind parameters from iso_fortran_env
+  - Avoid the single-precision literal bug with kind suffixes such as 0.1_dp
+  - Explain rounding accumulation and cancellation, and use compensated summation and IEEE tests
+  - Write and read files with open, newunit, iostat and iomsg, and detect the end of a file
+  - Read configuration with namelist and format numbers with the f, es, en and g descriptors
+prerequisites: [procedures-and-modules]
+related: [math.comp.numerical-analysis]
+references:
+  - title: What Every Computer Scientist Should Know About Floating-Point Arithmetic
+    author: David Goldberg
+    year: 1991
+    url: https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+    note: The classic tutorial on IEEE floating point, rounding and cancellation.
+  - title: Fortran-lang, Floating point numbers
+    url: https://fortran-lang.org/learn/best_practices/floating_point/
+    note: Community advice on kinds, literals and precision.
+  - title: GNU Fortran, ISO_FORTRAN_ENV
+    url: https://gcc.gnu.org/onlinedocs/gfortran/ISO_005fFORTRAN_005fENV.html
+    note: The constants the intrinsic module provides in GFortran.
+  - title: GNU Fortran, Namelist
+    url: https://gcc.gnu.org/onlinedocs/gfortran/Extensions-to-namelist.html
+    note: GFortran's notes on namelist input and output; the standard behaviour is described in the Fortran standard itself.
+---
+
+<Section id="motivation" kind="motivation" title="How many digits do you need?">
+
+Scientific results are only as good as the arithmetic behind them. A weather model integrates millions of small changes, and if each step loses a little precision, the errors can grow until they swamp the physics. A financial or engineering calculation that subtracts two nearly equal numbers can lose almost every significant digit in one operation. Choosing the right precision, and knowing where floating-point arithmetic bites, is part of the craft of numerical programming, and Fortran gives you more direct control over it than most languages.
+
+The second half of this lesson is about getting numbers in and out: printing them in readable formats, writing and reading data files safely, and reading configuration files with Fortran's own **namelist** format. All the file examples work in the current directory and delete their files when they are done.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Kind parameters">
+
+<Definition term="Kind parameter">
+
+A **kind parameter** is an integer constant that selects one of the representations a compiler offers for an intrinsic type, for example 32-, 64- or 128-bit reals. It is written in parentheses after the type, `real(dp) :: x`, and as a suffix on literals, `1.5_dp`. The numeric values of kinds are compiler-specific, so portable code never writes them directly.
+
+</Definition>
+
+There are two portable ways to get kind values. The intrinsic module `iso_fortran_env` (Fortran 2008) names kinds by size: `int32`, `int64`, `real32`, `real64` and `real128`. The intrinsic function `selected_real_kind(p, r)` returns the smallest kind with at least `p` decimal digits and an exponent range of at least `r`. The usual practice is to define them once, in a small module, and use that module everywhere:
+
+```fortran check
+! Choosing precision portably with kind parameters
+module kinds
+  use, intrinsic :: iso_fortran_env, only: int32, int64, real32, real64, real128
+  implicit none
+  private
+  public :: int32, int64, sp, dp, qp
+  integer, parameter :: sp = real32       ! single precision, 4 bytes
+  integer, parameter :: dp = real64       ! double precision, 8 bytes
+  integer, parameter :: qp = real128      ! quadruple precision, 16 bytes, where available
+end module kinds
+
+program precision_demo
+  use kinds
+  implicit none
+  real(sp) :: a
+  real(dp) :: b, wrong, right
+  real(qp) :: c
+  integer(int64) :: big
+
+  print '(a7, a6, a8, a10, a16)', 'kind', 'bytes', 'digits', 'range', 'epsilon'
+  print '(a7, i6, i8, i10, es16.3)', 'real32', storage_size(a) / 8, precision(a), range(a), epsilon(a)
+  print '(a7, i6, i8, i10, es16.3)', 'real64', storage_size(b) / 8, precision(b), range(b), epsilon(b)
+  print '(a7, i6, i8, i10, es16.3)', 'real128', storage_size(c) / 8, precision(c), range(c), epsilon(c)
+
+  ! The classic bug: 0.1 without a kind suffix is a single-precision literal
+  wrong = 0.1
+  right = 0.1_dp
+  print '(a, f22.18)', '0.1 assigned to real64:    ', wrong
+  print '(a, f22.18)', '0.1_dp assigned to real64: ', right
+
+  ! selected_real_kind asks for at least 12 digits and exponents up to 10**100
+  print '(a, i0, a, i0)', 'selected_real_kind(12, 100) = ', selected_real_kind(12, 100), ', dp = ', dp
+
+  big = huge(1_int32)
+  big = big + 1                           ! fine in 64 bits
+  print '(a, i0, a, i0)', 'huge(int32) + 1 = ', big, ', huge(int64) = ', huge(big)
+end program precision_demo
+```
+
+It prints:
+
+```text
+   kind bytes  digits     range         epsilon
+ real32     4       6        37       1.192E-07
+ real64     8      15       307       2.220E-16
+real128    16      33      4931       1.926E-34
+0.1 assigned to real64:      0.100000001490116119
+0.1_dp assigned to real64:   0.100000000000000006
+selected_real_kind(12, 100) = 8, dp = 8
+huge(int32) + 1 = 2147483648, huge(int64) = 9223372036854775807
+```
+
+- **The table** shows what each kind offers: `real32` holds about 6 significant decimal digits, `real64` about 15, and `real128` about 33. `real128` is computed in software on most hardware, so it is many times slower; GFortran supports it through the `libquadmath` library, and `real128` is negative on compilers that lack it. Almost all scientific code uses `real64`.
+- **The literal bug.** `wrong = 0.1` stored `0.100000001490116119` in a 64-bit variable, because `0.1` without a suffix is a *default*, single-precision literal: it was rounded to 24 bits first and only then converted. `0.1_dp` is accurate to the full 53 bits. This bug is everywhere in old code; the cure is a `_dp` suffix on every real literal (or `d0`, as in `0.1d0`, in older code).
+- **`selected_real_kind(12, 100)`** returned the same kind as `real64`, the smallest kind with 12 digits.
+- **Integers** have kinds too. `huge(1_int32) + 1` would overflow a 32-bit integer, but in an `int64` variable it is fine. Use `int64` for counts that could pass two thousand million, such as the number of cells in a large 3D grid.
+
+</Section>
+
+<Section id="computation" kind="computation" title="How floating-point arithmetic behaves">
+
+```fortran check
+! Floating-point arithmetic: accumulated rounding, cancellation, and IEEE special values
+program floating_point
+  use, intrinsic :: iso_fortran_env, only: sp => real32, dp => real64
+  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_positive_inf, ieee_is_nan, ieee_is_finite
+  implicit none
+  real(sp) :: s32
+  real(dp) :: s64, kahan, compensation, y, t, x, nan, inf
+  integer :: k
+
+  ! Add 0.1 ten million times: the exact answer is 1 000 000
+  s32 = 0.0_sp
+  s64 = 0.0_dp
+  kahan = 0.0_dp
+  compensation = 0.0_dp
+  do k = 1, 10000000
+     s32 = s32 + 0.1_sp
+     s64 = s64 + 0.1_dp
+     y = 0.1_dp - compensation            ! Kahan's compensated summation
+     t = kahan + y
+     compensation = (t - kahan) - y
+     kahan = t
+  end do
+  print '(a, f20.8)', 'single precision sum: ', s32
+  print '(a, f20.8)', 'double precision sum: ', s64
+  print '(a, f20.8)', 'compensated sum:      ', kahan
+
+  ! Catastrophic cancellation: 1 - cos(x) for small x loses every digit
+  x = 1.0e-8_dp
+  print '(a, es12.4)', '1 - cos(x):      ', 1.0_dp - cos(x)
+  print '(a, es12.4)', '2 sin(x/2)**2:   ', 2.0_dp * sin(x / 2.0_dp)**2
+
+  ! IEEE special values and tests
+  nan = ieee_value(nan, ieee_quiet_nan)
+  inf = ieee_value(inf, ieee_positive_inf)
+  print '(a, l1, a, l1)', 'nan == nan: ', nan == nan, ', ieee_is_nan(nan): ', ieee_is_nan(nan)
+  print '(a, l1, a, es10.2)', 'ieee_is_finite(inf): ', ieee_is_finite(inf), ', 1/inf = ', 1.0_dp / inf
+end program floating_point
+```
+
+It prints:
+
+```text
+single precision sum:     1087937.00000000
+double precision sum:      999999.99983898
+compensated sum:          1000000.00000000
+1 - cos(x):        0.0000E+00
+2 sin(x/2)**2:     5.0000E-17
+nan == nan: F, ieee_is_nan(nan): T
+ieee_is_finite(inf): F, 1/inf =   0.00E+00
+```
+
+**Rounding accumulates.** Adding `0.1` ten million times should give exactly one million. In single precision, once the sum is large each addition of 0.1 is rounded to the nearest representable value, and the errors pile up in one direction: the result is off by almost 9 %. Double precision is much better but still not exact. **Kahan's compensated summation** keeps a running correction term holding the low-order bits each addition lost and feeds them back in, and with it the double-precision sum came out exactly. Compensated and pairwise summation matter in long simulations and large reductions; note that aggressive compiler options such as `-ffast-math` may "simplify" the compensation away, because algebraically it is zero.
+
+**Cancellation destroys digits.** For $x = 10^{-8}$, $\cos x$ is so close to 1 that `1.0_dp - cos(x)` gave exactly zero: every significant digit cancelled. The mathematically identical $2\sin^2(x/2)$ gives the correct $5 \times 10^{-17}$. Whenever you subtract nearly equal quantities, look for a reformulation like this one.
+
+**IEEE special values.** Since Fortran 2003, the intrinsic modules `ieee_arithmetic` and `ieee_exceptions` give portable access to IEEE 754 features: creating NaN ("not a number") and infinity with `ieee_value`, testing with `ieee_is_nan` and `ieee_is_finite`, and querying or changing exception flags and rounding modes. Note that `nan == nan` is false, which is how NaN is defined, so testing for NaN with `==` never works. For debugging, GFortran's `-ffpe-trap=invalid,zero,overflow` stops the program at the first invalid operation, division by zero or overflow, instead of letting NaNs spread silently through the results.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Files and formatted I/O">
+
+Fortran I/O works on **units**, numbered connections to files. `open` connects a file to a unit, `write` and `read` transfer data, and `close` disconnects. Each statement accepts `iostat=` (an integer status: 0 for success, negative for end of file, positive for errors) and `iomsg=` (a message), which turn failures into values you can check.
+
+```fortran check
+! Writing a data file, reading it back, and handling errors and end of file
+program file_io
+  use, intrinsic :: iso_fortran_env, only: dp => real64, iostat_end
+  implicit none
+  integer :: unit, ios, k, n
+  real(dp) :: t, temp, sum_temp, t_read, temp_read
+  character(len=200) :: msg, header
+
+  ! Newton's law of cooling: a cup of tea at 90 °C in a 20 °C room
+  open(newunit=unit, file='cooling.csv', status='replace', action='write', iostat=ios, iomsg=msg)
+  if (ios /= 0) error stop 'cannot create cooling.csv: ' // trim(msg)
+  write (unit, '(a)') 'minutes,celsius'
+  do k = 0, 30, 5
+     t = real(k, dp)
+     temp = 20.0_dp + 70.0_dp * exp(-0.05_dp * t)
+     write (unit, '(f0.1, ",", f0.2)') t, temp
+  end do
+  close(unit)
+
+  ! Read it back line by line until the end of the file
+  open(newunit=unit, file='cooling.csv', status='old', action='read')
+  read (unit, '(a)') header
+  n = 0
+  sum_temp = 0.0_dp
+  do
+     read (unit, *, iostat=ios) t_read, temp_read     ! list-directed input accepts the comma
+     if (ios == iostat_end) exit
+     if (ios /= 0) error stop 'bad line in cooling.csv'
+     n = n + 1
+     sum_temp = sum_temp + temp_read
+     print '(f6.1, " min", f8.2, " °C")', t_read, temp_read
+  end do
+  close(unit, status='delete')                         ! tidy up: remove the file
+
+  print '(a, a)', 'columns: ', trim(header)
+  print '(i0, a, f0.2, a)', n, ' readings, mean ', sum_temp / n, ' °C'
+
+  ! Opening a file that does not exist: iostat and iomsg instead of a crash
+  open(newunit=unit, file='no_such_file.txt', status='old', action='read', iostat=ios, iomsg=msg)
+  if (ios /= 0) print '(a)', 'could not open: ' // trim(msg)
+end program file_io
+```
+
+It prints:
+
+```text
+   0.0 min   90.00 °C
+   5.0 min   74.52 °C
+  10.0 min   62.46 °C
+  15.0 min   53.07 °C
+  20.0 min   45.75 °C
+  25.0 min   40.06 °C
+  30.0 min   35.62 °C
+columns: minutes,celsius
+7 readings, mean 57.35 °C
+could not open: Cannot open file 'no_such_file.txt': No such file or directory
+```
+
+- **`newunit=unit`** asks the runtime for a free unit number, avoiding clashes with units used elsewhere (old code hard-wires numbers such as 10 or 99).
+- **`status=`** says what to expect: `'replace'` creates or overwrites, `'old'` requires an existing file, `'new'` requires that it does not exist. **`action=`** says whether you will read, write or both, so mistakes are caught.
+- **Formatted write.** `'(f0.1, ",", f0.2)'` writes two numbers separated by a literal comma, producing lines like `5.0,74.52`, a simple CSV file.
+- **Reading until the end.** The loop reads with `iostat=ios` and leaves when `ios` equals `iostat_end`, the standard constant from `iso_fortran_env`. List-directed input (`*`) accepts commas or blanks between values.
+- **`close(unit, status='delete')`** removes the file. Files are also closed automatically when the program ends.
+- **Handling failure.** Opening a missing file with `status='old'` failed with a clear message instead of a crash, because `iostat=` was present. Without it, any I/O error stops the program. **`error stop`** ends a program deliberately with a message and a nonzero exit status, which scripts and job schedulers can detect.
+
+The common edit descriptors, for reference:
+
+| Descriptor | Meaning |
+| --- | --- |
+| `iw`, `i0` | integer in `w` characters, or as few as needed |
+| `fw.d`, `f0.d` | fixed-point real with `d` decimals |
+| `esw.d` | scientific notation, one digit before the point: `1.23E+04` |
+| `enw.d` | engineering notation, exponent a multiple of 3: `12.30E+03` |
+| `gw.d` | general: fixed or scientific, whichever suits the magnitude |
+| `a`, `aw` | character string |
+| `l1` | logical as `T` or `F` |
+| `nx`, `/` | skip `n` spaces; start a new line |
+| `3f8.2`, `*(…)` | repeat a descriptor three times; repeat a group as often as needed |
+
+For large amounts of numerical data, text is slow and wasteful. **Unformatted** files (`form='unformatted'`, with `access='stream'` for a plain byte stream) store numbers in their binary form, exactly and compactly; most research codes write their large outputs in binary, often through libraries such as HDF5 or NetCDF, which add self-describing metadata and are readable from Python and other languages.
+
+</Section>
+
+<Section id="examples-namelist" kind="examples" title="Namelist: configuration files for free">
+
+Simulation codes need parameters: the number of steps, the time step, physical constants, a title. Fortran has a built-in format for exactly this, the **namelist**, which has been used by large models for decades:
+
+```fortran check
+! Namelist input: a readable configuration file, with defaults for anything left out
+program settings
+  use, intrinsic :: iso_fortran_env, only: dp => real64
+  implicit none
+  integer :: steps = 1000
+  real(dp) :: dt = 0.01_dp, gravity = 9.81_dp
+  character(len=40) :: title = 'untitled run'
+  logical :: verbose = .false.
+  integer :: unit
+  namelist /run/ steps, dt, gravity, title, verbose
+
+  ! Write an example configuration file (normally a person would write this)
+  open(newunit=unit, file='run.nml', status='replace', action='write')
+  write (unit, '(a)') '&run'
+  write (unit, '(a)') '  title = "Mars lander test"'
+  write (unit, '(a)') '  gravity = 3.721'
+  write (unit, '(a)') '  steps = 250   ! dt and verbose keep their defaults'
+  write (unit, '(a)') '/'
+  close(unit)
+
+  open(newunit=unit, file='run.nml', status='old', action='read')
+  read (unit, nml=run)
+  close(unit, status='delete')
+
+  print '(a)', trim(title)
+  print '(a, i0, a, es9.2, a, f6.3, a, l1)', 'steps = ', steps, ', dt = ', dt, ', g = ', gravity, ', verbose = ', verbose
+  print '(a, f0.2, a)', 'simulated time: ', steps * dt, ' s'
+
+  ! g and en descriptors choose a sensible layout for any magnitude
+  print '(3g12.4)', 6.674e-11_dp, gravity, 2.998e8_dp
+  print '(3en14.3)', 6.674e-11_dp, gravity, 2.998e8_dp
+end program settings
+```
+
+It prints:
+
+```text
+Mars lander test
+steps = 250, dt =  1.00E-02, g =  3.721, verbose = F
+simulated time: 2.50 s
+  0.6674E-10   3.721      0.2998E+09
+    66.740E-12     3.721E+00   299.800E+06
+```
+
+`namelist /run/ steps, dt, gravity, title, verbose` groups variables under the name `run`. A namelist file starts with `&run`, lists `name = value` pairs in any order, may contain `!` comments, and ends with `/`. Reading it with `read (unit, nml=run)` assigns only the variables that appear, so everything else keeps its default, here `dt` and `verbose`. Writing with `write (unit, nml=run)` produces a file in the same format, a convenient way to record exactly which settings a run used.
+
+The last two lines compare the `g` and `en` descriptors on numbers of very different sizes: `g12.4` switched between fixed and scientific notation as needed, and `en14.3` used exponents that are multiples of three, matching prefixes such as pico, kilo and mega.
+
+</Section>
+
+<Section id="human" kind="human" title="Precision and data in professional codes">
+
+**One kinds module, used everywhere.** Large codes define their working precision once, often as `wp` (working precision) in a module like the one in this lesson, and write every real as `real(wp)` and every literal as `1.0_wp`. Changing one line then switches the whole code between single and double precision, which is how teams test whether their results are sensitive to precision at all.
+
+**Mixed precision is a deliberate choice.** Double precision is the safe default, but it doubles memory and bandwidth compared with single. Some weather and climate centres have moved parts of their models to single precision after careful testing showed the forecasts did not suffer, and GPU codes often use even lower precision in places. The rule is to measure the effect on the science, not to assume.
+
+**Bitwise reproducibility is hard.** The same source can give slightly different results with a different compiler, optimisation level or number of threads, because floating-point addition is not associative and the order of operations changes. Options such as `-ffast-math` allow the compiler to reorder freely; fused multiply-add instructions change rounding; a parallel sum adds in a different order from a serial one. Projects that need identical results across runs, for example to debug or to certify a model, pin the compiler options carefully, avoid `-ffast-math`, and use deterministic reduction orders. Everyone else should compare results with tolerances, never with `==`.
+
+**Check every I/O statement that can fail.** Production codes run for days on clusters, and a missing input file or a full disk should produce a clear message and a nonzero exit status, not a crash with a cryptic runtime error or, worse, a silent run on default values. That means `iostat=` and `iomsg=` on every `open` and every `read` of external data, and `error stop` with a useful message when something is wrong.
+
+**Use standard formats for big data.** Text files are fine for small tables and configuration. For the gigabytes or terabytes a simulation produces, codes write binary data through **NetCDF** or **HDF5**, libraries with Fortran interfaces whose files carry their own metadata (variable names, units, dimensions) and can be read by Python, Julia, R and visualisation tools.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"`double precision` and `real*8` are the way to get 64-bit reals."** `double precision` is standard but tells the reader nothing about the actual precision, and `real*8` was never standard (GFortran rejects it with `-std=f2018`). Use `real(dp)` with `dp` defined once from `iso_fortran_env` or `selected_real_kind`.
+
+</Misconception>
+
+<Misconception>
+
+**"Declaring a variable `real(dp)` makes every calculation with it double precision."** Constants written without a suffix are still default reals: `x = 1.0_dp / 3.0` divides by a single-precision 3.0 (harmless here, because 3 is exact, but not for `0.1` or `1.0/3.0`). Suffix every literal.
+
+</Misconception>
+
+<Misconception>
+
+**"List-directed output is fine for results files."** `print *` and `write (*, *)` choose their layout freely, and it differs between compilers and versions. Use explicit formats for anything another program, or a person comparing runs, will read.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

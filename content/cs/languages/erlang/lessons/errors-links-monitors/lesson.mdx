@@ -1,0 +1,398 @@
+---
+title: Errors, links, monitors and supervision
+subtitle: Erlang's three kinds of exception, try and catch, the "let it crash" philosophy, links and trapped exits, monitors, and a supervisor built by hand.
+minutes: 60
+objectives:
+  - Distinguish the error, throw and exit classes of exception, and catch them with try ... of ... catch ... after
+  - Explain the "let it crash" philosophy and the idea of an error kernel
+  - Use links and trap_exit to propagate and observe process failure, including the special reasons normal and kill
+  - Use monitors to watch a process without sharing its fate, including in a request-reply call
+  - Build a simple supervisor by hand and explain what OTP's supervisor adds
+prerequisites: [processes-and-messages]
+references:
+  - title: Errors and error handling
+    url: https://www.erlang.org/doc/system/errors.html
+    note: The reference manual's chapter on exception classes, try and catch.
+  - title: Processes (reference manual)
+    url: https://www.erlang.org/doc/system/ref_man_processes.html
+    note: Links, exit signals, trapping exits and monitors, precisely.
+  - title: Supervision principles
+    url: https://www.erlang.org/doc/system/sup_princ.html
+    note: The OTP design principles for supervisors, which the next lesson uses.
+  - title: A history of Erlang
+    author: Joe Armstrong
+    year: 2007
+    url: https://doi.org/10.1145/1238844.1238850
+    note: Includes the reasoning behind links, error handling and "let it crash".
+---
+
+<Section id="motivation" kind="motivation" title="Errors are going to happen">
+
+Most programming advice about errors is defensive: check every input, handle every return code, catch every exception, never let the program crash. Erlang's designers, building switches that had to run for years, came to a different conclusion. In a large system, *something* will always be failing: a bug in a rarely used path, a corrupted message, a remote machine that stops answering. You cannot write enough defensive code to prevent all of it, and trying makes programs longer, harder to read and, ironically, more likely to continue in a corrupted state.
+
+So Erlang separates two jobs. **Workers** do the actual work and are written for the *expected* cases. If something unexpected happens, a worker should not limp on; it should **crash**, cleanly and loudly, discarding whatever state it had. **Supervisors** watch workers and react to crashes, typically by starting a fresh worker in a known-good state. Code that must not fail, the **error kernel**, is kept small and simple, and everything else is allowed to fail and recover.
+
+That is what "let it crash" means: not carelessness, but a division of labour that puts error *recovery* in one place instead of scattering error *handling* everywhere. This lesson covers the machinery that makes it possible: exceptions, links, monitors, and a supervisor you will build yourself before using OTP's in the next lesson.
+
+</Section>
+
+<Section id="exceptions" kind="definitions" title="Exceptions and try">
+
+<Definition term="Exception classes">
+
+Erlang has three classes of exception. **error** is raised by run-time errors (a failed match, a bad argument, division by zero, calling an undefined function) or explicitly with `error(Reason)`. **throw** is raised with `throw(Value)` and is meant for non-local returns that the caller is expected to catch. **exit** is raised with `exit(Reason)` and means "this process should stop".
+
+</Definition>
+
+The full form of the `try` expression is
+
+```erlang
+try Expression of
+    Pattern -> ...          % optional: runs if Expression succeeded
+catch
+    Class:Reason -> ...;    % Class is error, throw or exit
+    Class:Reason:Stacktrace -> ...
+after
+    ...                     % optional: always runs, for cleanup
+end
+```
+
+and here it is catching each kind of failure:
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    Tests = [fun() -> 1 / zero() end,
+             fun() -> {ok, _} = lookup(missing) end,
+             fun() -> parse("12a") end,
+             fun() -> no_such_module:hello() end,
+             fun() -> throw({found, 42}) end,
+             fun() -> exit(shutting_down) end,
+             fun() -> error({invalid_order, 17}) end,
+             fun() -> fine end],
+    [io:format("~p~n", [run(T)]) || T <- Tests],
+    io:format("~p~n", [find_first_negative([3, 8, -2, 5, -9])]),
+    io:format("~p~n", [safe_divide(10, 0)]).
+
+zero() -> 0.
+parse(Text) -> list_to_integer(Text).
+lookup(_) -> {error, not_found}.
+
+run(Fun) ->
+    try Fun() of
+        Value -> {returned, Value}
+    catch
+        error:{badmatch, V} -> {error, badmatch, V};
+        Class:Reason -> {Class, Reason}
+    after
+        ok
+    end.
+
+%% throw as a non-local return from deep inside a traversal.
+find_first_negative(List) ->
+    try
+        lists:foreach(fun(X) when X < 0 -> throw({found, X}); (_) -> ok end, List),
+        none
+    catch
+        throw:{found, X} -> {found, X}
+    end.
+
+safe_divide(A, B) ->
+    try A div B
+    catch error:badarith:Stack ->
+        [{Module, Function, Args, _Location} | _] = Stack,
+        {error, {badarith, {Module, Function, Args}}}
+    end.
+```
+
+It prints:
+
+```text
+{error,badarith}
+{error,badmatch,{error,not_found}}
+{error,badarg}
+{error,undef}
+{throw,{found,42}}
+{exit,shutting_down}
+{error,{invalid_order,17}}
+{returned,fine}
+{found,-2}
+{error,{badarith,{erlang,'div',[10,0]}}}
+```
+
+The first four lines show the run-time errors you will meet most: `badarith` (arithmetic on the wrong values, here `1 / 0`), `{badmatch, Value}` (a failed `=`), `badarg` (a built-in function given an invalid argument) and `undef` (a call to a function that does not exist). Others include `function_clause`, `{case_clause, Value}` and `if_clause`. In `run/1`, a specific clause for `badmatch` comes first, and `Class:Reason` catches everything else.
+
+`throw` has one legitimate everyday use, shown in `find_first_negative/1`: escaping from deep inside a traversal (here, a `lists:foreach/2`) as soon as the answer is known. Keep such throws inside one module, caught close to where they are thrown.
+
+The third pattern form, `Class:Reason:Stacktrace`, binds the stack trace. Its top frame shows exactly what failed: here the `div` operation of module `erlang` with the arguments `[10,0]`. Stack traces appear in crash reports automatically, so you will rarely need to bind one yourself except to log it.
+
+Older code catches exceptions with the expression `catch Expr`, which returns the value or a description of the exception. It mixes return values with errors and has been discouraged for years; **OTP 29 now warns** whenever it is used and recommends `try ... catch` instead.
+
+When *should* you catch? Mostly at **boundaries**: where your code calls something that signals expected failure by raising (a library that raises on invalid input), where you must turn an exception into a reply (a request handler answering with an error rather than disappearing), or where you must clean up a resource in `after`. Catching an exception just to carry on is usually the wrong choice: the process is now in a state nobody planned for.
+
+</Section>
+
+<Section id="links" kind="examples" title="Links and trapped exits">
+
+<Definition term="Link">
+
+A **link** is a bidirectional connection between two processes, created with `link(Pid)` or atomically with `spawn_link`. When a process exits, an **exit signal** carrying its exit reason goes to every linked process. If the reason is not `normal`, a linked process that is not **trapping exits** also exits, with the same reason. A process that traps exits, by calling `process_flag(trap_exit, true)`, instead receives the signal as a message `{'EXIT', Pid, Reason}`.
+
+</Definition>
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    %% 1. Without trapping exits, a linked process dies with its partner.
+    Watcher = spawn(fun() ->
+                        process_flag(trap_exit, true),
+                        receive start -> ok end,
+                        receive {'EXIT', _, Why} -> io:format("watcher saw the manager exit: ~p~n", [Why]) end
+                    end),
+    Manager = spawn(fun() ->
+                        link(Watcher),
+                        spawn_link(fun() -> exit(disk_full) end),
+                        timer:sleep(infinity)
+                    end),
+    Watcher ! start,
+    timer:sleep(100),
+    io:format("manager alive? ~p~n", [is_process_alive(Manager)]),
+
+    %% 2. Trapping exits turns exit signals into messages.
+    process_flag(trap_exit, true),
+    Worker = spawn_link(fun() -> exit(timeout_talking_to_bank) end),
+    receive {'EXIT', Worker, Reason} -> io:format("trapped: ~p~n", [Reason]) end,
+    Quiet = spawn_link(fun() -> done end),
+    receive {'EXIT', Quiet, Normal} -> io:format("normal exits are reported too: ~p~n", [Normal]) end,
+
+    %% 3. kill cannot be trapped; the linked process sees the reason 'killed'.
+    Stubborn = spawn_link(fun() -> process_flag(trap_exit, true), timer:sleep(infinity) end),
+    exit(Stubborn, kill),
+    receive {'EXIT', Stubborn, Killed} -> io:format("after kill: ~p~n", [Killed]) end.
+```
+
+It prints:
+
+```text
+watcher saw the manager exit: disk_full
+manager alive? false
+trapped: timeout_talking_to_bank
+normal exits are reported too: normal
+after kill: killed
+```
+
+In the first experiment, the manager was linked to a worker that exited with `disk_full`. The manager was not trapping exits, so it died too, with the same reason; the watcher, linked to the manager and trapping exits, saw that reason arrive as a message. Failure spread along the links, exactly as designed: processes that only make sense together live and die together, and nobody is left half-working.
+
+In the second, the main process traps exits, so its linked workers' deaths arrive as `{'EXIT', Pid, Reason}` messages, including normal ones. This is precisely the position of a supervisor.
+
+The third shows the one signal that cannot be trapped. `exit(Pid, kill)` terminates a process unconditionally, even one that traps exits; linked processes then see the reason `killed` (not `kill`, so that the kill does not cascade unconditionally through every link). Supervisors use `kill` as a last resort when a child will not shut down politely.
+
+There are two more ways to send signals. `exit(Pid, Reason)` with any other reason sends an exit signal as if `Pid`'s partner had died with that reason, and a process can call `unlink(Pid)` to remove a link.
+
+</Section>
+
+<Section id="monitors" kind="examples" title="Monitors">
+
+<Definition term="Monitor">
+
+A **monitor**, created with `erlang:monitor(process, Pid)` or atomically with `spawn_monitor`, is one-way and harmless: when the monitored process exits, for any reason, the monitoring process receives `{'DOWN', Ref, process, Pid, Reason}`. If the process is already dead, the message arrives at once with the reason `noproc`.
+
+</Definition>
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    {Pid, Ref} = spawn_monitor(fun() -> exit({bad_row, 17}) end),
+    receive
+        {'DOWN', Ref, process, Pid, Reason} -> io:format("down: ~p~n", [Reason])
+    end,
+    Gone = spawn(fun() -> ok end),
+    timer:sleep(50),
+    Ref2 = erlang:monitor(process, Gone),
+    receive
+        {'DOWN', Ref2, process, Gone, Why} -> io:format("monitoring a dead process: ~p~n", [Why])
+    end,
+    Sleeper = spawn(fun() -> receive stop -> ok end end),
+    Ref3 = erlang:monitor(process, Sleeper),
+    Sleeper ! stop,
+    receive
+        {'DOWN', Ref3, process, Sleeper, normal} -> io:format("normal exit noticed~n")
+    end,
+    Server = spawn(fun() -> receive {From, Tag, What} -> From ! {Tag, {echo, What}} end end),
+    io:format("~p~n", [call(Server, hello)]),
+    io:format("~p~n", [call(Server, hello_again)]).
+
+%% A call that notices when the server is dead instead of waiting for a timeout.
+call(Server, Request) ->
+    Ref = erlang:monitor(process, Server),
+    Server ! {self(), Ref, Request},
+    receive
+        {Ref, Reply} ->
+            erlang:demonitor(Ref, [flush]),
+            Reply;
+        {'DOWN', Ref, process, Server, Reason} ->
+            {error, {server_down, Reason}}
+    after 1000 ->
+        erlang:demonitor(Ref, [flush]),
+        {error, timeout}
+    end.
+```
+
+It prints:
+
+```text
+down: {bad_row,17}
+monitoring a dead process: noproc
+normal exit noticed
+{echo,hello}
+{error,{server_down,noproc}}
+```
+
+The `call/2` function is the most important pattern here; it is essentially how OTP's `gen_server:call` works. It monitors the server *before* sending the request, and uses the monitor's reference as the request's tag. Then it waits for either the reply or the server's `'DOWN'` message, whichever comes first. If the server is dead or dies while working on the request, the caller learns immediately instead of waiting for a timeout. `erlang:demonitor(Ref, [flush])` removes the monitor afterwards, and `flush` also discards a `'DOWN'` message that may already have arrived, so it does not linger in the mailbox. The second call fails with `noproc`, because the echo server answered once and finished.
+
+Notice one more detail in the program. The server's fun receives `{From, Tag, What}`, not `{From, Ref, What}`. A fun captures every variable already bound where it is written, and `Ref` was already bound in `main/1` (by the first `spawn_monitor`), so a pattern using `Ref` would only match that old reference, and the server would never answer. Erlang does not warn about this; choosing fresh names in funs avoids it.
+
+**Links or monitors?** Link processes that depend on each other: a worker and its helper, a connection and the process parsing its data. Monitor processes you only want to know about: a server you are calling, a client whose session should be cleaned up when it disconnects.
+
+</Section>
+
+<Section id="supervisor" kind="computation" title="A supervisor by hand">
+
+Put trapped exits together with a loop and you have a supervisor. This one starts a counter worker under a registered name, restarts it when it crashes, and gives up after a limited number of restarts:
+
+```erlang check
+#!/usr/bin/env escript
+-module(mini_sup).
+-export([main/1, counter/1]).
+
+%% A hand-made supervisor: it starts a worker, and restarts it when it
+%% crashes, at most MaxRestarts times, before giving up itself.
+start_supervisor(MaxRestarts) ->
+    spawn(fun() ->
+              process_flag(trap_exit, true),
+              supervise(start_worker(), MaxRestarts)
+          end).
+
+start_worker() ->
+    Pid = spawn_link(?MODULE, counter, [0]),
+    register(counter, Pid),
+    Pid.
+
+supervise(Worker, RestartsLeft) ->
+    receive
+        {'EXIT', Worker, normal} ->
+            ok;
+        {'EXIT', Worker, _Reason} when RestartsLeft > 0 ->
+            supervise(start_worker(), RestartsLeft - 1);
+        {'EXIT', Worker, Reason} ->
+            exit({too_many_restarts, Reason})
+    end.
+
+%% The worker: a counter that can be told to crash.
+counter(N) ->
+    receive
+        {add, K} -> counter(N + K);
+        {get, From} -> From ! {count, N}, counter(N);
+        crash -> exit(something_broke)
+    end.
+
+value() ->
+    counter ! {get, self()},
+    receive {count, N} -> N after 1000 -> timeout end.
+
+crash() ->
+    Old = whereis(counter),
+    counter ! crash,
+    wait_for_new_worker(Old, 50).
+
+wait_for_new_worker(_Old, 0) -> no_new_worker;
+wait_for_new_worker(Old, Tries) ->
+    case whereis(counter) of
+        Pid when is_pid(Pid), Pid =/= Old -> restarted;
+        _ -> timer:sleep(10), wait_for_new_worker(Old, Tries - 1)
+    end.
+
+main(_) ->
+    Sup = start_supervisor(2),
+    Ref = erlang:monitor(process, Sup),
+    timer:sleep(50),
+    counter ! {add, 5},
+    counter ! {add, 3},
+    io:format("before the crash: ~p~n", [value()]),
+    io:format("crash 1: ~p~n", [crash()]),
+    io:format("after the restart: ~p~n", [value()]),
+    io:format("crash 2: ~p~n", [crash()]),
+    io:format("crash 3: ~p~n", [crash()]),
+    receive
+        {'DOWN', Ref, process, Sup, Reason} -> io:format("supervisor gave up: ~p~n", [Reason])
+    end.
+```
+
+It prints:
+
+```text
+before the crash: 8
+crash 1: restarted
+after the restart: 0
+crash 2: restarted
+crash 3: no_new_worker
+supervisor gave up: {too_many_restarts,something_broke}
+```
+
+The worker reached 8, crashed, and was replaced by a fresh one starting from 0: a restart is a clean start, and the bad state is gone. After the second restart, the supervisor's budget was spent, so on the third crash it exited itself with a reason explaining why. In a larger system, *its* supervisor would see that exit and decide what to do: restart the whole subsystem, or give up in turn. That escalation is what a **supervision tree** is: workers at the leaves, supervisors above them, each level handling the failures the level below could not.
+
+The worker is started with `spawn_link(?MODULE, counter, [0])`, which is why the script declares `-module(mini_sup)` and exports `counter/1`: `spawn/3` and `spawn_link/3` call an exported function by name, and `?MODULE` is a macro for the current module's name.
+
+This supervisor has many gaps. Its restart limit never resets with time; it has only one child and one strategy; starting the child and registering it are not atomic; it cannot shut children down in order; and nothing reports what happened. OTP's `supervisor` behaviour fills every one of those gaps, with restart intensity measured over a time window, several restart strategies, ordered startup and shutdown, and crash reports in the system log. That is the subject of the next lesson.
+
+</Section>
+
+<Section id="layers" kind="human" title="Layers of recovery in production">
+
+The supervisor above recovers from one kind of failure. Production Erlang systems stack several layers of recovery, each catching what the layer below cannot, and knowing them helps you decide where a given failure should be handled.
+
+**Inside a process**, ordinary code handles expected outcomes with `{ok, ...}` and `{error, ...}` values, and `try` at the boundaries. Everything unexpected becomes a crash.
+
+**Between processes**, supervisors restart crashed workers. Most transient faults (a dropped connection, a timing-dependent bug, a corrupted message) do not happen twice in a row, so a restart *is* the repair. The crash still leaves evidence: processes started through OTP (with `proc_lib`, which every behaviour uses) produce a **crash report** through the `logger` application, with the reason, the stack trace, the last message and the state. Teams send these to their log aggregation and alerting systems, so a crash that was recovered from automatically is still investigated.
+
+**For the whole runtime**, an Erlang node that cannot continue (for example, because its top-level supervisor gave up, or memory ran out) writes a file called `erl_crash.dump` describing every process, table and memory area at the moment of death, and stops. A small companion program called `heart` can watch the node and restart it, and in modern deployments the container orchestrator or service manager plays the same role.
+
+**Across machines**, Erlang's distribution, which the last lesson describes, lets a system keep serving when an entire computer fails, because other nodes can take over its work.
+
+Designing an Erlang system is largely a matter of deciding which failures belong at which layer, and keeping the error kernel, the parts that must not fail, as small and simple as possible. Joe Armstrong's writing on the subject, including the paper linked in this lesson's references, is still the clearest explanation of why this works.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"Let it crash means I can skip validating input."** Input from users and other systems is *expected* to be wrong sometimes: validate it and return clear errors. Crashing is for the unexpected, and it only helps when a supervisor is there to restart what crashed.
+
+</Misconception>
+
+<Misconception>
+
+**"A process that exits normally kills its linked partners."** Only abnormal reasons propagate. An exit with reason `normal` is ignored by a linked process that is not trapping exits, and delivered as a message to one that is.
+
+</Misconception>
+
+<Misconception>
+
+**"Wrapping everything in try ... catch makes code robust."** It hides bugs and leaves processes running in states nobody designed for. Catch specific exceptions at boundaries; let the rest crash and be restarted.
+
+</Misconception>
+
+<Misconception>
+
+**"A monitor and a link are interchangeable."** A link is mutual and, unless trapped, fatal. A monitor is one-way and never harms the watcher. Using a link where a monitor belongs means a crash in something you merely observe takes you down too.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

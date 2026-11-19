@@ -1,0 +1,383 @@
+---
+title: Control flow, errors and testing
+subtitle: if, cond, case and with; error tuples versus exceptions; what "let it crash" really means; and tests with ExUnit.
+minutes: 60
+objectives:
+  - Choose between `if`, `cond`, `case` and `with`, and explain Elixir's truthiness rules
+  - Chain fallible steps with `with` and handle each failure in its `else` clauses
+  - Decide when to return `{:error, reason}` and when to raise, following the bang-function convention
+  - Define a custom exception and use `raise`, `rescue` and `after`
+  - Explain the "let it crash" philosophy and where rescuing is still appropriate
+  - Write ExUnit tests with `describe`, `test`, `assert`, `refute`, `assert_raise` and doctests, and read a failure report
+prerequisites: [structs-protocols-types]
+references:
+  - title: "Getting started: case, cond, and if"
+    url: https://hexdocs.pm/elixir/case-cond-and-if.html
+    note: The official chapter on conditionals.
+  - title: "Getting started: try, catch, and rescue"
+    url: https://hexdocs.pm/elixir/try-catch-and-rescue.html
+    note: Errors, throws and exits, and the official advice on when to use each.
+  - title: ExUnit
+    url: https://hexdocs.pm/ex_unit/ExUnit.html
+    note: The test framework that ships with Elixir; see also ExUnit.Case and ExUnit.Assertions.
+  - title: Code anti-patterns
+    url: https://hexdocs.pm/elixir/what-anti-patterns.html
+    note: The official catalogue of patterns to avoid, including several about error handling.
+  - title: Kernel.SpecialForms
+    url: https://hexdocs.pm/elixir/Kernel.SpecialForms.html
+    note: The precise rules for `with`, `case`, `cond` and `try`.
+  - title: Mox
+    url: https://hexdocs.pm/mox/
+    note: Test doubles generated from behaviours.
+---
+
+<Section id="motivation" kind="motivation" title="Two kinds of failure">
+
+Every program has to decide what happens when things go wrong, and it helps to notice that "wrong" comes in two very different kinds.
+
+Some failures are **expected**. A user types "twenty" where you asked for an age, a file someone uploaded is not valid CSV, a payment is declined. These are not bugs; they are part of the problem you are solving, and your code should handle each one deliberately, usually by telling someone what went wrong. In Elixir, expected failures are ordinary **values**: functions return `{:ok, result}` or `{:error, reason}`, and the caller decides what to do with each.
+
+Other failures are **unexpected**. A function receives `nil` where its author never imagined one, a database that should always be reachable is not, an invariant you were sure of turns out to be false. You cannot sensibly handle these where they happen, because you did not anticipate them. Elixir's answer, inherited from Erlang, is surprising at first: **let it crash**. Let the process that hit the problem die, log what happened, and have another process (a supervisor) start a fresh one in a known-good state. Lessons 7 and 8 build that machinery; this lesson builds the habits that make it work.
+
+Between the two sit the control-flow tools that choose a path through your code, and after them, the tests that prove each path does what you meant.
+
+</Section>
+
+<Section id="conditionals" kind="definitions" title="if, cond and case">
+
+Elixir has no statements, only expressions, so every conditional **returns a value**. You write `label = if ok?, do: "yes", else: "no"` rather than assigning inside the branches.
+
+<Definition term="Truthiness">
+
+In conditions, exactly two values count as false: `false` and `nil`. **Everything else is truthy**, including `0`, the empty string `""` and the empty list `[]`.
+
+</Definition>
+
+There are four tools, and each has a natural use:
+
+- **`if` / `unless`** for a single yes-or-no question. An `if` without an `else` returns `nil` when the condition is false.
+- **`cond`** for a chain of unrelated conditions, the equivalent of `else if` ladders elsewhere. The first true condition wins; end with `true ->` as a catch-all.
+- **`case`** for choosing by the *shape* of one value, using patterns and guards. This is the one you will use most.
+- **`with`** for a sequence of steps that may each fail, covered in the next section.
+
+```elixir check
+defmodule Dates do
+  def leap_year?(year) do
+    cond do
+      rem(year, 400) == 0 -> true
+      rem(year, 100) == 0 -> false
+      rem(year, 4) == 0 -> true
+      true -> false
+    end
+  end
+end
+
+for year <- [1900, 2000, 2024, 2026] do
+  IO.puts("#{year}: #{Dates.leap_year?(year)}")
+end
+
+IO.inspect(if nil, do: "yes", else: "no")
+IO.inspect(if 0, do: "yes", else: "no")
+IO.inspect(if "", do: "yes", else: "no")
+IO.inspect(if false, do: "never")
+```
+
+It prints:
+
+```text
+1900: false
+2000: true
+2024: true
+2026: false
+"no"
+"yes"
+"yes"
+nil
+```
+
+The leap-year rule is a classic `cond`: the order of the conditions *is* the rule (centuries are not leap years unless divisible by 400), so they must be tested in that order. The last four lines show truthiness: `0` and `""` are true, which surprises programmers coming from C, JavaScript or Python. If you mean "is this list empty?", say so with `list == []` or `Enum.empty?(list)`.
+
+</Section>
+
+<Section id="with" kind="examples" title="with: the happy path">
+
+Real operations are often a chain of steps, any of which can fail: read a field, validate it, parse another, look something up. Nesting a `case` inside a `case` inside a `case` gets unreadable fast. **`with`** flattens the chain. Each line `pattern <- expression` must match for the next line to run; if every line matches, the `do` block runs; the first value that does *not* match is handed to the `else` clauses (or returned as is, if there is no `else`).
+
+```elixir check
+defmodule Registration do
+  def register(params) do
+    with {:ok, name} <- required(params, "name"),
+         {:ok, email} <- required(params, "email"),
+         :ok <- check_email(email),
+         {:ok, age} <- parse_age(Map.get(params, "age", "")) do
+      {:ok, %{name: String.trim(name), email: String.downcase(email), age: age}}
+    else
+      {:error, :missing, field} -> {:error, "#{field} is required"}
+      {:error, :bad_email} -> {:error, "that email address looks wrong"}
+      {:error, :too_young} -> {:error, "you must be 13 or older"}
+      {:error, :not_a_number} -> {:error, "age must be a whole number"}
+    end
+  end
+
+  defp required(params, field) do
+    case Map.fetch(params, field) do
+      {:ok, value} when value != "" -> {:ok, value}
+      _ -> {:error, :missing, field}
+    end
+  end
+
+  defp check_email(email) do
+    if String.contains?(email, "@"), do: :ok, else: {:error, :bad_email}
+  end
+
+  defp parse_age(text) do
+    case Integer.parse(text) do
+      {age, ""} when age >= 13 -> {:ok, age}
+      {_age, ""} -> {:error, :too_young}
+      _ -> {:error, :not_a_number}
+    end
+  end
+end
+
+[
+  %{"name" => "Aiyana ", "email" => "Aiyana@Example.org", "age" => "34"},
+  %{"name" => "Tomasz", "age" => "40"},
+  %{"name" => "Mei", "email" => "mei.example.org", "age" => "22"},
+  %{"name" => "Sami", "email" => "sami@example.org", "age" => "twelve"},
+  %{"name" => "Leo", "email" => "leo@example.org", "age" => "11"}
+]
+|> Enum.each(&IO.inspect(Registration.register(&1)))
+```
+
+It prints:
+
+```text
+{:ok, %{name: "Aiyana", email: "aiyana@example.org", age: 34}}
+{:error, "email is required"}
+{:error, "that email address looks wrong"}
+{:error, "age must be a whole number"}
+{:error, "you must be 13 or older"}
+```
+
+Read the `with` block from top to bottom and it tells the story of a successful registration, uninterrupted by error handling. The failures are gathered in one place below it. Notice that each step's error has a *distinguishable shape*: `required/2` returns a three-element tuple naming the missing field, so the `else` clause can mention it. If two steps could return the same `{:error, :invalid}`, you would not know which one failed; designing distinct error values is part of using `with` well.
+
+Two more details. `Integer.parse/1` returns `{integer, rest_of_string}` or `:error`; matching on `{age, ""}` insists that nothing follows the number, so "34 years" is rejected. And a value that matches no `else` clause raises a `WithClauseError`, which is the right outcome for an error you did not plan for.
+
+</Section>
+
+<Section id="exceptions" kind="examples" title="Exceptions and bang functions">
+
+Exceptions in Elixir are structs with a `message`, raised with `raise` and caught with `rescue`. They are for situations the caller is not expected to handle. The standard library expresses this with a naming convention you met in lesson 3: **a function without `!` returns a tagged tuple; its twin with `!` returns the bare result or raises.**
+
+```elixir check
+defmodule InsufficientFunds do
+  defexception [:needed, :available]
+
+  @impl true
+  def message(e), do: "needed #{e.needed} but only #{e.available} available"
+end
+
+defmodule Wallet do
+  def withdraw(balance, amount) when amount <= balance, do: {:ok, balance - amount}
+
+  def withdraw(balance, amount) do
+    {:error, %InsufficientFunds{needed: amount, available: balance}}
+  end
+
+  def withdraw!(balance, amount) do
+    case withdraw(balance, amount) do
+      {:ok, new_balance} -> new_balance
+      {:error, exception} -> raise exception
+    end
+  end
+end
+
+IO.inspect(Wallet.withdraw(100, 30))
+IO.puts(Wallet.withdraw!(100, 30))
+
+{:error, error} = Wallet.withdraw(100, 300)
+IO.puts(Exception.message(error))
+
+try do
+  Wallet.withdraw!(10, 20)
+rescue
+  e in InsufficientFunds -> IO.puts("rescued: #{Exception.message(e)}")
+after
+  IO.puts("the after block always runs")
+end
+
+IO.inspect(Integer.parse("12a"))
+
+try do
+  String.to_integer("12a")
+rescue
+  e in ArgumentError -> IO.puts("#{inspect(e.__struct__)}: #{Exception.message(e)}")
+end
+```
+
+It prints:
+
+```text
+{:ok, 70}
+70
+needed 300 but only 100 available
+rescued: needed 20 but only 10 available
+the after block always runs
+{12, "a"}
+ArgumentError: errors were found at the given arguments:
+
+  * 1st argument: not a textual representation of an integer
+
+```
+
+`defexception` defines an exception struct; implementing `message/1` builds its text from the fields. `Wallet.withdraw/2` is the version for callers who want to handle the failure: it returns an error value (here the exception struct itself, which is a handy way to carry structured details). `withdraw!/2` is for callers who consider failure impossible or unrecoverable; it raises, and the process crashes unless something rescues it. The same pair appears throughout the standard library: `File.read/1` and `File.read!/1`, `Map.fetch/2` and `Map.fetch!/2`, `Integer.parse/1` and `String.to_integer/1`.
+
+`rescue` matches exceptions by struct (`e in ArgumentError`); `after` runs whether or not an exception happened, which is how you release resources. (Elixir also has `throw`/`catch` for non-local returns and `exit` for process exits, both rare in application code.)
+
+The official advice, and the habit of experienced teams, is to **use `rescue` sparingly**. If you find yourself writing `try ... rescue` around a call so you can continue, check first whether a non-bang version exists that returns a tuple; wrapping it in `rescue` is slower, hides real bugs along with the expected failure, and reads worse.
+
+</Section>
+
+<Section id="let-it-crash" kind="human" title="What “let it crash” really means">
+
+"Let it crash" is often misheard as "don't handle errors". It means something more precise: **don't write defensive code for situations you cannot meaningfully handle**. Handle the expected failures fully, with tuples and `with`. For everything else, let the process die, because a process in an unknown state is more dangerous than no process at all.
+
+This works on the BEAM, and not in most languages, for three reasons you have already glimpsed:
+
+1. **Processes are isolated.** A crash in the process handling one web request cannot corrupt the memory of the process handling another. There is no shared state to leave half-updated.
+2. **Crashes are observable.** Other processes can *link* to or *monitor* a process and be told when, and why, it died. You will use both in the next lesson.
+3. **Restarting is cheap and structured.** Supervisors restart crashed processes according to a declared strategy, from a known initial state. Many failures (a dropped network connection, a rare race) simply do not happen twice in a row, so a restart *is* the fix.
+
+So where *should* you rescue? At **boundaries** where an error must be translated rather than propagated: a web framework turns an exception during a request into a 500 response and keeps serving other requests (Phoenix does this for you); a job runner records that a job failed and schedules a retry; code calling a third-party library that raises on bad input may rescue that specific exception and return `{:error, reason}`. Rescuing a specific exception at a boundary is good engineering. Rescuing everything everywhere is how bugs go into hiding.
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing with ExUnit">
+
+Elixir ships with a test framework, **ExUnit**, and every Mix project comes with it configured. Tests live in `test/`, in files ending `_test.exs`, and `mix test` runs them all, in parallel where it can. A typical test file looks like this:
+
+```elixir
+defmodule RegistrationTest do
+  use ExUnit.Case, async: true
+  doctest Registration
+
+  describe "register/1" do
+    test "normalises a valid registration" do
+      params = %{"name" => "Ana ", "email" => "Ana@Example.org", "age" => "30"}
+      assert {:ok, %{name: "Ana", email: "ana@example.org"}} = Registration.register(params)
+    end
+
+    test "requires an email" do
+      assert Registration.register(%{"name" => "Ana"}) == {:error, "email is required"}
+    end
+  end
+
+  test "withdraw!/2 raises when funds are short" do
+    assert_raise InsufficientFunds, fn -> Wallet.withdraw!(1, 2) end
+  end
+end
+```
+
+`use ExUnit.Case` brings in the test macros; `async: true` lets this module's tests run concurrently with other async modules, which is safe when tests share no global state (a database sandbox or a named process would make it unsafe). `describe` groups tests for one function. `assert` takes either a boolean expression or a **pattern match**: `assert {:ok, %{name: "Ana"}} = ...` passes if the result matches the pattern, ignoring other fields, which keeps tests focused on what matters. `refute` is the opposite of `assert`, `assert_raise` checks that a function raises, and `doctest Registration` runs the `iex>` examples in that module's documentation as tests. A `setup` block can prepare data shared by the tests in a module.
+
+You can also run ExUnit from a script, which is how we can show it working here. The function below contains a deliberate bug:
+
+```elixir check
+ExUnit.start(autorun: false, seed: 0, max_cases: 1)
+
+defmodule Age do
+  def parse(text) do
+    case Integer.parse(text) do
+      {age, ""} when age > 13 -> {:ok, age}
+      {_age, ""} -> {:error, :too_young}
+      _ -> {:error, :not_a_number}
+    end
+  end
+end
+
+defmodule AgeTest do
+  use ExUnit.Case, async: true
+
+  describe "parse/1" do
+    test "accepts adults" do
+      assert Age.parse("27") == {:ok, 27}
+    end
+
+    test "accepts users who are exactly 13" do
+      assert Age.parse("13") == {:ok, 13}
+    end
+
+    test "rejects text that is not a whole number" do
+      assert Age.parse("twelve") == {:error, :not_a_number}
+      refute match?({:ok, _}, Age.parse("27 years"))
+    end
+  end
+end
+
+ExUnit.run()
+```
+
+ExUnit printed this report (the timings on the `Finished` line vary from run to run):
+
+```text
+Running ExUnit with seed: 0, max_cases: 1
+
+.
+
+  1) test parse/1 accepts users who are exactly 13 (AgeTest)
+     main.exs:21
+     Assertion with == failed
+     code:  assert Age.parse("13") == {:ok, 13}
+     left:  {:error, :too_young}
+     right: {:ok, 13}
+     stacktrace:
+       main.exs:22: (test)
+
+.
+Finished in 0.00 seconds (0.00s async, 0.00s sync)
+
+Result: 2/3 passed
+Failed: 1 test
+```
+
+The report tells you which test failed, on which line, the exact code of the failing assertion, and both sides of the comparison: the function returned `{:error, :too_young}` where the test expected `{:ok, 13}`. The bug is the guard `age > 13`, which should be `age >= 13`. In a terminal the two sides are coloured to highlight their differences, which helps a great deal with large maps. The fixed `seed: 0` makes the test order reproducible; normally ExUnit picks a random seed on each run, so that tests which secretly depend on each other's order are caught, and prints it so you can rerun a failing order with `mix test --seed 1234`.
+
+A few practices that working Elixir teams follow: test the public functions of a module, not its private helpers; prefer many small `test` blocks with descriptive names over one long one; use pattern-matching asserts to check only what matters; keep tests `async: true` unless they truly share state; and run `mix test --failed` to rerun just what failed while you fix it. For processes, ExUnit's `start_supervised!/1` starts a process under the test's own supervisor so it is cleaned up after each test.
+
+Two libraries from the wider ecosystem round out most teams' testing toolkits. [Mox](https://hexdocs.pm/mox/) builds test doubles from **behaviours**: because `Notifier` from the previous lesson declares its callbacks, Mox can generate a fake `Notifier` whose responses each test specifies, and it fails the test if the code calls something the behaviour does not define. This is one of the strongest practical reasons to put a behaviour in front of anything that talks to the outside world. [StreamData](https://hexdocs.pm/stream_data/) adds **property-based testing**: instead of three hand-picked ages, you state a property ("for every integer from 13 to 150, `parse` returns `{:ok, n}` for its decimal text") and the library generates hundreds of cases, shrinking any failure to the smallest example that still fails. A property like that would have caught our off-by-one at once.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"Zero and the empty string are false."** In Elixir only `false` and `nil` are falsy. `if length(list) do ...` is always true; write `if list != [] do ...`.
+
+</Misconception>
+
+<Misconception>
+
+**"`with` handles errors automatically."** `with` only stops at the first non-matching value and passes it on. If you omit `else`, the raw error value is returned to the caller; if you include `else` but none of its clauses match, it raises `WithClauseError`.
+
+</Misconception>
+
+<Misconception>
+
+**"Let it crash means I never need to validate input."** Bad input from users and other systems is an *expected* failure: validate it and return clear errors. "Let it crash" is for the unexpected, and it relies on supervisors being set up to restart what crashes.
+
+</Misconception>
+
+<Misconception>
+
+**"A test suite that passes in one order passes in every order."** Tests that share state (a named process, a global setting, a row in a database) can pass or fail depending on order. ExUnit randomises the order precisely to flush these out; when a failure appears only sometimes, rerun with the printed seed.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

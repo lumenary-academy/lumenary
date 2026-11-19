@@ -1,0 +1,406 @@
+---
+title: A complete program, and where to go next
+subtitle: A payment statement for a coffee cooperative, written as idiomatic modern Visual Basic, tested with xUnit, and the paths that lead on from here.
+minutes: 60
+objectives:
+  - Design a small console program around immutable data, validation and errors reported as data
+  - Combine TextFieldParser, LINQ grouping, culture-aware formatting, Async file I/O and Using in one program
+  - Split a program into a class library and an xUnit test project with the dotnet command line
+  - Choose a next step in the Visual Basic and .NET ecosystem that fits your work
+prerequisites: [errors-and-migration]
+references:
+  - title: Unit testing Visual Basic .NET Core libraries using dotnet test and xUnit
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/core/testing/unit-testing-visual-basic-with-xunit
+    note: A walkthrough of the same library-plus-tests layout used in this lesson.
+  - title: Documenting your code with XML (Visual Basic)
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/visual-basic/programming-guide/program-structure/documenting-your-code-with-xml
+    note: The ''' documentation comments used in this lesson's program.
+  - title: Visual Basic language strategy
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/visual-basic/getting-started/strategy
+    note: What Microsoft has committed to for Visual Basic, and what it has not.
+  - title: dotnet/vblang
+    url: https://github.com/dotnet/vblang
+    note: The language design repository, with the specification and the history of proposals.
+---
+
+<Section id="motivation" kind="motivation" title="The brief">
+
+A coffee cooperative buys freshly picked cherries from its member farmers. At the weighing station, each delivery is weighed and graded, and the scale's software exports the day's records as a CSV file. At the end of the week the cooperative must pay every farmer for what they delivered, at a price per kilogram that depends on the grade, and it must know which records could not be used, so that someone can go back to the scale and fix them.
+
+That is the kind of program Visual Basic has always been used for: a modest, practical tool on which real people's income depends. This lesson writes it as a complete console program in modern, idiomatic Visual Basic, using what the course has covered: `Option Strict`, classes and structures, collections and LINQ, files, culture-aware formatting, `Async`, and careful error handling. Then it turns the program into a library with automated tests, and ends with where you might go from here.
+
+The requirements, written down before any code:
+
+1. Read records of the form `date,farmer,kg,grade`, where the farmer's name may contain a comma (and is then quoted).
+2. Reject a record whose date, weight or grade cannot be read, or whose weight is not between 0 and 500 kg, and report it with its line number. A bad record must never stop the run.
+3. Pay each delivery at its grade's price, rounded to whole Rwandan francs (the prices in the program are illustrative).
+4. Print, and save to a file, one line per farmer (loads, kilograms, the share of grade A, the amount) sorted by amount, then totals.
+
+</Section>
+
+<Section id="design" kind="human" title="Design decisions">
+
+A few decisions shape the code more than any single line does, and they are the ones experienced developers make almost by reflex:
+
+- **Immutable, self-checking data.** `Delivery` has only `ReadOnly` properties, set in its constructor, which refuses impossible values. Once a `Delivery` exists, every other part of the program can trust it.
+- **Errors as data where they are expected.** A mistyped weight is not exceptional at a weighing station; it happens every week. So the reader returns a list of `InputProblem` values alongside the good deliveries instead of throwing. Exceptions remain for the truly unexpected, and the one place the program catches one (`ArgumentException` from the `Delivery` constructor) turns it into an `InputProblem` too.
+- **Pure functions in the middle, input and output at the edge.** `Pay` and `Statement` take values and return values: they touch no files and no console, so they are easy to test. Reading, writing and printing happen only in `RunAsync`. This arrangement is sometimes called a *functional core with an imperative shell*.
+- **Invariant culture for data.** The input is parsed with `CultureInfo.InvariantCulture`, and `Sub Main` pins the current culture to it, so the program reads and prints the same numbers on every computer.
+- **Modules for stateless code, classes for things.** `DeliveryReader` and `Payments` hold no state, so they are modules; a delivery is a thing, so it is a class; an input problem is a small value, so it is a structure.
+- **Documentation comments.** Lines beginning `'''` hold XML documentation, which Visual Studio shows when you hover over a name and which tools can turn into reference pages.
+
+</Section>
+
+<Section id="program" kind="examples" title="The program">
+
+```vb check
+Option Strict On
+Option Infer On
+
+Imports System.Globalization
+Imports System.IO
+Imports System.Text
+Imports System.Threading.Tasks
+Imports Microsoft.VisualBasic.FileIO
+
+''' <summary>Grades of coffee cherry, as sorted at the weighing station.</summary>
+Public Enum Grade
+    A
+    B
+    C
+End Enum
+
+''' <summary>One delivery of cherries. Immutable: every value is checked once, in the constructor.</summary>
+Public NotInheritable Class Delivery
+    Public ReadOnly Property Day As Date
+    Public ReadOnly Property Farmer As String
+    Public ReadOnly Property Kilograms As Decimal
+    Public ReadOnly Property Quality As Grade
+
+    Public Sub New(day As Date, farmer As String, kilograms As Decimal, quality As Grade)
+        If String.IsNullOrWhiteSpace(farmer) Then Throw New ArgumentException("a farmer's name is required", NameOf(farmer))
+        If kilograms <= 0D OrElse kilograms > 500D Then
+            Throw New ArgumentOutOfRangeException(NameOf(kilograms), $"{kilograms} kg is outside 0 to 500 kg")
+        End If
+        Me.Day = day
+        Me.Farmer = farmer.Trim()
+        Me.Kilograms = kilograms
+        Me.Quality = quality
+    End Sub
+End Class
+
+''' <summary>A line of input that could not be used: a value to report, not an exception to crash on.</summary>
+Public Structure InputProblem
+    Public ReadOnly Property LineNumber As Long
+    Public ReadOnly Property Message As String
+
+    Public Sub New(lineNumber As Long, message As String)
+        Me.LineNumber = lineNumber
+        Me.Message = message
+    End Sub
+End Structure
+
+Public Module DeliveryReader
+    ''' <summary>Reads "date,farmer,kilograms,grade" records, collecting problems instead of stopping.</summary>
+    Public Function ReadAll(source As TextReader, problems As List(Of InputProblem)) As List(Of Delivery)
+        Dim deliveries As New List(Of Delivery)
+        Using parser As New TextFieldParser(source)
+            parser.SetDelimiters(",")
+            parser.HasFieldsEnclosedInQuotes = True
+            parser.ReadLine()                                         ' the header
+            Do Until parser.EndOfData
+                Dim lineNumber = parser.LineNumber
+                Dim fields = parser.ReadFields()
+                Dim day As Date, kilograms As Decimal, quality As Grade
+                If fields.Length <> 4 Then
+                    problems.Add(New InputProblem(lineNumber, $"expected 4 fields, found {fields.Length}"))
+                ElseIf Not Date.TryParseExact(fields(0), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, day) Then
+                    problems.Add(New InputProblem(lineNumber, $"'{fields(0)}' is not a date"))
+                ElseIf Not Decimal.TryParse(fields(2), NumberStyles.Number, CultureInfo.InvariantCulture, kilograms) Then
+                    problems.Add(New InputProblem(lineNumber, $"'{fields(2)}' is not a weight"))
+                ElseIf Not [Enum].TryParse(fields(3), ignoreCase:=True, result:=quality) OrElse Not [Enum].IsDefined(quality) Then
+                    problems.Add(New InputProblem(lineNumber, $"'{fields(3)}' is not a grade"))
+                Else
+                    Try
+                        deliveries.Add(New Delivery(day, fields(1), kilograms, quality))
+                    Catch ex As ArgumentException
+                        problems.Add(New InputProblem(lineNumber, ex.Message))
+                    End Try
+                End If
+            Loop
+        End Using
+        Return deliveries
+    End Function
+End Module
+
+Public Module Payments
+    ''' <summary>Illustrative prices, in Rwandan francs per kilogram of cherries.</summary>
+    Public ReadOnly PricePerKg As New Dictionary(Of Grade, Decimal) From {
+        {Grade.A, 410D}, {Grade.B, 330D}, {Grade.C, 200D}
+    }
+
+    Public Function Pay(d As Delivery) As Decimal
+        Return Math.Round(d.Kilograms * PricePerKg(d.Quality), 0, MidpointRounding.AwayFromZero)
+    End Function
+
+    ''' <summary>A plain-text statement: one line per farmer, then totals.</summary>
+    Public Function Statement(deliveries As IEnumerable(Of Delivery)) As String
+        Dim byFarmer = From d In deliveries
+                       Group By d.Farmer Into Loads = Count(), Kg = Sum(d.Kilograms),
+                                              GradeA = Sum(If(d.Quality = Grade.A, d.Kilograms, 0D)),
+                                              Amount = Sum(Pay(d))
+                       Order By Amount Descending
+
+        Dim text As New StringBuilder()
+        text.AppendLine($"{"farmer",-14}{"loads",6}{"kg",9}{"grade A",9}{"RWF",10}")
+        For Each f In byFarmer
+            text.AppendLine($"{f.Farmer,-14}{f.Loads,6}{f.Kg,9:N1}{f.GradeA / f.Kg,9:P0}{f.Amount,10:N0}")
+        Next
+        Dim totalKg = Aggregate d In deliveries Into Sum(d.Kilograms)
+        Dim totalPay = Aggregate d In deliveries Into Sum(Pay(d))
+        text.AppendLine($"{"total",-14}{deliveries.Count(),6}{totalKg,9:N1}{"",9}{totalPay,10:N0}")
+        Return text.ToString()
+    End Function
+End Module
+
+Module Program
+    ' Stands in for the export from the weighing station's scale.
+    Private Const SampleExport As String = "date,farmer,kg,grade
+2026-11-02,Uwimana,38.5,A
+2026-11-02,Habimana,52,B
+2026-11-03,""Mukamana, J."",41.2,A
+2026-11-03,Uwimana,12,C
+2026-11-04,Habimana,47.5,A
+2026-11-04,Nshuti,,B
+2026-11-05,Habimana,33,D
+2026-11-05,Uwimana,640,A
+2026-11-06,Nshuti,29.8,b"
+
+    Async Function RunAsync() As Task
+        Dim folder = Directory.CreateTempSubdirectory("coop-")
+        Try
+            Dim inputPath = Path.Combine(folder.FullName, "deliveries.csv")
+            Await File.WriteAllTextAsync(inputPath, SampleExport)
+
+            Dim problems As New List(Of InputProblem)
+            Dim deliveries As List(Of Delivery)
+            Using reader As New StreamReader(inputPath)
+                deliveries = DeliveryReader.ReadAll(reader, problems)
+            End Using
+
+            Dim report = Payments.Statement(deliveries)
+            Console.Write(report)
+            For Each p In problems
+                Console.WriteLine($"line {p.LineNumber}: {p.Message}")
+            Next
+
+            Dim reportPath = Path.Combine(folder.FullName, "statement.txt")
+            Await File.WriteAllTextAsync(reportPath, report)
+            Dim saved = Await File.ReadAllLinesAsync(reportPath)
+            Console.WriteLine($"saved {Path.GetFileName(reportPath)} ({saved.Length} lines)")
+        Finally
+            folder.Delete(recursive:=True)
+        End Try
+    End Function
+
+    Sub Main()
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture     ' the same output on every computer
+        RunAsync().GetAwaiter().GetResult()
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+farmer         loads       kg  grade A       RWF
+Habimana           2     99.5     48 %    36,635
+Uwimana            2     50.5     76 %    18,185
+Mukamana, J.       1     41.2    100 %    16,892
+Nshuti             1     29.8      0 %     9,834
+total              6    221.0             81,546
+line 7: '' is not a weight
+line 8: 'D' is not a grade
+line 9: 640 kg is outside 0 to 500 kg (Parameter 'kilograms')
+saved statement.txt (6 lines)
+```
+
+</Section>
+
+<Section id="reading" kind="examples" title="Reading the program">
+
+**The data types.** `Grade` is an `Enum`, so a grade can only be `A`, `B` or `C`, and the compiler checks every use. `Delivery`'s constructor guards its invariants with `ArgumentException` and `ArgumentOutOfRangeException`, naming the offending parameter with `NameOf`, and trims the farmer's name. `InputProblem` is a `Structure` with two read-only properties.
+
+**The reader.** `DeliveryReader.ReadAll` wraps a `TextFieldParser` around any `TextReader`, so the same code reads a file, a string or, in a test, a `StringReader`. The `If ... ElseIf` chain tries each conversion with a `TryParse` method in turn and records the first problem it finds:
+
+- `Date.TryParseExact` accepts only `yyyy-MM-dd`, so `03/11/2026`, which means different dates in different countries, is rejected rather than guessed.
+- `[Enum].TryParse(fields(3), ignoreCase:=True, result:=quality)` accepted the lower-case `b` on the last line. The square brackets are needed because `Enum` is a Visual Basic keyword. `[Enum].IsDefined` then rejects numbers such as `7`, which `TryParse` would otherwise happily accept as a grade.
+- The named arguments `ignoreCase:=` and `result:=` make a call with two similar-looking arguments readable.
+
+The output's last three lines are the problems: line 7 has an empty weight, line 8 a grade `D`, and line 9 a weight of 640 kg, which only the `Delivery` constructor caught. Its message includes `(Parameter 'kilograms')` because that is how .NET formats an `ArgumentException`'s message.
+
+**The statement.** `Payments.Statement` is one LINQ query in Visual Basic's own syntax: `Group By d.Farmer Into Loads = Count(), Kg = Sum(d.Kilograms), ...` computes four aggregates per farmer in one clause, as in <LessonLink slug="collections-and-linq">the collections lesson</LessonLink>. The share of grade A is a `Sum` over an `If(...)` that counts only grade-A kilograms. The text is built with a `StringBuilder` and interpolated strings with alignment and format items (`{f.Kg,9:N1}`, `{f.GradeA / f.Kg,9:P0}`). `Pay` rounds with `MidpointRounding.AwayFromZero`, the rule people expect for money; `Math.Round`'s default, like `CInt`, rounds halves to the even neighbour, and choosing explicitly avoids an argument with a farmer over one franc.
+
+**The shell.** `RunAsync` creates a temporary folder, writes the sample export into it (standing in for the scale's file), reads it with a `StreamReader` in a `Using` block, prints the statement and the problems, saves the statement asynchronously, reads the file back to confirm it, and deletes the folder in `Finally`. `Sub Main` cannot be `Async`, so it waits once with `GetAwaiter().GetResult()`, as in <LessonLink slug="procedures-and-functions">the procedures lesson</LessonLink>.
+
+**What it does not do.** Look again at the data: `"Mukamana, J."` would count as a different farmer from `Mukamana J.` if the scale's operator typed the name both ways, and her payment would be split in two. Noticing such gaps, and asking the people who use a program about them, is as much part of the job as writing the code.
+
+</Section>
+
+<Section id="iteration" kind="examples" title="A second iteration: members, not names">
+
+Real systems identify people by a number that never changes, not by a name someone types. Suppose the cooperative's treasurer agrees, and the scale is changed to record each farmer's member number. The program then needs the member register, and every delivery must be matched against it. Here is the heart of that change, as a small program of its own:
+
+```vb check
+Option Strict On
+Option Infer On
+
+Imports System.Globalization
+
+''' <summary>A member of the cooperative, identified by a number that never changes.</summary>
+Public NotInheritable Class Member
+    Public ReadOnly Property Number As String
+    Public ReadOnly Property Name As String
+    Public ReadOnly Property Village As String
+
+    Public Sub New(number As String, name As String, village As String)
+        Me.Number = number
+        Me.Name = name
+        Me.Village = village
+    End Sub
+End Class
+
+Module Program
+    Sub Main()
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture
+
+        ' The member register, keyed by member number; the comparer makes "m-027" match "M-027".
+        Dim register As Dictionary(Of String, Member) = New List(Of Member) From {
+            New Member("M-014", "Jeanne Mukamana", "Nyamasheke"),
+            New Member("M-027", "Eric Habimana", "Rusizi"),
+            New Member("M-031", "Alice Uwimana", "Nyamasheke")
+        }.ToDictionary(Function(m) m.Number, StringComparer.OrdinalIgnoreCase)
+
+        ' Deliveries now name a member number instead of a typed name.
+        Dim deliveries = {
+            (Member:="M-014", Kg:=41.2D), (Member:="m-027", Kg:=52D), (Member:="M-031", Kg:=38.5D),
+            (Member:="M-014", Kg:=12D), (Member:="M-099", Kg:=20D)
+        }
+
+        Dim byMember = From d In deliveries
+                       Where register.ContainsKey(d.Member)
+                       Let m = register(d.Member)
+                       Group By m.Number, m.Name, m.Village Into Kg = Sum(d.Kg)
+                       Order By Village, Name
+
+        For Each row In byMember
+            Console.WriteLine($"{row.Number}  {row.Name,-16} {row.Village,-11} {row.Kg,6:N1} kg")
+        Next
+
+        Dim perVillage = From row In byMember
+                         Group By row.Village Into Total = Sum(row.Kg)
+        Console.WriteLine(String.Join("; ", perVillage.Select(Function(v) $"{v.Village} {v.Total:N1} kg")))
+
+        For Each d In deliveries.Where(Function(x) Not register.ContainsKey(x.Member))
+            Console.WriteLine($"unknown member {d.Member}: {d.Kg} kg held for checking")
+        Next
+    End Sub
+End Module
+```
+
+It printed:
+
+```text
+M-031  Alice Uwimana    Nyamasheke    38.5 kg
+M-014  Jeanne Mukamana  Nyamasheke    53.2 kg
+M-027  Eric Habimana    Rusizi        52.0 kg
+Nyamasheke 91.7 kg; Rusizi 52.0 kg
+unknown member M-099: 20 kg held for checking
+```
+
+- **A dictionary with a comparer.** `ToDictionary(Function(m) m.Number, StringComparer.OrdinalIgnoreCase)` builds the register keyed by member number, and the comparer makes the key case-insensitive, so the delivery recorded as `m-027` still found Eric Habimana. Choosing the comparer deliberately is better than upper-casing strings all over the program.
+- **Named tuples as lightweight records.** `(Member:="M-014", Kg:=41.2D)` creates a tuple whose elements have names, enough for test data that lives inside one procedure. Anything that travels further deserves a class, like `Delivery`.
+- **`Let` and a three-key `Group By`.** The query looks each member up once with `Let m = register(d.Member)`, then groups by number, name and village together, so all three are available in the result; the second query regroups those rows by village.
+- **Unknown numbers are held, not dropped.** The delivery for `M-099` is not paid and not silently lost: it is reported for someone to check, the same principle as the `InputProblem` list in the main program.
+
+Folding this into the main program means replacing the `Farmer` property with a member number, loading the register from its own CSV file with the same `TextFieldParser` approach, and adding "unknown member" as one more kind of `InputProblem`.
+
+</Section>
+
+<Section id="tests" kind="computation" title="From one file to a tested solution">
+
+A program people rely on needs tests that run automatically. The `dotnet` command line can create a class library and a test project in Visual Basic; `dotnet new list --language VB` shows the templates available, which in the .NET 10 SDK include `classlib`, `console`, `xunit`, `mstest` and `nunit`, and, for Windows, `winforms` and `wpf`. Move `Grade`, `Delivery`, `InputProblem`, `DeliveryReader` and `Payments` into a library, keep `Module Program` in the console project, and add tests:
+
+```bash
+dotnet new classlib -lang VB -o Coop.Core
+dotnet new xunit -lang VB -o Coop.Tests
+dotnet add Coop.Tests reference Coop.Core
+dotnet new console -lang VB -o Coop.App
+dotnet add Coop.App reference Coop.Core
+```
+
+A test class for the library:
+
+```vb
+Option Strict On
+
+Imports System.IO
+Imports Coop.Core
+Imports Xunit
+
+Public Class PaymentsTests
+    <Fact>
+    Public Sub GradeAIsPaidAtTheGradeAPrice()
+        Dim load As New Delivery(#11/2/2026#, "Uwimana", 10D, Grade.A)
+        Assert.Equal(4100D, Payments.Pay(load))
+    End Sub
+
+    <Theory>
+    <InlineData("2026-11-04,Nshuti,,B")>
+    <InlineData("2026-11-05,Habimana,33,D")>
+    <InlineData("2026-11-05,Uwimana,640,A")>
+    Public Sub BadLinesBecomeProblemsNotDeliveries(line As String)
+        Dim problems As New List(Of InputProblem)
+        Dim deliveries = DeliveryReader.ReadAll(New StringReader("date,farmer,kg,grade" & vbLf & line), problems)
+        Assert.Empty(deliveries)
+        Assert.Single(problems)
+    End Sub
+End Class
+```
+
+Attributes are written in angle brackets in Visual Basic: `<Fact>` marks a test, and `<Theory>` with several `<InlineData(...)>` runs one test method once per set of data, here once for each kind of bad line. When we ran `dotnet test Coop.Tests` on this layout with the .NET 10 SDK, it reported `Passed!  - Failed:     0, Passed:     4, Skipped:     0, Total:     4`, the fact plus three cases of the theory.
+
+One Visual Basic detail caught us while setting this up. A Visual Basic project puts all its code in a **root namespace**, set by `<RootNamespace>` in the project file (here `Coop.Core`), instead of the `Namespace` blocks a C# file would declare. So the tests could not see `Delivery` until we added `Imports Coop.Core`; the first build failed with *BC30002: Type 'Delivery' is not defined*. When you move code between projects, or from Visual Basic to C#, remember that the namespace comes from the project, not from the file.
+
+With the library separate, the same rules could later be used by a Windows Forms front end for the weighing station, a web service written in C#, or a scheduled job, without copying any code.
+
+</Section>
+
+<Section id="next" kind="reading" title="Where to go next">
+
+You can now read, write, test and modernise Visual Basic code. Where you go next depends on why you learned it:
+
+- **Maintaining Windows applications.** Most Visual Basic in production is Windows Forms or WPF. On a Windows machine, `dotnet new winforms -lang VB` and Visual Studio's designer are the place to start; learn how designer files, `Handles` clauses and data binding fit together, and practise moving logic out of forms into tested classes, as this lesson did.
+- **Modernising and migrating.** Take a real or sample .NET Framework application through the steps of <LessonLink slug="errors-and-migration">the previous lesson</LessonLink>: characterisation tests, `Option Strict On`, SDK-style projects, modern .NET, and perhaps C#. Microsoft's porting guide and the open-source Code Converter are the main tools.
+- **Learning C#.** Everything you know about .NET (types, collections, LINQ, `Async`, exceptions, the libraries) carries over unchanged, and [Lumenary's C# course](/en/cs/languages/csharp/) covers the language. Knowing both is what makes a gradual migration possible.
+- **Office automation with VBA.** VBA is classic Visual Basic, closer to VB6 than to this course: `On Error`, `ByRef` by default, `Variant` and COM objects. The ideas of the legacy sections of these lessons apply directly.
+- **The language itself.** The [dotnet/vblang](https://github.com/dotnet/vblang) repository holds the specification and years of design discussion, and Microsoft's [language strategy](https://learn.microsoft.com/dotnet/visual-basic/getting-started/strategy) says what will and will not change. As of 2026, Visual Basic is stable and supported on current .NET, with no new language features planned.
+
+Whatever you choose, the habits of this course travel with you: `Option Strict On`, small procedures with clear names, immutable data where you can, tests before changes, and an honest account of what the program does and does not do.
+
+<Reflection title="Just weights">
+
+The book of Proverbs says, in the King James Version, that "a false balance is abomination to the LORD: but a just weight is his delight" (Proverbs 11:1). It was written about merchants' scales, and it fits a program like this one surprisingly well. A rounding rule chosen carelessly, a record silently dropped, a name typed two ways: each is a small false weight, and the people who bear the cost are the ones least able to check the arithmetic. Writing code that is exact, that reports what it rejected, and that someone else can test is one practical way of keeping a just weight.
+
+</Reflection>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

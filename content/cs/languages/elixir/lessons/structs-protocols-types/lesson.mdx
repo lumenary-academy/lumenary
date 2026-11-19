@@ -1,0 +1,452 @@
+---
+title: Structs, protocols and types
+subtitle: Named data shapes, polymorphism without classes, and the gradual set-theoretic type checker that infers types in Elixir 1.20.
+minutes: 60
+objectives:
+  - Define structs with defaults and enforced keys, and pattern match on them
+  - Write a protocol and implement it for your own structs and for built-in types
+  - Define a behaviour with callbacks and explain how it differs from a protocol
+  - Write typespecs for documentation and Dialyzer, and say what they do not do
+  - Describe Elixir's gradual set-theoretic type system as of 1.20 and read its warnings
+prerequisites: [collections-enum-stream]
+references:
+  - title: "Getting started: Structs"
+    url: https://hexdocs.pm/elixir/structs.html
+    note: The official chapter on defining and using structs.
+  - title: "Getting started: Protocols"
+    url: https://hexdocs.pm/elixir/protocols.html
+    note: Protocols, implementations for built-in types, deriving and consolidation.
+  - title: Gradual set-theoretic types
+    url: https://hexdocs.pm/elixir/gradual-set-theoretic-types.html
+    note: The official guide to the type system, its notation and its roadmap.
+  - title: The Design Principles of the Elixir Type System
+    author: Giuseppe Castagna, Guillaume Duboc and José Valim
+    year: 2023
+    url: https://arxiv.org/abs/2306.06391
+    note: The research paper behind the type system, for readers who want the theory.
+  - title: Typespecs reference
+    url: https://hexdocs.pm/elixir/typespecs.html
+    note: The syntax of @type and @spec, used by documentation and Dialyzer.
+  - title: Elixir changelog
+    url: https://hexdocs.pm/elixir/changelog.html
+    note: What each release added to the type checker; check it when you upgrade.
+---
+
+<Section id="motivation" kind="motivation" title="Giving data a shape">
+
+Maps can hold anything, and that flexibility is a gift when you are exploring. In a growing codebase it becomes a liability. Somewhere a function expects `%{title: ..., author: ...}`, somewhere else a typo creates `%{titel: ...}`, and the mistake surfaces three modules away as a `nil` where a string should be.
+
+Object-oriented languages solve this with classes, which bundle a data layout, the methods that act on it, and a place in an inheritance hierarchy. Elixir unbundles those three jobs and gives each its own tool:
+
+- **Structs** give data a name and a fixed set of fields, checked when the code is compiled.
+- **Protocols** let one function behave differently for different types of data, including types you did not write, which is how `to_string/1` works on integers, atoms and your own structs alike.
+- **Behaviours** describe a set of functions a *module* must provide, so you can swap one implementation for another: a real payment provider in production, a fake one in tests.
+
+On top of all three sits the newest part of the language, a **type checker** that infers the types of your functions and warns when code is certain to fail. Unlike the type systems of Java or TypeScript, it asks you to write nothing. This lesson covers each tool and, above all, when to reach for it.
+
+</Section>
+
+<Section id="structs" kind="definitions" title="Structs">
+
+<Definition term="Struct">
+
+A **struct** is a map with a fixed set of keys and a special `__struct__` key holding the name of the module that defines it. It is declared with `defstruct` inside a module, and each module can define at most one struct, named after the module.
+
+</Definition>
+
+```elixir check
+defmodule Book do
+  @enforce_keys [:title, :author]
+  defstruct [:title, :author, year: nil, copies: 1, on_loan: 0]
+
+  def available?(%Book{copies: c, on_loan: l}), do: l < c
+
+  def lend(%Book{} = book) do
+    if available?(book) do
+      {:ok, %{book | on_loan: book.on_loan + 1}}
+    else
+      {:error, :none_available}
+    end
+  end
+end
+
+defmodule Demo do
+  def run do
+    book = %Book{title: "Things Fall Apart", author: "Chinua Achebe", year: 1958}
+    IO.inspect(book)
+
+    {:ok, book} = Book.lend(book)
+    IO.inspect(Book.lend(book))
+
+    %Book{author: author} = book
+    IO.puts(author)
+
+    IO.inspect(is_map(book))
+    IO.inspect(book.__struct__)
+    IO.inspect(book |> Map.keys() |> Enum.sort())
+
+    try do
+      struct!(Book, title: "Untitled")
+    rescue
+      e in ArgumentError -> IO.puts(Exception.message(e))
+    end
+  end
+end
+
+Demo.run()
+```
+
+It prints:
+
+```text
+%Book{
+  title: "Things Fall Apart",
+  author: "Chinua Achebe",
+  year: 1958,
+  copies: 1,
+  on_loan: 0
+}
+{:error, :none_available}
+Chinua Achebe
+true
+Book
+[:__struct__, :author, :copies, :on_loan, :title, :year]
+the following keys must also be given when building struct Book: [:author]
+```
+
+`defstruct` lists the fields; `year: nil, copies: 1, on_loan: 0` give defaults, and fields listed without one default to `nil`. `@enforce_keys` makes `:title` and `:author` mandatory, so building a book without an author fails, as the last line shows. Misspell a field in a literal such as `%Book{titel: "..."}` and the code does not even compile: the compiler knows every struct's keys.
+
+A struct is still a map underneath (`is_map(book)` is true), with the extra `__struct__` key naming its module, so map functions and the update syntax work. Two map features are deliberately missing: structs do not implement the `Access` behaviour, so `book[:title]` raises and you write `book.title`; and they do not implement `Enumerable`, so you cannot `Enum.map` over a struct's fields by accident.
+
+Pattern matching on `%Book{}` checks the type: `def lend(%Book{} = book)` accepts only books, and `%Book{author: author} = book` matches only a `Book`. Functions that work on a struct conventionally live in the struct's own module, with the struct as their first argument, so `Book.lend(book)` reads naturally and fits in a pipeline.
+
+You may wonder why the example wraps its demonstration in a `Demo` module instead of writing it at the top of the script. A script is compiled as a whole before it runs, and a struct literal such as `%Book{...}` must be expanded after its module has been defined. Code inside a later module is compiled after `Book` exists, so it works. In a Mix project, where each module lives in its own file, the question never comes up.
+
+</Section>
+
+<Section id="protocols" kind="examples" title="Protocols: one function, many types">
+
+<Definition term="Protocol">
+
+A **protocol** declares one or more functions whose implementation is chosen by the type of the first argument. Implementations can be written for your structs and for built-in types such as `Integer`, `List`, `Map` or `BitString` (strings), and they can live anywhere: in the struct's module, the protocol's module, or a third library.
+
+</Definition>
+
+Protocols are how Elixir achieves polymorphism. `to_string/1` and string interpolation use the `String.Chars` protocol; `IO.inspect` uses `Inspect`; every `Enum` function uses `Enumerable`; the `JSON` module added in Elixir 1.18 uses `JSON.Encoder`. Here is a protocol of our own, with implementations for two structs, two built-in types and a fallback:
+
+```elixir check
+defprotocol Describe do
+  @fallback_to_any true
+  @doc "A one-line, human-readable description of a value."
+  def describe(value)
+end
+
+defmodule Film do
+  defstruct [:title, :minutes]
+end
+
+defmodule Song do
+  defstruct [:title, :seconds]
+end
+
+defimpl Describe, for: Film do
+  def describe(%Film{title: t, minutes: m}), do: "the film #{t} (#{m} min)"
+end
+
+defimpl Describe, for: Song do
+  def describe(%Song{title: t, seconds: s}) do
+    seconds = s |> rem(60) |> Integer.to_string() |> String.pad_leading(2, "0")
+    "the song #{t} (#{div(s, 60)}:#{seconds})"
+  end
+end
+
+defimpl Describe, for: List do
+  def describe(list) do
+    "a list of #{length(list)}: " <> Enum.map_join(list, ", ", &Describe.describe/1)
+  end
+end
+
+defimpl Describe, for: Integer do
+  def describe(n) when n < 0, do: "the negative number #{n}"
+  def describe(n), do: "the number #{n}"
+end
+
+defimpl Describe, for: Any do
+  def describe(value), do: "something: #{inspect(value)}"
+end
+
+defimpl String.Chars, for: Film do
+  def to_string(film), do: film.title
+end
+
+defmodule Demo do
+  def run do
+    film = %Film{title: "Spirited Away", minutes: 125}
+    shelf = [film, %Song{title: "Pata Pata", seconds: 187}, 7, :unknown]
+
+    Enum.each(shelf, &IO.puts(Describe.describe(&1)))
+    IO.puts(Describe.describe([1, -2]))
+    IO.puts("Tonight: #{film}")
+    IO.inspect(Describe.impl_for(%Song{}))
+    IO.inspect(Describe.impl_for(3.5))
+  end
+end
+
+Demo.run()
+```
+
+It prints:
+
+```text
+the film Spirited Away (125 min)
+the song Pata Pata (3:07)
+the number 7
+something: :unknown
+a list of 2: the number 1, the negative number -2
+Tonight: Spirited Away
+Describe.Song
+Describe.Any
+```
+
+`defprotocol` declares the function; each `defimpl ... for: Type` supplies one implementation, which Elixir compiles into a module named after both (`Describe.Song`, as `impl_for/1` reveals). Calling `Describe.describe(x)` looks at the type of `x` and dispatches to the right implementation. The list implementation calls `Describe.describe/1` on each element, so the protocol is recursive for free. `@fallback_to_any true` together with `defimpl ... for: Any` handles every type without its own implementation; without a fallback, an unsupported type raises `Protocol.UndefinedError`, which is usually the better choice, because it tells you immediately that a type was forgotten. Implementing `String.Chars` for `Film` made `"#{film}"` work.
+
+The key property is that **the protocol and its implementations are decoupled**. A JSON library can define `JSON.Encoder`, and you implement it for your structs in your own code, without the library knowing your types exist and without your structs inheriting from anything. That is the problem object-oriented languages solve with interfaces, minus the requirement to declare them when the type is written.
+
+In a Mix project, protocols are **consolidated** when you build: the compiler gathers every implementation it can see and generates fast dispatch code, so protocol calls in production cost about as much as a `case`.
+
+</Section>
+
+<Section id="behaviours" kind="examples" title="Behaviours: contracts for modules">
+
+A protocol dispatches on *data*. Sometimes you want to swap a whole *module*: send notifications by SMS in one country and by email in another, or use a fake payment gateway in tests. For that, Elixir has **behaviours**, inherited from Erlang/OTP. A behaviour is a module that lists **callbacks**, functions with given names, arities and typespecs, that implementing modules must define.
+
+```elixir check
+defmodule Notifier do
+  @moduledoc "What every way of notifying a customer must provide."
+  @callback name() :: String.t()
+  @callback deliver(to :: String.t(), body :: String.t()) :: {:ok, String.t()} | {:error, atom()}
+end
+
+defmodule SmsNotifier do
+  @behaviour Notifier
+
+  @impl Notifier
+  def name, do: "SMS"
+
+  @impl Notifier
+  def deliver(to, body) do
+    if String.length(body) <= 160,
+      do: {:ok, "text sent to #{to}"},
+      else: {:error, :too_long}
+  end
+end
+
+defmodule EmailNotifier do
+  @behaviour Notifier
+
+  @impl Notifier
+  def name, do: "email"
+
+  @impl Notifier
+  def deliver(to, _body), do: {:ok, "email queued for #{to}"}
+end
+
+defmodule Orders do
+  @spec confirm(pos_integer(), String.t(), module()) :: :ok
+  def confirm(order_id, customer, notifier \\ EmailNotifier) do
+    body = "Order #{order_id} is confirmed. " <> String.duplicate("Thank you! ", order_id)
+
+    case notifier.deliver(customer, body) do
+      {:ok, receipt} -> IO.puts("[#{notifier.name()}] #{receipt}")
+      {:error, reason} -> IO.puts("[#{notifier.name()}] failed: #{reason}")
+    end
+  end
+end
+
+Orders.confirm(3, "+254 700 000 000", SmsNotifier)
+Orders.confirm(20, "+254 700 000 000", SmsNotifier)
+Orders.confirm(20, "nadia@example.org")
+IO.inspect(Notifier.behaviour_info(:callbacks))
+```
+
+It prints:
+
+```text
+[SMS] text sent to +254 700 000 000
+[SMS] failed: too_long
+[email] email queued for nadia@example.org
+[name: 0, deliver: 2]
+```
+
+Modules are atoms, so a module can be passed as an argument (`notifier`) and called dynamically (`notifier.deliver(...)`). `@behaviour Notifier` declares the contract; if `SmsNotifier` forgot `deliver/2`, the compiler would warn. `@impl Notifier` (or `@impl true`) marks each callback, so the compiler can also warn when you misspell one or mark a function that is not a callback. Real projects choose the implementation through configuration, for example `Application.get_env(:shop, :notifier)`, and tests swap in a fake.
+
+You have been surrounded by behaviours without knowing it: `GenServer`, `Supervisor` and `Application`, the heart of OTP, are behaviours, and you will implement them in the Professional lessons. The rule of thumb: **protocol when the choice depends on the data's type, behaviour when the choice is a module picked by configuration or by the caller.**
+
+</Section>
+
+<Section id="typespecs" kind="definitions" title="Typespecs">
+
+The `@callback` lines and the `@spec` above `Orders.confirm/3` are **typespecs**, a notation Elixir inherited from Erlang. `@spec confirm(pos_integer(), String.t(), module()) :: :ok` documents that the function takes a positive integer, a string and a module name and returns `:ok`. You can define your own named types with `@type`:
+
+```elixir
+@type status :: :pending | :paid | :refunded
+@type order :: %{id: pos_integer(), status: status(), total_cents: non_neg_integer()}
+
+@spec refund(order()) :: {:ok, order()} | {:error, :not_paid}
+```
+
+Typespecs appear in generated documentation and are read by **Dialyzer**, an Erlang static analysis tool that many Elixir teams run through the `dialyxir` package. The compiler itself does not enforce them: a wrong `@spec` compiles happily. They remain common in libraries and are worth reading fluently, but the type checking built into the compiler today comes from a different, newer system.
+
+</Section>
+
+<Section id="types" kind="computation" title="The gradual set-theoretic type system">
+
+Since Elixir 1.17 the compiler contains a type checker based on **set-theoretic types**, developed with researchers at CNRS and described in the paper linked below. The name describes the idea: a type is a *set of values*, and types combine with the operations you know from sets.
+
+| Notation | Meaning |
+| --- | --- |
+| `integer()`, `binary()`, `float()` | all integers, all binaries, all floats |
+| `:ok`, `nil` | a single atom: a set with one element |
+| `{:ok, integer()}` | two-element tuples whose first element is `:ok` and second an integer |
+| `integer() or float()` | union: a value of either type |
+| `atom() and not nil` | intersection and negation: every atom except `nil` |
+| `term()`, `none()` | every value; no value at all |
+| `dynamic()` | a value whose type is not known statically |
+
+The word **gradual** refers to `dynamic()`. Elixir was a dynamic language for over a decade, and a type checker that rejected every program it could not fully understand would be useless to existing code. So when the checker does not know a type exactly, it gives it the type `dynamic()`, possibly narrowed (as in `dynamic(integer() or float())`), and it reports a problem only when it can show that **every** possible combination of types will fail. The guide calls the system *sound*: the types it infers agree with what the program actually does. It does not promise to find every bug, but what it does report is real.
+
+Crucially, **you write no annotations**. As of Elixir 1.20 the checker infers types from patterns, guards and function bodies, carries information from earlier clauses to later ones, and uses the inferred types of the standard library and your dependencies. (Within a Mix project, calls between modules compiled together are treated as `dynamic()`; in a script like the one below, each module is already compiled when the next is checked, so its types are known.) Here is a module with two mistakes the checker can prove:
+
+```elixir check
+defmodule Temperature do
+  def to_fahrenheit(celsius) when is_number(celsius), do: celsius * 9 / 5 + 32
+
+  def describe(celsius) do
+    case to_fahrenheit(celsius) do
+      f when f > 86 -> "hot"
+      f when f < 50 -> "cold"
+      _ -> "mild"
+    end
+  end
+
+  def label(reading) do
+    "Reading: " <> to_fahrenheit(reading)
+  end
+
+  def parse(text) do
+    case Float.parse(text) do
+      {value, ""} -> {:ok, value}
+      :error -> {:error, :not_a_number}
+      {_value, _rest} -> {:error, :trailing_text}
+    end
+  end
+
+  def check(text) do
+    case parse(text) do
+      {:ok, value} -> describe(value)
+      {:error, reason} -> "invalid: #{reason}"
+      nil -> "missing"
+    end
+  end
+end
+
+IO.puts(Temperature.describe(31))
+IO.puts(Temperature.check("12.5"))
+IO.puts(Temperature.check("hot"))
+```
+
+The program runs and prints:
+
+```text
+hot
+mild
+invalid: not_a_number
+```
+
+but while compiling it, Elixir 1.20.5 printed these two warnings on standard error:
+
+```text
+    warning: incompatible types in binary construction:
+
+        <<..., to_fahrenheit(reading)::binary>>
+
+    got type:
+
+        float()
+
+    but expected type:
+
+        binary()
+
+    where "reading" was given the type:
+
+        # type: dynamic(float() or integer())
+        # from: main.exs:13:20
+        to_fahrenheit(reading)
+
+    type warning found at:
+    │
+ 13 │     "Reading: " <> to_fahrenheit(reading)
+    │     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │
+    └─ main.exs:13: Temperature.label/1
+
+    warning: the following clause will never match:
+
+        nil ->
+
+    because it attempts to match on the result of:
+
+        parse(text)
+
+    which has type:
+
+        dynamic({:error, :not_a_number or :trailing_text} or {:ok, term()})
+
+    type warning found at:
+    │
+ 28 │       nil -> "missing"
+    │       ~~~~~~~~~~~~~~~~
+    │
+    └─ main.exs:28: Temperature.check/1
+```
+
+Read what the checker worked out on its own. From the guard `is_number(celsius)` and the arithmetic, it inferred that `to_fahrenheit/1` returns a `float()` (because `/` always produces one), so `label/1` concatenates a float onto a string, which can never work. It also inferred the exact return type of `parse/1`, the union of `{:ok, ...}` and two specific error tuples, and concluded that the `nil ->` clause in `check/1` is dead code. Neither function has a single annotation. In a larger codebase these are exactly the bugs that hide for months in a rarely used branch.
+
+Three practical points. Type problems are **warnings**, not errors, so existing code keeps compiling; teams make them fatal in continuous integration with `mix compile --warnings-as-errors`. The checker is **improving with each release** (1.18 added checking of function calls, 1.19 protocols and anonymous functions, 1.20 inference of whole function bodies and guards), so upgrading Elixir may reveal new warnings in old code, which is the point. And **typespecs are separate**: the checker does not read `@spec`. The official guide states that signatures written in the new notation are planned for future releases, starting with typed structs, after which typespecs are to be phased out into a separate library. Until then, keep any `@spec`s you have, and let the compiler do the rest.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"A struct is an object with methods."** A struct is plain data: a map with a known set of keys. Functions that work on it live in its module by convention, but there is no `self`, no inheritance and no hidden state, and anyone can read every field.
+
+</Misconception>
+
+<Misconception>
+
+**"Protocols and behaviours are two names for interfaces."** They solve different problems. A protocol picks an implementation from the *type of a value* at the call site. A behaviour is a checklist for a *module*, and the caller decides which module to use. `Enumerable` is a protocol; `GenServer` is a behaviour.
+
+</Misconception>
+
+<Misconception>
+
+**"No type warnings means my code is type-correct."** The checker reports what it can prove will fail; where types are `dynamic()`, it stays quiet. Tests remain essential, and in the next lesson you will write them.
+
+</Misconception>
+
+<Misconception>
+
+**"The compiler checks my `@spec`s."** It does not. Typespecs are documentation and input for Dialyzer. A misleading `@spec` is worse than none, so keep them accurate or leave them out.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

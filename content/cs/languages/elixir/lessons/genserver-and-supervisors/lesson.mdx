@@ -1,0 +1,396 @@
+---
+title: GenServer, supervisors and OTP
+subtitle: The OTP behaviours that turn processes into reliable services, supervision trees that restart what fails, and how an application is assembled from them.
+minutes: 65
+objectives:
+  - Implement a GenServer with a client API and the init, handle_call, handle_cast and handle_info callbacks
+  - Choose between call and cast, and explain what happens on a timeout
+  - Start workers under a Supervisor and explain one_for_one, one_for_all and rest_for_one
+  - Explain restart intensity and what a supervisor does when it is exceeded
+  - Start processes on demand with DynamicSupervisor and find them by name with Registry
+  - Describe how a Mix application starts its supervision tree, and when not to use a GenServer
+prerequisites: [processes-and-messages]
+references:
+  - title: GenServer
+    url: https://hexdocs.pm/elixir/GenServer.html
+    note: The callbacks, their return values, timeouts and the guidance on when (not) to use a GenServer.
+  - title: Supervisor
+    url: https://hexdocs.pm/elixir/Supervisor.html
+    note: Child specifications, strategies, restart options and intensity.
+  - title: DynamicSupervisor
+    url: https://hexdocs.pm/elixir/DynamicSupervisor.html
+    note: Supervising children started at run time.
+  - title: Registry
+    url: https://hexdocs.pm/elixir/Registry.html
+    note: A local, decentralised key-value process registry.
+  - title: "Mix and OTP: Supervision trees and applications"
+    url: https://hexdocs.pm/elixir/supervisor-and-application.html
+    note: The official guide's chapter on building an application around a supervision tree.
+  - title: Erlang supervisor principles
+    url: https://www.erlang.org/doc/system/sup_princ.html
+    note: The OTP design principles behind Elixir's Supervisor, from the Erlang documentation.
+---
+
+<Section id="motivation" kind="motivation" title="Why not just write the loop?">
+
+In the last lesson you built a bank account as a process: a recursive loop, a `receive`, a reference to match replies, a timeout. It worked. Now imagine every team writing that loop for every stateful service. Each version would handle a slightly different set of edge cases. What happens if the caller dies while waiting? If the server crashes mid-request? How do you inspect the state of a running server, change its code, shut it down cleanly, or start it with a name?
+
+Ericsson's engineers faced this in the 1990s and extracted the answers into **OTP behaviours**: generic, battle-tested implementations of common process patterns, into which you plug only the code specific to your problem. The generic part handles messaging, timeouts, monitoring of callers, debugging hooks and clean shutdown; you write a handful of callback functions. Elixir exposes the two most important ones as `GenServer` (a generic server) and `Supervisor`.
+
+Learning them changes how you design systems. Instead of a program that tries to never fail, you build a **supervision tree**: workers that do the job, supervisors that watch them, and a clear statement of what to restart when something goes wrong. This lesson teaches both behaviours and the judgement that goes with them.
+
+</Section>
+
+<Section id="genserver" kind="definitions" title="GenServer">
+
+<Definition term="GenServer">
+
+A **GenServer** is a process that holds state and handles requests through callbacks. `GenServer.call/3` sends a request and waits for a reply (default timeout 5 seconds); `GenServer.cast/2` sends a request without waiting; any other message arrives in `handle_info/2`. The module that implements it declares `use GenServer` and defines the callbacks it needs.
+
+</Definition>
+
+| Callback | Called when | Typical return |
+| --- | --- | --- |
+| `init(arg)` | the server starts | `{:ok, state}` |
+| `handle_call(request, from, state)` | a client uses `GenServer.call` | `{:reply, reply, new_state}` |
+| `handle_cast(request, state)` | a client uses `GenServer.cast` | `{:noreply, new_state}` |
+| `handle_info(message, state)` | any other message arrives (timers, monitors, raw `send`) | `{:noreply, new_state}` |
+| `terminate(reason, state)` | the server is stopping (only guaranteed in some cases) | anything |
+
+Any callback can also return `{:stop, reason, ...}` to shut the server down. A GenServer module conventionally has two halves: a **client API** of ordinary functions that other processes call, and the **server callbacks** that run inside the GenServer process. Keeping the message format private to the module means you can change it without touching any caller.
+
+```elixir check
+defmodule Leaderboard do
+  use GenServer
+
+  # Client API: ordinary functions that other processes call.
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, :ok, opts)
+  end
+
+  def submit(board, player, score), do: GenServer.cast(board, {:submit, player, score})
+  def top(board, n), do: GenServer.call(board, {:top, n})
+  def reset_after(board, ms), do: Process.send_after(board, :reset, ms)
+
+  # Server callbacks: run inside the GenServer process.
+
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+
+  @impl true
+  def handle_cast({:submit, player, score}, scores) do
+    {:noreply, Map.update(scores, player, score, &max(&1, score))}
+  end
+
+  @impl true
+  def handle_call({:top, n}, _from, scores) do
+    top =
+      scores
+      |> Enum.sort_by(fn {player, score} -> {-score, player} end)
+      |> Enum.take(n)
+
+    {:reply, top, scores}
+  end
+
+  @impl true
+  def handle_info(:reset, _scores) do
+    {:noreply, %{}}
+  end
+end
+
+{:ok, board} = Leaderboard.start_link()
+
+Leaderboard.submit(board, "Ayesha", 120)
+Leaderboard.submit(board, "Bjorn", 95)
+Leaderboard.submit(board, "Chidi", 140)
+Leaderboard.submit(board, "Ayesha", 150)
+Leaderboard.submit(board, "Bjorn", 80)
+
+IO.inspect(Leaderboard.top(board, 2))
+IO.inspect(Leaderboard.top(board, 10))
+
+Leaderboard.reset_after(board, 50)
+Process.sleep(300)
+IO.inspect(Leaderboard.top(board, 10))
+```
+
+It prints:
+
+```text
+[{"Ayesha", 150}, {"Chidi", 140}]
+[{"Ayesha", 150}, {"Chidi", 140}, {"Bjorn", 95}]
+[]
+```
+
+Follow one request through. `Leaderboard.top(board, 2)` runs in the *caller's* process and calls `GenServer.call(board, {:top, 2})`, which sends a message and waits. Inside the GenServer process, OTP receives that message and calls `handle_call({:top, 2}, from, scores)`, which returns `{:reply, top, scores}`: the reply goes back to the caller, and `scores` becomes the state for the next message. `submit/3` uses `cast`, so callers do not wait; the submissions are still applied in order, before the `call` that follows them, because messages from one sender arrive in order. `Process.send_after/3` delivers a plain `:reset` message 50 ms later, which arrives in `handle_info/2`.
+
+**Call or cast?** Prefer `call` unless you have a reason not to. A call gives **back-pressure**: a client cannot send faster than the server processes, because it waits for each reply. A cast lets clients flood a slow server's mailbox, and the client never learns whether its request succeeded or the server even existed. Use cast for genuinely fire-and-forget work where losing a message is acceptable.
+
+If a call does not get a reply within its timeout, the *caller* exits with a timeout error. Two things follow. First, a slow GenServer slows down every caller, because it handles one message at a time. Second, a GenServer that crashes while handling a call takes its caller down too (the caller exits, like a linked process), unless the caller catches it. That is usually right: the caller asked for something that could not be done.
+
+</Section>
+
+<Section id="supervisors" kind="examples" title="Supervisors and restart strategies">
+
+A **supervisor** is a process whose only job is to start other processes (its *children*), link to them, trap their exits and restart them according to a policy. Children are described by **child specifications**; the shorthand `{Counter, 10}` means "call `Counter.start_link(10)`", and `use GenServer` generates a default spec for you.
+
+Here a supervisor watches a counter. We crash the counter on purpose, three times. The first line silences log output so that what is printed is predictable; you will see the log that it hides below.
+
+```elixir check
+Logger.configure(level: :none)
+
+defmodule Counter do
+  use GenServer
+
+  def start_link(start), do: GenServer.start_link(__MODULE__, start, name: __MODULE__)
+  def increment, do: GenServer.cast(__MODULE__, :increment)
+  def value, do: GenServer.call(__MODULE__, :value)
+  def crash, do: GenServer.cast(__MODULE__, :crash)
+
+  @impl true
+  def init(start), do: {:ok, start}
+
+  @impl true
+  def handle_cast(:increment, n), do: {:noreply, n + 1}
+  def handle_cast(:crash, _n), do: raise("something went wrong")
+
+  @impl true
+  def handle_call(:value, _from, n), do: {:reply, n, n}
+end
+
+defmodule Lab do
+  # Crash the counter, wait until it is gone, then wait for its replacement.
+  def crash_counter do
+    old = Process.whereis(Counter)
+    ref = Process.monitor(old)
+    Counter.crash()
+
+    receive do
+      {:DOWN, ^ref, :process, ^old, _reason} -> wait_for_replacement(old, 30)
+    end
+  end
+
+  defp wait_for_replacement(_old, 0), do: :no_replacement
+
+  defp wait_for_replacement(old, tries) do
+    case Process.whereis(Counter) do
+      pid when is_pid(pid) and pid != old -> :restarted
+      _ ->
+        Process.sleep(10)
+        wait_for_replacement(old, tries - 1)
+    end
+  end
+end
+
+Process.flag(:trap_exit, true)
+
+{:ok, sup} =
+  Supervisor.start_link([{Counter, 10}], strategy: :one_for_one, max_restarts: 2, max_seconds: 5)
+
+Counter.increment()
+Counter.increment()
+IO.puts("before the crash: #{Counter.value()}")
+
+IO.inspect(Lab.crash_counter(), label: "crash 1")
+IO.puts("after the restart: #{Counter.value()}")
+
+IO.inspect(Lab.crash_counter(), label: "crash 2")
+IO.inspect(Lab.crash_counter(), label: "crash 3")
+
+receive do
+  {:EXIT, ^sup, reason} -> IO.puts("the supervisor gave up: #{inspect(reason)}")
+end
+```
+
+It prints:
+
+```text
+before the crash: 12
+crash 1: :restarted
+after the restart: 10
+crash 2: :restarted
+crash 3: :no_replacement
+the supervisor gave up: :shutdown
+```
+
+What happened, step by step:
+
+1. The supervisor started `Counter` with state 10, and two increments made it 12.
+2. The `:crash` cast raised an exception inside the GenServer. The process died, the supervisor received its exit signal and started a **new** process (a new PID, registered under the same name) by calling `Counter.start_link(10)` again. Its state is back to **10**: a restart means a fresh start from a known-good state, and whatever was in memory is gone.
+3. After the second crash the supervisor restarted it again.
+4. The third crash happened within 5 seconds of the first two. With `max_restarts: 2, max_seconds: 5` (the defaults are 3 restarts in 5 seconds), that exceeded the supervisor's **restart intensity**. A child that keeps crashing indicates a problem a restart cannot fix, so the supervisor terminated all its children and exited itself with reason `:shutdown`. In a full application this escalates: *its* supervisor restarts it, and if that keeps failing, the failure travels up the tree until something can cope, or the application stops.
+
+With logging enabled, each crash produces a report like this (from a run of the same program without its first line, so the line number is one lower):
+
+```text
+20:11:45.498 [error] GenServer Counter terminating
+** (RuntimeError) something went wrong
+    main.exs:15: Counter.handle_cast/2
+    (stdlib 8.1.1) gen_server.erl:2460: :gen_server.try_handle_cast/3
+    (stdlib 8.1.1) gen_server.erl:2418: :gen_server.handle_msg/3
+    (stdlib 8.1.1) proc_lib.erl:333: :proc_lib.init_p_do_apply/3
+Last message: {:"$gen_cast", :crash}
+State: 12
+```
+
+The report names the server, the exception, the stack, the **last message** it was handling and its **state** at that moment. That is usually enough to find the bug, and it was logged while the system kept running.
+
+The **strategy** decides what else is restarted when one child dies:
+
+| Strategy | When a child dies, restart... | Use when |
+| --- | --- | --- |
+| `:one_for_one` | only that child | children are independent (the common case) |
+| `:one_for_all` | all children | children cannot work without each other |
+| `:rest_for_one` | that child and the children started after it | later children depend on earlier ones |
+
+Each child also has a **restart** option: `:permanent` (always restart; the default for GenServers), `:transient` (restart only after an abnormal exit; good for work that may finish normally) and `:temporary` (never restart; the default for `Task`).
+
+</Section>
+
+<Section id="dynamic" kind="examples" title="Dynamic children and the Registry">
+
+The children above were fixed when the supervisor started. Many systems need processes created on demand: one per chat room, per game, per connected device. **`DynamicSupervisor`** starts children at run time, and **`Registry`** lets you find them by any term you like, not just atoms.
+
+```elixir check
+Logger.configure(level: :none)
+
+defmodule Room do
+  use GenServer
+
+  def start_link(name), do: GenServer.start_link(__MODULE__, name, name: via(name))
+  def via(name), do: {:via, Registry, {RoomRegistry, name}}
+
+  def join(name, user), do: GenServer.call(via(name), {:join, user})
+  def members(name), do: GenServer.call(via(name), :members)
+
+  @impl true
+  def init(name), do: {:ok, %{name: name, members: MapSet.new()}}
+
+  @impl true
+  def handle_call({:join, user}, _from, state) do
+    state = update_in(state.members, &MapSet.put(&1, user))
+    {:reply, MapSet.size(state.members), state}
+  end
+
+  def handle_call(:members, _from, state) do
+    {:reply, state.members |> MapSet.to_list() |> Enum.sort(), state}
+  end
+end
+
+children = [
+  {Registry, keys: :unique, name: RoomRegistry},
+  {DynamicSupervisor, name: RoomSupervisor, strategy: :one_for_one}
+]
+
+{:ok, _} = Supervisor.start_link(children, strategy: :rest_for_one)
+
+for room <- ["lobby", "kitchen", "garden"] do
+  {:ok, _pid} = DynamicSupervisor.start_child(RoomSupervisor, {Room, room})
+end
+
+IO.inspect(Room.join("lobby", "Ama"))
+IO.inspect(Room.join("lobby", "Diego"))
+IO.inspect(Room.join("garden", "Sun-hee"))
+IO.inspect(Room.members("lobby"))
+
+{:error, {:already_started, _pid}} = DynamicSupervisor.start_child(RoomSupervisor, {Room, "lobby"})
+IO.puts("a second lobby was refused")
+IO.inspect(DynamicSupervisor.count_children(RoomSupervisor).active)
+IO.inspect(Registry.lookup(RoomRegistry, "kitchen") |> length())
+IO.inspect(Registry.lookup(RoomRegistry, "attic"))
+```
+
+It prints:
+
+```text
+1
+2
+1
+["Ama", "Diego"]
+a second lobby was refused
+3
+1
+[]
+```
+
+Three ideas combine here. `{:via, Registry, {RoomRegistry, name}}` is a **via tuple**: wherever OTP accepts a process name, it can delegate the lookup to a registry module, so `GenServer.call(via("lobby"), ...)` finds the lobby's process without anyone holding its PID. Because the registry was started with `keys: :unique`, starting a second "lobby" fails with `{:error, {:already_started, pid}}`, which is how you avoid duplicate rooms. And the two infrastructure processes sit under one top-level supervisor with `:rest_for_one`: if the registry ever crashed, the room supervisor (started after it) would be restarted too, because rooms registered in a dead registry would be unreachable. The order of the children list *is* the dependency order.
+
+A registry entry is removed automatically when its process dies, so names never point at dead processes. When a room crashes, the DynamicSupervisor restarts it with the same name argument, and it re-registers itself.
+
+</Section>
+
+<Section id="applications" kind="human" title="Applications and designing supervision trees">
+
+In a Mix project, the top of the tree is an **application**. `mix new shop --sup` generates this module, which the runtime calls when the application starts:
+
+```elixir
+defmodule Shop.Application do
+  # See https://hexdocs.pm/elixir/Application.html
+  # for more information on OTP Applications
+  @moduledoc false
+
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      # Starts a worker by calling: Shop.Worker.start_link(arg)
+      # {Shop.Worker, arg}
+    ]
+
+    # See https://hexdocs.pm/elixir/Supervisor.html
+    # for other strategies and supported options
+    opts = [strategy: :one_for_one, name: Shop.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+You fill in `children` in dependency order: configuration and telemetry first, then the database connection pool, then registries and dynamic supervisors, then the services that use them, and finally the web endpoint that lets traffic in. Starting in this order means each process can rely on everything before it; shutting down happens in reverse, so the endpoint stops accepting requests before the database pool goes away. Every library you depend on is an application too, with its own tree, started before yours.
+
+Designing good trees is a skill that grows with experience, but a few principles carry a long way:
+
+- **Supervise anything long-lived.** A process started with a bare `spawn` that nobody supervises is a process whose crash nobody will handle.
+- **Restarting loses in-memory state, by design.** Keep state that must survive a crash somewhere a restart cannot touch: a database, a file, or an ETS table owned by a more stable process higher in the tree. Rebuild the rest in `init/1`.
+- **Keep `init/1` fast.** The supervisor waits for each child's `init/1` before starting the next. If initialisation is slow (loading data, connecting to a service), return `{:ok, state, {:continue, :load}}` and do the work in `handle_continue/2`.
+- **Use processes for runtime concerns, not for code organisation.** A GenServer serialises every request through one mailbox. That is exactly what you want for a shared resource or a rate limiter, and exactly what you do not want for pure computations, which should be plain functions in a module. The official documentation calls the opposite an anti-pattern, and a single GenServer that every request must pass through is a classic production bottleneck.
+- **Reach for ETS when reads dominate.** ETS (Erlang Term Storage) gives you in-memory tables owned by a process but readable directly, and concurrently, by any process. A common pattern is a GenServer that owns an ETS table and handles the rare writes, while callers read the table without sending a message at all.
+- **Use the debugging hooks OTP gives you.** Because every GenServer speaks OTP's system protocol, `:sys.get_state(pid)` returns its current state and `:sys.trace(pid, true)` prints each message it handles, on a live system, without adding a line of code.
+- **Group what fails together.** Processes that cannot work without each other belong under the same supervisor with `:one_for_all` or `:rest_for_one`; independent ones under `:one_for_one`.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"A supervisor makes my data survive crashes."** A supervisor restarts *processes*, from their initial arguments. Anything held only in the crashed process's memory is gone. That is the point: the bad state that caused the crash is gone too.
+
+</Misconception>
+
+<Misconception>
+
+**"`terminate/2` always runs, so I can rely on it for cleanup."** It runs when the GenServer stops itself or when its supervisor shuts it down *and* it traps exits; it does not run if the process is killed brutally or the machine loses power. Put essential cleanup in a separate process that monitors the resource, or design so cleanup is not essential.
+
+</Misconception>
+
+<Misconception>
+
+**"Casts are faster, so prefer them."** A cast returns sooner to the caller, but it removes back-pressure and error reporting. Under load, casts are how mailboxes grow without bound. Default to `call`.
+
+</Misconception>
+
+<Misconception>
+
+**"Restart intensity limits are there to be raised until the crashes stop."** If a child crashes three times in five seconds, restarting it a fourth time rarely helps. The limit exists so failure escalates to a level that can do something different, or stops the system visibly instead of spinning.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

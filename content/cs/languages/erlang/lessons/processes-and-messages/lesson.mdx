@@ -1,0 +1,310 @@
+---
+title: Processes, mailboxes and selective receive
+subtitle: Spawning processes, sending messages, the mailbox and selective receive, keeping state in a receive loop, registered names, and parallel work.
+minutes: 55
+objectives:
+  - Start processes with spawn/1 and spawn/3, send messages with !, and receive them with receive ... after ... end
+  - Explain how a mailbox works and how selective receive chooses a message
+  - Write a long-lived process that keeps state in a recursive receive loop and answers requests
+  - Use references and timeouts to make reliable request-reply calls, and register processes by name
+  - Describe the guarantees and costs of message passing, and run work in parallel
+prerequisites: [lists-maps-binaries]
+references:
+  - title: Concurrent programming
+    url: https://www.erlang.org/doc/system/conc_prog.html
+    note: The Getting Started guide's chapter on processes, message passing and registered names.
+  - title: Processes (reference manual)
+    url: https://www.erlang.org/doc/system/ref_man_processes.html
+    note: The precise semantics of spawn, send, receive, links and monitors.
+  - title: Processes (efficiency guide)
+    url: https://www.erlang.org/doc/system/eff_guide_processes.html
+    note: How much a process costs, and how message data is copied.
+  - title: The erlang module
+    url: https://www.erlang.org/doc/apps/erts/erlang.html
+    note: spawn, send, register, process_info and the other process BIFs.
+---
+
+<Section id="motivation" kind="motivation" title="Many small, isolated workers">
+
+So far every program has run in a single process. Now we come to the reason Erlang exists. An Erlang system is meant to be made of **many processes**: one per phone call, per connected user, per open file, per job in a queue. Each process is a small, independent program with its own memory and a **mailbox**. Processes share nothing; they cooperate only by **sending messages**, which are copied into the receiver's mailbox. This model is close to what computer scientists call the *actor model*, and it is the foundation of everything in OTP.
+
+Why design programs this way? Because it makes the hard parts of concurrent programming easier. There are no shared variables, so there are no data races and no locks. A process that misbehaves can only damage its own state. A process that is busy does not stop the others, because the BEAM switches between processes preemptively. And the same code that runs many processes on one machine can run them across many machines, because a message to a process on another computer looks exactly like a message to one next door.
+
+This lesson covers the three primitives (spawn, send, receive), the way the mailbox works, and the patterns you build from them: servers that hold state, request-reply calls, and parallel work. The next lesson adds what happens when processes fail.
+
+</Section>
+
+<Section id="primitives" kind="definitions" title="spawn, send and receive">
+
+<Definition term="Process">
+
+An Erlang **process** runs a function concurrently with all other processes. It has its own heap, stack and mailbox, is identified by a **pid**, starts in microseconds with a couple of kilobytes of memory, and ends when its function returns or it crashes.
+
+</Definition>
+
+- `spawn(Fun)` starts a process running a fun of no arguments; `spawn(Module, Function, Args)` starts one running an exported function. Both return the new pid immediately.
+- `Pid ! Message` sends any term to a process. It never blocks, never fails for a pid (even a dead one), and returns the message.
+- `receive Pattern1 -> Body1; ... after Timeout -> Body end` removes the **first message in the mailbox that matches one of the patterns** and evaluates that clause. If nothing matches, the process waits; the optional `after` clause gives up after a number of milliseconds.
+- `self()` returns the pid of the running process.
+
+The phrase in bold is the key to Erlang's mailboxes, so read it twice. `receive` does not simply take the oldest message. It scans the mailbox from oldest to newest and takes the first message that matches any of its clauses. Messages that match nothing **stay in the mailbox**, in order, for a later `receive`. This is **selective receive**.
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    Echo = spawn(fun() ->
+                     receive
+                         {ping, From} -> From ! {pong, self()}
+                     end
+                 end),
+    Echo ! {ping, self()},
+    receive
+        {pong, Echo} -> io:format("pong from the echo process~n")
+    after 1000 ->
+        io:format("no reply~n")
+    end,
+    receive
+        never_sent -> ok
+    after 50 ->
+        io:format("gave up after 50 ms~n")
+    end,
+    self() ! {log, "disk 80% full"},
+    self() ! {alarm, "temperature critical"},
+    self() ! {log, "backup finished"},
+    receive
+        {alarm, Text} -> io:format("ALARM: ~s~n", [Text])
+    end,
+    io:format("~p~n", [erlang:process_info(self(), message_queue_len)]),
+    io:format("~p~n", [drain()]).
+
+%% Collect whatever is in the mailbox right now, without waiting.
+drain() ->
+    receive
+        Msg -> [Msg | drain()]
+    after 0 ->
+        []
+    end.
+```
+
+It prints:
+
+```text
+pong from the echo process
+gave up after 50 ms
+ALARM: temperature critical
+{message_queue_len,2}
+[{log,"disk 80% full"},{log,"backup finished"}]
+```
+
+The echo process waits for one `{ping, From}` message, replies, and ends because its function returns. In the main process, the pattern `{pong, Echo}` uses the already-bound variable `Echo`, so it accepts a pong only from that particular process. The second `receive` matches a message that never comes, and its `after 50` clause fires. Then three messages are queued; the `receive` that wants an alarm skips over the first log message to take it, leaving both logs in order. `drain/0` uses `after 0`, which means "do not wait at all", to collect whatever is left: the standard way to empty a mailbox.
+
+</Section>
+
+<Section id="servers" kind="examples" title="State in a receive loop: a booking service">
+
+A process that loops, receiving a message, computing a new state and calling itself with it, is a **server**. Its state is simply the argument of the loop function. Because a process handles one message at a time, the state never needs a lock, however many clients talk to it at once.
+
+```erlang check
+#!/usr/bin/env escript
+-module(rooms).
+-export([main/1, start/0, book/2, bookings/0]).
+
+%% A booking service for meeting rooms, registered under the name rooms.
+
+start() ->
+    Pid = spawn(fun() -> loop(#{}) end),
+    register(rooms, Pid),
+    Pid.
+
+book(Room, Who) -> call({book, Room, Who}).
+bookings() -> call(bookings).
+
+call(Request) ->
+    Ref = make_ref(),
+    rooms ! {Request, self(), Ref},
+    receive
+        {Ref, Reply} -> Reply
+    after 1000 ->
+        {error, timeout}
+    end.
+
+loop(Booked) ->
+    receive
+        {{book, Room, Who}, From, Ref} ->
+            case Booked of
+                #{Room := Holder} ->
+                    From ! {Ref, {error, {taken_by, Holder}}},
+                    loop(Booked);
+                #{} ->
+                    From ! {Ref, ok},
+                    loop(Booked#{Room => Who})
+            end;
+        {bookings, From, Ref} ->
+            From ! {Ref, lists:sort(maps:to_list(Booked))},
+            loop(Booked)
+    end.
+
+main(_) ->
+    start(),
+    io:format("~p~n", [book("Kilimanjaro", "Asha")]),
+    io:format("~p~n", [book("Andes", "Pablo")]),
+    io:format("~p~n", [book("Kilimanjaro", "Jonas")]),
+    %% Twenty processes race for five rooms; each room is booked exactly once.
+    Parent = self(),
+    Rooms = ["R1", "R2", "R3", "R4", "R5"],
+    [spawn(fun() -> Parent ! {done, book(lists:nth(I rem 5 + 1, Rooms), I)} end)
+     || I <- lists:seq(1, 20)],
+    Replies = [receive {done, R} -> R end || _ <- lists:seq(1, 20)],
+    io:format("successful bookings: ~p~n", [length([ok || ok <- Replies])]),
+    io:format("~p~n", [length(bookings())]),
+    io:format("~p~n", [whereis(rooms) =/= undefined]).
+```
+
+It prints:
+
+```text
+ok
+ok
+{error,{taken_by,"Asha"}}
+successful bookings: 5
+7
+true
+```
+
+The module has the shape of nearly every Erlang server:
+
+- **An interface of plain functions.** `book/2` and `bookings/0` hide the message format. Callers never write `rooms ! ...` themselves, so the protocol can change without touching them.
+- **Request-reply with a reference.** `call/1` creates a unique reference with `make_ref()`, sends it with the request, and waits for a reply carrying the *same* reference. That guarantees it takes its own reply and nothing else. The compiler and runtime optimise exactly this pattern: when a `receive` matches on a reference created just before, the scan skips every message that was already in the mailbox, so it stays fast even when the mailbox is busy.
+- **A timeout on every wait.** If the server is dead or stuck, the caller gets `{error, timeout}` instead of waiting forever.
+- **A registered name.** `register(rooms, Pid)` lets any process send to the atom `rooms` instead of a pid; `whereis(rooms)` looks it up. Names are atoms, so they suit a fixed set of long-lived services.
+
+The race at the end is the point of the example. Twenty processes try to book five rooms, all at the same time. Because every request goes through the single `rooms` process, each check-then-book happens atomically: exactly five bookings succeed, and the other fifteen get `{error, {taken_by, ...}}`. Together with the two bookings from the start, the service holds seven. No locks were written, and none were needed.
+
+This loop is the hand-made version of OTP's `gen_server`, which adds the details every real server needs: calls that notice when the server dies instead of waiting for a timeout, system messages for debugging and code upgrades, clean shutdown, and integration with supervisors. You will switch to it in <LessonLink slug="otp-behaviours">OTP behaviours</LessonLink>, and you will understand exactly what it does for you.
+
+</Section>
+
+<Section id="mailboxes" kind="intuition" title="What message passing guarantees, and what it costs">
+
+A few facts about messages determine how you design with them.
+
+**Order is guaranteed per pair.** If process A sends two messages to process B, B receives them in the order they were sent. There is no ordering guarantee between messages from *different* senders.
+
+**Delivery is not confirmed.** `!` succeeds even if the receiver is dead, and the message simply vanishes. The only evidence that a message was handled is a reply, which is why calls carry timeouts, and why the next lesson introduces monitors, which tell you when a process has died.
+
+**Messages are copied.** The receiver gets its own copy of the data in its own heap. This is what makes each process's memory private, and it allows each process to be garbage-collected independently, in microseconds, without pausing anyone else. The exception is large binaries (over 64 bytes), which live in a shared area and are passed by reference, so sending a big binary is cheap.
+
+**Unmatched messages accumulate.** A long-lived process whose `receive` never matches some kind of message will keep those messages forever, and every later `receive` must scan past them. A mailbox that grows without bound is one of the classic ways an Erlang system slows down. Servers therefore usually end their `receive` with a catch-all clause that logs and discards unexpected messages, and OTP's `gen_server` does this for you. Selective receive is a sharp tool: perfect for waiting for one specific reply, dangerous as a way of ignoring traffic you did not plan for. (OTP 28 also added *priority messages*, which a process can opt into so that urgent messages skip ahead of an overloaded mailbox; ordinary code rarely needs them.)
+
+**Scheduling is fair.** Each process runs for a budget of about four thousand reductions (roughly, function calls) before the scheduler moves on, and a process waiting in `receive` uses no CPU at all. That is why a server can hold a hundred thousand idle connections, one process each, and still answer the active ones promptly.
+
+</Section>
+
+<Section id="parallel" kind="computation" title="Parallel work">
+
+Processes make parallelism straightforward. Here is a parallel map: one process per element, each sending back its result tagged with a reference, and the parent collecting the results in the original order.
+
+```erlang check
+#!/usr/bin/env escript
+main(_) ->
+    Slow = fun(N) -> timer:sleep(100), N * N end,
+    {Micros, Squares} = timer:tc(fun() -> pmap(Slow, lists:seq(1, 10)) end),
+    io:format("~p~n", [Squares]),
+    io:format("10 jobs of 100 ms in under 0.5 s: ~p~n", [Micros < 500000]).
+
+%% Parallel map: one process per element, results in the original order.
+pmap(F, List) ->
+    Parent = self(),
+    Refs = [begin
+                Ref = make_ref(),
+                spawn(fun() -> Parent ! {Ref, F(X)} end),
+                Ref
+            end || X <- List],
+    [receive {Ref, Result} -> Result end || Ref <- Refs].
+```
+
+It prints:
+
+```text
+[1,4,9,16,25,36,49,64,81,100]
+10 jobs of 100 ms in under 0.5 s: true
+```
+
+`pmap/2` creates a reference per element and spawns a process that sends `{Ref, F(X)}` back. The final comprehension waits for each reference *in order*, so even though the processes finish in an unpredictable order, selective receive picks out each result where it belongs. Ten jobs that would take a second one after another finish in about a tenth of that.
+
+This version has deliberate gaps that real code must fill: if `F` crashes, the parent waits forever, and nothing limits how many processes run at once. A production version would monitor the workers, add a timeout and bound the concurrency. Elixir's `Task.async_stream` and many Erlang libraries package exactly that. Still, a dozen lines for a correct, ordered parallel map shows how naturally concurrency fits the language.
+
+</Section>
+
+<Section id="shell" kind="human" title="Experimenting in the shell">
+
+The shell is itself a process, which makes it a convenient place to explore. Here is a session from the toolchain used for this course, with each result as printed:
+
+```text
+1> Pid = spawn(fun() -> receive {From, N} -> From ! N * 2 end end).
+<0.87.0>
+2> Pid ! {self(), 21}.
+{<0.85.0>,21}
+3> flush().
+Shell got 42
+ok
+4> is_process_alive(Pid).
+false
+5> register(doubler, spawn(fun() -> receive {From, N} -> From ! N * 2 end end)).
+true
+6> doubler ! {self(), 50}.
+{<0.85.0>,50}
+7> flush().
+Shell got 100
+ok
+8> whereis(doubler).
+undefined
+```
+
+Line 2 shows that `!` returns the message it sent (with the shell's own pid inside). `flush()` prints and removes everything in the shell's mailbox, which is how you see replies when experimenting. After answering once, each doubler's function returned, so the process ended: `is_process_alive/1` is false, and a registered name is removed automatically when its process dies, which is why `whereis(doubler)` returns `undefined`.
+
+Other shell helpers worth knowing: `i()` lists every process with its current function and message queue length, `regs()` lists registered names, and `observer:start()` opens a graphical view of processes, memory and load (where a desktop is available). Production engineers use the same functions, plus libraries such as recon, through a remote shell attached to a live node, to find the process whose mailbox is growing or whose memory is ballooning.
+
+Prefer `spawn(Module, Function, Args)` with an exported function for long-lived processes in real code. A fun created by `spawn(fun() -> ... end)` is tied to the exact version of the module that created it, while `spawn/3` always calls the newest loaded version, which matters for the hot code loading you will meet in the last lesson.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"`receive` takes the oldest message."** It takes the oldest message *that matches*. Messages that match no clause stay in the mailbox; that is a feature for request-reply and a hazard for long-lived loops.
+
+</Misconception>
+
+<Misconception>
+
+**"If the send succeeded, the message arrived."** `Pid ! Msg` always succeeds and gives no information about delivery. Wait for a reply, with a timeout, or monitor the process.
+
+</Misconception>
+
+<Misconception>
+
+**"Processes are threads, so I should keep their number small."** BEAM processes are far cheaper than operating-system threads. Creating one per user, connection or task is normal design. The number of *cores* limits how much runs simultaneously, not how many processes exist.
+
+</Misconception>
+
+<Misconception>
+
+**"The process dictionary is a good place for state."** Each process has a key-value store, `put/2` and `get/1`, but state hidden there is invisible in function signatures and hard to test. Pass state explicitly through the loop, as the booking server does.
+
+</Misconception>
+
+<Misconception>
+
+**"Every process should be registered under a name."** Names are atoms, and atoms are never garbage-collected, so creating a name per user or per connection eventually exhausts the atom table. Register only a fixed set of long-lived services; keep pids of dynamic processes in a map or an ETS table, or use a process registry such as OTP's `pg` module for groups of processes.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

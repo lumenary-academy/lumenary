@@ -1,0 +1,420 @@
+---
+title: "LINQ: lambdas and queries"
+subtitle: Functions as values, and a small vocabulary of operators that filters, reshapes, groups and joins any sequence.
+minutes: 60
+objectives:
+  - Write lambdas, use the Func and Action delegate types, and explain what a closure captures
+  - Filter, project, order, aggregate, group and join in-memory data with LINQ's method syntax
+  - Read and write query syntax, and translate between the two forms
+  - Predict when a query runs (deferred execution) and avoid enumerating it more than once by accident
+  - Explain how the same operators become SQL with IQueryable and Entity Framework Core
+prerequisites: [interfaces-and-generics]
+related: [math.found.functions, math.cat.chaining-functions]
+references:
+  - title: Language Integrated Query (LINQ)
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/csharp/linq/
+    note: The official overview, with the full list of standard query operators.
+  - title: Lambda expressions
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/csharp/language-reference/operators/lambda-expressions
+    note: Syntax, captured variables, static lambdas and natural types.
+  - title: Entity Framework Core
+    author: Microsoft
+    url: https://learn.microsoft.com/ef/core/
+    note: The object-relational mapper that turns LINQ queries into SQL.
+  - title: The source of System.Linq
+    url: https://github.com/dotnet/runtime/tree/main/src/libraries/System.Linq
+    note: Each operator is short and readable; reading Where and Select is a good way to understand iterators.
+---
+
+<Section id="motivation" kind="motivation" title="Saying what, not how">
+
+Here is a question a farmers' cooperative might ask of a week's sales: *which regions earned the most, in order?* With only loops, the answer takes a dictionary of running totals, a loop to fill it, a list of pairs, and a sort with a comparison function. Twenty lines, three temporary variables, and the question itself is hard to see in them.
+
+With **LINQ** (Language Integrated Query, C# 3 and .NET 3.5, 2007) it is one expression that reads like the question:
+
+```csharp
+sales.GroupBy(s => s.Region)
+     .Select(g => new { Region = g.Key, Revenue = g.Sum(s => s.Revenue) })
+     .OrderByDescending(r => r.Revenue);
+```
+
+LINQ is a set of methods, defined once as extensions on `IEnumerable`, that work on every sequence: arrays, lists, dictionaries, your own `RingBuffer`, the lines of a file. The same operators, through a different interface, also query databases. It is the most characteristic part of everyday C#, and it rests on one idea that you need first: **functions as values**.
+
+</Section>
+
+<Section id="lambdas" kind="definitions" title="Lambdas, delegates and closures">
+
+<Definition term="Delegate">
+
+A type whose values are references to methods with a particular signature. The library's generic delegates cover almost every need: `Func<int, bool>` is "a function taking an `int` and returning a `bool`" (the last type argument is the result), and `Action<string>` is "a function taking a `string` and returning nothing".
+
+</Definition>
+
+<Definition term="Lambda expression">
+
+An anonymous function written inline: parameters, an arrow `=>`, and a body that is either an expression (`x => x * x`) or a block in braces. A lambda is converted to a delegate (or, for databases, to an expression tree that describes the code).
+
+</Definition>
+
+```csharp check
+// Delegates are types for methods; lambdas are inline methods.
+Func<int, int> square = x => x * x;
+Func<int, int, int> add = (a, b) => a + b;
+Func<string, bool> isLong = s => s.Length > 5;
+Action<string> shout = s => Console.WriteLine(s.ToUpperInvariant() + "!");
+
+Console.WriteLine(square(7));
+Console.WriteLine(add(2, 3));
+Console.WriteLine(isLong("Ulaanbaatar"));
+shout("hello");
+
+// Methods are values: pass them to other methods.
+static int ApplyTwice(Func<int, int> f, int x) => f(f(x));
+Console.WriteLine(ApplyTwice(square, 3));
+Console.WriteLine(ApplyTwice(x => x + 10, 3));
+
+// A method group: an existing method used where a delegate is expected.
+string[] words = ["Lagos", "  Lima ", "Lhasa  "];
+Console.WriteLine(string.Join("|", words.Select(Trim)));
+static string Trim(string s) => s.Trim();
+
+// Closures: a lambda captures variables, not their values at the time.
+int calls = 0;
+Func<string, string> tag = s => { calls++; return $"<{s}>"; };
+tag("a");
+tag("b");
+Console.WriteLine($"The lambda ran {calls} times");
+
+// Composing functions into a new function.
+static Func<T, TResult> Then<T, TMid, TResult>(Func<T, TMid> first, Func<TMid, TResult> second)
+    => x => second(first(x));
+var squareThenDescribe = Then(square, n => $"the square is {n}");
+Console.WriteLine(squareThenDescribe(12));
+```
+
+It prints:
+
+```text
+49
+5
+True
+HELLO!
+81
+23
+Lagos|Lima|Lhasa
+The lambda ran 2 times
+the square is 144
+```
+
+Things to notice:
+
+- **Lambdas are values.** `square` holds a function; `ApplyTwice` takes one as an argument and calls it twice. Functions that take or return functions are called *higher-order*, and every LINQ operator is one.
+- **A method group** such as `Trim` can be passed wherever a matching delegate is expected; you do not need to write `s => Trim(s)`.
+- **Closures capture variables, not values.** The lambda stored in `tag` refers to the variable `calls` itself and increments it each time it runs. That is powerful (it is how a lambda can use local data) and occasionally surprising (a variable changed later is seen changed by the lambda). If a lambda should not capture anything, write `static x => ...` and the compiler will enforce it, which also avoids allocating a closure object.
+- **Composition.** `Then` builds a new function from two existing ones. It is generic in three types, and the compiler infers all three from the arguments. Building pipelines of small functions is the style LINQ encourages.
+
+</Section>
+
+<Section id="operators" kind="examples" title="The operators you will use every day">
+
+The standard query operators fall into a few families. You do not need to memorise all of them; you need to recognise the families, and know that if you want to do something to a sequence, there is probably an operator for it.
+
+| Family | Operators |
+| --- | --- |
+| Filtering | `Where`, `OfType`, `Distinct`, `DistinctBy`, `Take`, `Skip`, `TakeWhile`, `SkipWhile` |
+| Projection | `Select`, `SelectMany`, `Zip`, `Index` |
+| Ordering | `OrderBy`, `OrderByDescending`, `ThenBy`, `Order`, `Reverse` |
+| Grouping and joining | `GroupBy`, `ToLookup`, `Join`, `GroupJoin`, `LeftJoin`, `RightJoin`, `CountBy`, `AggregateBy` |
+| Aggregation | `Count`, `Sum`, `Average`, `Min`, `Max`, `MinBy`, `MaxBy`, `Aggregate` |
+| Single elements | `First`, `FirstOrDefault`, `Single`, `Last`, `ElementAt` |
+| Tests | `Any`, `All`, `Contains`, `SequenceEqual` |
+| Conversion | `ToList`, `ToArray`, `ToDictionary`, `ToHashSet`, `Chunk` |
+
+Here they are at work on a week of sales from a cooperative of farms in western Kenya:
+
+```csharp check
+// A week of sales from a small cooperative of farms.
+List<Sale> sales =
+[
+    new("Kisumu", "coffee", 40, 6.50m),
+    new("Kisumu", "tea", 120, 2.10m),
+    new("Nakuru", "coffee", 25, 6.80m),
+    new("Nakuru", "avocado", 300, 0.45m),
+    new("Eldoret", "tea", 90, 2.00m),
+    new("Eldoret", "coffee", 15, 7.10m),
+    new("Kisumu", "avocado", 180, 0.40m),
+];
+
+// Filter, transform, order: method syntax.
+var bigCoffee = sales
+    .Where(s => s.Product == "coffee" && s.Quantity >= 20)
+    .OrderByDescending(s => s.Revenue)
+    .Select(s => $"{s.Region} {s.Revenue:F2}");
+Console.WriteLine($"Coffee sales of 20+ kg: {string.Join(", ", bigCoffee)}");
+
+// Aggregates.
+Console.WriteLine($"Total revenue: {sales.Sum(s => s.Revenue):F2}");
+Console.WriteLine($"Best single sale: {sales.MaxBy(s => s.Revenue)}");
+Console.WriteLine($"Any sale under 1.00? {sales.Any(s => s.Revenue < 1m)}");
+
+// Grouping: revenue per region, largest first.
+var byRegion = sales
+    .GroupBy(s => s.Region)
+    .Select(g => new { Region = g.Key, Revenue = g.Sum(s => s.Revenue), Lines = g.Count() })
+    .OrderByDescending(r => r.Revenue);
+foreach (var r in byRegion)
+{
+    Console.WriteLine($"{r.Region,-8} {r.Revenue,8:F2} from {r.Lines} sales");
+}
+
+// .NET 9: CountBy and AggregateBy skip the intermediate groups.
+foreach (var (product, count) in sales.CountBy(s => s.Product).OrderBy(p => p.Key))
+{
+    Console.WriteLine($"{product}: sold in {count} sales");
+}
+
+// The same grouping in query syntax.
+var kilosPerProduct =
+    from s in sales
+    group s by s.Product into g
+    let kilos = g.Sum(s => s.Quantity)
+    orderby kilos descending
+    select $"{g.Key}={kilos}";
+Console.WriteLine(string.Join(" ", kilosPerProduct));
+
+record Sale(string Region, string Product, int Quantity, decimal UnitPrice)
+{
+    public decimal Revenue => Quantity * UnitPrice;
+}
+```
+
+It prints:
+
+```text
+Coffee sales of 20+ kg: Kisumu 260.00, Nakuru 170.00
+Total revenue: 1175.50
+Best single sale: Sale { Region = Kisumu, Product = coffee, Quantity = 40, UnitPrice = 6.50, Revenue = 260.00 }
+Any sale under 1.00? False
+Kisumu     584.00 from 3 sales
+Nakuru     305.00 from 2 sales
+Eldoret    286.50 from 2 sales
+avocado: sold in 2 sales
+coffee: sold in 3 sales
+tea: sold in 2 sales
+avocado=480 tea=210 coffee=80
+```
+
+Read each query from top to bottom as a pipeline: data flows in at the top and each operator transforms the sequence it receives.
+
+- `Where` keeps the items for which the lambda returns true; `OrderByDescending` sorts by a key; `Select` turns each item into something else, here a string.
+- `Sum`, `MaxBy` and `Any` reduce a sequence to a single value. `MaxBy` (.NET 6) returns the *item* with the largest key, not the key itself. A record's generated `ToString` includes computed properties such as `Revenue`, as the output shows.
+- `GroupBy` produces groups, each with a `Key` and the items that share it. `new { Region = ..., Revenue = ... }` creates an **anonymous type**, a throwaway record-like object with named, read-only properties, ideal inside a single method.
+- `CountBy` (.NET 9) counts items by key in one step, without building the groups in memory. It returns key-value pairs, which the `foreach` deconstructs.
+- The last query is written in **query syntax**, which the compiler translates mechanically into method calls: `from s in sales group s by s.Product into g` becomes `sales.GroupBy(s => s.Product)`, `let` introduces a named intermediate value, and so on. Query syntax shines for joins and `let`; method syntax covers every operator and is what most codebases use most of the time. Use whichever reads better for the query in front of you.
+
+### Joining, flattening and pairing
+
+```csharp check
+Student[] students = [new(1, "Aroha"), new(2, "Bilal"), new(3, "Camila"), new(4, "Dang")];
+Enrolment[] enrolments = [new(1, "Maths"), new(1, "Music"), new(2, "Maths"), new(3, "History"), new(1, "History")];
+
+// Join: pair each enrolment with its student.
+var roster = students.Join(enrolments, s => s.Id, e => e.StudentId, (s, e) => $"{s.Name}:{e.Course}");
+Console.WriteLine(string.Join(" ", roster));
+
+// .NET 10: LeftJoin keeps students with no enrolment.
+var everyone = students.LeftJoin(enrolments, s => s.Id, e => e.StudentId,
+    (s, e) => $"{s.Name}:{e?.Course ?? "-"}");
+Console.WriteLine(string.Join(" ", everyone));
+
+// ToLookup: a read-only multi-valued dictionary.
+var coursesByStudent = enrolments.ToLookup(e => e.StudentId, e => e.Course);
+Console.WriteLine($"Aroha takes {string.Join(", ", coursesByStudent[1].Order())}");
+Console.WriteLine($"Dang takes {coursesByStudent[4].Count()} courses");
+
+// SelectMany flattens; Distinct removes duplicates; Chunk splits into pages.
+string[][] reading = [["Dune", "Emma"], ["Emma", "Ubuntu"], ["Dune"]];
+Console.WriteLine(string.Join(", ", reading.SelectMany(list => list).Distinct()));
+foreach (int[] page in Enumerable.Range(1, 7).Chunk(3))
+{
+    Console.WriteLine($"page: {string.Join(" ", page)}");
+}
+
+// Zip and Index (.NET 9) pair items up.
+string[] podium = ["gold", "silver", "bronze"];
+string[] runners = ["Kipchoge", "Gebrselassie", "Bekele"];
+foreach (var (medal, runner) in podium.Zip(runners)) Console.Write($"{medal}={runner} ");
+Console.WriteLine();
+foreach (var (i, runner) in runners.Index()) Console.Write($"{i + 1}.{runner} ");
+Console.WriteLine();
+
+record Student(int Id, string Name);
+record Enrolment(int StudentId, string Course);
+```
+
+It prints:
+
+```text
+Aroha:Maths Aroha:Music Aroha:History Bilal:Maths Camila:History
+Aroha:Maths Aroha:Music Aroha:History Bilal:Maths Camila:History Dang:-
+Aroha takes History, Maths, Music
+Dang takes 0 courses
+Dune, Emma, Ubuntu
+page: 1 2 3
+page: 4 5 6
+page: 7
+gold=Kipchoge silver=Gebrselassie bronze=Bekele 
+1.Kipchoge 2.Gebrselassie 3.Bekele 
+```
+
+`Join` matches items from two sequences by key, like an inner join in SQL, so Dang, with no enrolments, disappears. `LeftJoin`, new in **.NET 10**, keeps every item from the left sequence and passes `null` for a missing right-hand match (hence `e?.Course ?? "-"`); before .NET 10 this took a `GroupJoin` followed by `SelectMany` and `DefaultIfEmpty`, a combination few people could write from memory. `ToLookup` builds a dictionary from each key to *all* its values, and returns an empty sequence for a missing key rather than throwing. `SelectMany` flattens a sequence of sequences; `Chunk` (.NET 6) does the opposite, splitting one sequence into arrays of a given size. `Zip` pairs two sequences item by item, and `Index` (.NET 9) pairs each item with its position.
+
+</Section>
+
+<Section id="deferred" kind="intuition" title="Deferred execution: queries are recipes">
+
+The most important fact about LINQ is easy to miss: most operators **do not run when you call them**. `Where`, `Select`, `OrderBy` and their friends return an object that *describes* the query. The work happens only when something enumerates it: a `foreach`, or an operator that must see the items to produce its result, such as `Count`, `First`, `Sum` or `ToList`. And it happens *again* every time.
+
+```csharp check
+// Deferred execution: a query is a recipe, run each time it is enumerated.
+List<int> numbers = [1, 2, 3];
+var evens = numbers.Where(n =>
+{
+    Console.WriteLine($"  checking {n}");
+    return n % 2 == 0;
+});
+
+Console.WriteLine("Query defined; nothing has run yet.");
+numbers.Add(4);
+
+Console.WriteLine("First enumeration:");
+Console.WriteLine($"  count = {evens.Count()}");
+
+Console.WriteLine("Second enumeration:");
+Console.WriteLine($"  first = {evens.First()}");
+
+// ToList runs a query once and keeps the results.
+List<int> scores = [55, 72, 90];
+IEnumerable<int> passing = scores.Where(s => s >= 60);
+List<int> snapshot = passing.ToList();
+scores.Add(81);
+Console.WriteLine($"snapshot: {string.Join(",", snapshot)}; live query: {string.Join(",", passing)}");
+
+// Laziness means infinite sequences are fine, as long as you take only part of them.
+static IEnumerable<long> Fibonacci()
+{
+    long a = 0, b = 1;
+    while (true)
+    {
+        yield return a;
+        (a, b) = (b, a + b);
+    }
+}
+Console.WriteLine(string.Join(" ", Fibonacci().Where(f => f % 2 == 1).Take(8)));
+```
+
+It prints:
+
+```text
+Query defined; nothing has run yet.
+First enumeration:
+  checking 1
+  checking 2
+  checking 3
+  checking 4
+  count = 2
+Second enumeration:
+  checking 1
+  checking 2
+  first = 2
+snapshot: 72,90; live query: 72,90,81
+1 1 3 5 13 21 55 89
+```
+
+Four lessons in one program:
+
+1. **Nothing ran when the query was defined.** The first "checking" line appears only when `Count` enumerates it.
+2. **The query saw the 4** that was added after it was defined, because it reads `numbers` when it runs, not when it was written.
+3. **Each enumeration runs the whole pipeline again.** `First` re-ran the filter, though it stopped as soon as it found a match: LINQ operators pull items one at a time, so `First` and `Take` do only as much work as they need. That is why `Fibonacci().Where(...).Take(8)` works on an *infinite* sequence.
+4. **`ToList` takes a snapshot.** It runs the query once and stores the results; later changes to the source do not affect it.
+
+<Misconception>
+
+**"I'll just pass the query around; it's the same as a list."** A query passed to a method that loops over it twice does all its work twice. If the query reads a file, calls a web service or queries a database, that is twice the I/O, and the second pass may see different data. When a result will be used more than once, materialise it with `ToList` or `ToArray`. Code analysers and editors warn about "possible multiple enumeration" for this reason.
+
+</Misconception>
+
+</Section>
+
+<Section id="habits" kind="human" title="Habits of fluent LINQ users">
+
+A few habits separate code that merely uses LINQ from code that uses it well.
+
+- **Ask the question directly.** `items.Any()` stops at the first item; `items.Count() > 0` may walk the whole sequence. `orders.Count(o => o.IsLate)` beats `orders.Where(o => o.IsLate).Count()` for readability. `Contains` and `All` exist; use them.
+- **Keep lambdas free of side effects.** The printing inside `Where` in the deferred-execution program was there to make the timing visible. In real code a lambda passed to a query should only compute its answer; side effects belong in a `foreach` loop, where their timing is obvious.
+- **Know what throws.** `ToDictionary` throws if two items have the same key, which is right when duplicates mean bad data and wrong when they are expected; use `ToLookup` or `GroupBy` for the second case. `First` and `Single` throw on empty sequences, and so do `Min`, `Max` and `Average` over an empty sequence of numbers.
+- **Name intermediate results.** A twelve-operator chain is as hard to read as a twelve-line method with no blank lines. Break it into named variables (`var lateOrders = ...; var byCustomer = ...;`); deferred execution means this costs nothing.
+- **Write your own operator when a pattern repeats.** An operator is just an extension method on an `IEnumerable`, usually written with `yield return`, like `EveryNth` in the previous lesson. A well-named `WhereActive()` or `InBatchesOf(100)` makes queries in a large codebase read like the domain.
+
+```csharp
+// Three ways to ask "is anyone overdue?"; the first is the clearest and the cheapest.
+bool anyLate = loans.Any(l => l.IsOverdue);
+bool anyLate2 = loans.Where(l => l.IsOverdue).Count() > 0;   // walks every loan
+bool anyLate3 = loans.FirstOrDefault(l => l.IsOverdue) != null;
+```
+
+</Section>
+
+<Section id="iqueryable" kind="human" title="LINQ and databases">
+
+Everything so far was **LINQ to Objects**: operators on `IEnumerable` that take delegates and run in your process. There is a second interface, `IQueryable`, whose operators take *expression trees* instead: data structures describing the lambda's code, which the compiler builds when the lambda's target type is an `Expression` rather than a `Func`. A query provider can inspect that tree and translate it into another language.
+
+The most important provider is **Entity Framework Core**, .NET's standard object-relational mapper. With it, a query such as
+
+```csharp
+var overdue = await db.Loans
+    .Where(l => l.DueDate < today && l.ReturnedOn == null)
+    .OrderBy(l => l.DueDate)
+    .Select(l => new { l.Member.Name, l.Book.Title })
+    .ToListAsync();
+```
+
+is translated into a single SQL `SELECT` with a `WHERE`, a join and an `ORDER BY`, run by the database, and only the matching rows travel over the network. (The `await` and `ToListAsync` are the subject of the async lesson.)
+
+Two consequences matter in practice. First, not every C# expression can be translated: call your own helper method inside a `Where` and EF Core will refuse at run time with an exception explaining that the expression could not be translated. Second, the boundary between database and memory is invisible in the code. Calling `AsEnumerable()` or `ToList()` too early, then filtering, quietly downloads the whole table and filters it in your process. Professionals keep an eye on the generated SQL (EF Core can log it) for any query that touches large tables.
+
+### Performance in perspective
+
+LINQ to Objects allocates a few small objects per query and calls a delegate per item. For the vast majority of code (business logic, request handling, data preparation) that cost is invisible next to I/O, and the clarity is worth far more. Each .NET release has also made the operators faster. In genuinely hot loops (a game's per-frame update, a parser's inner loop, numeric kernels) experienced developers measure first and, where it matters, replace a query with a plain loop or work over a `Span`, the subject of a later lesson.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`First` and `FirstOrDefault` are interchangeable."** `First` throws if there is no matching item; `FirstOrDefault` returns the type's default (`null`, or 0 for an `int`), which can be confused with a real 0. `Single` throws if there is not *exactly* one. Choose the one that states your expectation, so a broken assumption fails loudly.
+
+</Misconception>
+
+<Misconception>
+
+**"`OrderBy(...).OrderBy(...)` sorts by two keys."** The second `OrderBy` replaces the first ordering. For a secondary key, use `ThenBy`.
+
+</Misconception>
+
+<Misconception>
+
+**"LINQ is for databases."** LINQ to Objects, on in-memory collections, is far more common, and is what this lesson is mostly about. The database providers reuse the same operators.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,392 @@
+---
+title: Option, Either, Try and testing
+subtitle: Exceptions and when to use them, failure as a value with Option, Either and Try, chaining with for comprehensions, and testing with MUnit and ScalaCheck.
+minutes: 60
+objectives:
+  - Throw and catch exceptions, and say when an exception is the right tool in Scala
+  - Represent absence with Option and work with it through map, flatMap, getOrElse and fold
+  - Represent failures with Either and an error enum, and chain fallible steps with for comprehensions
+  - Turn exception-throwing code into values with Try, and release resources safely with Using
+  - Write unit tests with assertions, MUnit and property-based testing, and run them with scala test
+prerequisites: [traits-generics-and-type-classes]
+references:
+  - title: "Scala 3 Book: Functional Error Handling"
+    url: https://docs.scala-lang.org/scala3/book/fp-functional-error-handling.html
+  - title: "Scala API: scala.util.Try"
+    url: https://www.scala-lang.org/api/current/scala/util/Try.html
+  - title: MUnit
+    url: https://scalameta.org/munit/
+    note: A small, fast testing library with clear failure messages; the default in many new projects.
+  - title: ScalaTest
+    url: https://www.scalatest.org/
+    note: The most widely used Scala testing library, with several testing styles.
+  - title: ScalaCheck
+    url: https://scalacheck.org/
+    note: Property-based testing for Scala.
+---
+
+<Section id="motivation" kind="motivation" title="Failure is part of the type">
+
+Every real program meets failure. A user types "three" where a number was expected; a record that should exist does not; a file is missing; a network call times out. How a language lets you handle failure shapes how reliable the programs written in it are.
+
+The tradition Scala inherits from Java is the **exception**: a function that cannot do its job *throws*, and some caller further up the stack, hopefully, *catches*. Exceptions are convenient, but they are invisible in a function's type. `def parsePort(text: String): Int` promises an `Int`; nothing in that signature warns you that it may instead blow up with a `NumberFormatException`. You find out by reading the code, the documentation, or the stack trace in production.
+
+Functional Scala prefers to make failure **visible in the type** by returning a value that is either a result or a description of what went wrong. `Option[Int]` says "maybe an Int". `Either[ValidationError, Booking]` says "a booking, or a reason why not". The compiler then makes callers deal with both cases. Combined with the for comprehensions you learned in lesson 5, this turns error handling from scattered `try` blocks into straight-line code that reads like the happy path.
+
+This lesson teaches both approaches, when each is right, and then the other half of reliability: tests.
+
+</Section>
+
+<Section id="exceptions" kind="examples" title="Exceptions and Try">
+
+Scala's exceptions are the JVM's. You throw with `throw`, and `try`/`catch`/`finally` is an **expression**: its value is the value of the `try` block or of the `catch` case that handled the exception. The `catch` block is a pattern match on the exception's type.
+
+```scala check
+import scala.util.{Failure, Success, Try}
+
+def parsePort(text: String): Int =
+  val n = text.trim.toInt
+  require(n >= 1 && n <= 65535, s"port out of range: $n")
+  n
+
+@main def exceptions(): Unit =
+  val inputs = List("8080", " 443 ", "http", "70000")
+
+  for input <- inputs do
+    val message =
+      try s"port ${parsePort(input)}"
+      catch
+        case e: NumberFormatException    => s"not a number: '$input'"
+        case e: IllegalArgumentException => e.getMessage
+    println(message)
+
+  for input <- inputs do
+    Try(parsePort(input)) match
+      case Success(port) => println(s"ok $port")
+      case Failure(e)    => println(s"failed with ${e.getClass.getSimpleName}")
+
+  println(Try(parsePort("22")).map(_ + 1).getOrElse(-1))
+  println(Try(parsePort("ssh")).toOption)
+```
+
+```text
+port 8080
+port 443
+not a number: 'http'
+requirement failed: port out of range: 70000
+ok 8080
+ok 443
+failed with NumberFormatException
+failed with IllegalArgumentException
+23
+None
+```
+
+Two details are worth knowing. First, `NumberFormatException` is a *subclass* of `IllegalArgumentException`, so the order of the cases matters: if the general case came first, it would catch both. Second, `require` throws an `IllegalArgumentException` whose message starts with "requirement failed". Use `require` to check arguments, and `assert` to check your own code's internal assumptions.
+
+<Definition term="Try">
+
+**`Try[A]`** is either `Success(value)` or `Failure(exception)`. `Try(expr)` evaluates `expr` and captures any non-fatal exception it throws. `Try` has `map`, `flatMap`, `getOrElse`, `recover`, `toOption` and `toEither`, so you can work with the result without a `try` block.
+
+</Definition>
+
+`Try` is the bridge between code that throws, typically Java libraries, and code that prefers values. It catches only **non-fatal** exceptions: errors such as `OutOfMemoryError`, which the program cannot meaningfully recover from, still propagate. If you write a `catch` that handles "anything", use the `NonFatal` extractor from `scala.util.control` for the same reason: `case NonFatal(e) =>`.
+
+So when are exceptions the right tool in Scala? For **bugs** and for **truly exceptional conditions** that the immediate caller cannot handle anyway: a violated invariant, a missing configuration file at start-up, a broken database connection that will be handled by a top-level supervisor. For failures that are an expected part of the domain, such as invalid user input, a record not found or a payment declined, return a value.
+
+</Section>
+
+<Section id="option" kind="examples" title="Option: a value that may be absent">
+
+<Definition term="Option">
+
+**`Option[A]`** is either `Some(value)` or `None`. It replaces `null` for "there may be no value". Its most used methods are `map` (transform the value if present), `flatMap` (chain another step that may also be absent), `getOrElse(default)`, `orElse(alternative)`, `fold(ifEmpty)(f)` and `foreach`.
+
+</Definition>
+
+Think of an `Option` as a collection that holds zero or one elements. Everything you learned about `map`, `flatMap` and for comprehensions on lists applies:
+
+```scala check
+case class User(name: String, managerId: Option[Int], email: Option[String])
+
+val users = Map(
+  1 -> User("Adaeze", None, Some("adaeze@example.org")),
+  2 -> User("Bram", Some(1), None),
+  3 -> User("Chen", Some(2), Some("chen@example.org")),
+  4 -> User("Dilnoza", Some(1), Some("dilnoza@example.org"))
+)
+
+def managerEmail(id: Int): Option[String] =
+  for
+    user    <- users.get(id)
+    boss    <- user.managerId
+    manager <- users.get(boss)
+    email   <- manager.email
+  yield email
+
+@main def options(): Unit =
+  println(managerEmail(4))
+  println(managerEmail(3))
+  println(managerEmail(1))
+  println(managerEmail(99))
+
+  println(users.get(2).flatMap(_.email).getOrElse("no email on file"))
+  println(users.get(3).map(_.name.toUpperCase))
+  println(users.get(7).fold("unknown user")(u => s"user ${u.name}"))
+  println(users.get(2).flatMap(_.email).orElse(users.get(1).flatMap(_.email)))
+  println(users.values.flatMap(_.email).toList.sorted)
+```
+
+```text
+Some(adaeze@example.org)
+None
+None
+None
+no email on file
+Some(CHEN)
+unknown user
+Some(adaeze@example.org)
+List(adaeze@example.org, chen@example.org, dilnoza@example.org)
+```
+
+`managerEmail` has four steps, and any of them may come up empty: the user may not exist, may have no manager, the manager's id may be dangling, the manager may have no email. The for comprehension expresses the happy path; the first `None` short-circuits the rest and becomes the result. For user 3 the chain stops at Bram's missing email; for user 1 it stops at "no manager". Without `Option`, the same function would be four nested `if (x != null)` checks, and forgetting one would be a `NullPointerException`.
+
+The last line uses a neat property: since an `Option` is like a collection of zero or one, `flatMap` over a collection of users simply drops the `None`s.
+
+</Section>
+
+<Section id="either" kind="examples" title="Either: success or a reason for failure">
+
+`Option` says *that* something is missing but not *why*. When the caller needs to know what went wrong, for example to show a message to a user, use `Either`.
+
+<Definition term="Either">
+
+**`Either[E, A]`** is either `Left(error)` or `Right(value)`. By convention `Right` is the success case ("right" as in correct), and `map`, `flatMap` and for comprehensions operate on it, passing a `Left` through untouched. The error type `E` is usually an enum of the failures your domain knows about.
+
+</Definition>
+
+```scala check
+enum ValidationError:
+  case Missing(field: String)
+  case NotANumber(field: String, value: String)
+  case OutOfRange(field: String, value: Int, min: Int, max: Int)
+
+  def message: String = this match
+    case Missing(f)               => s"$f is required"
+    case NotANumber(f, v)         => s"$f must be a number, got '$v'"
+    case OutOfRange(f, v, lo, hi) => s"$f must be between $lo and $hi, got $v"
+
+case class Booking(guest: String, nights: Int, people: Int)
+
+type Form = Map[String, String]
+
+def text(form: Form, name: String): Either[ValidationError, String] =
+  form.get(name).map(_.trim).filter(_.nonEmpty).toRight(ValidationError.Missing(name))
+
+def number(form: Form, name: String, min: Int, max: Int): Either[ValidationError, Int] =
+  for
+    raw <- text(form, name)
+    n   <- raw.toIntOption.toRight(ValidationError.NotANumber(name, raw))
+    _   <- Either.cond(n >= min && n <= max, (), ValidationError.OutOfRange(name, n, min, max))
+  yield n
+
+def parseBooking(form: Form): Either[ValidationError, Booking] =
+  for
+    guest  <- text(form, "guest")
+    nights <- number(form, "nights", 1, 30)
+    people <- number(form, "people", 1, 8)
+  yield Booking(guest, nights, people)
+
+@main def eithers(): Unit =
+  val forms = List(
+    Map("guest" -> "Ama Owusu", "nights" -> "3", "people" -> "2"),
+    Map("guest" -> "  ", "nights" -> "3", "people" -> "2"),
+    Map("guest" -> "Sven", "nights" -> "three", "people" -> "2"),
+    Map("guest" -> "Rosa", "nights" -> "2", "people" -> "12")
+  )
+  for form <- forms do
+    parseBooking(form) match
+      case Right(booking) => println(s"booked: $booking")
+      case Left(error)    => println(s"rejected: ${error.message}")
+
+  val (errors, bookings) = forms.map(parseBooking).partitionMap(identity)
+  println(s"${bookings.size} booking(s), ${errors.size} rejected")
+  println(parseBooking(forms.head).map(_.nights * 45))
+```
+
+```text
+booked: Booking(Ama Owusu,3,2)
+rejected: guest is required
+rejected: nights must be a number, got 'three'
+rejected: people must be between 1 and 8, got 12
+1 booking(s), 3 rejected
+Right(135)
+```
+
+Look at how the pieces fit:
+
+- `toRight(error)` turns an `Option` into an `Either`, supplying the error for the `None` case. `Either.cond(test, value, error)` builds a `Right` if the test passes and a `Left` otherwise. These two small helpers convert most checks into `Either`s.
+- `number` and `parseBooking` are for comprehensions over `Either`. Each step runs only if all previous steps succeeded; the first `Left` becomes the result. The code reads as a description of a valid booking, with no explicit error plumbing at all.
+- The error type is an **enum**, so every kind of failure is listed in one place, the `message` method is checked for exhaustiveness, and callers can match on specific errors, for instance to highlight the offending form field.
+- `partitionMap(identity)` splits a list of `Either`s into the lefts and the rights.
+
+This style stops at the *first* error. A web form would rather report every problem at once; libraries such as Cats provide a type (`Validated`) that accumulates errors instead, and you can write the same thing yourself with a fold. Choosing between "fail fast" and "collect all" is a design decision, not a matter of style.
+
+### Resources
+
+Code that opens files or connections must close them even when something fails. `scala.util.Using` does this and returns a `Try`:
+
+```scala
+import scala.io.Source
+import scala.util.Using
+
+val lineCount: scala.util.Try[Int] =
+  Using(Source.fromFile("data.csv"))(source => source.getLines().size)
+```
+
+The source is closed whether the block succeeds or throws. `Using.resource` does the same but rethrows instead of returning a `Try`, and `Using.Manager` handles several resources at once.
+
+</Section>
+
+<Section id="strategy" kind="human" title="Choosing an error strategy">
+
+With four tools available, teams settle on a few conventions so that every function does not reinvent error handling. A useful summary:
+
+| Situation | Tool | Example |
+| --- | --- | --- |
+| A value may legitimately be absent, and the reason does not matter | `Option[A]` | looking up a key, the first element of a possibly empty list |
+| An operation can fail in ways the caller should distinguish | `Either[E, A]` with an enum `E` | validating input, a business rule refusing an action |
+| Calling code that throws, usually Java or I/O libraries | `Try[A]`, then convert | parsing with a Java API, reading a file |
+| A bug or a broken invariant | an exception (`require`, `assert`, `throw`) | a negative quantity that the types should have prevented |
+| An unrecoverable environment problem | an exception, handled at the top | the database is unreachable at start-up |
+
+A typical service then has a clear shape. The **domain** layer (pure functions over case classes) returns `Either`s with domain error enums such as `BookingError`. The **boundary** layers, the HTTP handler, the message consumer or the command-line `main`, translate those errors into whatever the outside world needs: an HTTP status code and a JSON body, a log line, an exit code. Exceptions from libraries are caught near where they are thrown, converted with `Try(...).toEither` and a `left.map` into domain errors, and anything truly unexpected propagates to a single top-level handler that logs it with its stack trace.
+
+Two habits matter more than the choice of type. **Never swallow an error silently**: a `catch` that does nothing, or a `getOrElse` with a meaningless default, turns a clear failure into a mysterious wrong answer later. And **keep the error information** as you convert: when wrapping a low-level exception in a domain error, keep the original as a field, so the log still shows where it came from.
+
+<Note>
+
+In Scala 2.11 and earlier, `Either` was not right-biased: you had to write `either.right.map(...)` and it could not be used directly in for comprehensions. Since Scala 2.12 it works the way this lesson shows. You may still meet `.right` in very old code; it can simply be deleted.
+
+</Note>
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing">
+
+Pure functions that return values are a joy to test: call the function, compare the result. Here is a small function and a home-made test runner, enough to show the ideas without any library:
+
+```scala check
+def slugify(title: String): String =
+  title.trim.toLowerCase
+    .map(c => if c.isLetterOrDigit then c else '-')
+    .split("-+")
+    .filter(_.nonEmpty)
+    .mkString("-")
+
+case class Outcome(name: String, passed: Boolean)
+
+def test(name: String)(body: => Unit): Outcome =
+  try
+    body
+    Outcome(name, true)
+  catch case e: AssertionError =>
+    println(s"  ${e.getMessage}")
+    Outcome(name, false)
+
+@main def tests(): Unit =
+  val outcomes = List(
+    test("lower-cases and joins words") {
+      assert(slugify("Hello World") == "hello-world")
+    },
+    test("drops punctuation") {
+      assert(slugify("Scala 3: What's new?") == "scala-3-what-s-new")
+    },
+    test("collapses runs of separators") {
+      assert(slugify("  a  --  b ") == "a-b")
+    },
+    test("keeps letters from any alphabet") {
+      assert(slugify("Ünïcode Títle") == "ünïcode-títle")
+    },
+    test("gives an empty title a placeholder") {
+      assert(slugify("   ") == "untitled", s"got '${slugify("   ")}'")
+    },
+    test("is idempotent") {
+      for t <- List("Ünïcode Títle", "x", "", "--a--") do
+        assert(slugify(slugify(t)) == slugify(t), s"not idempotent on '$t'")
+    }
+  )
+  for o <- outcomes do println(s"${if o.passed then "PASS" else "FAIL"} ${o.name}")
+  println(s"${outcomes.count(_.passed)}/${outcomes.size} passed")
+```
+
+```text
+  assertion failed: got ''
+PASS lower-cases and joins words
+PASS drops punctuation
+PASS collapses runs of separators
+PASS keeps letters from any alphabet
+FAIL gives an empty title a placeholder
+PASS is idempotent
+5/6 passed
+```
+
+`test` takes its body **by name** (lesson 3), so the assertions run inside the `try`. One test fails, and that is useful: it records a decision nobody has made yet (what should an empty title become?). The last test checks a **property**, "slugifying twice changes nothing", over several inputs rather than one example.
+
+In a real project you would use a testing library. With Scala CLI, put tests in a file whose name ends in `.test.scala` and declare the library with a using directive; `scala test .` then finds and runs them. With **MUnit**, the tests above look like this (take the current version number from the MUnit website):
+
+```scala
+//> using test.dep org.scalameta::munit::<version>
+
+class SlugifySuite extends munit.FunSuite:
+  test("lower-cases and joins words") {
+    assertEquals(slugify("Hello World"), "hello-world")
+  }
+  test("drops punctuation") {
+    assertEquals(slugify("Scala 3: What's new?"), "scala-3-what-s-new")
+  }
+```
+
+`assertEquals` reports both values and a diff when they differ, which makes failures quick to diagnose. **ScalaTest** offers the same capabilities in several styles (`AnyFunSuite`, `AnyFlatSpec` with "should" sentences, and more) and is very common in established code bases. **ScalaCheck** does property-based testing: you state a property such as idempotence, and it generates hundreds of random inputs, including awkward ones like empty strings and unusual Unicode, and shrinks any failing input to a minimal example. MUnit and ScalaTest both integrate with it.
+
+<Note>
+
+Tests are easiest to write for code designed for them: pure functions that take values and return values, with input and output pushed to the edges. If a function is hard to test, that is often a sign it does too much. Split the decision-making (pure, easy to test) from the effects (printing, files, network).
+
+</Note>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`option.get` is fine when I'm sure the value is there."** `get` throws on `None`, bringing back exactly the kind of failure `Option` was meant to remove. Prefer `getOrElse`, `fold`, a `match` or a for comprehension. Many teams forbid `.get` with a linter rule.
+
+</Misconception>
+
+<Misconception>
+
+**"`Try` is a general way to handle errors."** `Try` can only carry a `Throwable`, which says little about *your* domain's failures, and it catches every non-fatal exception, including bugs you would rather see. Use it at the boundary with throwing code, then convert to `Either` with a meaningful error type.
+
+</Misconception>
+
+<Misconception>
+
+**"Returning `null` is a lighter-weight `Option`."** Idiomatic Scala never returns `null`. When you call Java code that might, wrap the result immediately with `Option(javaValue)`, which turns `null` into `None`.
+
+</Misconception>
+
+<Misconception>
+
+**"For comprehensions over `Either` collect all the errors."** They stop at the first `Left`. To report every validation error at once, you need an accumulating approach.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

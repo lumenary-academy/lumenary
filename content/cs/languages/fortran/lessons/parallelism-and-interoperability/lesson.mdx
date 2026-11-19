@@ -1,0 +1,582 @@
+---
+title: Parallelism and interoperability
+subtitle: Many cores and many machines with do concurrent, OpenMP, coarrays and MPI, and the standard bridge between Fortran, C and Python.
+minutes: 70
+objectives:
+  - Distinguish shared-memory from distributed-memory parallelism and name the Fortran tools for each
+  - Write do concurrent loops whose iterations are truly independent, and say what compilers do with them
+  - Parallelise a loop with OpenMP directives and a reduction, and recognise a data race
+  - Read a coarray program (images, coindexed access, sync all, co_sum) and the outline of an MPI program
+  - Call C from Fortran, and Fortran from C and Python, with iso_c_binding and bind(c)
+prerequisites: [derived-types-and-objects]
+related: [math.comp.numerical-methods]
+references:
+  - title: OpenMP
+    url: https://www.openmp.org/
+    note: The OpenMP Architecture Review Board's site, with the specifications for Fortran, C and C++ and reference cards.
+  - title: MPI Forum
+    url: https://www.mpi-forum.org/
+    note: The body that maintains the Message Passing Interface standard, with every version of the specification.
+  - title: OpenCoarrays
+    url: https://github.com/sourceryinstitute/OpenCoarrays
+    note: The library that gives GFortran multi-image coarray support on top of MPI, with the caf and cafrun wrappers.
+  - title: GNU Fortran, Interoperability with C
+    url: https://gcc.gnu.org/onlinedocs/gfortran/Interoperability-with-C.html
+    note: How GFortran implements bind(c), iso_c_binding and the Fortran 2018 C descriptors.
+  - title: F2PY user guide
+    url: https://numpy.org/doc/stable/f2py/
+    note: NumPy's tool for building Python extension modules from Fortran.
+---
+
+<Section id="motivation" kind="motivation" title="Thousands of cores, and other languages">
+
+A laptop today has between four and twenty cores, and the supercomputers that run weather and climate models have hundreds of thousands, spread across thousands of separate machines (**nodes**) joined by a fast network. A program written as a single sequence of steps uses one of those cores.
+
+Fortran has met this problem for longer than most languages have existed: the vector supercomputers of the 1970s and 1980s were programmed in it, and the Fortran 2008 standard made parallel programming part of the language. This lesson covers the four tools you will meet: **`do concurrent`**, a loop whose iterations you promise are independent; **OpenMP**, directives that spread a loop across the threads of one machine; **coarrays**, Fortran's built-in model for many cooperating copies of a program; and **MPI**, the message-passing library that most large codes are built on.
+
+The second half is about a different kind of cooperation. Very little numerical Fortran lives alone: it is called from C, C++ and Python, and itself calls C libraries. Since Fortran 2003 there has been a standard, portable way to cross that border.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Two kinds of parallel machine">
+
+<Definition term="Shared and distributed memory">
+
+In **shared-memory** parallelism, several threads run inside one process and can all read and write the same variables; this is how the cores of one machine cooperate. In **distributed-memory** parallelism, several separate processes each have private memory and exchange data explicitly, over a network or through the operating system; this is how many machines cooperate, and it also works on one machine.
+
+</Definition>
+
+| Tool | Memory model | Part of | Typical use |
+| --- | --- | --- | --- |
+| `do concurrent` | either; the compiler decides | the Fortran standard (2008) | loops with independent iterations, CPU vectorisation, some GPU compilers |
+| OpenMP | shared | a separate standard of compiler directives | parallel loops on one node, GPU offloading |
+| coarrays | distributed (also works on one node) | the Fortran standard (2008, extended in 2018) | single-program, many-copies codes written in pure Fortran |
+| MPI | distributed | a library standard with Fortran bindings | nearly every large simulation code |
+
+Two ideas run through all of them. First, parallel work only helps if the pieces really are independent, or if you say precisely how they combine. Second, the part of a program that remains serial limits the speed-up: if 10 % of the run time cannot be parallelised, no number of cores can make the program more than ten times faster. That observation is **Amdahl's law**, and it is why experienced programmers measure where the time goes before parallelising anything.
+
+<Definition term="Data race">
+
+A **data race** happens when two threads access the same memory location at the same time, at least one of them writes, and nothing orders the accesses. The result depends on timing, so a program with a race can give different answers from run to run, or the right answer almost always.
+
+</Definition>
+
+</Section>
+
+<Section id="do-concurrent" kind="examples" title="do concurrent: promising independence">
+
+A `do concurrent` loop looks like an ordinary loop with its index ranges in parentheses, but it carries a promise: **no iteration depends on another**, so they may run in any order, or all at once. The compiler is allowed to rely on that promise. Here it updates every cell of a metal plate whose left edge is held in boiling water:
+
+```fortran check
+! do concurrent: heat spreading through a metal plate, one independent update per cell
+program plate
+  use, intrinsic :: iso_fortran_env, only: dp => real64
+  implicit none
+  integer, parameter :: nx = 40, ny = 20
+  real(dp), parameter :: alpha = 0.2_dp        ! diffusion number; the scheme is stable below 0.25
+  real(dp) :: t(0:nx+1, 0:ny+1), tnew(0:nx+1, 0:ny+1)
+  integer :: i, j, step
+
+  t = 20.0_dp                                  ! the plate starts at room temperature...
+  t(0, :) = 100.0_dp                           ! ...with its left edge held in boiling water
+  tnew = t
+
+  do step = 1, 2000
+     do concurrent (j = 1:ny, i = 1:nx)        ! every cell can be updated independently
+        block
+          real(dp) :: neighbours               ! a block makes a variable local to one iteration
+          neighbours = t(i-1, j) + t(i+1, j) + t(i, j-1) + t(i, j+1)
+          tnew(i, j) = t(i, j) + alpha * (neighbours - 4.0_dp * t(i, j))
+        end block
+     end do
+     t(1:nx, 1:ny) = tnew(1:nx, 1:ny)
+  end do
+
+  print '(a)', 'temperature along the middle row, every 5th cell from the hot edge:'
+  print '(9f7.1)', t(0:nx:5, ny/2)
+  print '(a, f0.3)', 'mean temperature of the plate: ', sum(t(1:nx, 1:ny)) / (nx * ny)
+
+  ! Pure procedures may be called inside do concurrent
+  do concurrent (i = 1:nx)
+     tnew(i, 1) = fahrenheit(t(i, ny/2))
+  end do
+  print '(a, f0.1, a)', 'hottest interior cell: ', maxval(tnew(1:nx, 1)), ' F'
+contains
+  pure elemental function fahrenheit(c) result(f)
+    real(dp), intent(in) :: c
+    real(dp) :: f
+    f = c * 9.0_dp / 5.0_dp + 32.0_dp
+  end function fahrenheit
+end program plate
+```
+
+It prints:
+
+```text
+temperature along the middle row, every 5th cell from the hot edge:
+  100.0   64.9   42.4   30.7   25.1   22.4   21.1   20.5   20.1
+mean temperature of the plate: 30.898
+hottest interior cell: 198.2 F
+```
+
+The update is the stencil of <LessonLink slug="arrays">the arrays lesson</LessonLink> in two dimensions. Each new value `tnew(i, j)` depends only on *old* values in `t`, so the 800 updates of one step are independent, which is exactly what `do concurrent` asserts. The time loop around it is not: step 2 needs the results of step 1, so it stays an ordinary `do`.
+
+The rules follow from the promise:
+
+- **No iteration may use a value that another iteration writes.** `do concurrent (i = 2:n)` with `a(i) = a(i-1) + 1` is not allowed: each iteration reads what the previous one wrote. The compiler usually cannot detect the mistake, so the program is simply wrong.
+- **Only `pure` procedures may be called** inside the loop, which is one of the reasons <LessonLink slug="procedures-and-modules">the procedures lesson</LessonLink> recommended making procedures pure whenever possible. Statements such as `exit`, `return` and I/O to a shared unit are forbidden.
+- **Scalars that each iteration uses for scratch work must be local to the iteration.** A `block` inside the loop, as here, is the portable way to declare them. Fortran 2018 added **locality specifiers** for the same purpose, `do concurrent (i = 1:n) local(tmp) shared(a)`, and Fortran 2023 added `reduce(+: total)`; GFortran 11, which checked this course, rejects both with a syntax error, so test your compiler before relying on them.
+- **A mask may filter iterations:** `do concurrent (i = 1:n, x(i) > 0.0_dp)` runs only where the condition holds.
+
+What compilers *do* with the promise varies. GFortran 11 compiles the loop above as an ordinary serial loop; NVIDIA's nvfortran can run `do concurrent` loops on a GPU (with `-stdpar=gpu`), and other compilers can spread them across threads given the right options. So `do concurrent` is best understood as a portable statement of independence: it costs nothing and lets a capable compiler parallelise, but does not by itself guarantee more speed.
+
+</Section>
+
+<Section id="openmp" kind="computation" title="OpenMP: threads on one machine">
+
+**OpenMP** is a standard set of compiler directives, first published for Fortran in 1997 and now supported by every major Fortran, C and C++ compiler. A directive is a special comment beginning with `!$omp`. A compiler given an OpenMP option (`-fopenmp` for GFortran) obeys it; any other compiler sees an ordinary comment. Lines beginning with `!$` followed by a space are **conditional compilation**: they are compiled only when OpenMP is enabled. So one source file can serve both builds:
+
+```fortran check
+! OpenMP: one source that runs serially, or on every core when compiled with -fopenmp
+program prime_census
+  !$ use omp_lib, only: omp_get_max_threads
+  use, intrinsic :: iso_fortran_env, only: int64
+  implicit none
+  integer, parameter :: limit = 3000000
+  integer :: k, how_many, twins
+  integer(int64) :: total
+
+  how_many = 0
+  twins = 0
+  total = 0
+  !$omp parallel do schedule(dynamic, 2000) reduction(+: how_many, twins, total)
+  do k = 2, limit
+     if (is_prime(k)) then
+        how_many = how_many + 1
+        total = total + k
+        if (is_prime(k + 2)) twins = twins + 1
+     end if
+  end do
+  !$omp end parallel do
+
+  print '(a, i0, a, i0)', 'primes below ', limit, ': ', how_many
+  print '(a, i0)', 'their sum: ', total
+  print '(a, i0)', 'twin-prime pairs (p, p + 2): ', twins
+  !$ print '(a, i0, a)', '(computed by ', omp_get_max_threads(), ' OpenMP threads)'
+
+contains
+
+  pure logical function is_prime(n)
+    integer, intent(in) :: n
+    integer :: d
+    is_prime = n >= 2
+    if (n < 4) return
+    if (mod(n, 2) == 0) then
+       is_prime = .false.
+       return
+    end if
+    do d = 3, int(sqrt(real(n))), 2
+       if (mod(n, d) == 0) then
+          is_prime = .false.
+          return
+       end if
+    end do
+  end function is_prime
+
+end program prime_census
+```
+
+Compiled as usual, without OpenMP, it prints:
+
+```text
+primes below 3000000: 216816
+their sum: 312471072265
+twin-prime pairs (p, p + 2): 20932
+```
+
+Compiled with `gfortran -std=f2018 -Wall -fopenmp` and run with the environment variable `OMP_NUM_THREADS=8`, it printed the same three lines followed by `(computed by 8 OpenMP threads)`. On the machine that checked this course (a 14-core laptop processor), the serial build took about 0.24 seconds and the eight-thread build about 0.04 seconds.
+
+Reading the directive from left to right:
+
+- **`parallel do`** starts a team of threads and divides the iterations of the following loop among them.
+- **`schedule(dynamic, 2000)`** hands out chunks of 2000 iterations to whichever thread is free. Large numbers take longer to test than small ones, so a fixed, equal split (`schedule(static)`, the usual default) would leave some threads idle while others finish.
+- **`reduction(+: how_many, twins, total)`** gives every thread its own private copy of the three counters, starting at zero, and adds the copies together when the loop ends. Without it, the counters would be shared.
+- **Variables are shared by default**, except the loop index, which is private. Clauses such as `private(x)` and `default(none)` (which forces you to list every variable's status) make the sharing explicit; many teams require `default(none)` in all their parallel regions.
+
+Here is what happened when we deleted the `reduction` clause, leaving the three counters shared, and ran the program three times with eight threads:
+
+```text
+primes below 3000000: 209848
+primes below 3000000: 215324
+primes below 3000000: 215414
+```
+
+Three runs, three different wrong answers. `how_many = how_many + 1` is a read, an addition and a write; when two threads interleave those steps, one increment is lost. This is a data race. Race detectors, such as Valgrind's Helgrind and the thread sanitizers of GCC and Clang, can help find races, but the real defence is discipline: `default(none)`, reductions for anything accumulated, and as little shared mutable state as possible.
+
+OpenMP can do much more, including tasks for irregular work, `!$omp simd` for vectorisation and, since version 4.0, `!$omp target` for offloading loops to GPUs; see [openmp.org](https://www.openmp.org/).
+
+</Section>
+
+<Section id="coarrays-and-mpi" kind="examples" title="Coarrays and MPI: many cooperating processes">
+
+### Coarrays
+
+A coarray program runs as several **images**, identical copies of the program executing at the same time, each with its own memory, in the style called *single program, multiple data*. `this_image()` returns an image's number, from 1 to `num_images()`. A variable declared with a **codimension** in square brackets, `real(dp) :: u(0:n+1)[*]`, is a **coarray**: every image has its own `u`, and any image can read or write another image's copy by giving its number in square brackets, as in `u(n)[me - 1]`. That is the whole syntax of communication.
+
+With GFortran, coarray programs need either `-fcoarray=single` (one image, for testing) or the OpenCoarrays library, whose `caf` and `cafrun` commands wrap the compiler and the launcher, so this program is a listing rather than a checked block; we compiled it with `caf -std=f2018 -Wall rod.f90 -o rod` and ran it with `cafrun -n 4 ./rod`:
+
+```fortran
+! Coarrays: a heated rod split between images, which exchange their edge values every step
+program rod
+  use, intrinsic :: iso_fortran_env, only: dp => real64
+  implicit none
+  integer, parameter :: n = 10                       ! cells owned by each image
+  real(dp), parameter :: alpha = 0.25_dp
+  real(dp) :: u(0:n+1)[*]                            ! a coarray: every image has its own u
+  real(dp) :: unew(n), heat
+  integer :: me, images, step, img
+
+  me = this_image()
+  images = num_images()
+  u = 0.0_dp
+  if (me == 1) u(0) = 100.0_dp                       ! the left end of the rod is held at 100
+  sync all
+
+  do step = 1, 20000
+     if (me > 1) u(0) = u(n)[me - 1]                 ! ghost cell from the left neighbour
+     if (me < images) u(n+1) = u(1)[me + 1]          ! ghost cell from the right neighbour
+     unew = u(1:n) + alpha * (u(0:n-1) - 2.0_dp * u(1:n) + u(2:n+1))
+     sync all                                        ! all reads done before anyone writes
+     u(1:n) = unew
+     sync all                                        ! all writes done before the next reads
+  end do
+
+  heat = sum(u(1:n))
+  call co_sum(heat, result_image=1)                  ! a collective: add one value from every image
+
+  if (me == 1) then
+     print '(a, i0, a, i0, a)', 'rod of ', n * images, ' cells on ', images, ' images'
+     print '(a)', 'temperature in the middle of each image''s segment:'
+     print '(*(f7.2))', (u(n/2)[img], img = 1, images)
+     print '(a, f0.2)', 'total heat in the rod: ', heat
+  end if
+end program rod
+```
+
+With four images it printed:
+
+```text
+rod of 40 cells on 4 images
+temperature in the middle of each image's segment:
+  87.80  63.41  39.02  14.63
+total heat in the rod: 2000.00
+```
+
+This is **domain decomposition**, the pattern behind almost every parallel simulation. The rod is cut into four segments, one per image. Each image stores its own ten cells plus two **ghost cells** (indices 0 and `n + 1`) holding copies of its neighbours' edge values, refreshed at the start of every step by a **halo exchange**. After 20 000 steps the temperature falls in a straight line from 100 at the hot end to 0 at the cold end, as the physics says it should.
+
+The two `sync all` statements are what make the program correct. The first guarantees that every image has read its neighbours' old values before any image overwrites its own; the second, that every image has finished writing before the next round of reads. Remove either, and images read half-updated data: the coarray version of a data race. **`co_sum`** is one of the Fortran 2018 **collective subroutines** (with `co_max`, `co_min`, `co_broadcast` and `co_reduce`), which combine a value across all images efficiently. Finally, image 1 reads the middle cell of every image directly, `u(n/2)[img]`, to print them.
+
+Coarrays are elegant, and some codes use them, but support is uneven: Intel's ifx and the Cray and NAG compilers implement them natively, GFortran relies on OpenCoarrays, and other compilers vary, so check before you build a project on them.
+
+### MPI
+
+The **Message Passing Interface** is a library standard, first published in 1994, and it is how the overwhelming majority of large Fortran (and C and C++) simulation codes run on clusters. Its model is the same as that of coarrays, separate processes called **ranks** numbered from 0, but communication is by explicit library calls instead of square brackets. The modern Fortran binding is the module `mpi_f08`, added in MPI 3.0. Here is the classic first MPI program, which estimates $\pi$ as $\int_0^1 4/(1 + x^2)\,dx$ by the midpoint rule, every rank taking every fourth point:
+
+```fortran
+! MPI: every process integrates part of 4/(1 + x**2) on [0, 1]; rank 0 collects the total
+program mpi_pi
+  use mpi_f08
+  use, intrinsic :: iso_fortran_env, only: dp => real64
+  implicit none
+  integer, parameter :: n = 10000000
+  integer :: rank, nprocs, k
+  real(dp) :: h, x, partial, pi_estimate
+
+  call MPI_Init()
+  call MPI_Comm_rank(MPI_COMM_WORLD, rank)
+  call MPI_Comm_size(MPI_COMM_WORLD, nprocs)
+
+  h = 1.0_dp / n
+  partial = 0.0_dp
+  do k = rank + 1, n, nprocs                       ! process r takes points r+1, r+1+p, ...
+     x = (k - 0.5_dp) * h
+     partial = partial + 4.0_dp / (1.0_dp + x * x)
+  end do
+  partial = partial * h
+
+  call MPI_Reduce(partial, pi_estimate, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD)
+  if (rank == 0) then
+     print '(a, i0)', 'processes: ', nprocs
+     print '(a, f18.15)', 'pi is about ', pi_estimate
+     print '(a, es9.2)', 'error: ', abs(pi_estimate - acos(-1.0_dp))
+  end if
+  call MPI_Finalize()
+end program mpi_pi
+```
+
+Compiled with Open MPI's wrapper, `mpif90 -std=f2018 -Wall mpi_pi.f90 -o mpi_pi`, and run with `mpirun -n 4 ./mpi_pi`, it printed:
+
+```text
+processes: 4
+pi is about  3.141592653589686
+error:  1.07E-13
+```
+
+Every MPI program has this skeleton: initialise, ask for your rank and the number of ranks, do your share, communicate, finalise. `MPI_Reduce` is the counterpart of `co_sum`; point-to-point calls such as `MPI_Send`, `MPI_Recv` and `MPI_Sendrecv` do halo exchanges. Real codes add non-blocking communication that overlaps with computation, and much more; the specifications are at the [MPI Forum](https://www.mpi-forum.org/).
+
+</Section>
+
+<Section id="c-interop" kind="examples" title="Talking to C">
+
+<Definition term="C interoperability">
+
+The intrinsic module **`iso_c_binding`** (Fortran 2003) provides kind parameters that match C's types (`c_int`, `c_double`, `c_char`, `c_size_t`, `c_bool`), the types `c_ptr` and `c_funptr` for C's data and function pointers, and procedures to convert between Fortran and C (`c_loc`, `c_funloc`, `c_f_pointer`). The attribute **`bind(c)`** on a procedure or derived type makes it follow C's conventions, and `bind(c, name='...')` fixes the name the linker sees.
+
+</Definition>
+
+The C standard library is linked into every GFortran program, so calling it is the simplest way to see interoperability at work. This program measures a string with C's `strlen` and sorts an array with C's `qsort`, handing `qsort` a comparison function written in Fortran:
+
+```fortran check
+! Calling the C standard library from Fortran: strlen, and qsort with a Fortran comparison function
+module c_library
+  use, intrinsic :: iso_c_binding, only: c_char, c_double, c_int, c_size_t, c_ptr, c_funptr, c_f_pointer
+  implicit none
+  private
+  public :: c_strlen, c_qsort, by_magnitude
+
+  interface
+     ! size_t strlen(const char *s);
+     function c_strlen(s) bind(c, name='strlen') result(length)
+       import :: c_char, c_size_t
+       character(kind=c_char), intent(in) :: s(*)
+       integer(c_size_t) :: length
+     end function c_strlen
+
+     ! void qsort(void *base, size_t count, size_t size, int (*compare)(const void *, const void *));
+     subroutine c_qsort(base, count, size, compare) bind(c, name='qsort')
+       import :: c_ptr, c_size_t, c_funptr
+       type(c_ptr), value :: base
+       integer(c_size_t), value :: count, size
+       type(c_funptr), value :: compare
+     end subroutine c_qsort
+  end interface
+
+contains
+
+  ! A comparison function that C can call: int by_magnitude(const void *a, const void *b)
+  function by_magnitude(pa, pb) result(order) bind(c)
+    type(c_ptr), value, intent(in) :: pa, pb
+    integer(c_int) :: order
+    real(c_double), pointer :: a, b
+    call c_f_pointer(pa, a)                  ! turn C's untyped pointers into Fortran pointers
+    call c_f_pointer(pb, b)
+    if (abs(a) < abs(b)) then
+       order = -1
+    else if (abs(a) > abs(b)) then
+       order = 1
+    else
+       order = 0
+    end if
+  end function by_magnitude
+
+end module c_library
+
+program call_c
+  use, intrinsic :: iso_c_binding, only: c_double, c_size_t, c_null_char, c_loc, c_funloc, c_sizeof
+  use c_library
+  implicit none
+  real(c_double), target :: errors(7) = [0.3_c_double, -2.5_c_double, 0.01_c_double, 1.75_c_double, &
+                                         -0.4_c_double, 12.0_c_double, -0.02_c_double]
+  character(len=*), parameter :: word = 'Fortran'
+
+  print '(a, i0)', 'strlen of "Fortran" plus a null: ', c_strlen(word // c_null_char)
+
+  call c_qsort(c_loc(errors), size(errors, kind=c_size_t), c_sizeof(errors(1)), c_funloc(by_magnitude))
+  print '(a)', 'sorted by magnitude in C''s qsort:'
+  print '(7f7.2)', errors
+end program call_c
+```
+
+It prints:
+
+```text
+strlen of "Fortran" plus a null: 7
+sorted by magnitude in C's qsort:
+   0.01  -0.02   0.30  -0.40   1.75  -2.50  12.00
+```
+
+Each interface translates the C prototype in the comment above it:
+
+- **`value`** passes an argument by value, as C does. Without it, Fortran passes the address, which is what C means by a pointer parameter: `c_strlen`'s array argument `s(*)` arrives in C as `const char *`.
+- **Strings.** C strings end with a null character, Fortran strings do not, so the program appends `c_null_char`. A Fortran `character(len=7)` cannot be passed to C as it is; a `character(kind=c_char)` array of single characters can.
+- **`c_loc(errors)`** gives the C address of an array, which must have the `target` attribute. **`c_funloc(by_magnitude)`** gives the address of a procedure, which must itself be `bind(c)`.
+- **`c_f_pointer`** goes the other way, turning a C pointer into a Fortran pointer of a known type (and, for arrays, a given shape), which is how `by_magnitude` reads the two numbers `qsort` points it to.
+- **`c_sizeof`** (Fortran 2008) is C's `sizeof`, here 8 bytes per `c_double`.
+
+### Calling Fortran from C
+
+The other direction needs one more piece: a fixed linker name. Here is a module whose two procedures are written to be called from C:
+
+```fortran
+! smoothing.f90: numerical routines with C-compatible interfaces
+module smoothing
+  use, intrinsic :: iso_c_binding, only: c_int, c_double
+  implicit none
+  private
+  public :: moving_average, rms
+
+contains
+
+  ! void moving_average(int n, const double *x, int width, double *y);
+  subroutine moving_average(n, x, width, y) bind(c, name='moving_average')
+    integer(c_int), value, intent(in) :: n, width
+    real(c_double), intent(in) :: x(n)
+    real(c_double), intent(out) :: y(n)
+    integer :: i, lo, hi
+    do i = 1, n
+       lo = max(1, i - width / 2)
+       hi = min(n, i + width / 2)
+       y(i) = sum(x(lo:hi)) / (hi - lo + 1)
+    end do
+  end subroutine moving_average
+
+  ! double rms(int n, const double *x);
+  function rms(n, x) result(r) bind(c, name='rms')
+    integer(c_int), value, intent(in) :: n
+    real(c_double), intent(in) :: x(n)
+    real(c_double) :: r
+    r = sqrt(sum(x**2) / n)
+  end function rms
+
+end module smoothing
+```
+
+and a C program that uses them, declaring the prototypes that the comments promise:
+
+```c
+/* main.c: a C program calling the Fortran routines */
+#include <stdio.h>
+
+void moving_average(int n, const double *x, int width, double *y);
+double rms(int n, const double *x);
+
+int main(void) {
+    double rainfall[8] = {12.0, 0.0, 3.5, 27.0, 8.0, 0.5, 15.0, 4.0};
+    double smooth[8];
+    moving_average(8, rainfall, 3, smooth);
+    for (int i = 0; i < 8; i++) printf("%6.2f", smooth[i]);
+    printf("\nrms of the raw data: %.3f\n", rms(8, rainfall));
+    return 0;
+}
+```
+
+Compile each file with its own compiler and link with `gfortran`, which adds the Fortran runtime library:
+
+```bash
+gfortran -std=f2018 -Wall -c smoothing.f90
+gcc -std=c17 -Wall -c main.c
+gfortran main.o smoothing.o -o demo
+./demo
+```
+
+It printed:
+
+```text
+  6.00  5.17 10.17 12.83 11.83  7.83  6.50  9.50
+rms of the raw data: 12.199
+```
+
+Why is `name='moving_average'` needed? Because without `bind(c)`, a compiler is free to choose the linker name of a module procedure, and each compiler chooses differently. Listing the symbols of the object file with `nm` showed that GFortran 11 called the procedure `__smoothing_MOD_moving_average` when the `bind(c)` was removed, and an old-style external subroutine `old_style` became `old_style_`, with a trailing underscore. Code that calls Fortran from C by guessing such names still exists, and it breaks when the compiler changes; `bind(c)` makes the name part of the interface.
+
+Notice also that the Fortran side uses **explicit-shape** arrays, `x(n)`, which C can supply as a plain pointer. Assumed-shape arrays, `x(:)`, carry a hidden descriptor that C knows nothing about. Fortran 2018 standardised that descriptor in the C header `ISO_Fortran_binding.h`, so C code can now accept and create assumed-shape, allocatable and pointer arrays, but explicit-shape arguments remain the simplest and most widely supported choice. Inside Fortran, the matching tool is the **`contiguous`** attribute (Fortran 2008): a dummy declared `real(c_double), contiguous, intent(in) :: x(:)` is guaranteed to occupy one unbroken block of memory, so it can be handed to C; the compiler copies a strided section, such as a matrix row, into a temporary only when a caller passes one.
+
+</Section>
+
+<Section id="python" kind="examples" title="Fortran inside Python">
+
+Once a routine has a C interface, any language that can call C can call it, and that includes Python. Build a shared library from the same file:
+
+```bash
+gfortran -std=f2018 -Wall -O2 -shared -fPIC smoothing.f90 -o libsmoothing.so
+```
+
+and load it with Python's standard `ctypes` module, letting NumPy supply the arrays:
+
+```python
+# use_smoothing.py: calling the Fortran library from Python with ctypes and NumPy
+import ctypes
+import numpy as np
+
+lib = ctypes.CDLL("./libsmoothing.so")
+doubles = np.ctypeslib.ndpointer(dtype=np.float64, flags="C_CONTIGUOUS")
+lib.moving_average.argtypes = [ctypes.c_int, doubles, ctypes.c_int, doubles]
+lib.moving_average.restype = None
+lib.rms.argtypes = [ctypes.c_int, doubles]
+lib.rms.restype = ctypes.c_double
+
+rainfall = np.array([12.0, 0.0, 3.5, 27.0, 8.0, 0.5, 15.0, 4.0])
+smooth = np.empty_like(rainfall)
+lib.moving_average(rainfall.size, rainfall, 3, smooth)
+print(np.round(smooth, 2))
+print(f"rms: {lib.rms(rainfall.size, rainfall):.3f}")
+```
+
+It printed:
+
+```text
+[ 6.    5.17 10.17 12.83 11.83  7.83  6.5   9.5 ]
+rms: 12.199
+```
+
+The `argtypes` lines describe the C prototype to Python, as the `interface` block described `qsort` to Fortran; a mistake there is not caught, and usually crashes. NumPy passes pointers to its data, with no copying, so Fortran writes straight into `smooth`.
+
+For larger wrappers, NumPy ships **F2PY**, which reads Fortran source and generates a Python extension module: `python -m numpy.f2py -c smoothing.f90 -m smoothing` builds a module you can `import`, with argument checking and conversion of NumPy arrays to Fortran order when needed. (Since Python 3.12, F2PY builds with the Meson build system, which must be installed.) SciPy's low-level LAPACK wrappers, `scipy.linalg.lapack`, are generated with F2PY.
+
+</Section>
+
+<Section id="human" kind="human" title="How production codes put it together">
+
+Large simulation codes rarely use just one of these tools. The common architecture is called **MPI + X**: MPI divides the domain between nodes (the rod's halo exchange, in three dimensions and with thousands of ranks), and within each node an "X" uses the cores or the accelerator: OpenMP threads or `target` offloading, OpenACC directives, NVIDIA's CUDA Fortran, or `do concurrent` with a compiler that maps it to a GPU. Weather and climate centres have spent much of the last decade porting Fortran models to GPUs this way, and the choice is a long-term bet, because each option ties the code to particular compilers and hardware.
+
+Some habits are shared by people who do this well:
+
+- **Measure first.** Profile the serial code (with `gprof`, `perf` or a vendor tool), parallelise the loops that actually take the time, then measure **scaling** as you add cores. A code that is 7 times faster on 8 cores and 9 times faster on 64 has hit Amdahl's law or a communication bottleneck.
+- **Keep the serial build working.** Conditional compilation, `-fcoarray=single` and single-rank MPI runs let you debug the logic without parallel noise.
+- **Expect tiny differences in floating-point results.** A parallel reduction adds numbers in a different order from a serial loop, and, as <LessonLink slug="precision-and-io">the precision lesson</LessonLink> showed, floating-point addition is not associative. Compare results with tolerances, and use deterministic reductions where bit-for-bit reproducibility is required.
+- **Design interfaces for the border.** Libraries meant for other languages expose a thin `bind(c)` layer with plain types and explicit-shape arrays, keep the rich modern Fortran inside, and document which side owns each piece of memory.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"`do concurrent` makes my loop run in parallel."** It *permits* parallel execution; it does not require it. GFortran 11 runs it on one core. Its guaranteed value is that it states independence in a form the compiler can rely on and readers can check.
+
+</Misconception>
+
+<Misconception>
+
+**"If the OpenMP program gives the right answer, it has no data race."** A race may show up only with a particular number of threads, a particular machine, or one run in a thousand. The racy prime counter above came within about 1 % of the right total on one of its runs. Make sharing explicit with `default(none)` and use reductions.
+
+</Misconception>
+
+<Misconception>
+
+**"A two-dimensional array passed between C and Fortran keeps its shape."** It keeps its memory, and the two languages read memory in opposite orders: Fortran is column-major, C row-major. A C array `double a[3][4]` must be declared `a(4, 3)` in Fortran, and element `a[i][j]` in C is `a(j+1, i+1)` in Fortran. NumPy arrays are row-major unless created with `order="F"`, which is why F2PY sometimes copies them.
+
+</Misconception>
+
+<Misconception>
+
+**"`logical` and `character` work across the border like `integer`."** A default `logical` is not guaranteed to match any C type; use `logical(c_bool)` to match C's `bool`. Fortran strings have a length and no terminator; C strings have a terminator and no length. Convert explicitly at the border.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

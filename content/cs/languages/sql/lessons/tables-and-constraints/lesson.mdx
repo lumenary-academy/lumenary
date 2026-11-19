@@ -1,0 +1,323 @@
+---
+title: Tables, types and constraints
+subtitle: Defining tables that refuse bad data, and changing rows safely with INSERT, UPDATE, DELETE and upsert.
+minutes: 60
+objectives:
+  - Choose column types in standard SQL, and explain SQLite's type affinity and STRICT tables
+  - Declare primary keys, NOT NULL, UNIQUE, CHECK, DEFAULT and foreign-key constraints, and say what each one guarantees
+  - Generate keys the way SQLite, PostgreSQL and MySQL each do it
+  - Change data with INSERT, UPDATE and DELETE, use RETURNING, and write an upsert
+  - Alter and drop tables, and explain why professionals change schemas through migrations
+prerequisites: [first-steps]
+related: [math.found.functions, math.found.sets]
+references:
+  - title: "SQLite: Datatypes In SQLite"
+    url: https://www.sqlite.org/datatype3.html
+    note: Storage classes and type affinity, the part of SQLite that differs most from other databases.
+  - title: "SQLite: STRICT Tables"
+    url: https://www.sqlite.org/stricttables.html
+  - title: "SQLite: Foreign Key Support"
+    url: https://www.sqlite.org/foreignkeys.html
+    note: Including why foreign keys must be switched on with a PRAGMA.
+  - title: "SQLite: UPSERT"
+    url: https://www.sqlite.org/lang_upsert.html
+  - title: "PostgreSQL: Data Types"
+    url: https://www.postgresql.org/docs/current/datatype.html
+  - title: "PostgreSQL: Constraints"
+    url: https://www.postgresql.org/docs/current/ddl-constraints.html
+    note: A careful account of every kind of constraint, with examples.
+---
+
+<Section id="motivation" kind="motivation" title="Let the database say no">
+
+A spreadsheet will accept anything in any cell: a date in the price column, a blank where a name should be, the same customer twice with different spellings. Programs that read such data must check everything, everywhere, and they never all check the same things.
+
+A relational database can do better. When you create a table you describe not only its columns but the **rules** its rows must obey: this column is a whole number, that one may never be empty, no two members share an e-mail address, every loan belongs to a member who exists. These rules are **constraints**, and the database enforces them on every change, from every program, forever. A bug in one application cannot put a loan for a non-existent member into the table, because the database refuses the change.
+
+Experienced engineers lean on this heavily. Application code changes every week and is written by many people; the schema is the one place where a rule is stated once and cannot be bypassed. This lesson covers the statements that define tables (the **data definition language**, DDL: `CREATE`, `ALTER`, `DROP`) and those that change rows (the **data manipulation language**, DML: `INSERT`, `UPDATE`, `DELETE`).
+
+</Section>
+
+<Section id="types" kind="definitions" title="Column types">
+
+Standard SQL has a rich set of types. The ones you will use most:
+
+| Kind | Standard types | Notes |
+| --- | --- | --- |
+| Whole numbers | `SMALLINT`, `INTEGER`, `BIGINT` | 16, 32 and 64 bits in most databases |
+| Exact decimals | `NUMERIC(p, s)`, `DECIMAL(p, s)` | `p` digits in total, `s` after the point: right for money |
+| Approximate numbers | `REAL`, `DOUBLE PRECISION`, `FLOAT` | Binary floating point: fast, but `0.1 + 0.2` is not exactly `0.3` |
+| Text | `CHAR(n)`, `VARCHAR(n)` | PostgreSQL and SQLite also have unlimited `TEXT` |
+| Truth values | `BOOLEAN` | `TRUE`, `FALSE` (and `NULL`) |
+| Dates and times | `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` | Plus `INTERVAL` for durations |
+| Bytes | `BINARY`, `VARBINARY`, `BLOB` | PostgreSQL calls it `BYTEA` |
+
+PostgreSQL follows this table closely and adds many more (`UUID`, arrays, ranges, `JSONB`, network addresses). MySQL adds `TINYINT` and its own `DATETIME`, and has no separate `BOOLEAN` type (it is an alias for `TINYINT(1)`).
+
+### SQLite is different: type affinity
+
+SQLite does something unusual. Every *value* has one of five **storage classes**: `NULL`, `INTEGER`, `REAL`, `TEXT` or `BLOB`. A column's declared type is only a preference, called its **affinity**: SQLite converts a value to the preferred class when that can be done without losing information, and otherwise stores it as it is. It has no separate date or boolean types; dates are usually stored as ISO 8601 text such as `'2026-03-14'` (which sorts correctly as text) and booleans as `0` and `1`.
+
+Since version 3.37 (2021), a table declared `STRICT` enforces its types the way other databases do. The function `typeof()` shows the storage class of each value.
+
+```sql check
+.mode column
+-- An ordinary SQLite table: declared types are only preferences ("affinities").
+CREATE TABLE loose (n INTEGER, label VARCHAR(3));
+INSERT INTO loose VALUES (42, 'abc'), ('42', 'abcdef'), ('forty-two', 7), (4.0, NULL);
+SELECT n, typeof(n), label, typeof(label) FROM loose;
+
+-- A STRICT table (SQLite 3.37+) enforces the declared types.
+CREATE TABLE tight (n INTEGER, label TEXT) STRICT;
+INSERT INTO tight VALUES (42, 'abc'), ('42', 'abcdef');
+SELECT n, typeof(n), label, typeof(label) FROM tight;
+```
+
+```text
+n          typeof(n)  label   typeof(label)
+---------  ---------  ------  -------------
+42         integer    abc     text
+42         integer    abcdef  text
+forty-two  text       7       text
+4          integer            null
+n   typeof(n)  label   typeof(label)
+--  ---------  ------  -------------
+42  integer    abc     text
+42  integer    abcdef  text
+```
+
+Read the first table row by row. The text `'42'` looks like an integer, so the `INTEGER` affinity converted it. `'forty-two'` cannot be converted, so it was stored as text in an integer column. `4.0` became the integer `4`, because no information was lost. In the other column, the number `7` became the text `'7'`, because `VARCHAR` gives text affinity, and `VARCHAR(3)` happily stored six characters: SQLite does not enforce lengths. In the `STRICT` table, `'42'` is still converted (losslessly), but inserting `'forty-two'` is refused. Running that insert without `-bail` prints:
+
+```text
+Error: near line 2: stepping, cannot store TEXT value in INTEGER column tight.n (19)
+```
+
+SQLite's designers chose flexibility deliberately, and it suits a database embedded in a program that already validates its data. But if you come from PostgreSQL it is a trap, and new SQLite schemas are often declared `STRICT`. (`STRICT` tables accept only the types `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB` and `ANY`.)
+
+<Misconception>
+
+"Use a floating-point column for prices." Binary floating point cannot represent most decimal fractions exactly, so sums of prices drift by fractions of a cent, and comparisons such as `total = 30.30` fail unexpectedly. Use `NUMERIC(10, 2)` in PostgreSQL and MySQL, or store whole cents (or the smallest unit of the currency) in an integer column, as this course does in SQLite.
+
+</Misconception>
+
+</Section>
+
+<Section id="constraints" kind="definitions" title="Constraints">
+
+<Definition term="Constraint">
+
+A **constraint** is a rule attached to a table that every row must satisfy. The database checks it on every `INSERT` and `UPDATE` (and, for foreign keys, on `DELETE`) and rejects the whole statement if any row would break it.
+
+</Definition>
+
+- `NOT NULL`: the column must have a value. Most columns should be `NOT NULL`; allow a missing value only when "unknown" or "not applicable" is a real state.
+- `UNIQUE`: no two rows have equal values in this column (or this combination of columns).
+- `PRIMARY KEY`: the row's main identifier; it implies `UNIQUE`, and in standard SQL also `NOT NULL`. (SQLite, keeping an old bug for compatibility, lets a primary key that is not an `INTEGER PRIMARY KEY` hold `NULL`s unless the table is `STRICT`; add `NOT NULL` explicitly.) A table has at most one. A key of several columns is written as a table constraint: `PRIMARY KEY (course_id, student_id)`.
+- `CHECK (condition)`: an arbitrary condition on the row, such as `CHECK (qty >= 0)` or `CHECK (ends_on > starts_on)`.
+- `DEFAULT value`: not a rule but a convenience; the value used when an `INSERT` does not mention the column.
+- `REFERENCES other (column)`: a **foreign key**. Every non-null value must exist as a key in the other table. It may say what happens when the referenced row is deleted: `ON DELETE RESTRICT` (refuse, the usual default behaviour), `CASCADE` (delete the referring rows too) or `SET NULL`.
+
+Constraints can be given names with `CONSTRAINT name …`, which makes error messages clearer and lets you drop a specific constraint later.
+
+<Example title="A library's members and loans">
+
+The program creates two related tables. Note the `PRAGMA` line: SQLite, for backward compatibility, does not enforce foreign keys unless each connection switches them on. PostgreSQL and MySQL (with its default InnoDB engine) always enforce them.
+
+```sql check
+.mode column
+PRAGMA foreign_keys = ON;   -- SQLite only: enforce foreign keys on this connection
+
+CREATE TABLE member (
+  id      INTEGER PRIMARY KEY,
+  name    TEXT NOT NULL,
+  email   TEXT NOT NULL UNIQUE,
+  status  TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'suspended')),
+  CONSTRAINT email_has_at CHECK (email LIKE '%_@_%')
+);
+
+CREATE TABLE loan (
+  id         INTEGER PRIMARY KEY,
+  member_id  INTEGER NOT NULL REFERENCES member (id) ON DELETE CASCADE,
+  title      TEXT    NOT NULL,
+  due_on     TEXT    NOT NULL,
+  fine_cents INTEGER NOT NULL DEFAULT 0 CHECK (fine_cents >= 0)
+);
+
+INSERT INTO member (name, email) VALUES
+  ('Aiko Tanaka', 'aiko@example.org'),
+  ('Kwame Mensah', 'kwame@example.org');
+INSERT INTO member (name, email, status) VALUES
+  ('Lucía Romero', 'lucia@example.org', 'suspended');
+
+INSERT INTO loan (member_id, title, due_on) VALUES
+  (1, 'Kokoro', '2026-02-01'),
+  (2, 'Things Fall Apart', '2026-02-03'),
+  (2, 'Ficciones', '2026-02-10');
+
+SELECT * FROM member;
+
+-- INSERT OR IGNORE skips rows that would break a constraint (SQLite syntax).
+INSERT OR IGNORE INTO member (name, email) VALUES ('Second Aiko', 'aiko@example.org');
+SELECT changes() AS rows_inserted;
+
+-- Deleting a member cascades to their loans.
+DELETE FROM member WHERE id = 2;
+SELECT id, member_id, title FROM loan;
+```
+
+```text
+id  name          email              status
+--  ------------  -----------------  ---------
+1   Aiko Tanaka   aiko@example.org   active
+2   Kwame Mensah  kwame@example.org  active
+3   Lucía Romero  lucia@example.org  suspended
+rows_inserted
+-------------
+0
+id  member_id  title
+--  ---------  ------
+1   1          Kokoro
+```
+
+The `id` column was filled in automatically, the `status` default applied to the first two members, the duplicate e-mail was skipped (`changes()` reports how many rows the last statement changed), and deleting Kwame removed his two loans.
+
+</Example>
+
+Here is what happens when statements break the rules. A script that creates the same two tables, inserts Aiko, and then runs these five statements (lines 18 to 22 of the script) in the shell without `-bail`, so that it carries on after each error, prints one error per statement:
+
+```sql
+INSERT INTO member (name, email) VALUES ('Aiko again', 'aiko@example.org');
+INSERT INTO member (name, email) VALUES (NULL, 'nobody@example.org');
+INSERT INTO member (name, email) VALUES ('Bea', 'not-an-address');
+INSERT INTO loan (member_id, title, due_on) VALUES (99, 'Kokoro', '2026-03-01');
+INSERT INTO loan (member_id, title, due_on, fine_cents) VALUES (1, 'Kokoro', '2026-03-01', -50);
+```
+
+```text
+Error: near line 18: stepping, UNIQUE constraint failed: member.email (19)
+Error: near line 19: stepping, NOT NULL constraint failed: member.name (19)
+Error: near line 20: stepping, CHECK constraint failed: email_has_at (19)
+Error: near line 21: stepping, FOREIGN KEY constraint failed (19)
+Error: near line 22: stepping, CHECK constraint failed: fine_cents >= 0 (19)
+```
+
+The named constraint `email_has_at` produced the most readable message. In an application, the driver turns each of these into an exception your code can catch, for instance to tell a user that the e-mail address is already registered.
+
+<Misconception>
+
+"A `CHECK` constraint rejects every row where the condition is not true." It rejects only rows where the condition is *false*. If the condition is *unknown*, because it involves a `NULL`, the row is accepted: `CHECK (fine_cents >= 0)` alone would let a `NULL` fine through. That is why the example also says `NOT NULL`. The next lesson explains this three-valued logic.
+
+</Misconception>
+
+</Section>
+
+<Section id="keys" kind="human" title="Generating keys in three dialects">
+
+Most tables use a **surrogate key**: a meaningless number that the database generates, rather than a **natural key** such as an e-mail address that might change. Every database does this differently:
+
+```sql
+-- SQLite: a column declared exactly INTEGER PRIMARY KEY is an alias for the
+-- internal 64-bit rowid and is filled in automatically.
+CREATE TABLE member (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+
+-- PostgreSQL (and the standard since SQL:2003): an identity column.
+CREATE TABLE member (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name TEXT NOT NULL);
+
+-- MySQL:
+CREATE TABLE member (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(200) NOT NULL);
+```
+
+Older PostgreSQL code uses `SERIAL`, a shorthand that predates identity columns. Some systems use random **UUIDs** as keys instead, which can be generated by any machine without asking the database; the price is larger keys and, for random UUIDs, less efficient indexes.
+
+Natural keys still deserve a `UNIQUE` constraint even when a surrogate is the primary key: the member's e-mail above is not the key, but two members must not share one. A schema with surrogate keys and no uniqueness rules on the real-world identifiers fills up with duplicates.
+
+</Section>
+
+<Section id="changing-data" kind="examples" title="Changing data: INSERT, UPDATE, DELETE and upsert">
+
+The three DML statements share a shape: they name a table, and `UPDATE` and `DELETE` take a `WHERE` clause choosing which rows to change. Leave out the `WHERE` and the statement changes **every** row, which is the most common way people destroy data with SQL. A good habit is to write the `WHERE` first, run it as a `SELECT` to see which rows match, and only then turn it into an `UPDATE` or `DELETE`.
+
+`RETURNING`, supported by PostgreSQL and by SQLite since 3.35, makes a changing statement also return the rows it changed, which saves a second query. (MySQL does not support it; MariaDB supports it for `INSERT` and `DELETE`.)
+
+An **upsert** inserts a row, or updates the existing row if one with the same key is already there. SQLite (since 3.24) and PostgreSQL write it `INSERT … ON CONFLICT (key) DO UPDATE SET …`, where the pseudo-table `excluded` holds the row that could not be inserted. MySQL writes `INSERT … ON DUPLICATE KEY UPDATE …`. The standard's more general `MERGE` statement is available in PostgreSQL 15 and later, SQL Server and Oracle, but not in SQLite or MySQL.
+
+```sql check
+.mode column
+CREATE TABLE stock (
+  sku         TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  qty         INTEGER NOT NULL CHECK (qty >= 0),
+  price_cents INTEGER NOT NULL
+);
+INSERT INTO stock VALUES
+  ('TEA-01', 'Darjeeling tea, 250 g', 12, 950),
+  ('COF-07', 'Ethiopian coffee, 500 g', 4, 1480),
+  ('HON-02', 'Manuka honey, 340 g', 0, 2600);
+
+-- UPDATE changes every row that matches WHERE. RETURNING shows what changed.
+UPDATE stock SET price_cents = price_cents * 11 / 10
+WHERE sku LIKE 'TEA-%'
+RETURNING sku, price_cents;
+
+-- Upsert: insert a delivery, or add to the quantity if the SKU exists.
+INSERT INTO stock (sku, name, qty, price_cents) VALUES
+  ('COF-07', 'Ethiopian coffee, 500 g', 10, 1480),
+  ('MAT-03', 'Yerba mate, 1 kg', 6, 1250)
+ON CONFLICT (sku) DO UPDATE SET qty = qty + excluded.qty;
+
+-- DELETE removes matching rows; here, products that are sold out.
+DELETE FROM stock WHERE qty = 0 RETURNING sku;
+
+SELECT sku, qty, price_cents FROM stock ORDER BY sku;
+```
+
+```text
+sku     price_cents
+------  -----------
+TEA-01  1045
+sku
+------
+HON-02
+sku     qty  price_cents
+------  ---  -----------
+COF-07  14   1480
+MAT-03  6    1250
+TEA-01  12   1045
+```
+
+The tea's price rose by ten per cent (with integer arithmetic, 950 × 11 / 10 = 1045 exactly). The coffee delivery found an existing row and added 10 to its 4; the yerba mate was new and was inserted. The sold-out honey was deleted.
+
+Two more forms are worth knowing. `INSERT INTO … SELECT …` inserts the result of a query, which is how you copy or archive rows:
+
+```sql
+INSERT INTO loan_archive (member_id, title, due_on)
+SELECT member_id, title, due_on FROM loan WHERE due_on < '2025-01-01';
+```
+
+And an `UPDATE` may set several columns at once, each computed from the row's *old* values: `UPDATE account SET a = b, b = a` swaps two columns in standard SQL and PostgreSQL. (MySQL, unusually, evaluates the assignments left to right, so the same statement there sets both columns to `b`.)
+
+</Section>
+
+<Section id="altering" kind="human" title="Changing the schema">
+
+Tables change as applications grow. `ALTER TABLE` adds, renames and drops columns and constraints; `DROP TABLE` removes a table and its data:
+
+```sql
+ALTER TABLE member ADD COLUMN phone TEXT;
+ALTER TABLE member RENAME COLUMN phone TO phone_number;
+ALTER TABLE member DROP COLUMN phone_number;      -- SQLite 3.35+, PostgreSQL, MySQL
+DROP TABLE IF EXISTS loan_archive;
+```
+
+SQLite's `ALTER TABLE` is limited: it cannot add a constraint to an existing table or change a column's type. The documented recipe is to create a new table with the desired shape, copy the rows across with `INSERT … SELECT`, drop the old table and rename the new one, all inside a transaction. PostgreSQL can do almost everything in place (`ALTER TABLE … ALTER COLUMN … TYPE …`, `ADD CONSTRAINT …`).
+
+In professional work nobody types `ALTER TABLE` into a production database by hand. Each change is written as a numbered **migration** file, reviewed like code, kept in version control and applied by a tool (Flyway, Liquibase, Alembic for Python, the migration systems of Rails and Django, and many more) in the same order on every developer's machine, in testing and in production. Two practical lessons come with experience. First, on a big table some changes lock or rewrite the whole table, so teams learn which operations their database can do online. Second, adding a `NOT NULL` column to a table that already has rows needs a `DEFAULT` or a backfill, because existing rows must satisfy the new rule the moment it appears.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

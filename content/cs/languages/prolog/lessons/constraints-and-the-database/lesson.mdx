@@ -1,0 +1,431 @@
+---
+title: Constraints, tabling and the database
+subtitle: Arithmetic that runs in every direction and prunes the search for you, memoised predicates that survive left recursion and cycles, and facts that change while the program runs.
+minutes: 60
+objectives:
+  - Use library(clpfd) to state integer constraints with #=, #\=, #<, in and ins, and explain propagation and labelling
+  - Model puzzles, colouring and scheduling problems as constraints, and find optimal solutions with labeling/2
+  - Table predicates to make left-recursive and cyclic definitions terminate, to memoise, and to keep only the best answer
+  - Change the database with assertz/1, retract/1 and retractall/1, and explain the logical update view
+  - Decide when global state in the database is the right tool and when to pass state in arguments instead
+prerequisites: [grammars-and-parsing]
+related: [math.discrete.graph-theory, math.comp.complexity-theory]
+references:
+  - title: SWI-Prolog manual, library(clpfd)
+    url: https://www.swi-prolog.org/pldoc/man?section=clpfd
+    note: Markus Triska's constraint library for integers, with many worked examples.
+  - title: SWI-Prolog manual, tabled execution
+    url: https://www.swi-prolog.org/pldoc/man?section=tabling
+    note: Tabling, answer subsumption (mode-directed tabling) and well-founded negation.
+  - title: SWI-Prolog manual, database
+    url: https://www.swi-prolog.org/pldoc/man?section=db
+    note: assertz, retract, the logical update view, and alternatives such as global variables.
+  - title: The Power of Prolog
+    author: Markus Triska
+    url: https://www.metalevel.at/prolog
+    note: The chapters on integer arithmetic and puzzles explain why constraints are the modern way to do arithmetic in Prolog.
+  - title: Constraint logic programming (Wikipedia)
+    url: https://en.wikipedia.org/wiki/Constraint_logic_programming
+    note: The CLP scheme of Jaffar and Lassez and the systems that followed.
+---
+
+<Section id="motivation" kind="motivation" title="Three tools for real programs">
+
+Three promises are waiting from earlier lessons. <LessonLink slug="backtracking-and-search">Lesson 3</LessonLink> said that constraint programming would make the system prune a search automatically, and that **tabling** would let even a left-recursive definition run. <LessonLink slug="arithmetic-cut-negation">Lesson 5</LessonLink> said that arithmetic need not be one-directional. This lesson keeps all three, and adds a fourth tool that every practical program eventually needs: facts that change while the program runs.
+
+- **Constraints** turn arithmetic back into logic. `X + Y #= 10` is a relation, like any other Prolog predicate, and a constraint solver narrows down the possible values of `X` and `Y` *before* any search, so that whole branches of the search tree are never visited.
+- **Tabling** makes Prolog remember the answers to calls it has already made. That one change makes left recursion terminate, makes cycles in graphs harmless, turns exponential recursions into linear ones, and can even keep only the best answer.
+- **The dynamic database** lets a program add and remove clauses as it runs: a counter, a cache, a log, the current state of a game. It is powerful and easy to misuse, so the lesson ends with when to use it and when not to.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Constraint logic programming">
+
+<Definition term="Constraint">
+
+A relation between variables, such as `X #< Y` or `all_different([A, B, C])`, that the system remembers and enforces as the variables become known. In `library(clpfd)` (constraint logic programming over finite domains), the variables are integers.
+
+</Definition>
+
+The library is loaded with `:- use_module(library(clpfd)).` Its main predicates:
+
+| Goal | Meaning |
+| --- | --- |
+| `X #= Y`, `X #\= Y` | Arithmetic equality and disequality, in every direction |
+| `X #< Y`, `X #=< Y`, `X #> Y`, `X #>= Y` | Order |
+| `X in 1..9`, `[X, Y] ins 0..9` | Domains: the values a variable may take (`inf` and `sup` for no bound) |
+| `all_different(Xs)`, `all_distinct(Xs)` | Pairwise different (`all_distinct` reasons harder and prunes more) |
+| `sum(Xs, #=, S)`, `cumulative(Tasks, Options)` | Sums, and scheduling with limited resources |
+| `label(Xs)`, `labeling(Options, Xs)` | Search: try concrete values, honouring the constraints |
+| `fd_dom(X, Dom)` | The domain the solver has narrowed `X` down to |
+
+Solving with constraints always has two phases. First, posting a constraint triggers **propagation**: the solver removes from each domain the values that cannot be part of any solution, and wakes up other constraints whose variables changed, until nothing more can be removed. Propagation is fast but incomplete: it may leave several values in each domain without knowing which combinations work. Then **labelling** searches: it picks a variable, tries a value, propagates again, and backtracks on failure, exactly like the search of lesson 3, except that each choice is followed by a round of pruning.
+
+At the toplevel you can watch propagation on its own. These are SWI-Prolog 10.1's answers; whatever the solver could not settle is printed as **residual constraints**:
+
+```text
+?- X #> 3, X #< 6.
+X in 4..5.
+
+?- X * X #= 49.
+X in -7\/7.
+
+?- B + C #= 10, B - C #= 4, [B, C] ins 0..10.
+B in 4..10,
+4+C#=B,
+B+C#=10,
+C in 0..6.
+
+?- B + C #= 10, B - C #= 4, [B, C] ins 0..10, label([B, C]).
+B = 7,
+C = 3.
+```
+
+`-7\/7` means "-7 or 7". The third answer shows propagation's limits: it narrowed the domains but did not solve the two equations, because it reasons about each constraint's bounds separately. Labelling finished the job.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Constraints at work">
+
+### Reversible arithmetic and a puzzle
+
+The classic showcase is a **cryptarithm**: a sum written in letters, where each letter stands for a different digit. Here is one fitting for this course, LOGIC + LOGIC = PROLOG:
+
+```prolog check
+:- initialization(main, main).
+:- use_module(library(clpfd)).
+
+% puzzle(Letters): LOGIC + LOGIC = PROLOG, where each letter stands for a
+% different digit and no number starts with 0.
+puzzle([L, O, G, I, C, P, R]) :-
+    [L, O, G, I, C, P, R] ins 0..9,
+    all_different([L, O, G, I, C, P, R]),
+    L #\= 0,
+    P #\= 0,
+    2 * (10000*L + 1000*O + 100*G + 10*I + C) #=
+        100000*P + 10000*R + 1000*O + 100*L + 10*O + G.
+
+main :-
+    X #= 3 + 4,
+    3 #= Y + 1,
+    Z * 4 #= 28,
+    format("X = ~w, Y = ~w, Z = ~w~n", [X, Y, Z]),
+    A in 1..10,
+    A #> 7,
+    A #\= 9,
+    fd_dom(A, Dom),
+    findall(A, label([A]), As),
+    format("A in ~w, labelled: ~w~n", [Dom, As]),
+    Letters = [L, O, G, I, C, P, R],
+    puzzle(Letters),
+    format("After propagation, before search:~n"),
+    forall(member(Name-V, [l-L, o-O, g-G, i-I, c-C, p-P, r-R]),
+           ( fd_dom(V, VD), format("  ~w in ~w~n", [Name, VD]) )),
+    findall(Letters, label(Letters), Solutions),
+    format("Solutions: ~w~n", [Solutions]).
+```
+
+```text
+X = 7, Y = 2, Z = 7
+A in 8\/10, labelled: [8,10]
+After propagation, before search:
+  l in 5..9
+  o in 0\/2..9
+  g in 0\/2..8
+  i in 0\/2..9
+  c in 0\/2..9
+  p in 1..1
+  r in 0\/2..8
+Solutions: [[9,0,4,5,2,1,8]]
+```
+
+The first lines keep lesson 5's promise: `3 #= Y + 1` and `Z * 4 #= 28` simply work, where `is/2` would have raised instantiation errors. Then look at what propagation alone deduced about the puzzle. Twice a five-digit number is a six-digit number only if it is at least 100,000, so the leading `P` must be 1, and `L` must be at least 5. Because `P` is 1, no other letter can be 1, which is why 1 has vanished from every other domain. The solver worked all this out from the constraints, before trying a single digit. The search then found the only solution, 90452 + 90452 = 180904.
+
+Notice the shape of `puzzle/1`: it **states** the problem and does no searching. The search happens in `main`, through `label/1`. Keeping the model and the search apart is the central habit of constraint programming: you can test the model, count solutions, or switch search strategies without touching it.
+
+### Colouring and scheduling
+
+Here is lesson 3's map of East Africa again, now with constraints, and a small scheduling problem: preparing a shared meal in a kitchen with two burners, finishing as early as possible.
+
+```prolog check
+:- initialization(main, main).
+:- use_module(library(clpfd)).
+
+% colouring(Colours): Kenya, Uganda, Tanzania, Rwanda and Burundi get
+% colours 1, 2 or 3, and neighbours differ (the map of lesson 3).
+colouring([K, U, T, R, B]) :-
+    [K, U, T, R, B] ins 1..3,
+    K #\= U, K #\= T, U #\= T, U #\= R, T #\= R, R #\= B, T #\= B.
+
+% kitchen(Plan, End): start times in minutes for cooking a shared meal,
+% as Task-Start pairs, served and finished at End.
+kitchen(Plan, End) :-
+    Plan = [soak-Soak, beans-Beans, chop-Chop, stew-Stew,
+            rice-Rice, plantain-Plantain, serve-Serve],
+    pairs_values(Plan, Starts),
+    Starts ins 0..200,
+    Beans #>= Soak + 30,          % the beans soak for 30 minutes first
+    Stew #>= Chop + 20,           % chopping (20 minutes) comes before
+    Plantain #>= Chop + 20,       % the stew and the plantain
+    Serve #>= Beans + 45,
+    Serve #>= Stew + 35,
+    Serve #>= Rice + 25,
+    Serve #>= Plantain + 15,
+    End #= Serve + 10,
+    % Two burners: at most two stove tasks at any moment.
+    cumulative([task(Beans, 45, _, 1, beans), task(Stew, 35, _, 1, stew),
+                task(Rice, 25, _, 1, rice), task(Plantain, 15, _, 1, plantain)],
+               [limit(2)]),
+    labeling([min(End)], Starts).
+
+main :-
+    colouring(Map),
+    label(Map),
+    format("First colouring: ~w~n", [Map]),
+    aggregate_all(count, (colouring(M), label(M)), N),
+    format("Number of colourings: ~w~n", [N]),
+    kitchen(Plan, End),
+    transpose_pairs(Plan, ByStart),
+    format("Shortest plan, finished at minute ~w:~n", [End]),
+    forall(member(Start-Task, ByStart),
+           format("  ~t~w~4| ~w~n", [Start, Task])).
+```
+
+```text
+First colouring: [1,2,3,1,2]
+Number of colourings: 6
+Shortest plan, finished at minute 85:
+   0 soak
+   0 chop
+   0 rice
+  20 stew
+  30 beans
+  55 plantain
+  75 serve
+```
+
+The colouring finds the same first answer and the same six solutions as lesson 3's generate-and-test, but the work is organised differently: after Kenya gets colour 1, propagation immediately removes 1 from Uganda's and Tanzania's domains, so those branches are never even generated. On five countries the difference hardly shows; on large maps, timetables and rosters, it is the difference between a program that finishes and one that does not.
+
+The kitchen is a genuine optimisation problem in a few lines. Precedences are inequalities between start times. `cumulative/2` takes tasks of the form `task(Start, Duration, End, Resource, Id)` and ensures that the resources in use never exceed the limit: here, each stove task needs one of two burners. `labeling([min(End)], Starts)` makes the first plan it reports one with the smallest possible `End`. It gets there by **branch and bound**: whenever it finds a plan, it demands a strictly better one, until none exists. The answer, 85 minutes, is provably optimal, since the beans alone need 30 + 45 minutes of soaking and cooking before the 10 minutes of serving. `transpose_pairs/2` flips `Task-Start` pairs to `Start-Task` and sorts them, to print the plan in time order.
+
+Labelling options matter for hard problems. `ff` ("first fail") labels the variable with the smallest domain first, which tends to find dead ends early; `down` tries values from largest to smallest; `bisect` splits domains in half instead of trying values one by one. Choosing the model and the labelling strategy is most of the craft of constraint programming. SWI-Prolog also ships `library(clpb)` for Boolean constraints and `library(clpqr)` for linear constraints over rationals and reals.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Tabling">
+
+<Definition term="Tabling">
+
+A declaration, `:- table Name/Arity.`, that makes Prolog record every call to the predicate and every answer it finds, in a table. A repeated call (one that is a variant of an earlier call) is answered from the table instead of being run again, and calls that depend on themselves are evaluated until no new answers appear.
+
+</Definition>
+
+Tabling changes Prolog's execution from plain depth-first search to something closer to how a database computes a query: it keeps working until the set of answers reaches a **fixed point**. This program uses it three ways.
+
+```prolog check
+:- initialization(main, main).
+
+% link(A, B): a direct train from A to B. Note the cycle back to lisbon.
+link(lisbon, porto).
+link(porto, madrid).
+link(madrid, lisbon).
+link(madrid, lyon).
+
+% reachable(A, B): the left-recursive definition from lesson 3, now tabled.
+:- table reachable/2.
+reachable(A, B) :- reachable(A, C), link(C, B).
+reachable(A, B) :- link(A, B).
+
+% road(A, B, Km): roads in Ghana, usable in both directions, with
+% illustrative distances.
+road(accra, kumasi, 250).
+road(accra, cape_coast, 145).
+road(cape_coast, kumasi, 220).
+road(kumasi, tamale, 380).
+road(cape_coast, takoradi, 75).
+road(takoradi, kumasi, 240).
+
+way(A, B, D) :- road(A, B, D).
+way(A, B, D) :- road(B, A, D).
+
+% distance(A, B, D): D is the length of the shortest route from A to B.
+% The table keeps only the minimum D for each pair A, B.
+:- table distance(_, _, min).
+distance(A, B, D) :- way(A, B, D).
+distance(A, B, D) :-
+    distance(A, C, D1),
+    way(C, B, D2),
+    D is D1 + D2.
+
+% fib(N, F): the N-th Fibonacci number, with tabling as memoisation.
+:- table fib/2.
+fib(0, 0).
+fib(1, 1).
+fib(N, F) :-
+    N > 1,
+    N1 is N - 1,
+    N2 is N - 2,
+    fib(N1, F1),
+    fib(N2, F2),
+    F is F1 + F2.
+
+main :-
+    findall(X, reachable(lisbon, X), Xs),
+    sort(Xs, Reachable),
+    format("Reachable from lisbon: ~w~n", [Reachable]),
+    forall(member(To, [kumasi, takoradi, tamale]),
+           ( distance(accra, To, D),
+             format("accra to ~w: ~w km~n", [To, D]) )),
+    fib(100, F),
+    format("fib(100) = ~w~n", [F]).
+```
+
+```text
+Reachable from lisbon: [lisbon,lyon,madrid,porto]
+accra to kumasi: 250 km
+accra to takoradi: 220 km
+accra to tamale: 630 km
+fib(100) = 354224848179261915075
+```
+
+- **Left recursion and cycles.** `reachable/2` is the definition that overflowed the stack in lesson 3, now on a graph that even has a cycle (Lisbon, Porto, Madrid, Lisbon). With `:- table reachable/2.`, the recursive call `reachable(lisbon, C)` is recognised as a repeat of the call in progress, so instead of recursing forever, Prolog feeds it the answers found so far and keeps going until no new ones appear. Lisbon is reachable from itself, round the cycle. Answers from a table come in no promised order, so the program sorts them.
+- **The best answer only.** `:- table distance(_, _, min).` is **mode-directed tabling** (also called answer subsumption): for each pair of towns the table keeps only the smallest distance found. Lesson 3 had to collect every route and sort them to find the shortest; here the table does it, cycles and all. Accra to Takoradi is 220 km through Cape Coast, and the direct road from Accra to Kumasi beats both detours.
+- **Memoisation.** Without tabling, `fib/2` recomputes the same values exponentially many times, and `fib(100)` would not finish in your lifetime. With tabling, each `fib(K, _)` is computed once: the work is linear.
+
+Tabling was developed in the 1980s and 1990s, notably by Hisao Tamaki and Taisuke Sato (who described the method in 1986) and by David S. Warren's group at Stony Brook, whose XSB system made it practical. It also gives a sound meaning to negation in recursive programs, the **well-founded semantics**, which SWI-Prolog supports through `tnot/1`. The cost is memory: tables keep every answer, so use tabling where repeated or recursive calls actually occur. Tabled execution is closely related to how Datalog engines evaluate rules, a connection <LessonLink slug="project-puzzle-solver">lesson 8</LessonLink> returns to.
+
+</Section>
+
+<Section id="human" kind="human" title="The dynamic database">
+
+So far a program's clauses have been fixed when the file was loaded. Prolog can also change them while running:
+
+| Goal | Effect |
+| --- | --- |
+| `:- dynamic stock/2.` | Declares that `stock/2` may change at run time (and exists even with no clauses) |
+| `assertz(Clause)`, `asserta(Clause)` | Adds a clause at the end, or at the start, of its predicate |
+| `retract(Clause)` | Removes the first clause that unifies with `Clause`; on backtracking, the next |
+| `retractall(Head)` | Removes every clause whose head unifies with `Head` |
+
+```prolog check
+:- initialization(main, main).
+
+% stock(Item, Count): what is in the pantry right now.
+:- dynamic stock/2.
+stock(rice, 10).
+stock(beans, 4).
+
+% log(Event): a record of what happened, added as the program runs.
+:- dynamic log/1.
+
+% take(Item, N): remove N of Item, if there are enough.
+take(Item, N) :-
+    stock(Item, Have),
+    Have >= N,
+    retract(stock(Item, Have)),
+    Left is Have - N,
+    assertz(stock(Item, Left)),
+    assertz(log(took(Item, N))).
+
+% add(Item, N): add N of Item, creating the entry if it is new.
+add(Item, N) :-
+    (   retract(stock(Item, Have))
+    ->  New is Have + N
+    ;   New = N
+    ),
+    assertz(stock(Item, New)),
+    assertz(log(added(Item, N))).
+
+show :-
+    findall(I-C, stock(I, C), Pairs),
+    format("  stock: ~w~n", [Pairs]).
+
+main :-
+    show,
+    take(rice, 3),
+    add(onions, 6),
+    add(beans, 2),
+    (   take(beans, 10)
+    ->  true
+    ;   format("  not enough beans for 10~n")
+    ),
+    show,
+    findall(E, log(E), Events),
+    format("  log: ~w~n", [Events]),
+    % Changes to the database are not undone by backtracking.
+    (   assertz(log(tried)), fail
+    ;   true
+    ),
+    aggregate_all(count, log(_), N),
+    format("  log entries after a failed branch: ~w~n", [N]),
+    % The logical update view: this loop sees only the clauses that
+    % existed when it started, so it does not run forever.
+    forall(stock(I, C), ( C2 is C * 2, assertz(stock(I, C2)) )),
+    aggregate_all(count, stock(_, _), S),
+    format("  stock clauses after the doubling loop: ~w~n", [S]),
+    retractall(log(_)),
+    aggregate_all(count, log(_), L),
+    format("  log entries after retractall: ~w~n", [L]).
+```
+
+```text
+  stock: [rice-10,beans-4]
+  not enough beans for 10
+  stock: [rice-7,onions-6,beans-6]
+  log: [took(rice,3),added(onions,6),added(beans,2)]
+  log entries after a failed branch: 4
+  stock clauses after the doubling loop: 6
+  log entries after retractall: 0
+```
+
+Three behaviours here differ from everything else in Prolog, and each is a trap if you forget it:
+
+1. **No undo on backtracking.** Bindings are undone when Prolog backtracks; database changes are not. The `assertz(log(tried))` in the failed branch stayed, which is why there are four log entries. A predicate that asserts and then fails leaves its changes behind, so assert only after the decisions are made, as `take/2` does: it checks the stock first and changes it last.
+2. **Order changes.** `take/2` and `add/2` remove a clause and add a new one at the end, so `beans` moved behind `onions`. If the order of facts matters, the program has to manage it.
+3. **The logical update view.** A goal that is iterating over a predicate sees the clauses as they were when it started. The doubling loop added three new `stock` facts while running through `stock/2`, but did not visit them, so it ended instead of doubling forever. The ISO standard requires this behaviour, and it makes such loops predictable.
+
+### When to use the database
+
+Experienced Prolog programmers use `assert` sparingly, because global state breaks the properties that make Prolog code easy to reason about: a predicate that reads dynamic facts can give different answers at different times, cannot be tested in isolation and does not undo its effects on failure. In rough order of preference:
+
+- **Pass state in arguments.** A counter, an accumulator or the state of a simulation threads naturally through recursion, as in <LessonLink slug="recursion-and-lists">lesson 4</LessonLink>. It is faster, too: asserting a clause means compiling it.
+- **Use tabling** rather than a hand-made cache of asserted results. It handles recursion and cycles correctly, which a hand-made cache usually does not.
+- **Use the database for what really is a database**: facts loaded from a file at startup, configuration, a knowledge base that a long-running server updates. SWI-Prolog's `library(persistency)` keeps such facts in a file across runs, and global variables (`b_setval/2`, `nb_setval/2`) cover the occasional global flag.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Constraints solve the problem when you post them."** Posting constraints only propagates, which may leave many values possible. You must call `label/1` or `labeling/2` to get concrete solutions, and you should check that every variable you print has been labelled.
+
+</Misconception>
+
+<Misconception>
+
+**"clpfd is only for puzzles."** Puzzles make good examples, but the same techniques schedule exams, staff rosters and factory machines, and constraint solvers are used in industry for exactly these problems. Many Prolog programmers also use `#=` instead of `is` for everyday integer arithmetic, because it keeps predicates working in more directions.
+
+</Misconception>
+
+<Misconception>
+
+**"Tabling is just memoisation."** It is memoisation plus a way of completing recursive calls to a fixed point, which is why it makes left recursion and cyclic graphs terminate. Plain memoisation with `assert` would still loop on them.
+
+</Misconception>
+
+<Misconception>
+
+**"assert is Prolog's assignment."** It changes the program, globally and permanently, not a variable. Most code that uses it as assignment is clearer, faster and safer when the value is passed as an argument instead.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Try each question before opening the hints. Every answer about program output was checked by running the program with SWI-Prolog 10.1.
+
+<Exercises/>
+
+</Section>

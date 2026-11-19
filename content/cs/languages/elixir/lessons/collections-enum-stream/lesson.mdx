@@ -1,0 +1,370 @@
+---
+title: Collections, Enum and Stream
+subtitle: Lists, tuples, keyword lists and maps, the Enum toolkit that processes them, comprehensions, and lazy streams for data too big to hold.
+minutes: 55
+objectives:
+  - Choose between lists, tuples, keyword lists, maps and MapSets by what each makes cheap
+  - Read and update nested data with `Map`, the update syntax, and `put_in`/`update_in`
+  - Process collections with the most-used `Enum` functions, including `reduce`
+  - Write comprehensions with several generators, filters, `into:` and `reduce:`
+  - Explain when a lazy `Stream` beats an eager `Enum` pipeline, and show the difference
+prerequisites: [functions-and-modules]
+references:
+  - title: The Enum module
+    url: https://hexdocs.pm/elixir/Enum.html
+    note: Over a hundred functions for any enumerable, each with examples.
+  - title: The Stream module
+    url: https://hexdocs.pm/elixir/Stream.html
+    note: Lazy counterparts of Enum functions, and generators such as iterate, unfold and resource.
+  - title: "Getting started: Enumerables and streams"
+    url: https://hexdocs.pm/elixir/enumerable-and-streams.html
+    note: The official chapter contrasting eager and lazy processing.
+  - title: "Getting started: Comprehensions"
+    url: https://hexdocs.pm/elixir/comprehensions.html
+    note: Generators, filters, `into:` and bitstring generators.
+  - title: "Getting started: Keyword lists and maps"
+    url: https://hexdocs.pm/elixir/keywords-and-maps.html
+    note: When to use each, and nested data structures.
+---
+
+<Section id="motivation" kind="motivation" title="Data in, data out">
+
+Much of a working programmer's day is spent reshaping data: take a list of orders, keep the paid ones, group them by country, add up the totals, sort, and show the top five. In languages with mutable collections you often write that as a loop that updates several variables at once. In Elixir you write it as a **pipeline** of small transformations, each returning a new collection, with the `Enum` module doing the work.
+
+This lesson has three parts. First, the collection types and what each one is good at, because choosing the right one matters for both clarity and speed. Second, `Enum` and comprehensions, the everyday tools. Third, `Stream`, which runs the same kind of pipeline *lazily*, one element at a time, so you can process a log file larger than memory or an infinite sequence.
+
+</Section>
+
+<Section id="collections" kind="definitions" title="Choosing a collection">
+
+| Type | Literal | Cheap | Expensive | Typical use |
+| --- | --- | --- | --- | --- |
+| list | `[1, 2, 3]` | add or remove at the front | index, length, append at end | sequences you walk from the start |
+| tuple | `{:ok, 1, "a"}` | read any element | any change (copies it) | fixed groups of a few values, tagged results |
+| keyword list | `[timeout: 500, retry: true]` | small, ordered, duplicate keys allowed | lookup in long lists | options passed to functions |
+| map | `%{id: 7, name: "Ana"}` | lookup, insert, update by key | none for typical sizes | records, indexes, counters |
+| MapSet | `MapSet.new([1, 2])` | membership, union, intersection | | sets of unique values |
+
+A **list** is a linked list: each cell holds a value and a pointer to the rest. That is why `[x | list]` is instant while `list ++ [x]` copies the whole list. Getting the 10,000th element means walking past 9,999 others. A **tuple** stores its elements side by side in memory, so `elem(tuple, 2)` is instant, but changing one element copies the whole tuple; keep tuples small. **Maps** are the general-purpose key-value structure; small ones are sorted arrays, and above 32 keys they switch to a hash array mapped trie, so lookups stay fast at any size.
+
+**Keyword lists** look like maps but are just lists of two-element tuples whose first element is an atom: `[timeout: 500]` is `[{:timeout, 500}]`. They keep their order and allow duplicate keys, which makes them right for options (`String.split(s, ",", trim: true)`) and for DSLs such as database queries, and wrong for storing data you look up often.
+
+```elixir check
+langs = ["Elixir", "Erlang"]
+langs = ["Gleam" | langs]
+IO.inspect(langs)
+IO.inspect(langs ++ ["LFE"])
+IO.inspect(Enum.at(langs, 1))
+
+opts = [timeout: 500, retries: 3, timeout: 900]
+IO.inspect(opts[:timeout])
+IO.inspect(Keyword.get_values(opts, :timeout))
+
+user = %{name: "Ana", city: "Porto", tags: []}
+IO.inspect(user.name)
+IO.inspect(user[:email])
+IO.inspect(Map.get(user, :email, "none"))
+IO.inspect(Map.fetch(user, :city))
+
+user = %{user | city: "Braga"}
+user = Map.put(user, :email, "ana@example.org")
+user = Map.update!(user, :tags, &["admin" | &1])
+IO.inspect(user)
+
+library = %{shelves: %{a: %{books: 12}, b: %{books: 7}}}
+library = update_in(library.shelves.b.books, &(&1 + 1))
+IO.inspect(get_in(library, [:shelves, :b, :books]))
+
+seen = MapSet.new(["kiwi", "fig", "kiwi"])
+IO.inspect(MapSet.member?(seen, "fig"))
+IO.inspect(MapSet.size(seen))
+```
+
+It prints:
+
+```text
+["Gleam", "Elixir", "Erlang"]
+["Gleam", "Elixir", "Erlang", "LFE"]
+"Elixir"
+500
+[500, 900]
+"Ana"
+nil
+"none"
+{:ok, "Porto"}
+%{name: "Ana", city: "Braga", tags: ["admin"], email: "ana@example.org"}
+8
+true
+2
+```
+
+Some rules of thumb follow from this output. Use `map.key` when the key **must** exist (it raises `KeyError` otherwise, catching typos early) and `map[key]` or `Map.get/3` when it is optional. The update syntax `%{user | city: "Braga"}` likewise only updates keys that already exist; use `Map.put/3` to add a new one. `Map.fetch/2` returns a tagged tuple, `{:ok, value}` or `:error`, so you can tell "missing" apart from "present but `nil`". And `put_in`, `update_in` and `get_in` reach into nested data without unpacking every level by hand; the dotted path `library.shelves.b.books` works when every key is an atom known to exist.
+
+</Section>
+
+<Section id="enum" kind="examples" title="The Enum toolkit">
+
+`Enum` works on anything that implements the `Enumerable` protocol: lists, maps (as `{key, value}` tuples), ranges, MapSets and streams. Here is a realistic pipeline over some invented sales figures for a cooperative of small farms:
+
+```elixir check
+sales = [
+  %{farm: "Kiambu", crop: :coffee, kg: 420, paid: true},
+  %{farm: "Huila", crop: :coffee, kg: 610, paid: true},
+  %{farm: "Sidama", crop: :coffee, kg: 380, paid: false},
+  %{farm: "Assam", crop: :tea, kg: 900, paid: true},
+  %{farm: "Kericho", crop: :tea, kg: 750, paid: true},
+  %{farm: "Uji", crop: :tea, kg: 120, paid: false}
+]
+
+paid = Enum.filter(sales, & &1.paid)
+IO.puts("paid deliveries: #{length(paid)}")
+IO.puts("total paid kg: #{Enum.sum_by(paid, & &1.kg)}")
+
+paid
+|> Enum.group_by(& &1.crop, & &1.kg)
+|> Enum.map(fn {crop, kgs} -> {crop, Enum.sum(kgs)} end)
+|> Enum.sort()
+|> IO.inspect(label: "kg by crop")
+
+sales
+|> Enum.max_by(& &1.kg)
+|> Map.fetch!(:farm)
+|> IO.inspect(label: "largest delivery")
+
+sales
+|> Enum.sort_by(& &1.kg, :desc)
+|> Enum.take(3)
+|> Enum.map(& &1.farm)
+|> IO.inspect(label: "top three")
+
+IO.inspect(Enum.frequencies_by(sales, & &1.crop), label: "deliveries per crop")
+IO.inspect(Enum.chunk_every(1..7, 3), label: "chunks", charlists: :as_lists)
+IO.inspect(Enum.zip(["a", "b", "c"], [1, 2, 3]), label: "zip")
+IO.inspect(Enum.with_index(["x", "y"], 1), label: "indexed")
+
+{evens, odds} = Enum.split_with(1..10, &(rem(&1, 2) == 0))
+IO.inspect({evens, odds}, label: "split")
+
+running = Enum.scan([5, 3, 8, 1], &+/2)
+IO.inspect(running, label: "running total")
+
+longest =
+  Enum.reduce(sales, nil, fn
+    sale, nil -> sale
+    sale, best -> if sale.kg > best.kg, do: sale, else: best
+  end)
+
+IO.inspect(longest.farm, label: "via reduce")
+```
+
+It prints:
+
+```text
+paid deliveries: 4
+total paid kg: 2680
+kg by crop: [coffee: 1030, tea: 1650]
+largest delivery: "Assam"
+top three: ["Assam", "Kericho", "Huila"]
+deliveries per crop: %{coffee: 3, tea: 3}
+chunks: [[1, 2, 3], [4, 5, 6], [7]]
+zip: [{"a", 1}, {"b", 2}, {"c", 3}]
+indexed: [{"x", 1}, {"y", 2}]
+split: {[2, 4, 6, 8, 10], [1, 3, 5, 7, 9]}
+running total: [5, 8, 16, 17]
+via reduce: "Assam"
+```
+
+A few notes:
+
+- `& &1.paid` is the capture shorthand for `fn sale -> sale.paid end`, which you will see constantly in pipelines. `Enum.sum_by/2` (added in Elixir 1.18) maps and sums in one pass.
+- `group_by/3` takes a key function and, optionally, a value function. The result is a map from each key to a list of values.
+- `kg by crop: [coffee: 1030, tea: 1650]` is a list of `{atom, integer}` tuples, which `IO.inspect` prints in keyword-list syntax because that is exactly what such a list is.
+- The `charlists: :as_lists` option is there because of the charlist confusion from <LessonLink slug="values-and-pattern-matching">lesson 2</LessonLink>: without it, the last chunk `[7]` prints as `~c"\a"`, since 7 is the code point of the invisible "bell" character and `IO.inspect` guesses that a list of printable code points is text.
+- `Enum.reduce/3` is the general tool underneath almost everything else: it walks the collection carrying an accumulator. When a more specific function exists (`max_by`, `sum`, `frequencies`), prefer it; it says what you mean. Reach for `reduce` when you need to compute several things in one pass or the shape is unusual.
+
+Every `Enum` function is **eager**: it walks the whole input and builds the whole output before the next step starts. That is simple and fast for the collections that fit comfortably in memory, which is most of them.
+
+</Section>
+
+
+<Section id="comprehensions" kind="examples" title="Comprehensions">
+
+The `for` special form, a **comprehension**, combines mapping, filtering and nested iteration in one expression. Each `x <- collection` is a *generator*; a plain boolean expression is a *filter*; the result is a list unless you ask for something else with `into:`.
+
+```elixir check
+squares = for n <- 1..20, rem(n, 3) == 0, do: n * n
+IO.inspect(squares, label: "squares of multiples of 3")
+
+pairs = for x <- [:a, :b], y <- 1..3, do: {x, y}
+IO.inspect(pairs, label: "pairs")
+
+results = [{:ok, 3}, {:error, :late}, {:ok, 9}]
+IO.inspect(for({:ok, v} <- results, do: v), label: "only the oks")
+
+prices = %{"tea" => 250, "bread" => 120, "jam" => 480}
+discounted = for {item, cents} <- prices, into: %{}, do: {item, div(cents * 90, 100)}
+IO.inspect(discounted, label: "10% off")
+
+by_length =
+  for word <- String.split("the quick brown fox jumps"), reduce: %{} do
+    acc -> Map.update(acc, String.length(word), [word], &[word | &1])
+  end
+
+IO.inspect(by_length, label: "by length")
+
+triples =
+  for a <- 1..20, b <- a..20, c <- b..20, a * a + b * b == c * c, do: {a, b, c}
+
+IO.inspect(triples, label: "Pythagorean triples")
+```
+
+It prints:
+
+```text
+squares of multiples of 3: [9, 36, 81, 144, 225, 324]
+pairs: [a: 1, a: 2, a: 3, b: 1, b: 2, b: 3]
+only the oks: [3, 9]
+10% off: %{"bread" => 108, "jam" => 432, "tea" => 225}
+by length: %{3 => ["fox", "the"], 5 => ["jumps", "brown", "quick"]}
+Pythagorean triples: [{3, 4, 5}, {5, 12, 13}, {6, 8, 10}, {8, 15, 17}, {9, 12, 15}, {12, 16, 20}]
+```
+
+Several generators nest like loops inside loops: for each `x`, every `y`. Later generators can use earlier variables, which is how `b <- a..20` avoids listing each triangle twice. Two features make comprehensions more than syntax sugar. **Patterns in generators filter**: `{:ok, v} <- results` silently skips the elements that do not match, exactly what you want when collecting successes. And **`reduce:`** turns the comprehension into a fold, with the accumulator matched by the `acc ->` clause; here it builds a map from word length to words.
+
+Be careful when piping out of a one-line comprehension. When we first wrote this example, we put `|> IO.inspect(label: "squares of multiples of 3")` on the line after `for n <- 1..20, rem(n, 3) == 0, do: n * n`. Elixir read the pipe as part of the `do:` expression, so it piped each `n * n` into `IO.inspect` *inside* the loop and printed six separate lines. Binding the result to a variable first, as above, removes the ambiguity.
+
+</Section>
+
+<Section id="choosing" kind="human" title="Enum, for, or recursion?">
+
+You now have three ways to walk a collection, and newcomers often ask which one is "right". Experienced Elixir developers tend to follow a simple order of preference.
+
+**First, a named `Enum` function.** If the job is "keep the paid orders", write `Enum.filter`; if it is "count each kind", write `Enum.frequencies_by`. A reader who knows the library understands the intent instantly, and the implementation is already tested and tuned. It is worth spending ten minutes reading the list of functions in the [Enum documentation](https://hexdocs.pm/elixir/Enum.html) once; you will recognise opportunities to use them for years.
+
+**Second, a comprehension**, when you need several generators, pattern filtering, or a different output collection (`into: %{}` for a map, `into: MapSet.new()` for a set). Comprehensions also shine with binaries: `for <<byte <- data>>, do: ...` walks a binary byte by byte.
+
+**Third, `Enum.reduce/3`**, when you must compute something no specific function covers, or several results in one pass over a large collection.
+
+**Last, explicit recursion**, when the iteration does not fit any of the above: walking two lists in step with different rules, parsing tokens where each step decides how much input to consume, or a process loop that waits for messages. Recursion is the foundation everything else is built on, but in application code it is the tool for unusual shapes.
+
+Whichever you choose, think about the cost of each step. `Enum` functions that produce lists walk the input once and allocate a new list; a pipeline of five of them walks the data five times. That is almost always fine. When a profiler says otherwise, fuse steps into one `reduce`, or switch to `Stream` and let the consumer pull elements through all the steps at once.
+
+</Section>
+
+<Section id="streams" kind="computation" title="Lazy streams">
+
+A **stream** is a description of a computation that has not run yet. Functions in the `Stream` module, such as `Stream.map/2` and `Stream.filter/2`, do no work when you call them; they wrap the input in a recipe. The work happens only when something *consumes* the stream: an `Enum` function, a comprehension, or `Stream.run/1`. Then each element travels through every step before the next element starts.
+
+The difference is easiest to see with side effects:
+
+```elixir check
+double = fn x ->
+  IO.puts("  doubling #{x}")
+  x * 2
+end
+
+IO.puts("Enum (eager):")
+[1, 2, 3] |> Enum.map(double) |> Enum.each(&IO.puts("  got #{&1}"))
+
+IO.puts("Stream (lazy):")
+[1, 2, 3] |> Stream.map(double) |> Enum.each(&IO.puts("  got #{&1}"))
+
+IO.puts("Infinite sequences:")
+
+collatz =
+  Stream.iterate(27, fn
+    n when rem(n, 2) == 0 -> div(n, 2)
+    n -> 3 * n + 1
+  end)
+
+steps = collatz |> Stream.take_while(&(&1 != 1)) |> Enum.count()
+IO.puts("  27 reaches 1 after #{steps} steps")
+
+fibs = Stream.unfold({0, 1}, fn {a, b} -> {a, {b, a + b}} end)
+IO.inspect(Enum.take(fibs, 12), label: "  fibonacci")
+
+shifts = Enum.zip(["Wanjiru", "Mateo", "Yuki", "Omar"], Stream.cycle([:am, :pm]))
+IO.inspect(shifts, label: "  rota")
+
+first_three =
+  1..100_000_000
+  |> Stream.map(&(&1 * 3))
+  |> Stream.filter(&(rem(&1, 7) == 0))
+  |> Enum.take(3)
+
+IO.inspect(first_three, label: "  multiples of 21")
+```
+
+It prints:
+
+```text
+Enum (eager):
+  doubling 1
+  doubling 2
+  doubling 3
+  got 2
+  got 4
+  got 6
+Stream (lazy):
+  doubling 1
+  got 2
+  doubling 2
+  got 4
+  doubling 3
+  got 6
+Infinite sequences:
+  27 reaches 1 after 111 steps
+  fibonacci: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+  rota: [{"Wanjiru", :am}, {"Mateo", :pm}, {"Yuki", :am}, {"Omar", :pm}]
+  multiples of 21: [21, 42, 63]
+```
+
+With `Enum`, all three doublings happen before any result is printed, because `Enum.map` builds a complete intermediate list. With `Stream`, each element is doubled and immediately printed. That changes what is possible:
+
+- **Infinite sequences.** `Stream.iterate/2` produces a value, then applies the function to it forever; `Stream.unfold/2` does the same while letting you carry hidden state (here the pair of the last two Fibonacci numbers); `Stream.cycle/1` repeats a list endlessly. They are only safe because the consumer (`take_while`, `take`, `zip` with a finite list) stops pulling.
+- **Early exit.** The last pipeline touches only the first 21 numbers of a range of a hundred million, because `Enum.take(3)` stops asking once it has three results. The eager version would build two lists of tens of millions of elements first.
+- **Bounded memory.** `File.stream!("big.log")` reads a file line by line, so a pipeline over it uses the same memory for a 10 MB file as for a 10 GB one. `Stream.resource/3` wraps any external source (a paginated API, a database cursor) the same way.
+
+Streams are not free: each element pays a little bookkeeping for every step, so for small in-memory collections an `Enum` pipeline is usually faster. The professional habit is to start with `Enum`, and switch to `Stream` when the data is large, unbounded, or comes from outside the program. In <LessonLink slug="processes-and-messages">Processes and messages</LessonLink> you will meet `Task.async_stream/3`, which runs each element's work in its own process, in parallel, with the same lazy shape.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common mistakes">
+
+<Misconception>
+
+**"`list ++ [item]` in a loop is fine."** Appending copies the whole left-hand list, so doing it once per element makes the loop quadratic. Prepend with `[item | list]` and reverse once at the end, or let `Enum.map`, a comprehension or `Enum.reduce` build the list for you.
+
+</Misconception>
+
+<Misconception>
+
+**"Maps keep the order I inserted."** They do not, and the printed order can change between Elixir and Erlang versions or with the number of keys. If order matters, sort when you present the data, or keep a list (or a keyword list) alongside.
+
+</Misconception>
+
+<Misconception>
+
+**"Streams are always faster because they are lazy."** Laziness saves work only when you can skip elements or avoid building big intermediate collections. For a few thousand items fully consumed, plain `Enum` is simpler and typically quicker.
+
+</Misconception>
+
+<Misconception>
+
+**"`Enum.each` returns the list, so I can keep piping."** `Enum.each/2` exists for side effects and returns the atom `:ok`. If you want to look at values and carry on, use `tap/2` or `IO.inspect/2`, which return their input.
+
+</Misconception>
+
+<Misconception>
+
+**"`Enum.count(list) > 0` is a fine emptiness test."** It walks the entire list just to learn whether there is a first element. Match on `[]` versus `[_ | _]`, or call `Enum.empty?/1`, which stops at the first element. The same goes for `length(list) == 0`.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

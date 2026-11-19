@@ -1,0 +1,340 @@
+---
+title: Indexes and query plans
+subtitle: How B-tree indexes turn scans into searches, how to design composite, covering, expression and partial indexes, and how to read the plan a database chooses.
+minutes: 60
+objectives:
+  - Explain how a B-tree index finds rows in logarithmic time, and what an index costs
+  - Read SQLite's EXPLAIN QUERY PLAN and recognise SCAN, SEARCH, covering indexes and temporary B-trees
+  - Design composite indexes using the leftmost-prefix rule, and covering indexes that avoid reading the table
+  - Recognise conditions an index cannot use, and fix them with rewrites, expression indexes or partial indexes
+  - Read PostgreSQL's EXPLAIN and EXPLAIN ANALYZE output, and describe how professionals find and fix slow queries
+prerequisites: [window-functions]
+related: [math.comp.algorithms-and-efficiency, math.found.order-theory]
+references:
+  - title: "SQLite: EXPLAIN QUERY PLAN"
+    url: https://www.sqlite.org/eqp.html
+  - title: "SQLite: Query Planning"
+    url: https://www.sqlite.org/queryplanner.html
+    note: An exceptionally clear explanation of tables, indexes, covering indexes and sorting, with diagrams.
+  - title: "SQLite: Indexes On Expressions"
+    url: https://www.sqlite.org/expridx.html
+  - title: "SQLite: Partial Indexes"
+    url: https://www.sqlite.org/partialindex.html
+  - title: "PostgreSQL: Indexes"
+    url: https://www.postgresql.org/docs/current/indexes.html
+    note: B-tree, hash, GiST, GIN, BRIN and the rules for multicolumn, partial and expression indexes.
+  - title: "PostgreSQL: Using EXPLAIN"
+    url: https://www.postgresql.org/docs/current/using-explain.html
+  - title: Use The Index, Luke
+    author: Markus Winand
+    url: https://use-the-index-luke.com/
+    note: A free online book on SQL indexing for developers, covering several databases.
+---
+
+<Section id="motivation" kind="motivation" title="Finding one row among millions">
+
+So far every query has run on tables of a few rows, where any method is instant. Real tables hold millions or billions of rows. If the only way to find one sensor's readings is to read every row of the table and test it, then each query's cost grows with the size of the whole table, however few rows it returns. A web page that runs ten such queries becomes slower every week as the data grows, until one day it times out.
+
+An **index** is a separate data structure that keeps some columns of a table in sorted order, with a pointer back to each row, so that the database can jump to the rows it needs. Indexes are the single most important tool for making SQL fast, and choosing them well is a large part of what database-savvy engineers do. Because SQL is declarative, adding an index never changes a query's result, only how the database computes it; the database's **query planner** decides, for each query, whether an index helps. Your job is to give it the right indexes and to read its decisions, which every database will show you on request.
+
+</Section>
+
+<Section id="b-trees" kind="intuition" title="B-trees: sorted, shallow and wide">
+
+<Analogy>
+
+An index at the back of a book lists terms in alphabetical order, each with the pages where it appears. To find "photosynthesis" you do not read the whole book; you open the index near the P's, narrow down in a few glances, and turn to the pages listed. A database index is the same idea, with one difference: it stays sorted automatically as rows are inserted, changed and deleted.
+
+</Analogy>
+
+Almost every relational database implements indexes as **B-trees** (more precisely B+trees). A B-tree is a balanced search tree whose nodes are disk pages of several kilobytes, so each node holds hundreds of keys and the tree is very wide and very shallow. With a few hundred keys per node, three or four levels reach millions of rows: finding a key takes a handful of page reads, about $\log_{b} n$ for branching factor $b$, rather than a scan of all $n$ rows. The leaves are linked in key order, so after finding the first matching key, the database can walk forward through a whole range (`BETWEEN`, `<`, `ORDER BY`) cheaply.
+
+In SQLite each ordinary table is itself a B-tree keyed by its `rowid` (the `INTEGER PRIMARY KEY`), and each index is another B-tree holding the indexed columns plus the `rowid`. A lookup through an index is therefore two searches: one in the index to find the `rowid`s, then one in the table for each row. PostgreSQL stores table rows in an unordered "heap" and its indexes point into it; MySQL's InnoDB stores each table as a B-tree on its primary key, much like SQLite. The details differ, but the costs behave alike.
+
+Indexes are not free. Each one takes space, and every `INSERT`, `DELETE`, and `UPDATE` of an indexed column must update every index on the table. A table with fifteen indexes is slow to write to. Index what your queries need, not every column "just in case".
+
+</Section>
+
+<Section id="eqp" kind="computation" title="Asking SQLite for its plan">
+
+Put `EXPLAIN QUERY PLAN` in front of a statement and SQLite prints the plan it would use instead of running it. The words to look for are **SCAN** (read every row of a table or index) and **SEARCH** (use a B-tree to jump to the matching rows). The program below generates 100,000 made-up sensor readings with a recursive CTE, then compares plans before and after creating an index.
+
+```sql check
+-- 100,000 made-up readings from 50 sensors, generated with a recursive CTE.
+CREATE TABLE reading (
+  id        INTEGER PRIMARY KEY,
+  sensor_id INTEGER NOT NULL,
+  taken_at  TEXT    NOT NULL,
+  celsius   REAL    NOT NULL
+);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000)
+INSERT INTO reading (sensor_id, taken_at, celsius)
+SELECT i % 50 + 1,
+       datetime('2026-01-01', '+' || (i * 7) || ' minutes'),
+       round(15 + (i * 37 % 200) / 10.0, 1)
+FROM n;
+
+SELECT count(*), min(taken_at), max(taken_at) FROM reading;
+
+-- Without an index on sensor_id, finding one sensor's readings means scanning.
+EXPLAIN QUERY PLAN
+SELECT taken_at, celsius FROM reading WHERE sensor_id = 7;
+
+-- Looking up the primary key is always a search of the table's own B-tree.
+EXPLAIN QUERY PLAN
+SELECT taken_at, celsius FROM reading WHERE id = 4242;
+
+CREATE INDEX reading_sensor ON reading (sensor_id);
+
+EXPLAIN QUERY PLAN
+SELECT taken_at, celsius FROM reading WHERE sensor_id = 7;
+
+SELECT count(*) FROM reading WHERE sensor_id = 7;
+```
+
+```text
+100000|2026-01-01 00:07:00|2027-05-02 02:40:00
+QUERY PLAN
+`--SCAN reading
+QUERY PLAN
+`--SEARCH reading USING INTEGER PRIMARY KEY (rowid=?)
+QUERY PLAN
+`--SEARCH reading USING INDEX reading_sensor (sensor_id=?)
+2000
+```
+
+Before the index, the only way to find sensor 7 was `SCAN reading`: all 100,000 rows read to return 2,000. The primary-key lookup was a `SEARCH` from the start, because the table is a B-tree on `id`. After `CREATE INDEX`, the same query became a `SEARCH … USING INDEX reading_sensor (sensor_id=?)`; the `?` shows which conditions the index is used for. On a table this size the difference is a few milliseconds; on a billion-row table it is the difference between a millisecond and minutes.
+
+</Section>
+
+<Section id="composite" kind="definitions" title="Composite and covering indexes">
+
+<Definition term="Composite index and the leftmost-prefix rule">
+
+A **composite** (multi-column) index sorts rows by its first column, then by the second within equal first values, and so on, like a phone book sorted by surname and then given name. The database can use it for conditions on a **leftmost prefix** of its columns: the first column, or the first and second, and so on. Equality conditions on the earlier columns can be followed by one range condition on the next.
+
+</Definition>
+
+<Definition term="Covering index">
+
+An index **covers** a query when every column the query needs is in the index. The database can then answer from the index alone, without visiting the table at all, which saves one search per row.
+
+</Definition>
+
+```sql check
+-- 100,000 made-up readings from 50 sensors, generated with a recursive CTE.
+CREATE TABLE reading (
+  id        INTEGER PRIMARY KEY,
+  sensor_id INTEGER NOT NULL,
+  taken_at  TEXT    NOT NULL,
+  celsius   REAL    NOT NULL
+);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000)
+INSERT INTO reading (sensor_id, taken_at, celsius)
+SELECT i % 50 + 1,
+       datetime('2026-01-01', '+' || (i * 7) || ' minutes'),
+       round(15 + (i * 37 % 200) / 10.0, 1)
+FROM n;
+
+-- One composite index serves several query shapes.
+CREATE INDEX reading_sensor_time ON reading (sensor_id, taken_at);
+
+-- 1. Both columns, equality then range: a narrow search.
+EXPLAIN QUERY PLAN
+SELECT celsius FROM reading
+WHERE sensor_id = 7 AND taken_at >= '2026-03-01' AND taken_at < '2026-04-01';
+
+-- 2. The leftmost column alone: still usable.
+EXPLAIN QUERY PLAN
+SELECT count(*) FROM reading WHERE sensor_id = 7;
+
+-- 3. Only the second column: the index is sorted by sensor first, so no search.
+EXPLAIN QUERY PLAN
+SELECT count(*) FROM reading WHERE taken_at >= '2026-03-01' AND taken_at < '2026-03-02';
+
+-- 4. Sorting: the index already holds each sensor's rows in time order.
+EXPLAIN QUERY PLAN
+SELECT taken_at, celsius FROM reading WHERE sensor_id = 7 ORDER BY taken_at DESC LIMIT 5;
+
+-- 5. Sorting by a column the index does not cover needs a temporary B-tree.
+EXPLAIN QUERY PLAN
+SELECT taken_at, celsius FROM reading WHERE sensor_id = 7 ORDER BY celsius DESC LIMIT 5;
+```
+
+```text
+QUERY PLAN
+`--SEARCH reading USING INDEX reading_sensor_time (sensor_id=? AND taken_at>? AND taken_at<?)
+QUERY PLAN
+`--SEARCH reading USING COVERING INDEX reading_sensor_time (sensor_id=?)
+QUERY PLAN
+`--SCAN reading USING COVERING INDEX reading_sensor_time
+QUERY PLAN
+`--SEARCH reading USING INDEX reading_sensor_time (sensor_id=?)
+QUERY PLAN
+|--SEARCH reading USING INDEX reading_sensor_time (sensor_id=?)
+`--USE TEMP B-TREE FOR ORDER BY
+```
+
+Read the five plans in turn:
+
+1. Equality on `sensor_id`, then a range on `taken_at`: the index narrows to one sensor and, within it, one month. (SQLite prints both `>=` and `>` as `>` in the plan.)
+2. `sensor_id` alone is a leftmost prefix, so the index works. And because `count(*)` needs no other columns, the index **covers** the query: SQLite never touches the table.
+3. A condition on `taken_at` alone cannot use the index to search, because within the index a given date appears once per sensor, scattered across fifty places. SQLite still chose to **scan the whole index** (it is smaller than the table and covers the query), but a scan is a scan: the cost grows with the table. If such queries matter, they need an index that starts with `taken_at`.
+4. For one sensor, the index already holds rows in `taken_at` order, so `ORDER BY taken_at DESC LIMIT 5` reads the last five entries backwards and stops. No sort at all.
+5. Ordering by `celsius` is not something the index provides, so SQLite must collect the sensor's rows and sort them: `USE TEMP B-TREE FOR ORDER BY`. That line is worth noticing in plans of queries that run often.
+
+The order of columns in a composite index is therefore a design decision. A good rule of thumb: columns tested with equality first, then the column used for ranges or sorting. An index on `(sensor_id, taken_at)` serves "sensor 7 in March, newest first"; an index on `(taken_at, sensor_id)` would not do that nearly as well.
+
+</Section>
+
+<Section id="sargable" kind="examples" title="Conditions an index can use">
+
+An index on `email` is sorted by `email`. A condition such as `lower(email) = 'user42@example.org'` asks about a *different* value, `lower(email)`, which the index does not hold in order, so the database must compute it for every row. Conditions that an index can serve are called **sargable** (from "search argument"). Common ways to make a condition unusable:
+
+- wrapping the column in a function or calculation: `lower(email) = …`, `substr(taken_at, 1, 7) = '2026-03'`, `price_cents / 100 > 20`;
+- a `LIKE` pattern with a leading wildcard: `LIKE '%gmail.com'` (a prefix such as `LIKE 'User4%'` can use an index in principle, though SQLite does so only when the index and the `LIKE` agree on case sensitivity);
+- comparing with a value of a different type, which forces a conversion of the column in some databases.
+
+The fixes are to rewrite the condition so the bare column is compared (`taken_at >= '2026-03-01' AND taken_at < '2026-04-01'` instead of `substr(…)`), or to index the expression itself. A **partial index**, with a `WHERE` clause, indexes only the rows that a frequent query needs, which keeps it small.
+
+```sql check
+CREATE TABLE account (
+  id      INTEGER PRIMARY KEY,
+  email   TEXT NOT NULL,
+  country TEXT NOT NULL,
+  status  TEXT NOT NULL            -- 'active', 'closed' or 'flagged'
+);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+INSERT INTO account (email, country, status)
+SELECT 'User' || i || '@Example.org',
+       CASE i % 4 WHEN 0 THEN 'GH' WHEN 1 THEN 'IN' WHEN 2 THEN 'MX' ELSE 'VN' END,
+       CASE WHEN i % 499 = 0 THEN 'flagged' WHEN i % 7 = 0 THEN 'closed' ELSE 'active' END
+FROM n;
+
+CREATE INDEX account_email ON account (email);
+
+-- A function wrapped around the column hides it from the index.
+EXPLAIN QUERY PLAN SELECT id FROM account WHERE lower(email) = 'user42@example.org';
+
+-- An index on the expression itself fixes that.
+CREATE INDEX account_email_lower ON account (lower(email));
+EXPLAIN QUERY PLAN SELECT id FROM account WHERE lower(email) = 'user42@example.org';
+
+-- A partial index covers only the rows a hot query needs: here, the rare flagged ones.
+CREATE INDEX account_flagged ON account (country) WHERE status = 'flagged';
+EXPLAIN QUERY PLAN SELECT id FROM account WHERE status = 'flagged' AND country = 'GH';
+SELECT count(*) AS flagged_in_ghana FROM account WHERE status = 'flagged' AND country = 'GH';
+
+-- ANALYZE gathers statistics that help the planner choose between indexes.
+ANALYZE;
+SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY idx;
+```
+
+```text
+QUERY PLAN
+`--SCAN account USING COVERING INDEX account_email
+QUERY PLAN
+`--SEARCH account USING INDEX account_email_lower (<expr>=?)
+QUERY PLAN
+`--SEARCH account USING INDEX account_flagged (country=?)
+10
+account|account_email|20000 1
+account|account_email_lower|20000 1
+account|account_flagged|40 10
+```
+
+With `lower(email)`, SQLite scanned the whole `account_email` index, computing `lower()` on 20,000 entries. The index on the expression `lower(email)` turned that into a search (`<expr>=?`). The partial index holds only the 40 flagged accounts, so it is tiny, yet it serves the query exactly, because the query's `WHERE` implies the index's. Finally, `ANALYZE` stored statistics in the table `sqlite_stat1`: for each index, the number of rows and the average number of rows per distinct key. The planner uses them to estimate how selective each index is. PostgreSQL gathers similar statistics automatically (its autovacuum daemon runs `ANALYZE`), and stale statistics are a classic reason for a plan that suddenly turns bad after a large data load.
+
+</Section>
+
+<Section id="postgres-plans" kind="human" title="Plans in PostgreSQL, and how professionals tune">
+
+Every database has its own `EXPLAIN`. PostgreSQL's shows a tree of plan nodes with cost estimates, and `EXPLAIN ANALYZE` actually runs the query and adds what really happened. Here is what PostgreSQL 16 printed for the sensor query on a similar 100,000-row table, before and after creating the index on `sensor_id`:
+
+```text
+                          QUERY PLAN
+--------------------------------------------------------------
+ Seq Scan on reading  (cost=0.00..1986.00 rows=2027 width=14)
+   Filter: (sensor_id = 7)
+(2 rows)
+
+                                   QUERY PLAN
+---------------------------------------------------------------------------------
+ Bitmap Heap Scan on reading  (cost=24.00..785.34 rows=2027 width=14)
+   Recheck Cond: (sensor_id = 7)
+   ->  Bitmap Index Scan on reading_sensor  (cost=0.00..23.50 rows=2027 width=0)
+         Index Cond: (sensor_id = 7)
+(4 rows)
+```
+
+A **Seq Scan** is PostgreSQL's full scan. After the index, it chose a **bitmap** plan: first collect the locations of all matching rows from the index, then read the table pages in physical order. The `cost` numbers are the planner's estimates in arbitrary units, and `rows=2027` is its guess (the true count is 2,000). Adding a condition on time and asking for `EXPLAIN (ANALYZE, COSTS OFF)` shows real figures:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT taken_at, celsius FROM reading
+WHERE sensor_id = 7 AND taken_at < '2026-01-15';
+```
+
+```text
+                                       QUERY PLAN
+----------------------------------------------------------------------------------------
+ Bitmap Heap Scan on reading (actual time=0.173..0.741 rows=58 loops=1)
+   Recheck Cond: (sensor_id = 7)
+   Filter: (taken_at < '2026-01-15 00:00:00'::timestamp without time zone)
+   Rows Removed by Filter: 1942
+   Heap Blocks: exact=735
+   ->  Bitmap Index Scan on reading_sensor (actual time=0.092..0.092 rows=2000 loops=1)
+         Index Cond: (sensor_id = 7)
+ Planning Time: 0.025 ms
+ Execution Time: 0.750 ms
+(9 rows)
+```
+
+The timings depend on the machine, but the shape is the lesson: the index found 2,000 rows, then `Rows Removed by Filter: 1942` shows that 97% of the work was thrown away, because the index does not include `taken_at`. A composite index on `(sensor_id, taken_at)` would find the 58 rows directly. "Rows removed by filter" after an index scan, and estimated rows wildly different from actual rows, are the two first things experienced engineers look for. MySQL's `EXPLAIN` (and `EXPLAIN ANALYZE` since 8.0.18) presents similar information in a table or tree.
+
+How professionals actually tune a database:
+
+- **Measure first.** Find the queries that use the most total time, not the ones that look slow. PostgreSQL's `pg_stat_statements` extension and MySQL's slow query log record exactly this.
+- **Index for the workload.** Start with primary keys and foreign keys (which joins search), then add composite indexes for the most frequent filters and sorts. Check each new index with `EXPLAIN` against real queries.
+- **Remove what is unused.** PostgreSQL's statistics views show how often each index is scanned; an index never used still costs on every write.
+- **Change data and indexes carefully.** Building an index on a large table can lock it; PostgreSQL offers `CREATE INDEX CONCURRENTLY` to avoid blocking writes.
+
+Beyond B-trees, databases offer specialised indexes: hash indexes for pure equality, PostgreSQL's GIN for JSON documents, arrays and full-text search, GiST for geometric data, BRIN for huge tables ordered by time, and SQLite's FTS5 module for full-text search.
+
+</Section>
+
+<Section id="history" kind="history" title="Where B-trees and planners came from">
+
+The B-tree was invented by Rudolf Bayer and Edward McCreight while they worked at Boeing's research laboratories; their paper on organising large ordered indexes appeared in 1972. Its insight was to match the data structure to the hardware: disks read whole blocks at a time, so a tree whose nodes fill a block, and which therefore needs very few levels, beats a binary tree that needs a disk read per comparison. Half a century later the same reasoning applies to memory pages and caches, and B-trees remain the default index in SQLite, PostgreSQL, MySQL, SQL Server and Oracle.
+
+The other half of this lesson, the query planner, also traces back to IBM's System R. A 1979 paper by Patricia Selinger and colleagues described choosing among access paths and join orders by *estimating the cost* of each from statistics about the data, and picking the cheapest. Essentially every relational database still works this way. It is what makes SQL's declarative promise real: you describe the result, and decades of engineering in the planner decide how to compute it, using whatever indexes you have provided.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions about indexes">
+
+<Misconception>
+
+"An index on every column makes everything fast." Separate single-column indexes rarely serve multi-column conditions well (a database typically uses one index per table access, though PostgreSQL can combine several with bitmaps), and each index slows every write. A few well-chosen composite indexes beat many single-column ones.
+
+</Misconception>
+
+<Misconception>
+
+"The database will always use my index." The planner uses an index only when it estimates that it is cheaper. For a condition that matches a large fraction of the table (`status = 'active'` when 85% of accounts are active), reading the table sequentially is faster than tens of thousands of index lookups, and a good planner will scan. Low-selectivity columns make poor index leaders, which is exactly why the partial index above indexes only the rare `flagged` rows.
+
+</Misconception>
+
+<Misconception>
+
+"Indexes change results." They never change *what* a query returns, only how fast. They can, however, change the *order* of rows returned by a query without `ORDER BY`, which is one more reason to always write `ORDER BY` when order matters.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

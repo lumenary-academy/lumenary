@@ -1,0 +1,360 @@
+---
+title: Modules, packages, errors and tests
+subtitle: Organising code into modules, managing reproducible environments with Pkg, handling errors, testing with the Test library, and a tour of the package ecosystem.
+minutes: 65
+objectives:
+  - Write modules with export and public, and use using, import and qualified names correctly
+  - Create and manage project environments with Project.toml and Manifest.toml, and explain compat bounds
+  - Throw, catch and define exceptions, and decide when to return nothing instead
+  - Write unit tests with @test, @test_throws and @testset, and lay out a package's tests
+  - Name the main packages of the scientific ecosystem and what each is for
+prerequisites: [performance]
+references:
+  - title: Julia manual, Modules
+    url: https://docs.julialang.org/en/v1/manual/modules/
+    note: Namespaces, export and public, using and import, and submodules.
+  - title: Pkg.jl documentation
+    url: https://pkgdocs.julialang.org/
+    note: Environments, compatibility bounds, creating packages and registries.
+  - title: Unit Testing (the Test standard library)
+    url: https://docs.julialang.org/en/v1/stdlib/Test/
+    note: Every test macro, test sets and how pkg> test runs a package's tests.
+  - title: Julia manual, Control Flow (exception handling)
+    url: https://docs.julialang.org/en/v1/manual/control-flow/
+    note: throw, try, catch, finally and the built-in exception types.
+  - title: Documenter.jl
+    url: https://documenter.juliadocs.org/stable/
+    note: The documentation generator used by nearly every Julia package, including Julia itself.
+---
+
+<Section id="motivation" kind="motivation" title="From scripts to software">
+
+Everything so far has fitted in a single file. Real projects do not: a research group's simulation code grows to dozens of files, depends on a handful of packages, is shared with collaborators, and has to produce the same results next year as it does today. The tools for this are not glamorous, but they are what separates a script that worked once from software that people trust.
+
+Julia's answers are compact. **Modules** give code its own namespace. **Packages** are modules with a little metadata, and **Pkg**, built into Julia, records exactly which versions of which packages a project uses, so that anyone can recreate the environment. **Exceptions** report what went wrong, and the **Test** standard library checks that code keeps doing what it should. This lesson takes each in turn, then surveys the packages that make Julia useful for science.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Modules">
+
+```julia check
+# A module is a separate namespace. In a package it would live in src/Geo.jl.
+module Geo
+
+export Place, distance_km          # brought into scope by `using Geo`
+public EARTH_RADIUS_KM             # part of the API, but must be qualified (Julia 1.11+)
+
+const EARTH_RADIUS_KM = 6371.0
+
+struct Place
+    name::String
+    lat::Float64                   # degrees
+    lon::Float64
+end
+
+# Great-circle distance by the haversine formula
+function distance_km(a::Place, b::Place)
+    φ1, φ2 = deg2rad(a.lat), deg2rad(b.lat)
+    Δφ, Δλ = φ2 - φ1, deg2rad(b.lon - a.lon)
+    h = sin(Δφ / 2)^2 + cos(φ1) * cos(φ2) * sin(Δλ / 2)^2
+    return 2 * EARTH_RADIUS_KM * asin(sqrt(h))
+end
+
+helper() = "internal"              # neither exported nor public: an implementation detail
+
+end # module Geo
+
+using .Geo                         # the dot means "a module defined here, not a package"
+
+quito = Place("Quito", -0.18, -78.47)
+nairobi = Place("Nairobi", -1.29, 36.82)
+println(round(Int, distance_km(quito, nairobi)), " km from ", quito.name, " to ", nairobi.name)
+
+println(Geo.EARTH_RADIUS_KM)       # public names are used with the module's name
+println(Geo.helper())              # internal names are reachable too, but not promised to stay
+println("public names: ", names(Geo))          # exported and public names
+println("public? ", Base.ispublic(Geo, :EARTH_RADIUS_KM), " ", Base.ispublic(Geo, :helper))
+
+# import brings in a specific name, and lets you add methods to it
+import .Geo: distance_km
+distance_km(a::Place, b::Place, c::Place) = distance_km(a, b) + distance_km(b, c)
+lima = Place("Lima", -12.05, -77.04)
+println(round(Int, distance_km(lima, quito, nairobi)), " km from Lima via Quito to Nairobi")
+```
+
+It prints:
+
+```text
+12818 km from Quito to Nairobi
+6371.0
+internal
+public names: [:EARTH_RADIUS_KM, :Geo, :Place, :distance_km]
+public? true false
+14148 km from Lima via Quito to Nairobi
+```
+
+<Definition term="Module">
+
+A **module** is a separate global namespace, written `module Name ... end`. Names defined inside it do not clash with names elsewhere. `export` lists names that `using` brings into the user's scope; `public` (Julia 1.11 and later) marks names that belong to the module's supported interface without bringing them into scope, so users write them qualified, as `Geo.EARTH_RADIUS_KM`.
+
+</Definition>
+
+The ways of loading a module differ in what they bring into scope:
+
+| Statement | Effect |
+| --- | --- |
+| `using Geo` | the module name `Geo` and all its exported names |
+| `using Geo: Place` | only `Place` (and not even the name `Geo`) |
+| `import Geo` | only the name `Geo`; everything is written `Geo.name` |
+| `import Geo: distance_km` | the name `distance_km`, which you may then extend with new methods |
+
+The dot in `using .Geo` means the module was defined in the current file or module, rather than being an installed package. Inside a package, a large module is usually split across several files that the main file pulls in with `include("geometry.jl")`; `include` simply evaluates a file's contents in place, so the files share the module's namespace.
+
+Two names in the output are worth pausing on. `names(Geo)` lists the public interface (exported and `public` names, plus the module's own name), and `helper` is not in it. But `Geo.helper()` still worked: Julia has no truly private names. The convention is that anything neither exported nor declared `public` is an internal detail that may change in any release, and code that depends on it does so at its own risk. `Base.ispublic` lets tools check.
+
+Extending a function from another module requires either `import` of that name, as at the end of the program, or qualifying the method definition, as in `Geo.distance_km(...) = ...`. Without one of them, a definition such as `distance_km(a, b, c) = ...` after a plain `using` does *not* add a method to Geo's function. On Julia 1.13 it quietly creates a new, unrelated function called `distance_km` in your own module, which hides the imported one; the two-argument calls inside it then fail with a `MethodError`, because the new function has only a three-argument method. (Julia versions before 1.12 refused such a definition with an error once the name had been used.) When a `MethodError` says a function you know has a method lacks it, check whether you shadowed it this way.
+
+</Section>
+
+<Section id="computation" kind="computation" title="Packages and environments">
+
+A **package** is a module that lives in a directory with a particular layout and a `Project.toml` file. Typing `generate Thermo` in package mode creates the smallest possible one, a folder `Thermo` holding `Project.toml` and `src/Thermo.jl`, and a typical package grows into this shape:
+
+```text
+Thermo/
+├── Project.toml        name, unique id (UUID), version, dependencies, compat bounds
+├── Manifest.toml       exact versions of every dependency (usually only for applications)
+├── src/
+│   ├── Thermo.jl       module Thermo ... include("units.jl") ... end
+│   └── units.jl
+├── test/
+│   └── runtests.jl     run by pkg> test
+└── docs/               Documenter.jl sources
+```
+
+Many Julia developers create packages with the PkgTemplates.jl package instead, which also sets up continuous integration, a licence and documentation.
+
+### Environments
+
+An **environment** is a set of packages at particular versions, described by two files:
+
+- **`Project.toml`** lists the packages you asked for directly, and, for a package, its `[compat]` section: the range of versions of each dependency it is known to work with, such as `DataFrames = "1.6"`, meaning any 1.x version from 1.6 on, following semantic versioning.
+- **`Manifest.toml`** records the exact version (and source) of *every* package in the environment, including dependencies of dependencies. Commit it to version control for an application, a paper's analysis code or a course, and anyone can rebuild exactly the same environment with `instantiate`.
+
+The everyday commands, typed after `]`:
+
+```text
+pkg> activate .           # use the environment in the current directory (creates it on first add)
+pkg> add CSV DataFrames   # add packages, resolving compatible versions
+pkg> status               # what is installed
+pkg> instantiate          # install exactly what Manifest.toml lists
+pkg> update               # move to the newest versions the compat bounds allow
+pkg> test                 # run test/runtests.jl of the active package
+```
+
+From a terminal, `julia --project=. script.jl` runs a script in the environment of the current directory. Professionals give **every project its own environment** and keep the default `@v1.13` environment almost empty, perhaps with Revise and BenchmarkTools, because a shared environment slowly accumulates conflicting version requirements.
+
+Packages are installed from **registries**. The **General** registry holds the community's registered open-source packages, more than ten thousand of them; companies often run private registries alongside it. Registering a new version of a package is automated: a bot checks it and merges it into the registry.
+
+</Section>
+
+<Section id="human" kind="human" title="Errors">
+
+Julia reports problems with **exceptions**, values whose types are subtypes of `Exception`, such as `ArgumentError`, `DomainError`, `BoundsError`, `KeyError`, `MethodError` and `DivideError`. `throw(e)` raises one; `error("message")` is shorthand for throwing an `ErrorException`.
+
+```julia check
+# Errors: throwing, catching and defining your own exception types
+
+struct SensorError <: Exception
+    raw::String
+    reason::String
+end
+Base.showerror(io::IO, e::SensorError) = print(io, "bad reading \"", e.raw, "\": ", e.reason)
+
+function parse_celsius(raw::AbstractString)
+    value = tryparse(Float64, strip(raw))          # nothing if it is not a number
+    value === nothing && throw(SensorError(raw, "not a number"))
+    value < -273.15 && throw(SensorError(raw, "below absolute zero"))
+    return value
+end
+
+readings = ["21.5", " 19.0 ", "n/a", "-300", "23.25"]
+good = Float64[]
+for raw in readings
+    try
+        push!(good, parse_celsius(raw))
+    catch err
+        err isa SensorError || rethrow()            # only handle the errors we expect
+        println("skipped: ", sprint(showerror, err))
+    end
+end
+println("kept ", good, ", mean ", sum(good) / length(good))
+
+# finally always runs, whether or not an error happened
+function careful_divide(a, b)
+    try
+        return a ÷ b
+    catch err
+        println("caught ", typeof(err))
+        return nothing
+    finally
+        println("finished dividing $a by $b")
+    end
+end
+println(careful_divide(7, 2))
+println(careful_divide(7, 0))
+
+# error() throws a plain ErrorException with a message
+try
+    error("configuration file is missing the key \"steps\"")
+catch err
+    println(typeof(err), ": ", err.msg)
+end
+```
+
+It prints:
+
+```text
+skipped: bad reading "n/a": not a number
+skipped: bad reading "-300": below absolute zero
+kept [21.5, 19.0, 23.25], mean 21.25
+finished dividing 7 by 2
+3
+caught DivideError
+finished dividing 7 by 0
+nothing
+ErrorException: configuration file is missing the key "steps"
+```
+
+The pieces:
+
+- **A custom exception type** is just a struct that subtypes `Exception`. Adding a `showerror` method gives it a clear message wherever it is displayed.
+- **`try ... catch err ... end`** catches any exception thrown inside the `try` block. Julia has no syntax for catching only certain types, so the idiom is to test the type and **`rethrow()`** anything you did not expect. Swallowing every exception hides real bugs.
+- **`finally`** runs whether the block finished normally, returned early or threw, which makes it the place to release resources. (For files, the `do`-block form of `open` does this for you.)
+- **`tryparse`** returns `nothing` instead of throwing when the text is not a number. Many Base functions come in pairs like this, `parse` and `tryparse`, `getindex` and `get`.
+
+**When to throw and when to return `nothing`.** Exceptions are for situations the caller did not expect and usually cannot handle locally: a malformed configuration file, an argument outside a function's domain. A result that may legitimately be absent, such as "the first negative number, if any", is better returned as `nothing` (giving a return type like `Union{Float64, Nothing}`), so the caller must handle both cases. Exceptions are also relatively slow in Julia, so do not use them for ordinary control flow inside hot loops.
+
+</Section>
+
+<Section id="examples-testing" kind="examples" title="Testing">
+
+The **Test** standard library provides everything most projects need:
+
+```julia check
+# Unit tests with the Test standard library
+using Test
+
+function parse_celsius(raw::AbstractString)
+    value = tryparse(Float64, strip(raw))
+    value === nothing && throw(ArgumentError("not a number: $raw"))
+    value < -273.15 && throw(DomainError(value, "below absolute zero"))
+    return value
+end
+
+celsius_to_kelvin(c) = c + 273.15
+
+@testset "temperatures" begin
+    @testset "parsing" begin
+        @test parse_celsius("21.5") == 21.5
+        @test parse_celsius("  -4 ") == -4.0
+        @test_throws ArgumentError parse_celsius("n/a")
+        @test_throws DomainError parse_celsius("-300")
+    end
+    @testset "conversion" begin
+        @test celsius_to_kelvin(0) ≈ 273.15
+        @test celsius_to_kelvin(-273.15) ≈ 0 atol = 1e-12
+        for c in (-40.0, 0.0, 37.0, 100.0)
+            @test celsius_to_kelvin(c) > 0
+        end
+    end
+end
+```
+
+It printed:
+
+```text
+Test Summary: | Pass  Total  Time
+temperatures  |   10     10  0.4s
+```
+
+(The time column will differ on your machine.)
+
+- **`@test expr`** passes if `expr` is `true`. On failure it records the expression and, since Julia 1.13, the evaluated arguments of every function call in it, which makes failures easy to read.
+- **`@test a ≈ b atol = 1e-12`** compares approximately, with an absolute tolerance when comparing with zero, where a purely relative tolerance cannot work.
+- **`@test_throws T expr`** passes if `expr` throws an exception of type `T`.
+- **`@testset "name" begin ... end`** groups tests and prints a summary. A failing test inside a test set does not stop the others; at the end, the set reports the failures and the program exits with an error, which is what makes continuous integration fail.
+
+In a package, tests live in `test/runtests.jl`, usually as a list of `@testset`s that `include` one file per area, and `pkg> test` runs them in a fresh environment. Most open-source Julia packages run their tests on GitHub Actions for several Julia versions and operating systems on every pull request. Two further habits are common: **doctests**, examples in docstrings that Documenter.jl runs and compares with their shown output, and the **Aqua.jl** package, which checks a package for problems such as method ambiguities, type piracy and missing compat bounds.
+
+Documentation itself starts with **docstrings**: a string literal placed immediately before a definition becomes its documentation, shown by `?name` in the REPL.
+
+```julia
+"""
+    celsius_to_kelvin(c)
+
+Convert a temperature in degrees Celsius to kelvin.
+"""
+celsius_to_kelvin(c) = c + 273.15
+```
+
+</Section>
+
+<Section id="reading" kind="reading" title="A tour of the ecosystem">
+
+You now know enough to use any registered package. Here are the ones you are most likely to meet in scientific and technical work, as of late 2026. None of them is part of the standard library, so the examples in this course do not use them; install them with `] add` in a project environment.
+
+| Area | Packages | What they do |
+| --- | --- | --- |
+| Tables and data | DataFrames.jl, CSV.jl, Arrow.jl | in-memory tables with split-apply-combine, fast file reading and writing |
+| Plotting | Plots.jl, Makie.jl, AlgebraOfGraphics.jl | a unified interface over several back ends; a fast, GPU-capable plotting system; a grammar of graphics on Makie |
+| Differential equations | DifferentialEquations.jl and the SciML organisation | ODEs, SDEs, DAEs and more, with dozens of solvers; ModelingToolkit.jl for symbolic models |
+| Optimisation | JuMP.jl, Optim.jl | mathematical programming with many solvers; general nonlinear optimisation |
+| Machine learning | Flux.jl, Lux.jl, MLJ.jl | neural networks; explicit-parameter neural networks; a common interface to many ML models |
+| Automatic differentiation | ForwardDiff.jl, Zygote.jl, Enzyme.jl | derivatives of ordinary Julia code |
+| Statistics and probability | Distributions.jl, StatsBase.jl, Turing.jl | probability distributions, statistics, Bayesian inference |
+| Units and uncertainty | Unitful.jl, Measurements.jl | physical units checked at compile time; error propagation |
+| Notebooks | Pluto.jl, IJulia.jl | reactive notebooks; Jupyter support |
+| Other languages | PythonCall.jl, RCall.jl | calling Python and R from Julia, and Julia from them |
+
+To give you the flavour, this is how reading a CSV file and summarising it looks with DataFrames.jl. It is shown as plain code because it needs packages from the registry:
+
+```julia
+using CSV, DataFrames, Statistics
+
+df = CSV.read("rainfall.csv", DataFrame)          # columns: city, month, mm
+by_city = combine(groupby(df, :city), :mm => mean => :mean_mm)
+sort!(by_city, :mean_mm; rev = true)
+```
+
+Because all of these packages are written in Julia and built on multiple dispatch, they compose: a `Measurement` from Measurements.jl can flow through a DifferentialEquations.jl solver, a Unitful quantity can be plotted with Plots.jl, and ForwardDiff.jl can differentiate through most of them. Search for packages through the links on [julialang.org](https://julialang.org/) and ask questions on the [Julia Discourse](https://discourse.julialang.org/) forum.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Misconceptions">
+
+<Misconception>
+
+**"Names that are not exported are private."** Julia has no private names: `Module.anything` always works. Exporting and `public` declare what is *supported*. Reaching into internals is sometimes necessary, but expect it to break in a future version.
+
+</Misconception>
+
+<Misconception>
+
+**"`include` is how you load a package."** `include` pastes a file's code in place; it knows nothing about packages, versions or environments. Load packages with `using` or `import` after adding them with Pkg, and use `include` only to split your own module into files.
+
+</Misconception>
+
+<Misconception>
+
+**"Committing Manifest.toml is always right" (or always wrong).** For applications, analyses and anything that must be reproducible, commit it. For a reusable library, usually do not: its users will resolve their own versions within your `[compat]` bounds, and those bounds are what you must keep accurate.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

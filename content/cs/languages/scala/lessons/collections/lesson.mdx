@@ -1,0 +1,373 @@
+---
+title: Collections
+subtitle: Immutable lists, vectors, sets and maps, the operations that transform them, for comprehensions, laziness, and when mutation is the right tool.
+minutes: 60
+objectives:
+  - Choose between List, Vector, Set, Map, Array and ArrayBuffer, knowing what each operation costs
+  - Transform data with map, filter, flatMap, foldLeft, groupMapReduce, partition, zip, sliding and friends
+  - Write for comprehensions and translate them into map, flatMap and withFilter
+  - Use views and LazyList to avoid building large intermediate collections
+  - Use mutable collections deliberately and locally
+prerequisites: [case-classes-enums-and-pattern-matching]
+references:
+  - title: "Scala 3 Book: Scala Collections"
+    url: https://docs.scala-lang.org/scala3/book/collections-intro.html
+  - title: Scala Collections overview (2.13 and Scala 3)
+    url: https://docs.scala-lang.org/overviews/collections-2.13/introduction.html
+    note: The detailed guide to the collections library, which Scala 3 shares with Scala 2.13.
+  - title: Performance characteristics of the collections
+    url: https://docs.scala-lang.org/overviews/collections-2.13/performance-characteristics.html
+    note: The official table of what each operation costs on each collection.
+---
+
+<Section id="motivation" kind="motivation" title="Describing what you want, not how to loop">
+
+Suppose you have a list of sales and want the total revenue per city, largest first. In many languages you would write a loop, a mutable dictionary, an `if` to check whether each city is already present, and another loop to sort. That code works, but every line is about *how* to compute the answer, and the *what* is buried in the bookkeeping.
+
+In Scala you will usually write something like:
+
+```scala
+sales.groupMapReduce(_.city)(s => s.units * s.unitPrice)(_ + _).toList.sortBy((_, total) => -total)
+```
+
+which reads almost as a sentence: group the sales by city, map each to its revenue, reduce each group by adding, and sort by descending total. Scala's collections library offers a large vocabulary of such operations, all of them higher-order methods that take the small functions you learned to write in lesson 3. Learning that vocabulary is one of the best investments you can make in Scala, because it applies everywhere: to lists and maps here, to `Option` and `Either` in lesson 7, to Futures in lesson 8, and to Spark's distributed datasets, whose API was modelled on it.
+
+The other big idea of this lesson is that Scala's default collections are **immutable**. Adding an element to a list gives you a new list and leaves the old one as it was. That sounds wasteful until you see how the library shares structure between versions, and it makes programs dramatically easier to reason about, especially once several threads are involved.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The main collection types">
+
+The collections live in a hierarchy. **`Iterable`** is anything you can walk through. Below it are three families: **`Seq`** (ordered, indexed by position), **`Set`** (no duplicates) and **`Map`** (keys to values). The names you use without importing anything, such as `List`, `Vector`, `Set` and `Map`, are the immutable versions; mutable ones live in `scala.collection.mutable`.
+
+<Definition term="List">
+
+An immutable **singly linked list**: either empty (`Nil`) or a head element followed by a tail list (`head :: tail`). Prepending and taking the head or tail are constant time; indexing and appending take time proportional to the length.
+
+</Definition>
+
+<Definition term="Vector">
+
+An immutable indexed sequence stored as a shallow tree of small arrays. Indexing, updating, appending and prepending are all **effectively constant time** (logarithmic with a very large base). It is the best general-purpose immutable sequence when you need random access.
+
+</Definition>
+
+<Definition term="Set and Map">
+
+Immutable **hash sets and hash maps** by default, with effectively constant-time lookup, insertion and removal. `SortedSet` and `SortedMap` (trees) keep elements ordered, at logarithmic cost. A `Map` is a collection of key-value pairs, written `key -> value`.
+
+</Definition>
+
+<Definition term="Array and ArrayBuffer">
+
+`Array` is a JVM array: fixed length, mutable elements, constant-time indexing, and the fastest choice for numeric loops. `mutable.ArrayBuffer` is a growable array, with amortised constant-time appends.
+
+</Definition>
+
+| Collection | head | index `(i)` | prepend | append | lookup by key / contains |
+| --- | --- | --- | --- | --- | --- |
+| `List` | constant | linear | constant | linear | linear |
+| `Vector` | eff. constant | eff. constant | eff. constant | eff. constant | linear |
+| `Array` | constant | constant | linear (copy) | linear (copy) | linear |
+| `ArrayBuffer` | constant | constant | linear | amortised constant | linear |
+| `Set`, `Map` (hash) | — | — | — | — | eff. constant |
+
+Rule of thumb: use `List` when you build sequences front to back and process them from the head, often recursively; use `Vector` when you need indexing or appending; use `Map` and `Set` for lookups; use `Array` or `ArrayBuffer` locally in performance-critical code.
+
+```scala check
+@main def basics(): Unit =
+  val primes = List(2, 3, 5, 7, 11)
+  println(primes.head)
+  println(primes.tail)
+  println(1 :: primes)
+  println(primes :+ 13)
+  println(primes(2))
+  println(primes.length)
+
+  val letters = Vector("a", "b", "c")
+  println(letters.updated(1, "B"))
+  println(letters)
+
+  val langs = Set("Scala", "Java", "Scala", "Kotlin")
+  println(langs.size)
+  println(langs.contains("Java"))
+
+  val capitals = Map("Kenya" -> "Nairobi", "Peru" -> "Lima", "Japan" -> "Tokyo")
+  println(capitals("Peru"))
+  println(capitals.get("Chile"))
+  println(capitals.getOrElse("Chile", "unknown"))
+  val more = capitals + ("Chile" -> "Santiago")
+  println(s"${capitals.size} ${more.size}")
+```
+
+```text
+2
+List(3, 5, 7, 11)
+List(1, 2, 3, 5, 7, 11)
+List(2, 3, 5, 7, 11, 13)
+5
+5
+Vector(a, B, c)
+Vector(a, b, c)
+3
+true
+Lima
+None
+unknown
+3 4
+```
+
+Every "change" returned a new collection: `letters` is still `Vector(a, b, c)` and `capitals` still has three entries. Two lookups deserve attention. `capitals("Peru")` returns the value directly but **throws an exception** if the key is missing. `capitals.get("Chile")` returns an `Option`, here `None`, which forces you to deal with the missing case; `getOrElse` supplies a default. Professional code prefers `get` and `getOrElse` unless the key is certain to be present.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="How immutable collections can be cheap">
+
+If every update makes a new collection, does `1 :: primes` copy the whole list? No. A list is a chain of cells, each holding one element and a pointer to the rest. `1 :: primes` creates a single new cell holding 1 that points at the *existing* first cell of `primes`. Both lists now share the cells for 2, 3, 5, 7 and 11, and since nobody can change those cells, sharing is perfectly safe.
+
+<Figure caption="Prepending to an immutable list creates one new cell; the old list's cells are shared, not copied.">
+<svg viewBox="0 0 520 130" role="img" aria-label="Two list names, primes and 1 :: primes, pointing into one shared chain of cells 2, 3, 5, 7, 11, with a single new cell holding 1 in front.">
+<g fill="none" stroke="currentColor" stroke-width="1.5">
+<rect x="20" y="70" width="60" height="30" rx="4"/>
+<rect x="120" y="70" width="60" height="30" rx="4"/>
+<rect x="210" y="70" width="60" height="30" rx="4"/>
+<rect x="300" y="70" width="60" height="30" rx="4"/>
+<rect x="390" y="70" width="60" height="30" rx="4"/>
+<rect x="470" y="70" width="40" height="30" rx="4" stroke-dasharray="4 3"/>
+<path d="M80 85 H118"/><path d="M180 85 H208"/><path d="M270 85 H298"/><path d="M360 85 H388"/><path d="M450 85 H468"/>
+<path d="M150 35 V68"/><path d="M50 35 V68"/>
+</g>
+<g fill="currentColor" font-family="sans-serif" font-size="14" text-anchor="middle">
+<text x="50" y="90">1</text><text x="150" y="90">2</text><text x="240" y="90">3</text><text x="330" y="90">5</text><text x="420" y="90">7 … 11</text><text x="490" y="90">Nil</text>
+<text x="50" y="28">1 :: primes</text><text x="150" y="28">primes</text>
+</g>
+</svg>
+</Figure>
+
+`Vector` and the hash maps use the same idea with trees: an update copies only the short path from the root to the changed leaf, a handful of small arrays, and shares everything else. This technique is called **structural sharing**, and data structures built on it are called **persistent**, because old versions persist and stay valid after an update. It is what makes immutability practical rather than merely pleasant.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Transforming data">
+
+Here is a small data set and a tour of the operations you will use most:
+
+```scala check
+case class Sale(city: String, product: String, units: Int, unitPrice: BigDecimal)
+
+@main def pipeline(): Unit =
+  val sales = List(
+    Sale("Accra", "tea", 12, 2.50),
+    Sale("Hanoi", "coffee", 5, 4.00),
+    Sale("Accra", "coffee", 7, 4.00),
+    Sale("Quito", "tea", 20, 2.50),
+    Sale("Hanoi", "tea", 3, 2.50),
+    Sale("Quito", "cocoa", 9, 3.20)
+  )
+  val revenue = sales.map(s => s.units * s.unitPrice)
+  println(revenue)
+  println(revenue.sum)
+  println(sales.filter(_.product == "tea").map(_.units).sum)
+
+  val byCity = sales.groupMapReduce(_.city)(s => s.units * s.unitPrice)(_ + _)
+  for (city, total) <- byCity.toList.sortBy((_, total) => -total) do
+    println(f"$city%-6s $total%7.2f")
+
+  val (big, small) = sales.partition(_.units >= 10)
+  println(s"${big.size} big sales, ${small.size} small")
+  println(sales.maxBy(_.units).city)
+  println(sales.map(_.product).distinct.sorted.mkString(", "))
+  println(sales.exists(_.units > 15))
+  println(sales.forall(_.unitPrice > 3))
+  println(sales.foldLeft(0)((total, s) => total + s.units))
+```
+
+```text
+List(30.0, 20.0, 28.0, 50.0, 7.5, 28.8)
+164.3
+35
+Quito    78.80
+Accra    58.00
+Hanoi    27.50
+2 big sales, 4 small
+Quito
+cocoa, coffee, tea
+true
+false
+56
+```
+
+The vocabulary:
+
+| Operation | What it does |
+| --- | --- |
+| `map(f)` | applies `f` to every element, giving a collection of the results |
+| `filter(p)` | keeps the elements for which `p` is true |
+| `flatMap(f)` | applies `f`, which returns a collection, and concatenates the results |
+| `sum`, `max`, `min`, `maxBy(f)`, `minBy(f)` | aggregates (they throw on an empty collection, except `sum`; `maxByOption` and friends return an `Option`) |
+| `foldLeft(start)(op)` | combines elements left to right, starting from `start`; the general tool behind `sum`, `count` and many others |
+| `groupBy(key)` | builds a `Map` from each key to the elements with that key |
+| `groupMapReduce(key)(f)(op)` | groups by key, maps each element, and combines each group with `op` |
+| `partition(p)` | splits into the elements that pass and those that fail, as a pair |
+| `exists(p)`, `forall(p)`, `find(p)`, `count(p)` | asks questions about elements |
+| `sorted`, `sortBy(f)`, `sortWith(lt)` | sorts (a new collection, as always) |
+| `distinct`, `mkString(sep)` | removes duplicates; joins into a string |
+
+Two Scala 3 conveniences appear here. `for (city, total) <- ...` takes each pair apart with a pattern. And `sortBy((_, total) => -total)` passes a two-parameter lambda where a function of one *pair* is expected; Scala 3 untuples it automatically, which reads better than Scala 2's `sortBy(_._2)`.
+
+### For comprehensions are map and flatMap
+
+A `for` with `yield` is a readable way to write nested `flatMap`, `map` and `withFilter` calls, and the compiler translates it into exactly those:
+
+```scala check
+@main def comprehensions(): Unit =
+  val sizes = List("S", "M", "L")
+  val colours = List("red", "blue")
+
+  val variants =
+    for
+      size <- sizes
+      colour <- colours
+      if !(size == "L" && colour == "red")
+    yield s"$colour-$size"
+  println(variants)
+
+  val same = sizes.flatMap(size =>
+    colours
+      .withFilter(colour => !(size == "L" && colour == "red"))
+      .map(colour => s"$colour-$size"))
+  println(same == variants)
+
+  val triples =
+    for
+      c <- 1 to 20
+      b <- 1 until c
+      a <- 1 until b
+      if a * a + b * b == c * c
+    yield (a, b, c)
+  println(triples)
+```
+
+```text
+List(red-S, blue-S, red-M, blue-M, blue-L)
+true
+Vector((3,4,5), (6,8,10), (5,12,13), (9,12,15), (8,15,17), (12,16,20))
+```
+
+Every generator except the last becomes a `flatMap`, the last becomes a `map`, and each `if` becomes a `withFilter` (a lazy filter that avoids building an intermediate collection). The type of the result follows the first generator: a `List` in, a `List` out; a `Range` in, an `IndexedSeq` (here a `Vector`) out. Because the translation only needs `map`, `flatMap` and `withFilter`, a for comprehension works on *any* type that has those methods. That is why you will use the same syntax with `Option`, `Either` and `Future` in the coming lessons.
+
+### More tools: windows, laziness and mutation
+
+```scala check
+import scala.collection.mutable
+
+val fib: LazyList[BigInt] = BigInt(0) #:: BigInt(1) #:: fib.zip(fib.tail).map(_ + _)
+
+@main def more(): Unit =
+  val days = List("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+  val temps = Vector(18, 21, 25, 24, 19, 27, 30)
+  println(days.zip(temps).take(3))
+  println(temps.sliding(3).map(w => f"${w.sum / 3.0}%.1f").mkString(" "))
+  println(temps.grouped(3).toList)
+  println(temps.scanLeft(0)(_ + _))
+  println(temps.zipWithIndex.collect { case (t, i) if t > 24 => days(i) })
+  println(temps.takeWhile(_ < 25))
+  println(List(List(1, 2), List(3), Nil).flatten)
+
+  println(fib.take(12).toList)
+  println(fib(90))
+
+  val firstSquares = (1 to 1_000_000).view.filter(_ % 7 == 0).map(n => n * n).take(3).toList
+  println(firstSquares)
+
+  val counts = mutable.Map.empty[Char, Int].withDefaultValue(0)
+  for ch <- "mississippi" do counts(ch) += 1
+  println(counts.toList.sorted)
+  println("mississippi".toList.groupMapReduce(identity)(_ => 1)(_ + _).toList.sorted)
+
+  val buffer = mutable.ArrayBuffer(1, 2, 3)
+  buffer += 4
+  buffer.prepend(0)
+  println(buffer)
+  println(buffer.toList)
+```
+
+```text
+List((Mon,18), (Tue,21), (Wed,25))
+21.3 23.3 22.7 23.3 25.3
+List(Vector(18, 21, 25), Vector(24, 19, 27), Vector(30))
+Vector(0, 18, 39, 64, 88, 107, 134, 164)
+Vector(Wed, Sat, Sun)
+Vector(18, 21)
+List(1, 2, 3)
+List(0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89)
+2880067194370816120
+List(49, 196, 441)
+List((i,4), (m,1), (p,2), (s,4))
+List((i,4), (m,1), (p,2), (s,4))
+ArrayBuffer(0, 1, 2, 3, 4)
+List(0, 1, 2, 3, 4)
+```
+
+- `zip` pairs two collections element by element; `sliding(3)` gives overlapping windows (here a three-day moving average); `grouped(3)` gives non-overlapping chunks; `scanLeft` is a fold that keeps every intermediate result (running totals).
+- `collect` takes a **partial function**, a `{ case ... }` block, and keeps the results only for elements that match a case. It is `filter` and `map` in one step.
+- **`LazyList`** computes elements only when asked and remembers them. `fib` is defined in terms of itself, the Fibonacci sequence as an infinite list; asking for `fib(90)` computes just the first 91 elements. (It is defined at the top level because a local `val` may not refer to itself.)
+- A **`view`** makes the following operations lazy. Without `.view`, `filter` would build a collection of 142,857 multiples of 7 and `map` another, only for `take(3)` to throw almost all of it away. With it, only the elements actually needed are computed.
+- The **mutable map** counts letters with a classic loop. The next line does the same immutably with `groupMapReduce`. Both are fine; the mutable version is a reasonable choice inside a function, as long as the mutable map never escapes. A common pattern is to build with a mutable buffer and then return `buffer.toList` or `toVector`, as the last line does.
+
+<Note>
+
+Scala 3.7 added **named tuples**, such as `(city = "Accra", units = 12)`, whose fields are read by name (`t.city`) instead of `_1`. They are handy for the intermediate results of a pipeline when a full case class would be overkill. Check that your Scala version supports them before relying on them.
+
+</Note>
+
+</Section>
+
+<Section id="practice-notes" kind="human" title="How professionals use the collections">
+
+A few habits separate fluent collection code from code that merely works.
+
+- **Prefer the safe variants.** `head`, `last`, `max` and `reduce` throw on an empty collection; `headOption`, `lastOption`, `maxOption` and `reduceOption` return an `Option`. Use the throwing versions only when emptiness is impossible, and say why in a comment if it is not obvious.
+- **Name the steps of long pipelines.** A chain of eight operations is hard to debug. Break it into a few `val`s with meaningful names; it costs nothing and makes each intermediate result easy to print.
+- **Pick the result type deliberately.** Methods return the same kind of collection they were called on. When a function's result type matters to callers, end with `toList`, `toVector`, `toSet` or `toMap`, and declare the return type. In public APIs many teams accept the most general type that works (`Iterable[A]` or `Seq[A]`) and return a concrete one.
+- **Avoid accidental quadratic work.** Appending to a `List` in a loop, calling `list(i)` in a loop, or rebuilding a large `Map` with `++` on every iteration all cost time proportional to the size each time. Build with a `Vector`, a fold or a mutable builder instead.
+- **`Iterator` is single-use.** An iterator is consumed as you read it; calling `size` on it and then `map` gives an empty result. Convert it to a collection if you need it twice.
+- **Talking to Java.** Java libraries return `java.util.List` and friends. `import scala.jdk.CollectionConverters.*` adds `.asScala` and `.asJava`, which wrap rather than copy.
+
+Finally, when a collection pipeline is slow, measure before rewriting it. The JVM's JIT compiler is very good at the small lambdas these methods use; the usual culprits are the algorithmic mistakes above, not the style.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"`List` is Scala's general-purpose array."** `list(i)` and `list :+ x` walk the whole list. Code that indexes into a `List` inside a loop is quadratic. If you need indexing or appending, use a `Vector` (immutable) or an `ArrayBuffer` (mutable).
+
+</Misconception>
+
+<Misconception>
+
+**"Immutable collections copy everything on each update."** Structural sharing means an update creates only a few new nodes. Immutable collections do cost more than a raw array for tight numeric loops, which is why `Array` exists, but for ordinary application code the difference rarely matters.
+
+</Misconception>
+
+<Misconception>
+
+**"A `Map` keeps entries in the order I inserted them."** The default immutable `Map` and `Set` are hash-based and make no ordering promise; small ones happen to preserve insertion order, which misleads people in tests. Use `SortedMap` for sorted keys, `ListMap` or `VectorMap` for insertion order, or sort when you print.
+
+</Misconception>
+
+<Misconception>
+
+**"`map(f).filter(p).take(3)` processes only three elements."** On a strict collection each step processes the whole collection and builds a new one. Add `.view` (or use an `Iterator` or `LazyList`) when the input is large and you only need a little of the output.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

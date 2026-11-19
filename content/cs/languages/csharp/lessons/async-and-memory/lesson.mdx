@@ -1,0 +1,345 @@
+---
+title: Async, tasks and memory
+subtitle: Waiting without blocking, running work in parallel safely, and how .NET's memory model shapes fast code.
+minutes: 70
+objectives:
+  - Write async methods that return Task and Task values, and await several operations concurrently with Task.WhenAll
+  - Cancel work and apply timeouts with CancellationToken, and consume async streams with await foreach
+  - Recognise the classic async mistakes (async void, blocking on .Result) and avoid them
+  - Distinguish I/O-bound from CPU-bound work, and protect shared state with Interlocked, lock and concurrent collections
+  - Explain the stack, the heap, boxing and generational garbage collection, and use Span to avoid allocations
+prerequisites: [exceptions]
+references:
+  - title: Asynchronous programming with async and await
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/csharp/asynchronous-programming/
+    note: The official overview of the task-based model.
+  - title: Fundamentals of garbage collection
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/standard/garbage-collection/fundamentals
+    note: Generations, the large object heap, and what triggers a collection.
+  - title: Memory and Span usage guidelines
+    author: Microsoft
+    url: https://learn.microsoft.com/dotnet/standard/memory-and-spans/memory-t-usage-guidelines
+    note: When to use Span, Memory and their read-only forms.
+  - title: .NET Blog
+    author: Microsoft
+    url: https://devblogs.microsoft.com/dotnet/
+    note: Each release brings a long, detailed post on performance improvements in the runtime and libraries, written by the people who made them.
+---
+
+<Section id="motivation" kind="motivation" title="Waiting well">
+
+A web server handling a request spends most of its time *waiting*: for the database to answer, for another service to reply, for a file to be read. If each request held an operating-system thread while it waited, a server with ten thousand slow requests would need ten thousand threads, each with its own megabyte-sized stack, and would spend more time switching between them than working. The same problem appears in a desktop app: if the thread that draws the window waits for a download, the window freezes.
+
+C#'s answer, introduced in C# 5 (2012) and since adopted in similar forms by JavaScript, Python, Rust, Swift and others, is **`async` and `await`**: write code that looks sequential, but which gives its thread back while it waits and continues when the result arrives. The first half of this lesson is about that model, and about the different problem of doing CPU-heavy work on several cores at once.
+
+The second half is about memory. C# is garbage-collected, so you never free memory by hand. But *how* a program allocates still decides how fast it runs, and modern .NET gives you precise tools, `Span` above all, to process data without allocating at all. Knowing when those tools matter, and when they do not, is part of professional C#.
+
+</Section>
+
+<Section id="async" kind="definitions" title="Tasks and await">
+
+<Definition term="Task">
+
+An object representing an operation that may not have finished yet. A `Task` completes with no value; a `Task<int>` (or any result type) completes with a value. A task can also complete with an exception, or be cancelled. `await task` pauses the current method until the task completes, then gives back its value or rethrows its exception.
+
+</Definition>
+
+An `async` method can use `await`; it returns a task to its caller as soon as it first has to wait. The compiler turns the method into a state machine, much as it does for `yield return`: the code after each `await` becomes a continuation that runs when the awaited operation finishes. No thread sits blocked in the meantime. Top-level statements may use `await` directly.
+
+```csharp check
+// Simulated I/O: each "download" waits without using a thread.
+static async Task<int> DownloadAsync(string name, int milliseconds)
+{
+    Console.WriteLine($"  start  {name}");
+    await Task.Delay(milliseconds);          // the thread is free while we wait
+    Console.WriteLine($"  finish {name}");
+    return name.Length * 100;                // pretend size in bytes
+}
+
+Console.WriteLine("One after another:");
+int a = await DownloadAsync("weather", 150);
+int b = await DownloadAsync("news", 150);
+Console.WriteLine($"  total {a + b} bytes");
+
+Console.WriteLine("All at once:");
+Task<int> maps = DownloadAsync("maps", 600);
+Task<int> rates = DownloadAsync("rates", 200);
+Task<int> scores = DownloadAsync("scores", 400);
+int[] sizes = await Task.WhenAll(maps, rates, scores);   // results in the order given
+Console.WriteLine($"  sizes {string.Join(", ", sizes)}; total {sizes.Sum()} bytes");
+```
+
+It prints:
+
+```text
+One after another:
+  start  weather
+  finish weather
+  start  news
+  finish news
+  total 1100 bytes
+All at once:
+  start  maps
+  start  rates
+  start  scores
+  finish rates
+  finish scores
+  finish maps
+  sizes 400, 500, 600; total 1500 bytes
+```
+
+`Task.Delay` stands in for real I/O, such as `HttpClient.GetStringAsync` or a database query. The two halves differ only in *when* they await:
+
+- **One after another**: each `await` happens immediately, so the second download does not start until the first finishes. Total time: the sum of the waits.
+- **All at once**: calling `DownloadAsync` starts the operation and returns a task straight away. All three start, and `Task.WhenAll` waits for all of them. They finish in order of their delays, but `WhenAll` returns the results in the order the tasks were *given*. Total time: about the longest single wait.
+
+By convention, methods that return tasks end in `Async`. The pattern "start several tasks, then await them together" is the main way to speed up I/O-heavy code, and it needs no threads of your own.
+
+<Note>
+
+`await` does not create a thread, and `async` does not make code run in the background. An async method runs synchronously until its first `await` of an incomplete task. Where the continuation runs afterwards depends on the environment: in a console app or ASP.NET Core, on a thread-pool thread; in a desktop UI app, back on the UI thread, so that code after an `await` can update the window safely.
+
+</Note>
+
+### Cancellation, timeouts and async streams
+
+Long operations should be cancellable. .NET uses one cooperative mechanism everywhere: a **`CancellationTokenSource`** creates a **`CancellationToken`**, which you pass down to every method that might wait; calling `Cancel` on the source asks all of them to stop, and they do so by throwing `OperationCanceledException`. A timeout is cancellation scheduled in advance.
+
+**Async streams** (C# 8) combine iterators with `await`: an `async` method returning `IAsyncEnumerable` can `await` between `yield return`s, and the consumer reads it with `await foreach`.
+
+```csharp check
+using System.Runtime.CompilerServices;
+
+// An async stream: items arrive over time, consumed with await foreach.
+static async IAsyncEnumerable<string> ReadingsAsync([EnumeratorCancellation] CancellationToken token = default)
+{
+    for (int i = 1; ; i++)
+    {
+        await Task.Delay(20, token);              // honours cancellation while waiting
+        yield return $"reading {i}: {18 + i % 4} °C";
+    }
+}
+
+using var cts = new CancellationTokenSource();
+int received = 0;
+try
+{
+    await foreach (string reading in ReadingsAsync(cts.Token))
+    {
+        Console.WriteLine(reading);
+        if (++received == 3) cts.Cancel();      // e.g. the user pressed Stop
+    }
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine($"stopped after {received} readings");
+}
+
+// A timeout is just cancellation scheduled in advance.
+using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+try
+{
+    await Task.Delay(TimeSpan.FromSeconds(10), timeout.Token);
+}
+catch (TaskCanceledException)
+{
+    Console.WriteLine("gave up waiting after the timeout");
+}
+```
+
+It prints:
+
+```text
+reading 1: 19 °C
+reading 2: 20 °C
+reading 3: 21 °C
+stopped after 3 readings
+gave up waiting after the timeout
+```
+
+The attribute `[EnumeratorCancellation]` lets a token passed to the stream reach the iterator's parameter. `TaskCanceledException` derives from `OperationCanceledException`, so catching the base class handles both. In ASP.NET Core, every request has a token (`HttpContext.RequestAborted`) that is cancelled if the client disconnects, so passing it down to database calls stops wasted work.
+
+</Section>
+
+<Section id="pitfalls" kind="misconceptions" title="The classic async mistakes">
+
+<Misconception>
+
+**"I'll call `.Result` (or `.Wait()`) to get the value without making my method async."** Blocking on a task wastes a thread and, in environments with a synchronisation context (desktop UI, old ASP.NET), can deadlock: the blocked thread is the very one the continuation needs. The rule is "async all the way": once a call is async, its callers become async too, up to the entry point, which may itself be `async Task Main` or top-level statements with `await`.
+
+</Misconception>
+
+<Misconception>
+
+**"`async void` is fine for methods that return nothing."** An `async void` method cannot be awaited, so the caller cannot know when it finishes, and an exception thrown inside it cannot be caught by the caller and typically crashes the process. Return `Task` instead. The only legitimate `async void` methods are event handlers in UI frameworks.
+
+</Misconception>
+
+<Misconception>
+
+**"Wrapping a call in `Task.Run` makes it async."** `Task.Run` moves work to a thread-pool thread, which helps keep a UI responsive during a CPU-heavy computation. It does not make I/O more efficient: a thread-pool thread that blocks on synchronous I/O is still a blocked thread. For I/O, use the library's real async methods (`ReadAsync`, `GetAsync`, `SaveChangesAsync`).
+
+</Misconception>
+
+</Section>
+
+<Section id="parallel" kind="examples" title="Parallel work and shared state">
+
+Async is for **I/O-bound** work: the program mostly waits. **CPU-bound** work (resizing ten thousand images, simulating a model, compressing files) needs the opposite: more cores computing at once. .NET's `Parallel` class splits loops across the thread pool; `Parallel.ForEachAsync` does the same for async bodies, with a limit on how many run at once.
+
+Parallelism brings back an old danger. When several threads read and write the same variable, their operations interleave unpredictably: `count++` is really "read, add one, write back", and two threads can both read 41 and both write 42. That is a **data race**, and its result can differ from run to run.
+
+```csharp check
+using System.Collections.Concurrent;
+
+// CPU-bound work in parallel, and three ways to update shared state.
+const int N = 1_000_000;
+
+int unsafeCount = 0;
+Parallel.For(0, N, _ => unsafeCount++);          // a data race: increments get lost
+
+int atomicCount = 0;
+Parallel.For(0, N, _ => Interlocked.Increment(ref atomicCount));
+
+int lockedCount = 0;
+Lock gate = new();                               // System.Threading.Lock (.NET 9)
+Parallel.For(0, N, _ => { lock (gate) { lockedCount++; } });
+
+Console.WriteLine($"unsafe count is at most {N}: {unsafeCount <= N}");
+Console.WriteLine($"Interlocked: {atomicCount}");
+Console.WriteLine($"lock:        {lockedCount}");
+
+// Concurrent collections handle their own locking.
+var wordCounts = new ConcurrentDictionary<string, int>();
+string[] lines = ["to be or not to be", "be kind", "not now", "to the sea"];
+Parallel.ForEach(lines, line =>
+{
+    foreach (string w in line.Split(' '))
+        wordCounts.AddOrUpdate(w, 1, (_, old) => old + 1);
+});
+Console.WriteLine(string.Join(" ", wordCounts.OrderByDescending(p => p.Value).ThenBy(p => p.Key).Take(3).Select(p => $"{p.Key}={p.Value}")));
+```
+
+It prints:
+
+```text
+unsafe count is at most 1000000: True
+Interlocked: 1000000
+lock:        1000000
+be=3 to=3 not=2
+```
+
+The program prints only `unsafeCount <= N`, because its exact value changes from run to run: on a multi-core machine, some increments are typically lost. The three safe options, from smallest to largest tool:
+
+- **`Interlocked`** performs single operations (increment, add, exchange, compare-and-swap) atomically, using a processor instruction. Ideal for counters.
+- **`lock`** lets only one thread at a time run a block of code. .NET 9 added a dedicated `System.Threading.Lock` type, which C# 13 recognises in `lock` statements; before that you locked on any private object. Keep locked sections short, never `await` inside one (the compiler forbids it), and always acquire several locks in the same order to avoid deadlocks.
+- **Concurrent collections** (`ConcurrentDictionary`, `ConcurrentQueue`, `ConcurrentBag`) and **channels** (`System.Threading.Channels`, for producer-consumer pipelines) handle their own synchronisation.
+
+Better still is to avoid shared mutable state: give each task its own data and combine the results at the end, or use immutable objects (records), which any number of threads can read safely. Many of the hardest bugs in concurrent code come from state that did not need to be shared.
+
+</Section>
+
+<Section id="memory" kind="intuition" title="How .NET uses memory">
+
+Every running .NET program uses two kinds of memory.
+
+The **stack** belongs to a thread. Each method call pushes a frame holding its local variables and parameters, and returning pops it: allocation and release are essentially free, and perfectly predictable. The **managed heap** holds objects whose lifetime is not tied to one method call: every instance of a class, every array, every string. Allocating on the heap is fast (usually just moving a pointer forward), but each object must eventually be found unused and reclaimed by the **garbage collector** (GC).
+
+Where does a value live? A rough but honest rule: *reference-type objects live on the heap; value types live wherever their container lives*. An `int` local variable lives in the method's stack frame; an `int` field of a class lives inside that object on the heap; the elements of an `int[]` live inside the array on the heap. (The JIT sometimes optimises further, but you cannot rely on that.)
+
+### Generational garbage collection
+
+The .NET GC is **generational**, built on the observation that most objects die young: a string built for one log message, a list used inside one method. New objects go into **generation 0**, which is collected often and quickly. Objects that survive a collection are promoted to generation 1, then generation 2, which is collected rarely. Objects of 85,000 bytes or more go straight to the **large object heap**, collected with generation 2. A collection must briefly pause the program's threads (the *background* GC does most generation-2 work concurrently), so a program that allocates heavily in a hot path spends more time in the GC and has longer, less predictable pauses.
+
+That is why performance-sensitive .NET code is often about **not allocating**: reusing buffers, avoiding temporary strings and arrays, and avoiding *boxing*.
+
+<Definition term="Boxing">
+
+Converting a value type to `object` (or to an interface it implements) by copying it into a new heap object. Unboxing copies it back out. Boxing allocates, and the box is a separate copy: changing the original does not change the box.
+
+</Definition>
+
+### Span: a view instead of a copy
+
+`Span<char>`, `Span<int>` and their read-only forms are **views over contiguous memory**: part of an array, part of a string, a block on the stack, or native memory. Slicing a span creates a new view of the same memory, without copying and without allocating. Many .NET APIs accept spans: parsing, formatting, encoding, hashing, searching and, since .NET 9, splitting.
+
+```csharp check
+// Spans: views over memory, without copying.
+string csv = "2026-11-19,Mombasa,31.5,82";
+
+// The classic way allocates an array and four new strings.
+long before = GC.GetAllocatedBytesForCurrentThread();
+string[] parts = csv.Split(',');
+double tempA = double.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
+long withSplit = GC.GetAllocatedBytesForCurrentThread() - before;
+
+// The span way slices the original string in place.
+before = GC.GetAllocatedBytesForCurrentThread();
+double tempB = ParseTemperature(csv);
+long withSpan = GC.GetAllocatedBytesForCurrentThread() - before;
+
+Console.WriteLine($"Split: {tempA} (allocated something: {withSplit > 0})");
+Console.WriteLine($"Span:  {tempB} (allocated {withSpan} bytes)");
+
+static double ParseTemperature(ReadOnlySpan<char> line)
+{
+    Span<Range> fields = stackalloc Range[5];       // on the stack, not the heap
+    int count = line.Split(fields, ',');
+    if (count < 3) throw new FormatException("too few fields");
+    return double.Parse(line[fields[2]], System.Globalization.CultureInfo.InvariantCulture);
+}
+
+// A span can view part of an array and change it in place.
+int[] pixels = [10, 20, 30, 40, 50, 60];
+Span<int> middle = pixels.AsSpan(2, 3);
+middle.Fill(0);
+Console.WriteLine(string.Join(",", pixels));
+
+// Boxing: putting a value type into an object allocates a copy on the heap.
+int answer = 42;
+object boxed = answer;      // copy of 42 in a new heap object
+answer = 7;
+Console.WriteLine($"{boxed} {answer}");
+
+Console.WriteLine($"GC generations: {GC.MaxGeneration + 1}");
+```
+
+It prints:
+
+```text
+Split: 31.5 (allocated something: True)
+Span:  31.5 (allocated 0 bytes)
+10,20,0,0,0,60
+42 7
+GC generations: 3
+```
+
+- `csv.Split(',')` allocates an array and four strings, just to read one number. The span version slices the original string and parses the slice directly: zero bytes allocated, measured with `GC.GetAllocatedBytesForCurrentThread`. On a server parsing millions of lines, that difference is the difference between a busy GC and an idle one.
+- `stackalloc` allocates a small buffer on the stack, which disappears when the method returns. It is safe here because it is assigned to a `Span`, which the compiler tracks.
+- A span over part of an array writes straight into the array: `Fill(0)` zeroed elements 2 to 4 of `pixels`.
+- `boxed` kept 42 after `answer` changed to 7, because boxing copied the value.
+- `GC.MaxGeneration` is 2, so there are three generations: 0, 1 and 2.
+
+Spans have one big restriction. `Span` is a **`ref struct`**: it may only live on the stack, so it cannot be a field of a class, be captured by a lambda, or be held across an `await`. For those cases there is `Memory<char>` (and its relatives), which can live on the heap and produce a span when needed.
+
+</Section>
+
+<Section id="practice" kind="human" title="How professionals approach performance">
+
+**Measure first.** Intuition about performance is wrong surprisingly often. The standard tool is **BenchmarkDotNet**, an open-source library that runs micro-benchmarks properly (warm-up, many iterations, statistics, allocation counts); for whole applications, `dotnet-counters` and `dotnet-trace` show GC activity and hot methods, and Visual Studio and Rider have profilers built in.
+
+**Write clear code, then optimise the hot path.** Most code in most applications is dominated by I/O, and there the right async structure (concurrent calls, no blocking, sensible timeouts) matters far more than allocations. Reserve spans, pooling (`ArrayPool`), `stackalloc` and struct tricks for the small fraction of code that profiling shows is hot: parsers, serialisers, inner loops, request pipelines handling thousands of calls per second.
+
+**Upgrade.** Each .NET release has made the runtime, the JIT and the libraries faster; the .NET team's yearly performance posts list thousands of improvements. Moving from one LTS to the next is often the cheapest optimisation available.
+
+**Consider Native AOT where start-up matters.** For command-line tools, serverless functions and containers that scale up and down, publishing with Native AOT gives fast start-up and a small memory footprint, at the price of restrictions on reflection and dynamic code. File-based apps enable it by default when published.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

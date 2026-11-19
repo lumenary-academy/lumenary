@@ -1,0 +1,439 @@
+---
+title: Subprograms, modern COBOL and the mainframe
+subtitle: Calling programs and sharing copybooks, the newer language features, and the world of z/OS, JCL, CICS and Db2 where most professional COBOL runs.
+minutes: 65
+objectives:
+  - Split a system into called subprograms with CALL, the LINKAGE SECTION and BY REFERENCE, BY CONTENT and BY VALUE
+  - Explain the difference between WORKING-STORAGE and LOCAL-STORAGE, and between static and dynamic calls
+  - Share record layouts with copybooks and COPY ... REPLACING
+  - Use modern features (user-defined functions, recursion, nested programs, intrinsic functions without the FUNCTION keyword) and describe COBOL's object orientation
+  - Describe how a COBOL program runs on z/OS under JCL in batch and under CICS online, how it reaches Db2 with embedded SQL, and the main routes to modernisation
+prerequisites: [files-and-reports]
+references:
+  - title: IBM Enterprise COBOL for z/OS documentation
+    url: https://www.ibm.com/docs/en/cobol-zos
+    note: The programming guide covers subprograms, the COPY statement, OO COBOL and running under CICS and Db2.
+  - title: z/OS documentation
+    url: https://www.ibm.com/docs/en/zos
+    note: IBM's library for z/OS, including the MVS JCL reference and user's guide.
+  - title: CICS Transaction Server documentation
+    url: https://www.ibm.com/docs/en/cics-ts
+    note: The reference for the EXEC CICS commands and for designing online transactions.
+  - title: Db2 for z/OS documentation
+    url: https://www.ibm.com/docs/en/db2-for-zos
+    note: How to write embedded SQL in COBOL, with host variables, SQLCODE and cursors.
+  - title: Zowe
+    url: https://www.zowe.org/
+    note: The Open Mainframe Project's open-source tools for working with z/OS from modern editors and command lines.
+  - title: Open Mainframe Project COBOL Programming Course
+    url: https://github.com/openmainframeproject/cobol-programming-course
+    note: Free labs that walk through JCL, data sets and COBOL on a real z/OS system.
+---
+
+<Section id="motivation" kind="motivation" title="Programs that call programs">
+
+A real COBOL application is not one program. A payroll system or a core banking system is hundreds or thousands of programs: batch programs run in nightly sequences, online programs answer screen requests in fractions of a second, and shared subprograms compute tax, validate account numbers or format dates for all of them. The record layouts they share live in **copybooks**, files of source that every program copies in at compile time, so that the definition of an account exists in exactly one place.
+
+This lesson covers that machinery, then steps back to look at the environment where most professional COBOL runs: IBM's z/OS operating system, with its job control language (JCL) for batch work, CICS for online transactions and Db2 for relational data. You will not need a mainframe to follow along, but by the end you should be able to recognise each piece when you meet it on the job and know what to ask.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="CALL, the LINKAGE SECTION and copybooks">
+
+<Definition term="Subprogram">
+
+A separately named program that another program runs with `CALL "name" USING arguments`. The called program describes the arguments it receives in its `LINKAGE SECTION`, lists them in `PROCEDURE DIVISION USING`, and returns with `GOBACK`.
+
+</Definition>
+
+Arguments are passed in one of three ways:
+
+| Mode | What the callee gets | Changes visible to caller? |
+| --- | --- | --- |
+| `BY REFERENCE` (the default) | The address of the caller's item | Yes |
+| `BY CONTENT` | The address of a temporary copy | No |
+| `BY VALUE` | The value itself, as C would pass it | No; used mainly to call C and system APIs |
+
+The callee does not own the storage of its linkage items; it sees the caller's bytes through its own description of them. That is powerful and dangerous: if the caller passes a 5-byte item and the callee describes it as 50 bytes, the callee will read and write 45 bytes that belong to something else. Sharing one copybook between caller and callee is how professionals prevent that.
+
+**Working storage persists; local storage does not.** A called program's `WORKING-STORAGE` keeps its values from one call to the next (until the caller issues `CANCEL "name"`, which resets it). `LOCAL-STORAGE` is allocated fresh on every call, which is what recursive programs and programs shared between concurrent transactions need.
+
+**Static and dynamic calls.** A call can be resolved when the program is linked (static: the subprogram is bound into the same executable) or when the call runs (dynamic: the runtime loads the subprogram from a library the first time it is called). On z/OS, `CALL identifier`, where a data item holds the name, is always dynamic, and the compiler's `DYNAM` option makes literal calls dynamic too. Dynamic calls let a team replace one subprogram without relinking every program that uses it, which matters in a system of thousands of modules. GnuCOBOL loads called modules dynamically by default; the examples here put all programs in one source file, so they are compiled together.
+
+### Copybooks
+
+A copybook is a file of COBOL source, often a record layout, that the compiler pastes in wherever a program says `COPY name.` A copybook called `EMPREC` might contain:
+
+```cobol
+*> EMPREC: the employee master record, shared by every payroll program
+01 :TAG:-RECORD.
+   05 :TAG:-ID            PIC 9(6).
+   05 :TAG:-NAME          PIC X(30).
+   05 :TAG:-HOURLY-RATE   PIC S9(3)V99 COMP-3.
+   05 :TAG:-TAX-CODE      PIC X(4).
+```
+
+and two programs, or the same program twice, can copy it with different prefixes:
+
+```cobol
+COPY EMPREC REPLACING ==:TAG:== BY ==EMP==.
+COPY EMPREC REPLACING ==:TAG:== BY ==OLD-EMP==.
+```
+
+The first gives `EMP-RECORD`, `EMP-ID` and so on; the second gives `OLD-EMP-RECORD`, `OLD-EMP-ID`. When the record changes, the copybook changes, every program that uses it is recompiled, and the change is consistent everywhere. On z/OS copybooks live as members of partitioned data sets; with GnuCOBOL they are files found through the `-I` option or the `COBCPY` environment variable.
+
+</Section>
+
+<Section id="examples" kind="examples" title="Subprograms in practice">
+
+### Passing data, returning results
+
+GnuCOBOL can compile several programs from one source file: each ends with `END PROGRAM name`, and the first is the main program. This one calls a tax subprogram, shows the difference between `BY CONTENT` and `BY REFERENCE`, and shows what working storage and local storage remember:
+
+```cobol check
+IDENTIFICATION DIVISION.
+PROGRAM-ID. payroll-main.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 ws-gross            PIC 9(5)V99 VALUE 4200.00.
+01 ws-tax              PIC 9(5)V99.
+01 ws-tax-status       PIC X.
+   88 tax-ok           VALUE "0".
+01 ws-counter          PIC 99 VALUE 5.
+01 ws-money-out        PIC ZZ,ZZ9.99.
+PROCEDURE DIVISION.
+0000-main.
+    CALL "calc-tax" USING BY CONTENT   ws-gross
+                          BY REFERENCE ws-tax
+                          BY REFERENCE ws-tax-status
+    IF tax-ok
+        MOVE ws-tax TO ws-money-out
+        DISPLAY "tax on 4,200.00:    " ws-money-out
+    END-IF
+    DISPLAY "return code:        " RETURN-CODE
+
+    CALL "add-one" USING BY CONTENT ws-counter
+    DISPLAY "after BY CONTENT:   " ws-counter
+    CALL "add-one" USING BY REFERENCE ws-counter
+    DISPLAY "after BY REFERENCE: " ws-counter
+
+    CALL "count-calls"
+    CALL "count-calls"
+    CALL "count-calls"
+    STOP RUN.
+END PROGRAM payroll-main.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. calc-tax.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 band-limit          PIC 9(5)V99 VALUE 3000.00.
+LINKAGE SECTION.
+01 ls-gross            PIC 9(5)V99.
+01 ls-tax              PIC 9(5)V99.
+01 ls-status           PIC X.
+PROCEDURE DIVISION USING ls-gross ls-tax ls-status.
+    IF ls-gross > band-limit
+        COMPUTE ls-tax ROUNDED =
+            band-limit * 0.10 + (ls-gross - band-limit) * 0.25
+    ELSE
+        COMPUTE ls-tax ROUNDED = ls-gross * 0.10
+    END-IF
+    MOVE "0" TO ls-status
+    MOVE 0 TO RETURN-CODE
+    GOBACK.
+END PROGRAM calc-tax.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. add-one.
+DATA DIVISION.
+LINKAGE SECTION.
+01 ls-number           PIC 99.
+PROCEDURE DIVISION USING ls-number.
+    ADD 1 TO ls-number
+    GOBACK.
+END PROGRAM add-one.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. count-calls.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 ws-calls            PIC 99 VALUE 0.
+LOCAL-STORAGE SECTION.
+01 ls-calls            PIC 99 VALUE 0.
+PROCEDURE DIVISION.
+    ADD 1 TO ws-calls
+    ADD 1 TO ls-calls
+    DISPLAY "working-storage " ws-calls ", local-storage " ls-calls
+    GOBACK.
+END PROGRAM count-calls.
+```
+
+```text
+tax on 4,200.00:       600.00
+return code:        +000000000
+after BY CONTENT:   05
+after BY REFERENCE: 06
+working-storage 01, local-storage 01
+working-storage 02, local-storage 01
+working-storage 03, local-storage 01
+```
+
+The tax subprogram applies 10% up to 3,000.00 and 25% above it (an invented two-band scale): 300.00 + 300.00 = 600.00. It reports success twice, in two conventional ways: through a status argument and through the special register `RETURN-CODE`, which a main program's `STOP RUN` passes back to the operating system. In batch jobs, that return code decides whether the next step runs. `add-one` changed `ws-counter` only when it received the real item. And `count-calls` shows the two kinds of storage: its working-storage counter survived from call to call, while its local-storage counter started again at zero each time.
+
+The subprograms end with `GOBACK`, never `STOP RUN`: `STOP RUN` in a subprogram ends the entire run, including the caller.
+
+### Modern COBOL: functions, recursion and fewer keywords
+
+The 2002 standard brought features that make COBOL feel less foreign to programmers from other languages. GnuCOBOL implements many of them:
+
+```cobol check
+IDENTIFICATION DIVISION.
+FUNCTION-ID. net-to-gross.
+DATA DIVISION.
+LINKAGE SECTION.
+01 net-amount          PIC 9(7)V99.
+01 vat-percent         PIC 99V99.
+01 gross-amount        PIC 9(7)V99.
+PROCEDURE DIVISION USING net-amount vat-percent RETURNING gross-amount.
+    COMPUTE gross-amount ROUNDED = net-amount * (1 + vat-percent / 100)
+    GOBACK.
+END FUNCTION net-to-gross.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. modern-demo.
+ENVIRONMENT DIVISION.
+CONFIGURATION SECTION.
+REPOSITORY.
+    FUNCTION net-to-gross
+    FUNCTION ALL INTRINSIC.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 price               PIC 9(7)V99 VALUE 80.00.
+01 rate-kenya          PIC 99V99   VALUE 16.00.
+01 rate-norway         PIC 99V99   VALUE 25.00.
+01 money-out           PIC Z,ZZ9.99.
+01 day-count           PIC ZZ9.
+01 k                   PIC 99.
+01 fact                PIC 9(18).
+01 fact-out            PIC Z(17)9.
+PROCEDURE DIVISION.
+    MOVE net-to-gross(price, rate-kenya) TO money-out
+    DISPLAY "80.00 + 16% VAT = " money-out
+    MOVE net-to-gross(price, rate-norway) TO money-out
+    DISPLAY "80.00 + 25% VAT = " money-out
+    DISPLAY "no FUNCTION keyword: " upper-case("nairobi")
+    COMPUTE day-count =
+        integer-of-date(20261119) - integer-of-date(20260101)
+    DISPLAY "days from 1 Jan to 19 Nov 2026: " day-count
+    PERFORM VARYING k FROM 5 BY 5 UNTIL k > 20
+        CALL "fact-recursive" USING k fact
+        IF fact = ZERO
+            DISPLAY k "! does not fit in 18 digits"
+        ELSE
+            MOVE fact TO fact-out
+            DISPLAY k "! = " trim(fact-out)
+        END-IF
+    END-PERFORM
+    STOP RUN.
+END PROGRAM modern-demo.
+
+IDENTIFICATION DIVISION.
+PROGRAM-ID. fact-recursive RECURSIVE.
+DATA DIVISION.
+LOCAL-STORAGE SECTION.
+01 n-minus-1           PIC 99.
+01 sub-result          PIC 9(18).
+LINKAGE SECTION.
+01 n                   PIC 99.
+01 result              PIC 9(18).
+PROCEDURE DIVISION USING n result.
+    IF n <= 1
+        MOVE 1 TO result
+    ELSE
+        COMPUTE n-minus-1 = n - 1
+        CALL "fact-recursive" USING n-minus-1 sub-result
+        COMPUTE result = n * sub-result
+            ON SIZE ERROR MOVE ZERO TO result
+        END-COMPUTE
+    END-IF
+    GOBACK.
+END PROGRAM fact-recursive.
+```
+
+```text
+80.00 + 16% VAT =    92.80
+80.00 + 25% VAT =   100.00
+no FUNCTION keyword: NAIROBI
+days from 1 Jan to 19 Nov 2026: 322
+05! = 120
+10! = 3628800
+15! = 1307674368000
+20! does not fit in 18 digits
+```
+
+- **User-defined functions.** `FUNCTION-ID` defines a function with `RETURNING`. Declared in the caller's `REPOSITORY`, it is used inside expressions like any intrinsic function.
+- **`FUNCTION ALL INTRINSIC`** lets you write `upper-case(...)` and `trim(...)` without the `FUNCTION` keyword. The intrinsic library covers dates (`INTEGER-OF-DATE` counts days, so subtracting two of them gives the days between dates), mathematics, statistics, text and more.
+- **Recursion.** A program marked `RECURSIVE` may call itself; its `LOCAL-STORAGE` gives each activation its own `n-minus-1` and `sub-result`. Without `RECURSIVE`, a program that calls itself is an error. (The program is not called `factorial` because `FACTORIAL` is already the name of an intrinsic function.)
+- **Lesson 3 again.** 20! is 2,432,902,008,176,640,000, nineteen digits, one more than `PIC 9(18)` holds. The `ON SIZE ERROR` in the last multiplication caught it; without it, the program would have printed a number with its leading `2` silently cut off.
+
+### Nested programs and GLOBAL data
+
+A program can also **contain** other programs, written before its `END PROGRAM`. A contained program can be called only by the program that contains it (unless declared `COMMON`), and it can see the container's data items declared `GLOBAL`:
+
+```cobol check
+IDENTIFICATION DIVISION.
+PROGRAM-ID. order-batch.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 error-count         PIC 99 VALUE 0 GLOBAL.
+01 order-code          PIC X(6).
+PROCEDURE DIVISION.
+    MOVE "AB1234" TO order-code  CALL "validate-order" USING order-code
+    MOVE "ab12"   TO order-code  CALL "validate-order" USING order-code
+    MOVE "ZZ9999" TO order-code  CALL "validate-order" USING order-code
+    DISPLAY "orders rejected: " error-count
+    STOP RUN.
+
+    IDENTIFICATION DIVISION.
+    PROGRAM-ID. validate-order.
+    DATA DIVISION.
+    LINKAGE SECTION.
+    01 ls-code.
+       05 ls-letters   PIC XX.
+       05 ls-digits    PIC 9(4).
+    PROCEDURE DIVISION USING ls-code.
+        IF ls-letters IS ALPHABETIC-UPPER AND ls-digits IS NUMERIC
+            DISPLAY ls-code ": accepted"
+        ELSE
+            DISPLAY ls-code ": rejected"
+            ADD 1 TO error-count
+        END-IF
+        GOBACK.
+    END PROGRAM validate-order.
+
+END PROGRAM order-batch.
+```
+
+```text
+AB1234: accepted
+ab12  : rejected
+ZZ9999: accepted
+orders rejected: 01
+```
+
+Nested programs give COBOL something like private helper functions with controlled sharing. They are less common in older code than separately compiled subprograms, but they are standard and useful.
+
+### Object-oriented COBOL, at a glance
+
+The 2002 standard added classes, objects and methods: a `CLASS-ID` paragraph instead of `PROGRAM-ID`, `METHOD-ID` for each method, `USAGE OBJECT REFERENCE` for variables that hold objects, and `INVOKE` to call a method:
+
+```cobol
+INVOKE an-account "deposit" USING BY CONTENT amount
+```
+
+IBM's Enterprise COBOL supports OO syntax mainly so that COBOL can create and call Java objects on z/OS, and Visual COBOL (originally from Micro Focus) uses it to work with .NET and the JVM. GnuCOBOL 3.2 does not implement it. In practice OO COBOL is rare; most COBOL is, and will remain, procedural. Know the keywords so you can recognise them.
+
+</Section>
+
+<Section id="human" kind="human" title="Working on the mainframe">
+
+Most professional COBOL runs on **IBM Z** mainframes under the **z/OS** operating system. The language is the same as in this course, but the surroundings are different. Here is what a working day involves.
+
+### Batch: JCL
+
+A batch job is described in **JCL** (Job Control Language): a `JOB` card, then one `EXEC` step per program, each with `DD` (data definition) statements that connect the program's file names to real data sets. A nightly payroll job might begin like this:
+
+```text
+//PAYRUN   JOB (ACCT),'NIGHTLY PAYROLL',CLASS=A,MSGCLASS=X
+//*  STEP 1: SORT THE TIMESHEETS BY EMPLOYEE NUMBER
+//SORTTS   EXEC PGM=SORT
+//SORTIN   DD DSN=PAY.PROD.TIMESHEETS,DISP=SHR
+//SORTOUT  DD DSN=&&SORTED,DISP=(NEW,PASS),SPACE=(CYL,(5,5))
+//SYSIN    DD *
+  SORT FIELDS=(1,6,CH,A)
+/*
+//*  STEP 2: RUN THE COBOL PAYROLL PROGRAM IF STEP 1 ENDED WITH RC 0
+//PAYCALC  EXEC PGM=PAYCALC,COND=(0,NE)
+//STEPLIB  DD DSN=PAY.PROD.LOADLIB,DISP=SHR
+//TIMESHT  DD DSN=&&SORTED,DISP=(OLD,DELETE)
+//EMPMAST  DD DSN=PAY.PROD.EMPLOYEE.MASTER,DISP=SHR
+//PAYRPT   DD SYSOUT=*
+```
+
+Inside `PAYCALC`, `SELECT timesheet-file ASSIGN TO TIMESHT` names the DD statement, not the data set; the JCL decides which data set that is. Step 1 runs the system sort utility on the first six characters of each record; `&&SORTED` is a temporary data set passed to step 2; `COND=(0,NE)` skips step 2 unless every earlier step returned 0, the value the COBOL program sets through `RETURN-CODE`. `SYSOUT=*` sends the report to the job's output. Jobs are submitted and chained by a **scheduler** (products such as IBM Workload Scheduler or BMC's Control-M), which runs thousands of them each night in dependency order.
+
+### Online: CICS
+
+When a bank clerk looks up an account or a cash machine checks a balance, the request is usually handled by a short COBOL program running under **CICS**, IBM's transaction server. The program uses `EXEC CICS` commands, which a translator built into the compiler turns into calls:
+
+```cobol
+EXEC CICS READ FILE('ACCOUNTS') INTO(account-record)
+          RIDFLD(acct-number) RESP(ws-resp)
+END-EXEC
+IF ws-resp = DFHRESP(NOTFND)
+    MOVE "No such account" TO msg-out
+END-IF
+EXEC CICS SEND MAP('BALMAP') MAPSET('BALSET') FROM(balmapo) ERASE
+END-EXEC
+EXEC CICS RETURN TRANSID('BAL1') COMMAREA(ws-commarea)
+END-EXEC
+```
+
+CICS programs are written to be **pseudo-conversational**: the program sends a screen and *ends*, telling CICS which transaction to start when the user replies and what state to hand it (the `COMMAREA` or, in newer designs, channels and containers). No program sits waiting for a person to type, which is how one system serves thousands of users at once. Today the "screen" is as likely to be a JSON request from a mobile app, routed to the same COBOL program through a service layer such as z/OS Connect.
+
+### Data: Db2 and embedded SQL
+
+COBOL programs reach **Db2**, IBM's relational database, through SQL embedded in the source:
+
+```cobol
+EXEC SQL
+    SELECT CUST_NAME, CREDIT_LIMIT
+      INTO :ws-cust-name, :ws-credit-limit
+      FROM CUSTOMER
+     WHERE CUST_ID = :ws-cust-id
+END-EXEC
+EVALUATE SQLCODE
+    WHEN 0      PERFORM 2100-show-customer
+    WHEN 100    PERFORM 2200-customer-not-found
+    WHEN OTHER  PERFORM 9900-sql-error
+END-EVALUATE
+```
+
+Names with a colon are **host variables**, ordinary COBOL items whose pictures must match the column types (a `DECIMAL(9,2)` column pairs naturally with `PIC S9(7)V99 COMP-3`). `SQLCODE` is 0 for success, 100 for "no row found" and negative for errors. Queries returning many rows use a cursor (`DECLARE`, `OPEN`, `FETCH` in a loop, `CLOSE`). A tool called DCLGEN generates the copybook of host variables from the table definition, so the layout again lives in one place.
+
+### Tools and modernisation
+
+The classic mainframe workplace is a 3270 terminal session running TSO and the ISPF editor, and many experienced developers are still fastest there. Increasingly, teams also use VS Code with IBM's Z Open Editor, the open-source **Zowe** tools to reach z/OS from a laptop, Git for source control, automated builds and unit-testing tools for COBOL in continuous-integration pipelines. Organisations that want to move away from a COBOL system have several routes, each with honest costs: keep and modernise it in place (better tools, tests, APIs around it); *rehost* the COBOL on Linux or in the cloud with a compatible compiler and runtime; *convert* it automatically to Java or C# (fast, but the result often reads like COBOL written in another language); or *rewrite* it, usually piece by piece behind stable interfaces, because a big-bang rewrite of a system that encodes decades of business rules is one of the riskiest projects in software. AI-assisted tools that explain and translate COBOL, such as IBM's watsonx Code Assistant for Z, are now part of that toolbox; their output still has to be verified against the old system's results, record by record and cent by cent. Every one of these routes depends on people who can read the existing code with confidence.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"BY CONTENT protects the caller's data completely."** It protects the item you passed. If the subprogram describes its linkage item as longer than what you passed, it can still read beyond it, and other `BY REFERENCE` arguments are fully exposed. Shared copybooks and careful lengths are the real protection.
+
+</Misconception>
+
+<Misconception>
+
+**"A subprogram starts fresh each time it is called."** Its working storage keeps the values of the previous call. Counters and flags carry over unless the program resets them, uses `LOCAL-STORAGE`, or is cancelled. Many subtle bugs come from a flag left set by the previous call.
+
+</Misconception>
+
+<Misconception>
+
+**"Mainframe COBOL is a different language."** The language is the same standard COBOL with IBM extensions. What differs is the environment: EBCDIC instead of ASCII, data sets instead of files, JCL instead of shell scripts, and CICS and Db2 commands embedded in the source.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+Try each question before opening the hints. Every answer about program output was checked by compiling and running the program with GnuCOBOL 3.2.
+
+<Exercises/>
+
+</Section>
