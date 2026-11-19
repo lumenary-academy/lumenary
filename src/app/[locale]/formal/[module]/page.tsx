@@ -9,6 +9,8 @@ import { highlight } from "@/lib/highlight";
 import { href } from "@/lib/href";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { LeanBlock, webEditorUrl } from "@/components/lesson/LeanBlock";
+import { TutoringOffer } from "@/components/tutoring/TutoringOffer";
+import { PROOF_WRITING, TUTORING_EXERCISES, tutoringDestination } from "@/lib/tutoring";
 
 export const dynamicParams = false;
 
@@ -48,6 +50,8 @@ export default async function FormalModulePage({ params }: Params) {
       }),
   );
   const mathlib = decls.some((d) => d.foundation === "mathlib");
+  // The tutoring pilot (lib/tutoring.ts): shown only where a destination is configured.
+  const tutoring = tutoringDestination();
 
   return (
     <>
@@ -121,6 +125,7 @@ export default async function FormalModulePage({ params }: Params) {
                       </div>
                     </details>
                   )}
+                  {tutoring && TUTORING_EXERCISES.has(ex.name) && <TutoringOffer destination={tutoring} {...PROOF_WRITING} />}
                 </article>
               ))}
             </div>
