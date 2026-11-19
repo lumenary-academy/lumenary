@@ -1,0 +1,487 @@
+---
+title: String algorithms
+subtitle: Finding a pattern in a text without wasted work, indexing text for many searches, and why "character" is a slippery word.
+minutes: 60
+objectives:
+  - Analyse the naive string-matching algorithm and construct its worst case
+  - Compute the prefix function of a pattern and use it in the Knuth–Morris–Pratt algorithm, with its linear-time argument
+  - Implement Rabin–Karp with a rolling hash and reason about false alarms
+  - Build a trie for autocomplete and explain what a suffix array makes fast
+  - Handle Unicode text correctly when searching, measuring and comparing strings
+prerequisites: [complexity, hash-tables, trees, dynamic-programming]
+related: [math.comp.algorithm-design, math.number.modular-arithmetic]
+references:
+  - title: Fast pattern matching in strings
+    author: Donald E. Knuth, James H. Morris Jr. and Vaughan R. Pratt
+    year: 1977
+    url: https://doi.org/10.1137/0206024
+    note: The KMP paper, SIAM Journal on Computing.
+  - title: Efficient randomized pattern-matching algorithms
+    author: Richard M. Karp and Michael O. Rabin
+    year: 1987
+    url: https://doi.org/10.1147/rd.312.0249
+    note: Fingerprinting with random hashes, including the rolling hash.
+  - title: A fast string searching algorithm
+    author: Robert S. Boyer and J Strother Moore
+    year: 1977
+    url: https://doi.org/10.1145/359842.359859
+    note: The algorithm that skips ahead, behind many practical search tools.
+  - title: "Efficient string matching: an aid to bibliographic search"
+    author: Alfred V. Aho and Margaret J. Corasick
+    year: 1975
+    url: https://doi.org/10.1145/360825.360855
+    note: A trie with failure links that finds many patterns in one pass.
+  - title: "Suffix arrays: a new method for on-line string searches"
+    author: Udi Manber and Gene Myers
+    year: 1993
+    url: https://doi.org/10.1137/0222058
+  - title: Two efficient algorithms for linear time suffix array construction
+    author: Ge Nong, Sen Zhang and Wai Hong Chan
+    year: 2011
+    url: https://doi.org/10.1109/TC.2010.188
+    note: SA-IS, the linear-time construction used by many libraries.
+  - title: "Unicode Standard Annex #15: Unicode Normalization Forms"
+    url: https://www.unicode.org/reports/tr15/
+  - title: "Unicode Standard Annex #29: Unicode Text Segmentation"
+    url: https://www.unicode.org/reports/tr29/
+    note: Where "user-perceived character" (grapheme cluster) is defined.
+  - title: CPython's string search (fastsearch.h)
+    url: https://github.com/python/cpython/blob/main/Objects/stringlib/fastsearch.h
+    note: What `in` and `str.find` actually do, with comments explaining the design.
+---
+
+<Section id="motivation" kind="motivation" title="Finding a needle, quickly">
+
+Press Ctrl+F in a document and type a word: every occurrence lights up before you have lifted your finger. A biologist asks whether a 20-letter DNA probe appears anywhere in a three-billion-letter genome. A security system scans every packet crossing a network for thousands of known attack signatures at once. A phone keyboard suggests "Kathmandu" after you have typed "Kat". A plagiarism checker compares an essay against millions of web pages.
+
+All of these are *string algorithms*: algorithms whose input is text, or anything that can be written as a sequence of symbols. The obvious way to search a text is fine for a short document and painfully slow for a genome; the difference between the two is a handful of beautiful ideas that every working engineer should own. In this lesson you will meet four of them:
+
+- **Reuse what you already know** (Knuth–Morris–Pratt): when a match fails part-way through, the characters you have already compared tell you where the next possible match can start.
+- **Compare fingerprints, not strings** (Rabin–Karp): a hash of a window of text can be updated in constant time as the window slides, so most positions are rejected with one number comparison.
+- **Index once, search many times** (tries and suffix arrays): if you will search the same collection again and again, pay once to organise it.
+- **Know what a character is** (Unicode): before any of the above can be correct on real text, you must agree on what the symbols are.
+
+The closely related problem of measuring how *different* two strings are, the edit distance, was solved in <LessonLink slug="dynamic-programming">Dynamic programming</LessonLink>; we will point back to it rather than repeat it.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Strings, patterns and borders">
+
+<Definition term="alphabet, string, substring">
+
+An **alphabet** $\Sigma$ is a finite set of symbols: $\{0, 1\}$, $\{A, C, G, T\}$, or the code points of Unicode. A **string** of length $n$ is a sequence $s = s_0 s_1 \cdots s_{n-1}$ of symbols. A **substring** is a contiguous piece $s_i \cdots s_{j-1}$, written `s[i:j]` in Python. A **prefix** is a substring that starts at position 0; a **suffix** is one that ends at position $n$.
+
+</Definition>
+
+<Definition term="the string-matching problem">
+
+Given a **text** $T$ of length $n$ and a **pattern** $P$ of length $m \le n$, find every **shift** $s$ with $0 \le s \le n - m$ such that $T[s : s+m] = P$. Occurrences may overlap: the pattern `abab` occurs at shifts 0, 2 and 4 of `abababab`.
+
+</Definition>
+
+<Definition term="border, prefix function">
+
+A **border** of a string $x$ is a string that is both a proper prefix and a proper suffix of $x$ ("proper" means shorter than $x$ itself). The **prefix function** of a pattern $P$ is the array $\pi$ where $\pi[i]$ is the length of the longest border of $P[0 : i+1]$, the first $i+1$ characters.
+
+</Definition>
+
+For example, `ACAAC` has the borders `AC` and the empty string (the prefix `AC` equals the suffix `AC`; `A` is a prefix but the string ends in `C`), so its longest border has length 2. Borders are the whole secret of KMP: a border is a piece of the pattern that can slide forward and still line up with itself.
+
+</Section>
+
+<Section id="naive" kind="intuition" title="The obvious algorithm and what it forgets">
+
+The naive algorithm tries every shift: line $P$ up under $T$ at shift 0 and compare character by character until a mismatch or a full match; then move $P$ one place right and start again from the beginning of $P$.
+
+On ordinary prose this is fast, because a mismatch usually happens at the first or second character. But consider the text `aaaa…a` ($n$ letters) and the pattern `aa…ab` ($m-1$ copies of `a` and then `b`). At every one of the $n - m + 1$ shifts, the first $m - 1$ comparisons succeed and the last one fails, so the algorithm makes $(n - m + 1) \cdot m$ comparisons: $\Theta(nm)$. For a 1,000-letter pattern in a million-letter text that is about a billion comparisons.
+
+Look closely at what the naive algorithm throws away. At shift 0 it learned that $T[0 : m-1]$ is `aa…a`. At shift 1 it compares $T[1]$, $T[2]$, … against `a` again, even though it already knows the answer. The comparisons that succeeded contain information about the text, and the naive algorithm forgets it every time it moves.
+
+<Analogy>
+
+You are reading a long number aloud to a friend who is checking it against a list, and you stumble on the seventh digit. You would not go back to the beginning of the whole page; you know which digits you have already read correctly, and you would restart from the last point that could still be right. KMP formalises "the last point that could still be right".
+
+</Analogy>
+
+</Section>
+
+<Section id="kmp" kind="examples" title="Knuth–Morris–Pratt: never read a text character twice">
+
+Suppose we have matched the first $k$ characters of $P$ against the text, and the next text character disagrees with $P[k]$. Those $k$ text characters are exactly $P[0:k]$, so we know them without looking. Which shifts could still produce a match? Only shifts where some prefix of $P$ lines up with a suffix of $P[0:k]$, that is, where a **border** of $P[0:k]$ sits under the text we just read. The longest such border gives the smallest safe shift, so we keep $\pi[k-1]$ characters "already matched" and compare the same text character again against $P[\pi[k-1]]$. If that fails too, we fall back again, to the longest border of that border, and so on, until either a comparison succeeds or $k = 0$.
+
+<Figure caption="KMP on the text ACAACAACAC with pattern ACAACAC. First try: six characters match, then text A meets pattern C (red). The longest border of the matched part ACAACA is ACA, so the pattern slides three places and the three shaded characters are known to match without being compared again. Comparison resumes at the same text position, and this time the pattern is found at shift 3.">
+<svg viewBox="0 0 400 165" role="img" aria-label="Three rows of letter boxes. The top row is the text A C A A C A A C A C with positions 0 to 9. The second row places the pattern at shift 0: the first six boxes are marked as matches and the seventh as a mismatch. The third row places the pattern at shift 3: its first three boxes are shaded as known matches from the border, and the remaining four match the text.">
+  <g fontFamily="ui-monospace, monospace" fontSize="14" textAnchor="middle" fill="currentColor">
+    <text x="40" y="38" textAnchor="start" fontFamily="sans-serif" fontSize="12">text</text>
+    <text x="40" y="88" textAnchor="start" fontFamily="sans-serif" fontSize="12">try 1</text>
+    <text x="40" y="138" textAnchor="start" fontFamily="sans-serif" fontSize="12">try 2</text>
+    <text x="104" y="16" fontSize="10">0</text><text x="132" y="16" fontSize="10">1</text><text x="160" y="16" fontSize="10">2</text><text x="188" y="16" fontSize="10">3</text><text x="216" y="16" fontSize="10">4</text><text x="244" y="16" fontSize="10">5</text><text x="272" y="16" fontSize="10">6</text><text x="300" y="16" fontSize="10">7</text><text x="328" y="16" fontSize="10">8</text><text x="356" y="16" fontSize="10">9</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="90" y="22" width="28" height="24" /><rect x="118" y="22" width="28" height="24" /><rect x="146" y="22" width="28" height="24" /><rect x="174" y="22" width="28" height="24" /><rect x="202" y="22" width="28" height="24" /><rect x="230" y="22" width="28" height="24" /><rect x="258" y="22" width="28" height="24" /><rect x="286" y="22" width="28" height="24" /><rect x="314" y="22" width="28" height="24" /><rect x="342" y="22" width="28" height="24" />
+  </g>
+  <g fill="var(--compute)" fillOpacity="0.25" stroke="currentColor" strokeWidth="1">
+    <rect x="90" y="72" width="28" height="24" /><rect x="118" y="72" width="28" height="24" /><rect x="146" y="72" width="28" height="24" /><rect x="174" y="72" width="28" height="24" /><rect x="202" y="72" width="28" height="24" /><rect x="230" y="72" width="28" height="24" />
+  </g>
+  <rect x="258" y="72" width="28" height="24" fill="var(--bad)" fillOpacity="0.3" stroke="currentColor" strokeWidth="1" />
+  <g fill="var(--gold)" fillOpacity="0.45" stroke="currentColor" strokeWidth="1">
+    <rect x="174" y="122" width="28" height="24" /><rect x="202" y="122" width="28" height="24" /><rect x="230" y="122" width="28" height="24" />
+  </g>
+  <g fill="var(--compute)" fillOpacity="0.25" stroke="currentColor" strokeWidth="1">
+    <rect x="258" y="122" width="28" height="24" /><rect x="286" y="122" width="28" height="24" /><rect x="314" y="122" width="28" height="24" /><rect x="342" y="122" width="28" height="24" />
+  </g>
+  <g fontFamily="ui-monospace, monospace" fontSize="14" textAnchor="middle" fill="currentColor">
+    <text x="104" y="39">A</text><text x="132" y="39">C</text><text x="160" y="39">A</text><text x="188" y="39">A</text><text x="216" y="39">C</text><text x="244" y="39">A</text><text x="272" y="39">A</text><text x="300" y="39">C</text><text x="328" y="39">A</text><text x="356" y="39">C</text>
+    <text x="104" y="89">A</text><text x="132" y="89">C</text><text x="160" y="89">A</text><text x="188" y="89">A</text><text x="216" y="89">C</text><text x="244" y="89">A</text><text x="272" y="89">C</text>
+    <text x="188" y="139">A</text><text x="216" y="139">C</text><text x="244" y="139">A</text><text x="272" y="139">A</text><text x="300" y="139">C</text><text x="328" y="139">A</text><text x="356" y="139">C</text>
+  </g>
+  <path d="M 104 100 C 120 112, 160 112, 176 118" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+  <text x="120" y="160" fontFamily="sans-serif" fontSize="11" fill="currentColor">slide by 6 − π[5] = 6 − 3 = 3</text>
+</svg>
+</Figure>
+
+<Example title="The prefix function of ACAACAC">
+
+Work left to right, keeping $k$, the length of the longest border found so far.
+
+| $i$ | $P[0:i+1]$ | longest border | $\pi[i]$ |
+| --- | --- | --- | --- |
+| 0 | `A` | (empty) | 0 |
+| 1 | `AC` | (empty) | 0 |
+| 2 | `ACA` | `A` | 1 |
+| 3 | `ACAA` | `A` | 1 |
+| 4 | `ACAAC` | `AC` | 2 |
+| 5 | `ACAACA` | `ACA` | 3 |
+| 6 | `ACAACAC` | `AC` | 2 |
+
+Row 3 shows a fall-back: the border `A` of `ACA` would extend to `AC`, but the new character is `A`, not `C`, so we fall back to the longest border of `A`, which is empty, and then `A` extends it to length 1. Row 6 is the interesting one: the border `ACA` would extend to `ACAA`, but the new character is `C`; the longest border of `ACA` is `A` (that is $\pi[2] = 1$), and `A` followed by `C` matches the pattern's `AC`, so $\pi[6] = 2$.
+
+</Example>
+
+The key fact behind the fall-back is that **a border of a border is a border**: if $u$ is a border of $x$ and $v$ is a border of $u$, then $v$ is a prefix of $u$, hence of $x$, and a suffix of $u$, hence of $x$. So the borders of $x$, longest first, are exactly $\pi$, then $\pi$ of that, and so on down to zero. Computing $\pi$ is itself a matching problem, the pattern against itself, and uses the same loop.
+
+```python run
+def naive_search(text, pattern):
+    """Every shift where pattern occurs in text, and the number of character comparisons."""
+    n, m = len(text), len(pattern)
+    hits, comparisons = [], 0
+    for s in range(n - m + 1):
+        j = 0
+        while j < m:
+            comparisons += 1
+            if text[s + j] != pattern[j]:
+                break
+            j += 1
+        if j == m:
+            hits.append(s)
+    return hits, comparisons
+
+
+def prefix_function(p):
+    """pi[i] = length of the longest proper border of p[:i+1]."""
+    pi = [0] * len(p)
+    k = 0                                  # length of the current border
+    for i in range(1, len(p)):
+        while k > 0 and p[i] != p[k]:
+            k = pi[k - 1]                  # fall back to the next shorter border
+        if p[i] == p[k]:
+            k += 1
+        pi[i] = k
+    return pi
+
+
+def kmp_search(text, pattern):
+    pi = prefix_function(pattern)
+    hits, comparisons, k = [], 0, 0        # k = how much of the pattern is matched
+    for i, c in enumerate(text):
+        while True:
+            comparisons += 1
+            if c == pattern[k]:
+                k += 1
+                break
+            if k == 0:
+                break
+            k = pi[k - 1]
+        if k == len(pattern):              # a full match ending at position i
+            hits.append(i - k + 1)
+            k = pi[k - 1]                  # keep going: matches may overlap
+    return hits, comparisons
+
+
+print(prefix_function("ACAACAC"))
+
+text = "GACAACACAACACTT"
+print(naive_search(text, "ACAACAC"))
+print(kmp_search(text, "ACAACAC"))
+
+# The naive algorithm's bad case: a long run of a's, and a pattern that fails only at its end.
+text = "a" * 2000
+pattern = "a" * 30 + "b"
+print("naive:", naive_search(text, pattern)[1], "comparisons")
+print("KMP:  ", kmp_search(text, pattern)[1], "comparisons")
+```
+
+Both find the overlapping matches at shifts 1 and 6 of the short text. On the bad case the naive algorithm makes $(2000 - 31 + 1) \times 31 = 61{,}070$ comparisons and KMP fewer than $2 \times 2000$. Try changing the pattern to `"a" * 300 + "b"`: the naive count grows tenfold, KMP's does not move.
+
+<Theorem name="KMP runs in linear time">
+
+The prefix function of a pattern of length $m$ is computed with at most $2m$ character comparisons, and the search over a text of length $n$ makes at most $2n$. So KMP takes $O(n + m)$ time and $O(m)$ extra space, whatever the alphabet and whatever the input.
+
+</Theorem>
+
+<Proof>
+
+Look at the search loop and the quantity $k$, the number of pattern characters currently matched. Each comparison either succeeds or fails. A successful comparison increases $k$ by one and moves on to the next text character, so there are at most $n$ successful comparisons. A failed comparison either ends the work on this text character (when $k = 0$, at most $n$ times in total) or replaces $k$ by $\pi[k-1] \lt k$, a strict decrease. Since $k$ starts at 0, never goes negative, and increases by at most one per text character, the total of all decreases is at most the total of all increases, which is at most $n$. Adding up: at most $n$ successes plus at most $n$ failures, so at most $2n$ comparisons. The same argument, with the pattern as its own text, bounds the prefix-function computation by $2m$. (This style of argument, charging decreases to earlier increases, is called *amortised* analysis.)
+
+</Proof>
+
+</Section>
+
+<Section id="rabin-karp" kind="computation" title="Rabin–Karp: compare fingerprints, not strings">
+
+KMP is clever about *which* comparisons to make. Rabin and Karp took a different route: make each comparison cheap. Treat a window of $m$ characters as a number written in base $b$ (say $b = 256$, or anything larger than the alphabet) and reduce it modulo a prime $q$:
+
+$$h(x_0 x_1 \cdots x_{m-1}) = \left(x_0 b^{m-1} + x_1 b^{m-2} + \cdots + x_{m-1}\right) \bmod q.$$
+
+If the hash of a window differs from the hash of the pattern, the window certainly is not the pattern. If they agree, it probably is, and we check character by character to be sure. The trick that makes this fast is that the hash **rolls**: sliding the window one place right removes the leading character's contribution and appends a new trailing one,
+
+$$h_{s+1} = \left( (h_s - T[s] \cdot b^{m-1}) \cdot b + T[s+m] \right) \bmod q,$$
+
+which is a constant number of arithmetic operations, however long the pattern. (If modular arithmetic is rusty, Lumenary Math's <TopicLink id="math.number.modular-arithmetic">clock arithmetic</TopicLink> lesson covers it.)
+
+```python run
+import random
+
+def rabin_karp(text, pattern, base=256, mod=1_000_000_007):
+    """Every shift where pattern occurs, and how many hash matches turned out to be false alarms."""
+    n, m = len(text), len(pattern)
+    if m > n:
+        return [], 0
+    high = pow(base, m - 1, mod)           # weight of the character that leaves the window
+    hp = ht = 0
+    for i in range(m):
+        hp = (hp * base + ord(pattern[i])) % mod
+        ht = (ht * base + ord(text[i])) % mod
+    hits, spurious = [], 0
+    for s in range(n - m + 1):
+        if ht == hp:                       # equal hashes: probably a match, so check
+            if text[s:s + m] == pattern:
+                hits.append(s)
+            else:
+                spurious += 1
+        if s + m < n:                      # roll: drop text[s], bring in text[s + m]
+            ht = ((ht - ord(text[s]) * high) * base + ord(text[s + m])) % mod
+    return hits, spurious
+
+rng = random.Random(2026)
+genome = "".join(rng.choice("ACGT") for _ in range(200_000))
+probe = genome[123_456:123_468]            # a 12-letter piece we know is in there
+
+for mod in (101, 10_007, 1_000_000_007):
+    hits, spurious = rabin_karp(genome, probe, mod=mod)
+    print(f"mod {mod:>13,}: matches at {hits}, false alarms: {spurious}")
+```
+
+With a tiny modulus the hash values collide constantly: roughly one window in $q$ shares the pattern's hash by accident, so there are about $200{,}000 / 101 \approx 2{,}000$ false alarms, each costing an $m$-character check. With $q$ around $10^9$ there are essentially none. In expectation the running time is $O(n + m)$ plus $m$ times the number of false alarms.
+
+<Theorem name="False alarms are rare when the base is random">
+
+Let $q$ be a prime and choose the base $b$ uniformly at random from $\{0, 1, \ldots, q-1\}$. For two *different* strings $x \ne y$ of length $m$, the probability that $h(x) = h(y)$ is at most $(m-1)/q$.
+
+</Theorem>
+
+<Proof>
+
+$h(x) - h(y) \equiv \sum_{i} (x_i - y_i)\, b^{m-1-i} \pmod q$ is the value at $b$ of a polynomial of degree at most $m - 1$ with coefficients $x_i - y_i$. Since $x \ne y$ and the symbols are smaller than $q$, at least one coefficient is nonzero modulo $q$, so it is a nonzero polynomial over the field $\mathbb{Z}/q$. Such a polynomial has at most $m-1$ roots, so at most $m - 1$ of the $q$ possible bases make the hashes equal.
+
+</Proof>
+
+The randomness matters in adversarial settings. With a fixed, published base and modulus, someone who wants to slow your service down can construct many strings with the same hash. A random base, chosen when the program starts, takes that power away; you will see the same idea, applied to hash tables, in <LessonLink slug="randomized-algorithms">Randomness in algorithms</LessonLink>.
+
+Rabin–Karp shines where KMP is awkward. To search for *many* patterns of the same length, put all their hashes in a set and test each window's hash against the set in $O(1)$. To find a long substring that two documents share, hash every window of both. Document-fingerprinting systems for detecting copied code and text, such as the *winnowing* scheme of [Schleimer, Wilkerson and Aiken (2003)](https://doi.org/10.1145/872757.872770), are built on rolling hashes.
+
+</Section>
+
+<Section id="indexes" kind="examples" title="Searching many times: tries and suffix arrays">
+
+KMP and Rabin–Karp read the whole text for every query. That is optimal for one search, but if the text stays the same while the queries keep coming (a dictionary, a genome, a code base), it pays to build an **index** once.
+
+### Tries and autocomplete
+
+A **trie** (from re*trie*val; the name is Edward Fredkin's, from 1960) stores a set of strings as a tree. Each edge is labelled with a character, each node represents the prefix spelled out on the path from the root, and nodes where a stored word ends are marked. Words that share a prefix share the path for it. Looking up a word, or finding whether any word starts with a given prefix, takes $O(m)$ steps for a query of length $m$, *independent of how many words are stored*. That is exactly what autocomplete needs: walk down the prefix the user has typed, then list the words in that subtree, best first.
+
+Tries are the tree cousin of the <LessonLink slug="hash-tables">hash table</LessonLink>: a hash table answers "is this exact word present?" just as fast, but it cannot answer "which words start with `ka`?" without looking at every key. Their cost is memory: one node per distinct prefix, each with its own table of children. Production systems compress chains of single-child nodes into one edge labelled with a whole substring (a *radix tree* or *Patricia trie*); IP routers use exactly such tries over the bits of addresses, as you will see in <LessonLink slug="networking">Networks</LessonLink>. Add "failure links" that play the role of KMP's prefix function and you get the **Aho–Corasick** automaton, which finds every occurrence of thousands of patterns in one pass over the text; it was invented in 1975 for bibliographic search and still sits inside network intrusion-detection systems and many tools that search for a long list of fixed strings at once.
+
+### Suffix arrays
+
+A trie of all the *suffixes* of a text would answer any substring query: $P$ occurs in $T$ exactly when $P$ is a prefix of some suffix of $T$. That trie can have $\Theta(n^2)$ nodes, though. The **suffix array**, introduced by Manber and Myers, keeps the idea and drops the memory: it is just the list of starting positions of all suffixes, sorted alphabetically by the suffix that starts there. All the suffixes that begin with $P$ are adjacent in that order, so two binary searches find the whole block of matches in $O(m \log n)$ character comparisons.
+
+```python run
+class TrieNode:
+    def __init__(self):
+        self.children = {}     # character -> TrieNode
+        self.count = 0         # how often this exact word was entered (0: not a word)
+
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+        self.nodes = 1
+
+    def add(self, word, times=1):
+        node = self.root
+        for ch in word:
+            if ch not in node.children:
+                node.children[ch] = TrieNode()
+                self.nodes += 1
+            node = node.children[ch]
+        node.count += times
+
+    def complete(self, prefix, k=3):
+        """The k most frequent words that start with prefix (ties broken alphabetically)."""
+        node = self.root
+        for ch in prefix:                  # walk down: O(len(prefix))
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        found, stack = [], [(node, prefix)]
+        while stack:                       # collect every word below that node
+            node, word = stack.pop()
+            if node.count:
+                found.append((-node.count, word))
+            for ch, child in node.children.items():
+                stack.append((child, word + ch))
+        return [word for _, word in sorted(found)[:k]]
+
+
+searches = {"lagos": 9, "lahore": 7, "lima": 8, "lilongwe": 3, "lisbon": 6,
+            "luanda": 4, "lusaka": 5, "lyon": 4, "lima peru": 2, "kyiv": 6,
+            "kyoto": 7, "karachi": 8, "kathmandu": 5, "kampala": 4}
+trie = Trie()
+for city, times in searches.items():
+    trie.add(city, times)
+
+for typed in ["l", "li", "ly", "ka", "ky", "x"]:
+    print(f"{typed!r:6} -> {trie.complete(typed)}")
+letters = sum(len(c) for c in searches)
+print(f"{len(searches)} words, {letters} letters, {trie.nodes} trie nodes (shared prefixes are stored once)")
+
+# A suffix array: the starting positions of all suffixes, in sorted order.
+def suffix_array(s):
+    return sorted(range(len(s)), key=lambda i: s[i:])     # fine for small s; real ones are O(n)
+
+def occurrences(s, sa, p):
+    """All positions of p in s by binary search over the sorted suffixes."""
+    lo, hi = 0, len(sa)
+    while lo < hi:                          # find the first suffix that is >= p
+        mid = (lo + hi) // 2
+        if s[sa[mid]:sa[mid] + len(p)] < p:
+            lo = mid + 1
+        else:
+            hi = mid
+    start = lo
+    while lo < len(sa) and s[sa[lo]:sa[lo] + len(p)] == p:
+        lo += 1                             # the matches sit next to each other
+    return sorted(sa[start:lo])
+
+s = "papaya"
+sa = suffix_array(s)
+for rank, i in enumerate(sa):
+    print(rank, i, s[i:])
+print("'pa' at", occurrences(s, sa, "pa"), "  'a' at", occurrences(s, sa, "a"), "  'ya' at", occurrences(s, sa, "ya"))
+```
+
+Notice `lima` and `lima peru`: a word can end at a node that also has children, which is why nodes carry a count rather than being "leaves". The suffix array of `papaya` lists the suffixes `a`, `apaya`, `aya`, `papaya`, `paya`, `ya`; the two suffixes starting with `pa` are neighbours, at ranks 3 and 4.
+
+The one-line construction above sorts $n$ suffixes with comparisons that can each cost $O(n)$, so it is $O(n^2 \log n)$ in the worst case; fine for a word, hopeless for a genome. Linear-time constructions exist (SA-IS is the one most libraries use), and adding the **LCP array** (the length of the longest common prefix of neighbouring suffixes) lets a suffix array answer questions like "what is the longest repeated substring?" in one scan. A close relative, the Burrows–Wheeler transform with its FM-index, lets DNA read aligners such as [BWA](https://github.com/lh3/bwa) search a whole human genome held in a few gigabytes of memory.
+
+</Section>
+
+<Section id="unicode" kind="human" title="What is a character?">
+
+Every algorithm above compares "characters" for equality. On real text that word hides several different things, and getting them confused produces bugs that only appear for some languages.
+
+- A **byte** is eight bits. In UTF-8 a character takes one to four bytes (the encoding is explained in <LessonLink slug="bits-and-bytes">Representing data</LessonLink>).
+- A **code point** is a number Unicode assigns to an abstract character, written U+00E9 for é. A Python `str` is a sequence of code points; `len` counts them and `s[i]` returns one.
+- A **grapheme cluster** is what a reader perceives as one character: what the cursor jumps over, what "reverse this string" should keep intact. Unicode Annex #29 defines it, and it can span many code points.
+
+```python run
+import unicodedata
+
+composed = "café"          # é as a single code point, U+00E9
+decomposed = "café"       # e followed by U+0301 COMBINING ACUTE ACCENT
+print(composed, decomposed, composed == decomposed, len(composed), len(decomposed))
+
+def nfc(s):
+    return unicodedata.normalize("NFC", s)
+
+print("equal after NFC:", nfc(decomposed) == composed)
+
+menu = "Un café, por favor."
+print("plain search:", decomposed in menu, "  normalised search:", nfc(decomposed) in nfc(menu))
+
+for s in ["नमस्ते", "\U0001F1F3\U0001F1EC", "\U0001F44D\U0001F3FD", "\U0001F469‍\U0001F4BB"]:
+    names = [unicodedata.name(c, "?") for c in s]
+    print(s, len(s), "code points:", ", ".join(names))
+
+print("reversing the flag of Nigeria by code points:", "\U0001F1F3\U0001F1EC"[::-1])
+print("straße".upper(), "  casefold equal:", "Straße".casefold() == "STRASSE".casefold())
+print("dotted capital I lowercases to", len("İ".lower()), "code points:", [hex(ord(c)) for c in "İ".lower()])
+```
+
+Four lessons hide in that output.
+
+1. **The same text can have different code points.** `café` can be stored with a precomposed `é` or with `e` plus a combining accent. They look identical and compare unequal, so a search for one misses the other. The fix is **normalisation**: convert both text and pattern to the same form (NFC, composed, is the usual choice for storage; Annex #15 defines all four forms) before matching.
+2. **`len` does not count what a reader sees.** The Hindi greeting नमस्ते is six code points but only three or four visible units, depending on how the segmentation rules treat its conjunct; a flag is two "regional indicator" code points; a thumbs-up with a skin tone is two; "woman technologist" is three, glued by an invisible ZERO WIDTH JOINER. Reversing a string code point by code point turns the flag of Nigeria (N, G) into the flag of Guinea (G, N). Truncating a message "to 20 characters" by code points can cut an emoji or a conjunct in half.
+3. **Case is language-dependent.** `ß` uppercases to two letters, so `upper` can change a string's length. Turkish distinguishes dotted and dotless i, and Python's language-neutral `lower` turns the capital `İ` into two code points. For case-insensitive matching use `casefold`, and for user-facing text use a locale-aware library.
+4. **Your algorithms are still correct, on the right alphabet.** KMP, Rabin–Karp, tries and suffix arrays work on any sequence of symbols. The engineering decision is which symbols: bytes (fast, and fine for exact matching of normalised UTF-8), code points (Python's default), or grapheme clusters (what users mean), with normalisation applied first.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The naive algorithm is $O(nm)$, so it is always slow."** Its worst case is $\Theta(nm)$, but on natural-language text most shifts fail at the first character and the average is close to linear. The worst case matters when inputs can be adversarial or highly repetitive (DNA, logs, machine-generated text), and those are exactly the places where a guaranteed linear algorithm earns its keep.
+
+</Misconception>
+
+<Misconception>
+
+**"KMP is what real search tools use."** KMP's guarantee is beautiful, but it reads every text character. Practical searchers usually prefer Boyer–Moore-style algorithms, which compare the pattern from its *right* end and can skip ahead by up to $m$ characters on a mismatch, so on long patterns over large alphabets they look at only a fraction of the text. CPython's `str.find` is a tuned hybrid of this kind, switching to the Two-Way algorithm of Crochemore and Perrin (linear worst case, constant extra space) for long patterns; its source file is linked in the references and is worth reading.
+
+</Misconception>
+
+<Misconception>
+
+**"Equal hashes mean equal strings."** A hash is a fingerprint, not an identity. Rabin–Karp must verify every hash match, or accept that it is a Monte Carlo algorithm that is occasionally wrong. Skipping the check is a classic source of rare, unreproducible bugs.
+
+</Misconception>
+
+<Misconception>
+
+**"`str.count` counts occurrences."** It counts *non-overlapping* occurrences: `"abababab".count("abab")` is 2, while the pattern occurs at three shifts. Decide which one your problem needs.
+
+</Misconception>
+
+</Section>
+
+<Section id="practice" kind="history" title="Where these ideas came from, and where they live">
+
+Morris and Pratt found the linear-time matcher around 1970, and Knuth arrived at it independently from automata theory; the three published together in 1977, the same year Boyer and Moore published their skipping algorithm. Aho and Corasick's multi-pattern automaton dates from 1975, Rabin and Karp's fingerprinting from 1987, and suffix arrays from Manber and Myers around 1990, with linear-time construction following in the 2000s.
+
+Today the ideas are everywhere, usually inside a library:
+
+- **Editors and command-line tools** (`grep`, `ripgrep`, your IDE's search) combine Boyer–Moore-style skipping, Aho–Corasick for sets of literals, and automata for regular expressions, which reappear as the first stage of every compiler in <LessonLink slug="compilers-and-interpreters">Compilers and interpreters</LessonLink>.
+- **Bioinformatics** lives on suffix arrays, FM-indexes and $k$-mer hashing, which is Rabin–Karp's rolling hash applied to every length-$k$ window of a genome.
+- **Search engines** use inverted indexes over words rather than substring indexes, and tries for query suggestions.
+- **Spell checking and fuzzy search** need to know how far apart two strings are. That is edit distance, the dynamic programme from <LessonLink slug="dynamic-programming">Dynamic programming</LessonLink>, often combined with a trie so that whole subtrees of the dictionary are abandoned once the distance exceeds a limit.
+- **Every system that handles user text** needs the Unicode discipline of the previous section: normalise on input, compare with `casefold`, and count grapheme clusters when the user's notion of "character" matters.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

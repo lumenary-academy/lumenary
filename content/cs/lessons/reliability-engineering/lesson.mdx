@@ -1,0 +1,336 @@
+---
+title: Reliability engineering
+subtitle: Deciding how reliable a service should be, noticing when it is not, and designing it to bend rather than break.
+minutes: 80
+objectives:
+  - Define SLIs, SLOs and error budgets, and compute a budget and its burn rate
+  - Monitor the four golden signals and alert on symptoms rather than causes
+  - Run an incident and write a blameless postmortem
+  - Apply graceful degradation, load shedding and circuit breakers to stop failures spreading
+  - Implement retries with exponential backoff and jitter, and explain why jitter matters
+  - Release changes safely with canaries and feature flags, and describe chaos engineering
+prerequisites: [system-design, distributed-systems]
+related: [math.prob.probability-theory, math.prob.statistics-intro]
+references:
+  - title: "Site Reliability Engineering: How Google Runs Production Systems"
+    author: Beyer, Jones, Petoff and Murphy (eds.)
+    year: 2016
+    url: https://sre.google/sre-book/table-of-contents/
+    note: Free online. Start with the chapters on embracing risk, SLOs, monitoring, and postmortem culture.
+  - title: "The Site Reliability Workbook"
+    year: 2018
+    url: https://sre.google/workbook/table-of-contents/
+    note: The practical companion, including implementing SLOs and alerting on them.
+  - title: "SRE book: Service Level Objectives"
+    url: https://sre.google/sre-book/service-level-objectives/
+  - title: "SRE book: Monitoring Distributed Systems"
+    url: https://sre.google/sre-book/monitoring-distributed-systems/
+    note: The source of the four golden signals.
+  - title: "SRE workbook: Alerting on SLOs"
+    url: https://sre.google/workbook/alerting-on-slos/
+  - title: "SRE book: Postmortem Culture: Learning from Failure"
+    url: https://sre.google/sre-book/postmortem-culture/
+  - title: "SRE book: Addressing Cascading Failures"
+    url: https://sre.google/sre-book/addressing-cascading-failures/
+  - title: Exponential Backoff And Jitter
+    author: Marc Brooker
+    year: 2015
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+  - title: Timeouts, retries, and backoff with jitter
+    url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+    note: Amazon Builders' Library.
+  - title: Using load shedding to avoid overload
+    url: https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/
+  - title: "SRE workbook: Canarying Releases"
+    url: https://sre.google/workbook/canarying-releases/
+  - title: Feature Toggles (aka Feature Flags)
+    author: Pete Hodgson
+    url: https://martinfowler.com/articles/feature-toggles.html
+  - title: CircuitBreaker
+    author: Martin Fowler
+    url: https://martinfowler.com/bliki/CircuitBreaker.html
+  - title: Principles of Chaos Engineering
+    url: https://principlesofchaos.org/
+  - title: Chaos Monkey
+    url: https://netflix.github.io/chaosmonkey/
+    note: Netflix's open-source tool that randomly terminates instances in production.
+---
+
+<Section id="motivation" kind="motivation" title="How reliable is reliable enough?">
+
+Users notice reliability mostly by its absence: the payment that hangs, the map that will not load at the station in Nairobi, the video that buffers on the last minute of the final. So it is tempting to aim for perfection. It is also wrong. Each extra "nine" of availability costs much more than the last — more replicas, more regions, slower releases — while users stop being able to tell the difference: a phone on a mobile network fails more often than a well-run service does. And a team that is never allowed to fail never ships.
+
+**Site reliability engineering** (SRE), as Google named and described it, treats reliability as an engineering quantity: chosen deliberately, measured continuously, and traded against the speed of change. This lesson follows that approach — choosing targets, watching them, responding when they are missed, designing so that failures stay small, and changing systems safely — with the free SRE books at sre.google as the primary sources.
+
+</Section>
+
+<Section id="slos" kind="definitions" title="SLIs, SLOs and error budgets">
+
+<Definition term="Service level indicator (SLI)">
+
+A carefully defined measurement of some aspect of the service as users experience it, usually expressed as the proportion of good events: *successful requests ÷ valid requests*, or *requests answered within 300 ms ÷ valid requests*.
+
+</Definition>
+
+<Definition term="Service level objective (SLO)">
+
+A target value for an SLI over a time window: "99.9% of checkout requests succeed, measured over a rolling 30 days."
+
+</Definition>
+
+<Definition term="Error budget">
+
+One minus the SLO: the amount of unreliability the service may "spend" in the window. A 99.9% SLO gives a budget of 0.1% of requests (or of minutes).
+
+</Definition>
+
+An **SLA** (service level agreement) is different: a contract with customers that specifies consequences — refunds, credits — if a level is missed. SLAs are usually looser than internal SLOs, so the team notices trouble before it costs money.
+
+Good SLIs are measured as close to the user as practical (at the load balancer, or by probes that behave like users), cover the journeys users care about (search, add to cart, pay), and count latency with **percentiles** — the 99th percentile, say — rather than averages, which hide the slowest requests where unhappy users live.
+
+```python run
+# What does each SLO allow? (A 30-day window has 43,200 minutes.)
+WINDOW_MIN = 30 * 24 * 60
+print("SLO        allowed bad minutes in 30 days")
+for slo in (0.99, 0.995, 0.999, 0.9995, 0.9999, 0.99999):
+    budget = (1 - slo) * WINDOW_MIN
+    print(f"{slo:<9.5%}  {budget:8.1f} min  ({budget / 60:.2f} h)")
+
+# An error budget in requests, and how fast an incident burns it.
+requests = 1_200_000_000                     # requests in the 30-day window
+slo = 0.999
+budget = (1 - slo) * requests
+print(f"\nSLO {slo:.1%} over {requests:,} requests: {budget:,.0f} failed requests allowed")
+
+def burn_rate(error_ratio, slo):
+    """How many times faster than 'exactly on budget' the budget is being spent."""
+    return error_ratio / (1 - slo)
+
+for errors, label in ((0.0005, "a mild bug: 0.05% of requests fail"),
+                      (0.01, "a bad deploy: 1% fail"),
+                      (0.20, "a partial outage: 20% fail")):
+    b = burn_rate(errors, slo)
+    hours_to_empty = 30 * 24 / b
+    print(f"{label:36s} burn rate {b:6.1f}x -> whole budget gone in {hours_to_empty:7.1f} h")
+```
+
+The error budget turns an argument into a policy. While budget remains, the team ships features and takes risks: canary experiments, migrations, aggressive releases. When the budget is spent, the agreed policy applies — typically, freeze risky launches and spend engineering time on reliability until the window recovers. Developers and SREs no longer argue about whether a release is "too risky"; the budget answers. The **burn rate** — how fast the budget is being spent relative to exactly using it up over the window — measures urgency: at a burn rate of 1 the budget lasts exactly the window; at 10, a 30-day budget lasts three days.
+
+</Section>
+
+<Section id="monitoring" kind="human" title="Monitoring and the four golden signals">
+
+Monitoring answers two questions: *is something broken?* and *why?* For a user-facing system, Google's SRE book recommends that, if you can measure only four things, you measure these **golden signals**:
+
+1. **Latency**: how long requests take — and separately for successes and failures, since a fast error is still an error, and a flood of fast errors can make average latency look *better*.
+2. **Traffic**: demand on the system, such as requests per second.
+3. **Errors**: the rate of failed requests, whether explicit (HTTP 500s), implicit (a 200 with the wrong content) or by policy (slower than promised).
+4. **Saturation**: how full the system is — CPU, memory, disk, connection pools, queue length — especially the resource that will run out first.
+
+Signals come in three main forms. **Metrics** are numbers aggregated over time, cheap to store and fast to query, ideal for dashboards and alerts. **Logs** are records of individual events, rich but voluminous. **Traces** follow one request across services, showing where its time went. **Black-box** monitoring probes the system from outside, as a user would; **white-box** monitoring reads its internals. You need both: black-box tells you users are hurting, white-box tells you why.
+
+</Section>
+
+<Section id="alerting" kind="human" title="Alerting on symptoms">
+
+A **page** wakes a person up. That is expensive, so every page should be urgent, actionable, and about something users feel. The guiding rule: **alert on symptoms, not causes.** "Checkout error rate above SLO" is a symptom; "database CPU at 90%" is a possible cause, which may be harmless (a nightly batch job) or may never be noticed by users. Causes belong on dashboards and in tickets, to be looked at during working hours.
+
+SLOs give a principled way to alert. Rather than paging when the error rate crosses an arbitrary line, page when the error budget is burning fast enough to matter. The SRE workbook's worked example pages when the burn rate exceeds 14.4 — at which pace 2% of a 30-day budget disappears in one hour — measured over both the last hour and the last five minutes, so the alert fires quickly and also stops quickly once the problem is fixed. Slower burns over longer windows open tickets instead of pages. Alerts tied to the budget are rare when things are fine and loud when users are actually hurting.
+
+Watch also for **alert fatigue**: a rotation that receives dozens of pages per shift learns to ignore them. Every page that needed no action is a bug in the alerting.
+
+</Section>
+
+<Section id="incidents" kind="human" title="Incidents and blameless postmortems">
+
+When something serious breaks, the first goal is to **mitigate** — stop the user impact — not to understand. Roll back the release, shift traffic to another region, disable the feature with its flag; investigate after. Google's SRE book describes a lightweight structure for incidents: an **incident commander** who coordinates and delegates rather than debugging personally, an **operations** lead making changes to the system, a **communications** lead keeping stakeholders and users informed, and a single live document recording what is known and what was tried. Clear roles stop five engineers making five conflicting changes at once.
+
+Afterwards comes the **postmortem**: a written account of what happened, its impact, the timeline, the contributing causes, what went well, where the team got lucky, and **action items** with owners and dates that make a recurrence less likely or less harmful. Its defining property is being **blameless**: it assumes everyone acted reasonably given what they knew at the time, and asks how the *system* — tools, processes, defaults, alerts — allowed a reasonable action to cause harm. If an engineer deleted the wrong table, the questions are why the tool allowed it without confirmation, why it was not restorable in minutes, and why the alert came late.
+
+Blamelessness is not softness. It is a practical response to a fact: people who fear punishment hide mistakes, and hidden mistakes recur. Organisations that learn fastest make it safe to tell the whole truth.
+
+<Reflection title="Truth and grace together">
+
+A blameless postmortem holds together two things that are often pulled apart: complete honesty about what went wrong, and refusal to condemn the person who was there when it did. Christian tradition has long joined them in the same way — confession that hides nothing, met by a forgiveness that restores rather than shames, so that the next mistake is spoken of early instead of buried. Engineering teams rediscovered the practical wisdom of this the hard way.
+
+</Reflection>
+
+</Section>
+
+<Section id="degradation" kind="intuition" title="Designing for failure: degradation, shedding and circuit breakers">
+
+Large systems fail partially all the time. The design question is whether a local failure stays local. The usual way it spreads is a **cascading failure**: one overloaded component slows down, its callers wait and pile up requests and threads, they slow down in turn, retries multiply the load, and a small problem takes down everything. Several patterns stop the spread.
+
+**Graceful degradation.** Decide in advance what the service does when a dependency is unavailable: an online shop whose recommendations service is down shows the product page without recommendations; a news app serves slightly stale cached stories; a bank shows balances read-only when the transfer system is down. Degraded is better than down — provided the fallback is tested, because an untested fallback usually fails exactly when needed.
+
+**Timeouts and deadlines.** Every remote call needs a timeout; without one, a hung dependency holds resources forever. Better still, propagate a **deadline** with each request so that downstream services do not keep working on requests whose caller has already given up.
+
+**Load shedding.** When a server is saturated, accepting more work makes everything slower for everyone. Rejecting excess requests early and cheaply — with a 503 or 429 — keeps latency good for the requests that are accepted. Shed by priority: protect checkout before recommendations, user traffic before batch jobs.
+
+**Circuit breakers.** A caller that sees repeated failures from a dependency stops calling it for a while and fails fast — returning a fallback immediately — instead of waiting on timeouts and adding load to a struggling service. After a cooldown it lets one trial request through (the **half-open** state); success closes the circuit, failure opens it again.
+
+```python run
+class CircuitBreaker:
+    def __init__(self, threshold=3, cooldown=5):
+        self.threshold, self.cooldown = threshold, cooldown
+        self.state, self.failures, self.opened_at = "closed", 0, None
+
+    def call(self, now, fn, fallback):
+        """Returns (result, mark) where mark shows what happened, for the timeline below."""
+        if self.state == "open":
+            if now - self.opened_at < self.cooldown:
+                return fallback(), "f"                 # fail fast: don't touch the dependency
+            self.state = "half-open"                   # cooldown over: let one trial through
+        trial = self.state == "half-open"
+        try:
+            result = fn()
+        except Exception:
+            self.failures += 1
+            if trial or self.failures >= self.threshold:
+                self.state, self.opened_at = "open", now
+            return fallback(), "X" if trial else "x"
+        self.state, self.failures = "closed", 0
+        return result, "+" if trial else "."
+
+def recommendations(now):
+    """A dependency that times out between t = 8 s and t = 24 s."""
+    if 8 <= now < 24:
+        raise TimeoutError("no answer within 2 s")
+    return ["tea set", "atlas", "kora"]
+
+breaker = CircuitBreaker()
+down, calls, states = "", "", ""
+for now in range(40):                                  # one request per second
+    _, mark = breaker.call(now, lambda: recommendations(now), fallback=lambda: [])
+    down += "#" if 8 <= now < 24 else "."
+    calls += mark
+    states += breaker.state[0].upper()
+print("time (s)          " + "".join(str(t // 10) if t % 10 == 0 else " " for t in range(40)))
+print("dependency down   " + down)
+print("what happened     " + calls)
+print("state afterwards  " + states)
+print()
+print(". called, succeeded   x called, failed   f failed fast (fallback, no call)")
+print("X trial call failed   + trial call succeeded   C closed   O open")
+```
+
+During the outage the breaker makes only a handful of real calls — three to discover the problem and one trial every five seconds — instead of one per request, each waiting for a timeout. Users get an empty recommendations box instantly rather than a hanging page.
+
+</Section>
+
+<Section id="retries" kind="computation" title="Retries with exponential backoff and jitter">
+
+Many failures are transient — a dropped packet, a server restarting — so retrying is sensible. But retries are also the most common amplifier of outages. If every layer of a three-layer system makes up to three attempts, one user request can become $3^3 = 27$ requests at the bottom layer, arriving exactly when that layer is struggling. Three rules tame retries:
+
+1. **Retry only what is safe**: idempotent operations, or requests carrying an idempotency key, and only errors that may be transient (timeouts, 503) — not "invalid input".
+2. **Limit retries**: a small maximum number of attempts, ideally at one layer only, and a **retry budget** (for example, retries may add at most 10% to normal traffic).
+3. **Back off, with jitter**: wait longer after each failure, and randomise the wait.
+
+**Exponential backoff** waits $\min(\text{cap}, \text{base} \cdot 2^{n})$ after the $n$-th failure. On its own it has a flaw: clients that failed together retry together, in synchronised waves. **Jitter** randomises the wait. With **full jitter**, the wait is drawn uniformly from $[0, \min(\text{cap}, \text{base} \cdot 2^{n})]$; with **equal jitter**, from the upper half of that range. The simulation below has 200 clients whose requests all failed during a brief outage; the recovered server can take 20 requests per 10 ms, but turning away excess requests also costs it some work, as it does in real servers.
+
+```python run
+import random
+
+def simulate(policy, clients=200, capacity=20, reject_cost=0.15, seed=1, horizon=6000):
+    """All clients' requests failed during an outage at t = 0, and they retry under `policy`.
+    The recovered server can serve `capacity` requests per 10 ms tick, but turning away excess
+    requests also costs work: each one rejected uses `reject_cost` of a slot.
+    Returns (ms until everyone is served or None, total attempts, busiest tick)."""
+    rng = random.Random(seed)
+    schedule = {}                                    # tick -> list of (client, attempt number)
+    def retry(client, attempt, now):
+        t = now + max(1, round(policy(attempt, rng)))
+        schedule.setdefault(t, []).append((client, attempt + 1))
+    for c in range(clients):
+        retry(c, 0, 0)
+    served, attempts, peak = 0, clients, 0
+    for now in range(1, horizon):
+        arrivals = schedule.pop(now, [])
+        rng.shuffle(arrivals)
+        attempts += len(arrivals)
+        peak = max(peak, len(arrivals))
+        excess = max(0, len(arrivals) - capacity)
+        slots = max(0, int(capacity - reject_cost * excess))      # overload eats capacity
+        for client, attempt in arrivals[slots:]:
+            retry(client, attempt, now)
+        served += min(slots, len(arrivals))
+        if served == clients:
+            return now * 10, attempts, peak
+    return None, attempts, peak
+
+BASE, CAP = 4, 300                                   # in 10 ms ticks: 40 ms base, 3 s cap
+policies = {
+    "retry after 10 ms":           lambda n, rng: 1,
+    "exponential backoff":         lambda n, rng: min(CAP, BASE * 2 ** n),
+    "exponential + full jitter":   lambda n, rng: rng.uniform(0, min(CAP, BASE * 2 ** n)),
+    "exponential + equal jitter":  lambda n, rng: min(CAP, BASE * 2 ** n) * rng.uniform(0.5, 1),
+}
+print("200 clients retry after an outage; the server can take 20 requests per 10 ms.\n")
+print(f"{'policy':28s} {'everyone served after':>22s} {'attempts':>9s} {'busiest 10 ms':>14s}")
+for name, policy in policies.items():
+    ms, attempts, peak = simulate(policy)
+    when = f"{ms:,d} ms" if ms is not None else "not within 60 s"
+    print(f"{name:28s} {when:>22s} {attempts:9,d} {peak:14d}")
+```
+
+Retrying quickly keeps the server so busy rejecting requests that it never recovers — a **retry storm**, the self-sustaining overload behind many real outages. Backoff without jitter avoids the constant hammering but keeps the clients synchronised: each wave arrives together, overloads the server together, and fails together, at ever longer intervals. Adding jitter spreads the same clients out, and everyone is served in a fraction of a second with a fraction of the attempts. Marc Brooker's post on the AWS Architecture Blog, linked below, makes the same comparison with a different model; the conclusion is robust.
+
+</Section>
+
+<Section id="safe-change" kind="human" title="Changing systems safely: canaries and feature flags">
+
+Google's SRE book reports that roughly 70% of outages are due to changes in a live system. So the most effective reliability practice is often simply making change safer.
+
+**Progressive rollouts** release a new version to a small slice first: one server, then 1% of traffic, then one zone, then one region, then everywhere, with time to watch between steps. A **canary** compares the new version's SLIs with those of the old version running alongside it, on similar traffic at the same time, so that a daily traffic swing is not mistaken for a regression. If the canary's error rate or latency is worse beyond a threshold, the rollout stops and rolls back — automatically, ideally, because a human reviewing dashboards at 2 a.m. is slow and inconsistent. Rollbacks must be fast and routine; a release that cannot be rolled back (because of a one-way database migration, say) deserves special care, such as expanding the schema first and contracting it in a later release.
+
+**Feature flags** separate *deploying* code from *releasing* behaviour. New code ships turned off, then is enabled for employees, for 1% of users, for one country, for everyone — and can be switched off in seconds without a deploy. Flags also serve as **kill switches** for expensive features during overload. Their cost is complexity: every flag doubles the paths through some code, so old flags must be removed once a feature is fully launched.
+
+</Section>
+
+<Section id="chaos" kind="human" title="Chaos engineering">
+
+You do not really know how a system behaves under failure until it fails. **Chaos engineering** makes failures happen on purpose, under controlled conditions, to find weaknesses before they find you. Netflix popularised it with **Chaos Monkey**, which randomly terminates production instances so that every service must tolerate losing one; the practice has since grown into a discipline with published principles:
+
+1. Define the **steady state** in terms of user-visible metrics (stream starts per second, checkout success rate).
+2. Form a **hypothesis**: "if one zone's cache cluster disappears, checkout success stays above 99.9%".
+3. **Inject** a realistic failure: kill instances, add latency, partition a network, fail a dependency.
+4. **Minimise the blast radius**: start small, in a limited slice of traffic, with a stop button.
+5. Learn from the difference between hypothesis and reality, and fix what you find.
+
+Many companies also run regular **disaster-recovery exercises** — taking down a data centre or a critical team's tools for a day — and **game days** in which a team practises an incident. Drills like these are often how a team discovers that a backup cannot actually be restored, or that the runbook points to a dashboard that no longer exists.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The goal is 100% availability."** Users cannot perceive the difference past a point, the cost grows steeply with each nine, and a zero error budget forbids all change. Pick the target users actually need.
+
+</Misconception>
+
+<Misconception>
+
+**"Average latency tells you how the service feels."** Averages hide the slow tail. A service with a 50 ms average can make 1% of its users wait seconds — and a page that makes dozens of backend calls hits that tail often. Use percentiles.
+
+</Misconception>
+
+<Misconception>
+
+**"Retries make a system more reliable."** Bounded retries with backoff and jitter can; unbounded or synchronised retries turn a short blip into a long outage.
+
+</Misconception>
+
+<Misconception>
+
+**"Blameless means nobody is accountable."** People remain responsible for doing their jobs well and for completing action items. What blamelessness removes is punishment for honest mistakes, which is what makes the honest account possible.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

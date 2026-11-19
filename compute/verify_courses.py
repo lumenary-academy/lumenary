@@ -169,7 +169,13 @@ def run_check(lang, code, timeout):
 
 
 def lesson_dirs():
-    """(key, path) for every lesson directory, key like "cs/complexity" or "lingua/spanish/a1-greetings"."""
+    """(key, path) for every lesson in a syllabus, key like "cs/complexity" or "lingua/spanish/sounds-and-greetings"."""
+    for course, key, path in course_lessons():
+        yield key, path
+
+
+def course_lessons():
+    """(course, key, path) for every lesson in a syllabus; course like "cs" or "cs/languages/rust"."""
     courses = []
     if (CONTENT / "cs" / "course.json").exists():
         courses.append("cs")
@@ -183,7 +189,7 @@ def lesson_dirs():
         syllabus = json.loads((CONTENT / course / "course.json").read_text(encoding="utf-8"))
         for level in syllabus["levels"]:
             for slug in level["lessons"]:
-                yield f"{course}/{slug}", CONTENT / course / "lessons" / slug
+                yield course, f"{course}/{slug}", CONTENT / course / "lessons" / slug
 
 
 def run(source, timeout):
@@ -205,6 +211,8 @@ def run(source, timeout):
 def check_lesson(key, path, timeout, check_timeout=180):
     """The report row for one lesson, and a list of failure messages."""
     failures = []
+    if not (path / "lesson.mdx").exists():
+        return {"snippets": 0, "snippetsPassed": 0, "exercises": 0, "exercisesPassed": 0, "checks": 0, "checksPassed": 0, "checksSkipped": 0}, [f"{key}: lesson.mdx is missing"]
     body = (path / "lesson.mdx").read_text(encoding="utf-8")
     snippets = RUN_BLOCK.findall(body)
     snippets_passed = 0
@@ -275,9 +283,10 @@ def main():
         sys.stderr.write(proc.stderr)
         return proc.returncode
 
+    # --only takes whole courses ("cs", "cs/languages/rust", "lingua/spanish") or single lessons ("cs/complexity").
     selected = [
-        (key, path) for key, path in lesson_dirs()
-        if not args.only or any(key == o.rstrip("/") or key.startswith(o.rstrip("/") + "/") for o in args.only)
+        (key, path) for course, key, path in course_lessons()
+        if not args.only or any(o.rstrip("/") in (course, key) for o in args.only)
     ]
     rows, failures = {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:

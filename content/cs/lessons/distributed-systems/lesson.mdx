@@ -1,0 +1,414 @@
+---
+title: Distributed systems
+subtitle: Many machines acting as one — and what failure, time and an unreliable network make impossible.
+minutes: 85
+objectives:
+  - Explain why systems are distributed (scale, fault tolerance, latency) and what it costs
+  - Classify failures as crash, omission, timing or Byzantine, and explain why a slow node cannot be told apart from a dead one
+  - Order events with Lamport clocks and vector clocks, and tell happened-before from concurrency
+  - State the CAP theorem and PACELC precisely, without the common misreadings
+  - Design retries with timeouts, backoff and jitter, and make operations idempotent
+  - Explain why exactly-once delivery is impossible and what "exactly-once processing" really provides
+prerequisites: [concurrency, networking, databases]
+related: [math.found.order-theory, math.prob.probability-rules]
+references:
+  - title: "Time, Clocks, and the Ordering of Events in a Distributed System"
+    author: Leslie Lamport
+    year: 1978
+    url: https://dl.acm.org/doi/10.1145/359545.359563
+    note: The paper that defined happened-before and logical clocks. One of the most cited papers in computer science.
+  - title: "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services"
+    author: Seth Gilbert and Nancy Lynch
+    year: 2002
+    url: https://dl.acm.org/doi/10.1145/564585.564601
+    note: The formal statement and proof of the CAP theorem.
+  - title: "Consistency Tradeoffs in Modern Distributed Database System Design"
+    author: Daniel Abadi
+    year: 2012
+    note: IEEE Computer 45(2). The article that introduced PACELC.
+  - title: "Timeouts, retries, and backoff with jitter"
+    author: Amazon Builders' Library
+    url: https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+  - title: "Making retries safe with idempotent APIs"
+    author: Amazon Builders' Library
+    url: https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/
+  - title: Fallacies of distributed computing
+    url: https://en.wikipedia.org/wiki/Fallacies_of_distributed_computing
+  - title: "MIT 6.5840: Distributed Systems"
+    url: https://pdos.csail.mit.edu/6.824/
+    note: Lecture notes, papers and labs from MIT's graduate course (formerly 6.824).
+  - title: Jepsen
+    url: https://jepsen.io/
+    note: Independent analyses of how real distributed databases behave under partitions and clock faults, with a clear guide to consistency models.
+---
+
+<Section id="motivation" kind="motivation" title="Why distribute?">
+
+Everything so far in this course has run on one computer. One computer has one clock, one memory, and one point of failure: if it stops, everything stops, but at least everything stops *together*. Real services leave that comfortable world for three reasons.
+
+- **Scale.** The data or the request rate outgrows one machine: a search index of the web, a social network's messages, a payment system's transactions on a holiday. Sharding the work across many machines is the only way forward.
+- **Fault tolerance.** Any single machine will eventually fail — a disk dies, a power supply burns out, a kernel panics. With copies on several machines, in several buildings, the service survives.
+- **Latency.** Light in optical fibre travels about 200 km per millisecond, so a request from Sydney to a server in London (about 17,000 km away) needs at least 170 ms for the round trip, before any processing. To be fast for users everywhere, servers must be near them.
+
+The price is a new kind of difficulty. Leslie Lamport once quipped that a distributed system is one in which a computer you did not even know existed can stop yours from working. Machines fail *independently*, so part of the system can be dead while the rest carries on. Messages between them are delayed, lost, duplicated and reordered. There is no shared clock, so "which happened first?" has no simple answer. This lesson is about reasoning in that world: what can fail, how to order events without a global clock, what is provably impossible, and the engineering habits — timeouts, retries, idempotency — that keep real systems correct anyway. The next lesson, <LessonLink slug="replication-and-consensus">Replication and consensus</LessonLink>, builds on this to keep replicas in agreement.
+
+</Section>
+
+<Section id="failure-models" kind="definitions" title="Failure models">
+
+To reason about a distributed algorithm you must say what the components can do wrong. The standard **failure models**, from most benign to most severe:
+
+<Definition term="Failure models">
+
+- **Crash-stop**: a node works correctly until it halts, and never returns.
+- **Crash-recovery**: a node may halt and later restart, losing its memory but keeping what it had written to stable storage.
+- **Omission**: a node or link fails to send or receive some messages, but whatever it does send is correct.
+- **Timing (performance)**: a node or link responds, but outside the expected time bounds — a long garbage-collection pause, an overloaded switch.
+- **Byzantine**: a node may behave arbitrarily — send wrong, inconsistent or malicious messages, saying different things to different peers.
+
+</Definition>
+
+Each model needs stronger defences than the one before. With **majority quorums**, a group of $2f + 1$ replicas can keep working through $f$ crashed members, because any two majorities overlap in at least one member. Tolerating $f$ *Byzantine* members needs at least $3f + 1$, because the honest members must outvote both the liars and the members they cannot hear from. Inside one company's data centre, engineers usually assume crash-recovery with omission and timing faults; Byzantine tolerance is reserved for settings where participants do not trust each other, such as blockchains, or where hardware faults can corrupt data silently. (Leslie Lamport, Robert Shostak and Marshall Pease named the Byzantine model in 1982, after a parable of generals who must agree on a plan although some of them are traitors.)
+
+Equally important is the **timing model**. In a *synchronous* system, messages arrive and steps complete within known bounds. In an *asynchronous* one there are no bounds at all. Real networks are **partially synchronous**: usually well behaved, with occasional periods of arbitrary delay. Most practical algorithms are designed to be *safe* (never return a wrong answer) even when the network is asynchronous, and *live* (make progress) only when it behaves.
+
+</Section>
+
+<Section id="unreliable-network" kind="intuition" title="The network is unreliable">
+
+When a client sends a request and no reply arrives, there are several possibilities, and the client cannot tell them apart:
+
+1. the request was lost, and the server never saw it;
+2. the server is down, or overloaded and has not got to it yet;
+3. the server processed it, but the reply was lost or is still on its way.
+
+<Figure caption="Two runs that look identical to the client: in one the request is lost, in the other the server acted and the reply was lost.">
+
+<svg viewBox="0 0 560 190" role="img" aria-label="Left: a request from client to server is lost before reaching the server. Right: the request reaches the server, which charges the card, but the reply is lost. In both, the client sees only a timeout." xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+  <defs>
+    <marker id="ds-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="currentColor" text-anchor="middle" font-weight="600">
+    <text x="40" y="18">client</text>
+    <text x="220" y="18">server</text>
+    <text x="320" y="18">client</text>
+    <text x="500" y="18">server</text>
+  </g>
+  <g stroke="currentColor" stroke-width="1.2">
+    <line x1="40" y1="26" x2="40" y2="180"/>
+    <line x1="220" y1="26" x2="220" y2="180"/>
+    <line x1="320" y1="26" x2="320" y2="180"/>
+    <line x1="500" y1="26" x2="500" y2="180"/>
+  </g>
+  <g stroke="currentColor" stroke-width="1.5" fill="none">
+    <line x1="42" y1="45" x2="140" y2="70"/>
+    <line x1="322" y1="45" x2="496" y2="85" marker-end="url(#ds-arrow)"/>
+    <line x1="498" y1="105" x2="400" y2="130"/>
+  </g>
+  <g stroke="currentColor" stroke-width="2">
+    <line x1="134" y1="62" x2="148" y2="78"/>
+    <line x1="148" y1="62" x2="134" y2="78"/>
+    <line x1="394" y1="122" x2="408" y2="138"/>
+    <line x1="408" y1="122" x2="394" y2="138"/>
+  </g>
+  <g fill="currentColor" font-size="11">
+    <text x="60" y="42">charge card</text>
+    <text x="345" y="42">charge card</text>
+    <text x="508" y="98">charges it</text>
+    <text x="420" y="104">"done"</text>
+    <text x="48" y="170">timeout</text>
+    <text x="328" y="170">timeout</text>
+  </g>
+</svg>
+
+</Figure>
+
+The only tool the client has is a **timeout**: after waiting long enough, it *suspects* a failure. But a timeout detects slowness, not death; a node declared dead may be alive and still acting on old requests. Choosing the timeout is a trade-off — too short and you declare healthy-but-slow nodes dead and pile retries onto an already struggling system; too long and users wait for a node that really has gone.
+
+The deeper result is the **Two Generals problem**: two parties communicating over a channel that can lose messages cannot be *certain* of agreement, however many acknowledgements they exchange, because the last message sent might always be the one that was lost. Every distributed protocol lives with this: it can make uncertainty smaller and rarer, but not remove it.
+
+### The fallacies of distributed computing
+
+In the 1990s, L Peter Deutsch and colleagues at Sun Microsystems listed assumptions that programmers new to distributed systems make, all false (James Gosling later added the eighth):
+
+| Fallacy | What goes wrong when you believe it |
+| --- | --- |
+| The network is reliable | no handling of lost messages, no retries, no timeouts |
+| Latency is zero | "chatty" designs making hundreds of remote calls per page |
+| Bandwidth is infinite | shipping whole datasets when a query would do |
+| The network is secure | unencrypted internal traffic, implicit trust between services |
+| Topology doesn't change | hard-coded addresses that break when servers move |
+| There is one administrator | no plan for conflicting configurations and policies |
+| Transport cost is zero | serialisation, cloud data-transfer bills, CPU spent encoding |
+| The network is homogeneous | assumptions about one protocol, one data format, one vendor |
+
+A useful habit is to read every design document asking which of these it silently assumes.
+
+</Section>
+
+<Section id="simulation" kind="computation" title="Simulating an unreliable network">
+
+Here is the scenario from the figure as a small simulation: a client charges cards for 1,000 orders over a network that loses 20% of messages in each direction, and retries each order up to five times on timeout. The random generator is seeded, so every run gives the same result.
+
+```python run
+import random
+
+class Network:
+    """Delivers each message with probability 1 - loss."""
+    def __init__(self, loss, seed):
+        self.loss, self.rng = loss, random.Random(seed)
+
+    def delivers(self):
+        return self.rng.random() >= self.loss
+
+class PaymentServer:
+    def __init__(self):
+        self.charges = []            # what actually happened to customers' cards
+        self.responses = {}          # idempotency key -> response already given
+
+    def charge(self, account, amount, key=None):
+        if key is not None and key in self.responses:
+            return self.responses[key]          # a retry: replay the earlier answer
+        self.charges.append(account)
+        response = f"charged {amount} to {account}"
+        if key is not None:
+            self.responses[key] = response
+        return response
+
+def call(net, server, account, amount, key):
+    """One request and its reply. None means a timeout: the outcome is unknown."""
+    if not net.delivers():                      # request lost: the server never saw it
+        return None
+    response = server.charge(account, amount, key)
+    if not net.delivers():                      # reply lost: the server DID act
+        return None
+    return response
+
+def pay(net, server, order, use_key, attempts=5):
+    key = f"order-{order}" if use_key else None   # the same key on every retry
+    for _ in range(attempts):
+        if call(net, server, f"acct-{order}", 100, key) is not None:
+            return True
+    return False
+
+for use_key in (False, True):
+    net, server = Network(loss=0.2, seed=11), PaymentServer()
+    confirmed = {order for order in range(1000) if pay(net, server, order, use_key)}
+    times_charged = {}
+    for account in server.charges:
+        times_charged[account] = times_charged.get(account, 0) + 1
+    doubled = sum(1 for n in times_charged.values() if n > 1)
+    unknown = sum(1 for order in range(1000)
+                  if order not in confirmed and f"acct-{order}" in times_charged)
+    print(f"idempotency key: {str(use_key):5} | confirmed {len(confirmed)} | "
+          f"charges {len(server.charges)} | charged twice or more: {doubled} | "
+          f"charged but never confirmed: {unknown}")
+```
+
+Without idempotency keys, every lost *reply* turns a retry into a second charge. With them, the server recognises a retry and replays its earlier answer, so no customer is charged twice. And notice the last column: a few orders were charged although the client gave up after five timeouts. The client must record those as *unknown*, not *failed*, and resolve them later — for example, by asking the server about that key once the network recovers. This is the daily reality of distributed programming: outcomes come in three kinds, success, failure and **don't know**.
+
+</Section>
+
+<Section id="clocks" kind="definitions" title="Time and clocks">
+
+Each machine has its own clock, and clocks disagree. Quartz oscillators drift — by up to a few seconds a day — and the Network Time Protocol (NTP) keeps machines within a few milliseconds of each other over the internet, more closely on a good local network, but not exactly, and sometimes it steps a clock backwards. Two rules follow. Measure **durations** with a monotonic clock (`time.monotonic()` in Python), which never jumps backwards. And never decide **which of two events on different machines happened first** by comparing their wall-clock timestamps: with a 5 ms skew, an update made 2 ms later can carry an earlier timestamp and be silently discarded by a "last write wins" rule.
+
+What we usually need is not the time but the **order** of causally related events. Lamport's 1978 paper defined it precisely.
+
+<Definition term="Happened-before">
+
+Event $a$ **happened before** event $b$, written $a \to b$, if: $a$ and $b$ occur at the same node and $a$ comes first; or $a$ is the sending of a message and $b$ its receipt; or there is an event $c$ with $a \to c$ and $c \to b$. If neither $a \to b$ nor $b \to a$, the events are **concurrent**, written $a \parallel b$.
+
+</Definition>
+
+Happened-before is a **partial order**: some pairs of events are simply unordered, because no information could have flowed from one to the other. (Partial orders are the subject of <TopicLink id="math.found.order-theory">Orders and lattices</TopicLink>.)
+
+**Lamport clocks** attach a number to every event so that causality is respected. Each node keeps a counter $L$: before each local event or send, it increments $L$; a message carries the sender's $L$; on receipt, the node sets $L \leftarrow \max(L, L_{\text{msg}}) + 1$. Then $a \to b$ implies $L(a) < L(b)$. Breaking ties by node name gives a **total order** consistent with causality, which is enough to build, for example, a fair distributed lock. But the converse fails: $L(a) < L(b)$ does *not* tell you that $a$ happened before $b$.
+
+**Vector clocks** fix that. Each node keeps a vector with one counter per node; it increments its own entry on each event, sends the whole vector with each message, and on receipt takes the element-wise maximum and then increments its own entry. Comparing vectors element-wise then captures causality *exactly*: $a \to b$ if and only if $V(a) \le V(b)$ in every entry and $V(a) \neq V(b)$; if neither vector is $\le$ the other, the events are concurrent.
+
+```python run
+NODES = ["Ayo", "Bea", "Chen"]
+trace = [                                  # (node, kind, detail)
+    ("Ayo",  "local", "a1"),
+    ("Ayo",  "send",  "m1 to Bea"),
+    ("Bea",  "local", "b1"),
+    ("Bea",  "recv",  "m1"),
+    ("Chen", "local", "c1"),
+    ("Bea",  "send",  "m2 to Chen"),
+    ("Ayo",  "local", "a2"),
+    ("Chen", "recv",  "m2"),
+    ("Chen", "send",  "m3 to Ayo"),
+    ("Ayo",  "recv",  "m3"),
+]
+
+lamport = {n: 0 for n in NODES}
+vector = {n: {m: 0 for m in NODES} for n in NODES}
+in_flight = {}                             # message name -> (lamport time, vector) it carries
+stamps = {}
+
+for node, kind, detail in trace:
+    if kind == "recv":
+        sent_l, sent_v = in_flight.pop(detail)
+        lamport[node] = max(lamport[node], sent_l)
+        for m in NODES:
+            vector[node][m] = max(vector[node][m], sent_v[m])
+    lamport[node] += 1
+    vector[node][node] += 1
+    if kind == "send":
+        in_flight[detail.split()[0]] = (lamport[node], dict(vector[node]))
+    label = f"{node} {kind} {detail}"
+    stamps[label] = (lamport[node], tuple(vector[node][m] for m in NODES))
+    print(f"{label:22} Lamport {lamport[node]:2}   vector {stamps[label][1]}")
+
+def happened_before(u, v):
+    return all(x <= y for x, y in zip(u, v)) and u != v
+
+def relation(e, f):
+    u, v = stamps[e][1], stamps[f][1]
+    if happened_before(u, v):
+        return "happened before"
+    if happened_before(v, u):
+        return "happened after"
+    return "is concurrent with"
+
+print()
+for e, f in [("Ayo local a1", "Chen recv m2"), ("Ayo local a2", "Chen local c1"),
+             ("Bea local b1", "Ayo local a2"), ("Chen local c1", "Ayo recv m3")]:
+    print(f"{e!r} {relation(e, f)} {f!r}   (Lamport {stamps[e][0]} vs {stamps[f][0]})")
+```
+
+Look at the pair `Ayo local a2` and `Chen local c1`: no message chain connects them, so they are concurrent, and the vectors say so. Their Lamport timestamps nevertheless differ, which illustrates why Lamport clocks alone cannot detect concurrency. That ability is what replicated databases need: if two replicas accepted writes to the same key whose vector clocks are concurrent, neither write saw the other, and the system must merge them or report a conflict rather than silently dropping one. Amazon's Dynamo design used vector clocks this way. The cost is a vector entry per participant, which is why production systems often use variants (version vectors per replica, dotted version vectors) or **hybrid logical clocks**, which combine physical time with a logical counter. Google's Spanner takes another route: GPS receivers and atomic clocks bound the uncertainty of physical time to a few milliseconds, and transactions wait out that uncertainty before committing, so timestamps can be trusted to order transactions.
+
+</Section>
+
+<Section id="cap" kind="definitions" title="CAP and PACELC, stated carefully">
+
+The CAP theorem is the most quoted and most misquoted result in the field. Eric Brewer conjectured it in 2000; Seth Gilbert and Nancy Lynch proved a precise version in 2002.
+
+<Theorem name="CAP (Gilbert and Lynch)">
+
+Consider a replicated read/write data item, and a network that may lose arbitrarily many messages between the replicas (a **partition**). No system can guarantee both of the following in every execution:
+
+- **Consistency**, in the sense of *linearisability*: every read returns the value of the most recent completed write, as if there were a single copy;
+- **Availability**: every request received by a non-failed replica eventually gets a response.
+
+</Theorem>
+
+<Proof>
+
+Split the replicas into two groups that cannot communicate. A client writes a new value to a replica in the first group; by availability the write must complete without hearing from the second group. Another client then reads from a replica in the second group; by availability the read must also complete, without hearing from the first group, so it cannot know the new value and returns the old one. That violates linearisability. So during a partition, a system must either refuse some requests (giving up availability) or risk stale answers (giving up consistency).
+
+</Proof>
+
+Read precisely, CAP is narrower than its slogan, "pick two of three":
+
+- **Partitions are not optional.** Networks *will* partition, so "CA" is not a choice a distributed system can make. The real statement is: *when* a partition happens, choose between consistency and availability.
+- **The terms are specific.** C means linearisability, not the C in ACID (which is about constraints; see <LessonLink slug="databases">Databases</LessonLink>). A means *every* request at *every* non-failed node gets an answer — a strong definition that, for example, a system that keeps serving the majority side of a partition does not meet, though many users would call it available.
+- **It says nothing about the normal case**, which is most of the time.
+
+Daniel Abadi's **PACELC** fills that gap: if there is a **P**artition, choose between **A**vailability and **C**onsistency; **E**lse, in normal operation, choose between **L**atency and **C**onsistency. Even without partitions, keeping replicas consistent means waiting for messages between them, sometimes between continents, so strong consistency costs latency on every request. Systems in the Dynamo tradition (Cassandra, Riak, DynamoDB in its default mode) lean towards availability and low latency, letting replicas briefly disagree; systems such as Google Spanner, CockroachDB and etcd lean towards consistency, accepting the latency and refusing requests on the minority side of a partition. Many systems let you choose per request. The right choice depends on the cost of a stale answer — an out-of-date "likes" count, or a double-spent account balance.
+
+</Section>
+
+<Section id="retries" kind="human" title="Timeouts, retries and idempotency">
+
+The simulation showed the core pattern. Making it robust takes four ingredients.
+
+**Timeouts from measurements.** Set timeouts from the observed latency distribution of the dependency — a little above its 99th or 99.9th percentile — not from a round number someone guessed. Propagate **deadlines**: if a user request has 800 ms left, the call it makes to a downstream service should not wait 5 seconds.
+
+**Retries with backoff and jitter.** Retry only failures that may be transient (timeouts, "service unavailable"), never errors that will recur (invalid input, permission denied). Wait longer after each failure — **exponential backoff** — so a struggling service gets room to recover. And add randomness — **jitter** — because if a thousand clients fail at the same moment and all retry after exactly 1, 2 and 4 seconds, they hit the server in synchronised waves:
+
+```python run
+import random
+
+def capped_exponential(attempt, base=1.0, cap=20.0):
+    return min(cap, base * 2 ** attempt)
+
+def full_jitter(attempt, rng, base=1.0, cap=20.0):
+    return rng.uniform(0, capped_exponential(attempt, base, cap))
+
+def retry_times(delay, attempts=4):
+    t, times = 0.0, []
+    for attempt in range(attempts):
+        t += delay(attempt)
+        times.append(t)
+    return times
+
+rng = random.Random(5)
+clients = 300
+for name, delay in [("no jitter", capped_exponential),
+                    ("full jitter", lambda a: full_jitter(a, rng))]:
+    arrivals = [t for _ in range(clients) for t in retry_times(delay)]
+    per_100ms = {}
+    for t in arrivals:
+        per_100ms[int(t * 10)] = per_100ms.get(int(t * 10), 0) + 1
+    print(f"{name}: {len(arrivals)} retries; busiest 100 ms window has {max(per_100ms.values())}")
+    for half_second in range(16):
+        n = sum(1 for t in arrivals if half_second / 2 <= t < (half_second + 1) / 2)
+        print(f"  {half_second / 2:4.1f}s {'#' * (n // 6):<50} {n}")
+```
+
+Without jitter, all 300 clients retry in the same instant, again and again; with full jitter (a delay drawn uniformly between zero and the exponential bound) the same 1,200 retries are spread out, and the busiest 100 ms carries about a sixth as many. The Amazon Builders' Library articles in the references discuss these trade-offs from long operational experience.
+
+**Bounded retries.** Retries multiply load exactly when a system is weakest. If each of three layers of services makes up to three attempts, one user request can become $3^3 = 27$ requests at the bottom. Retry at one layer, cap attempts, and use a **retry budget** (for example, retries may add at most 10% to normal traffic) or a **circuit breaker** that stops calling a dependency that is clearly down.
+
+**Idempotency.** An operation is **idempotent** if performing it twice has the same effect as performing it once. "Set the delivery address to X" is idempotent; "add 100 to the balance" and "send an email" are not. Retries are safe only for idempotent operations, so make non-idempotent ones idempotent: the client generates a unique **idempotency key** for each logical operation and sends it with every attempt; the server records the key with the result, inside the same transaction as the effect, and answers repeats from that record. Payment APIs work this way, and so should any API whose callers retry — which is every API.
+
+</Section>
+
+<Section id="exactly-once" kind="human" title="Why exactly-once delivery is not really a thing">
+
+Messaging systems are often described by their **delivery guarantee**:
+
+- **At-most-once**: send and never retry. Messages may be lost, never duplicated.
+- **At-least-once**: retry until acknowledged. Messages are never lost (while the sender survives), but may be duplicated, since an acknowledgement can be lost just like the reply in the simulation.
+- **Exactly-once**: every message delivered once and only once.
+
+Over an unreliable network, exactly-once *delivery* cannot be guaranteed, for the reason in the figure: when an acknowledgement does not arrive, the sender cannot know whether the message was processed, so it must either risk loss (not resending) or risk duplication (resending). This is the Two Generals problem again.
+
+What systems such as Apache Kafka and Apache Flink advertise as "exactly-once" is something more specific and achievable: **exactly-once processing effects** within a system they control. Messages are delivered at least once, and duplicates are made harmless — by idempotent writes, by de-duplicating on message IDs, or by committing the processing result and the record of "this message is done" in one atomic transaction. The effect *looks* exactly-once, so many engineers call it **effectively-once**. Its boundaries matter: once the processing has an external side effect — charging a card, sending an email — the guarantee holds only if that external system is idempotent too. When someone promises exactly-once, ask: exactly-once *what*, between *which* boundaries, under *which* failures?
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"CAP means a database is CA, CP or AP: pick two."** Partitions happen whether you choose them or not; the theorem is about what to give up *while* one is happening, with narrow, precise definitions of C and A. And outside partitions, the trade-off is between consistency and latency (PACELC).
+
+</Misconception>
+
+<Misconception>
+
+**"A timeout means the other side failed."** It means you did not hear back in time. The other side may have done everything you asked. Design for the "unknown" outcome, not just success and failure.
+
+</Misconception>
+
+<Misconception>
+
+**"Synchronised clocks let us order events across machines."** Synchronised to within a few milliseconds is not synchronised. Use logical clocks or version vectors for causality, and only use physical timestamps for ordering when the clock uncertainty is explicitly bounded and accounted for, as in Spanner.
+
+</Misconception>
+
+<Misconception>
+
+**"More retries make a system more reliable."** Up to a point. Beyond it, retries amplify overload into an outage — a *retry storm* — and keep a recovering service from ever recovering. Bounded retries with jittered backoff and budgets improve reliability; unbounded ones destroy it.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Distributed computing grew up with networking, from the ARPANET in 1969 onwards. Lamport's 1978 paper on clocks gave the field its notion of causality, and the "Byzantine Generals" paper (1982) its most demanding failure model. In 1985 Fischer, Lynch and Paterson proved that in a fully asynchronous system, no deterministic algorithm can guarantee consensus if even one process may crash — the "FLP impossibility" result, which the next lesson takes up. Colin Fidge and Friedemann Mattern independently published vector clocks in 1988. At the scale of the web, Brewer's CAP conjecture (2000), Google's papers on GFS, MapReduce, Bigtable and Spanner, and Amazon's Dynamo paper (2007) shaped a generation of systems, and Kyle Kingsbury's Jepsen analyses, from 2013 onwards, showed how often real databases fell short of their stated guarantees under partitions — and helped many of them improve.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

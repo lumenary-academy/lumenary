@@ -1,0 +1,426 @@
+---
+title: "Networks: from packets to the web"
+subtitle: "How bytes cross the planet: layers, IP addresses and routing, TCP and UDP, DNS, HTTP and TLS, and what happens when you open a web page."
+minutes: 65
+objectives:
+  - Explain the layered model of the Internet and encapsulation
+  - Work with IPv4 and IPv6 addresses, CIDR prefixes, and longest-prefix-match routing
+  - Compare TCP and UDP, and explain ports, sockets and the TCP handshake
+  - Build and parse DNS and HTTP messages, and read HTTP methods, headers and status codes
+  - Describe what TLS provides, at the level of ideas
+  - Walk through, step by step and with a latency budget, what happens when a browser opens a page
+prerequisites: [operating-systems, concurrency, bits-and-bytes, graphs, shortest-paths]
+related: [math.discrete.graph-theory]
+references:
+  - title: "RFC 9110: HTTP semantics"
+    year: 2022
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: Methods, status codes and headers, independent of the HTTP version.
+  - title: "RFC 9112: HTTP/1.1"
+    year: 2022
+    url: https://www.rfc-editor.org/rfc/rfc9112
+  - title: "RFC 9293: Transmission Control Protocol (TCP)"
+    year: 2022
+    url: https://www.rfc-editor.org/rfc/rfc9293
+  - title: "RFC 768: User Datagram Protocol"
+    year: 1980
+    url: https://www.rfc-editor.org/rfc/rfc768
+  - title: "RFC 791: Internet Protocol"
+    year: 1981
+    url: https://www.rfc-editor.org/rfc/rfc791
+  - title: "RFC 8200: Internet Protocol, version 6 (IPv6)"
+    year: 2017
+    url: https://www.rfc-editor.org/rfc/rfc8200
+  - title: "RFC 1034 and RFC 1035: Domain names"
+    year: 1987
+    url: https://www.rfc-editor.org/rfc/rfc1035
+    note: RFC 1034 gives the concepts, RFC 1035 the message format used in this lesson.
+  - title: "RFC 9000: QUIC, a UDP-based multiplexed and secure transport"
+    year: 2021
+    url: https://www.rfc-editor.org/rfc/rfc9000
+  - title: "RFC 9114: HTTP/3"
+    year: 2022
+    url: https://www.rfc-editor.org/rfc/rfc9114
+  - title: "RFC 8446: The Transport Layer Security (TLS) protocol, version 1.3"
+    year: 2018
+    url: https://www.rfc-editor.org/rfc/rfc8446
+  - title: "RFC 1122: Requirements for Internet hosts"
+    year: 1989
+    url: https://www.rfc-editor.org/rfc/rfc1122
+    note: The Internet's own four-layer model.
+  - title: A protocol for packet network intercommunication
+    author: Vinton G. Cerf and Robert E. Kahn
+    year: 1974
+    url: https://doi.org/10.1109/TCOM.1974.1092259
+  - title: "Information management: a proposal"
+    author: Tim Berners-Lee
+    year: 1989
+    url: https://www.w3.org/History/1989/proposal.html
+    note: The proposal that became the World Wide Web.
+---
+
+<Section id="motivation" kind="motivation" title="What happens when you press Enter?">
+
+You type an address into a browser and press Enter. A fraction of a second later, a page assembled from dozens of files, served by computers that may be on another continent, appears on your screen. In between, your request was cut into packets, labelled with addresses, passed hop by hop through a chain of routers owned by different organisations in different countries, reassembled in order, answered, and the answer made the same journey back, encrypted so that nobody along the way could read or alter it.
+
+None of the machines involved knows the whole route, and no central authority runs the Internet. It works because every machine follows the same published rules, the **protocols**, most of them written down as freely available RFCs ("requests for comments") by the Internet Engineering Task Force. This lesson walks up the stack of protocols, building and parsing real message formats in Python as it goes. (The runnable blocks only build and parse bytes; they never touch the network.) At the end we will put it all together and follow one page load from keystroke to pixels.
+
+</Section>
+
+<Section id="layers" kind="definitions" title="Layers and encapsulation">
+
+Networking is organised in **layers**. Each layer offers a service to the layer above and uses the service of the layer below, so each can be designed and replaced independently. The Internet's own model (RFC 1122) has four:
+
+| Layer | Job | Examples | Unit |
+| --- | --- | --- | --- |
+| Application | what the programs are saying | HTTP, DNS, SMTP (email), SSH | message |
+| Transport | conversations between programs on two hosts | TCP, UDP, QUIC | segment or datagram |
+| Internet | delivering packets between any two hosts, across many networks | IP (IPv4, IPv6) | packet |
+| Link | delivering frames to the next machine on the same physical network | Ethernet, Wi-Fi, mobile radio | frame |
+
+You will also meet the seven-layer OSI model, which splits the bottom and top differently; people still say "layer 4" for transport and "layer 7" for application because of it.
+
+<Definition term="encapsulation">
+
+When a program sends data, each layer on the way down wraps what it receives from above with its own **header** (and sometimes a trailer) holding the information that layer needs. The receiver's layers unwrap in reverse order. Each layer reads only its own header and treats everything inside as opaque payload.
+
+</Definition>
+
+<Figure caption="Encapsulation of one HTTP request. The application's bytes become the payload of a TCP segment, which becomes the payload of an IP packet, which becomes the payload of an Ethernet frame. Routers along the way read and rewrite only the outer layers.">
+<svg viewBox="0 0 440 170" role="img" aria-label="Four rows. Row one: the HTTP request alone. Row two: a TCP header followed by the HTTP request. Row three: an IP header, then the TCP header and HTTP request. Row four: an Ethernet header, IP header, TCP header, HTTP request and an Ethernet trailer.">
+  <g fontFamily="sans-serif" fontSize="10" fill="currentColor">
+    <text x="8" y="28">application</text><text x="8" y="66">transport</text><text x="8" y="104">internet</text><text x="8" y="142">link</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="250" y="14" width="140" height="22" fill="var(--sky-soft)" />
+    <rect x="200" y="52" width="50" height="22" fill="var(--gold)" fillOpacity="0.45" /><rect x="250" y="52" width="140" height="22" fill="var(--sky-soft)" />
+    <rect x="150" y="90" width="50" height="22" fill="var(--compute)" fillOpacity="0.35" /><rect x="200" y="90" width="50" height="22" fill="var(--gold)" fillOpacity="0.45" /><rect x="250" y="90" width="140" height="22" fill="var(--sky-soft)" />
+    <rect x="95" y="128" width="55" height="22" fill="var(--bad)" fillOpacity="0.25" /><rect x="150" y="128" width="50" height="22" fill="var(--compute)" fillOpacity="0.35" /><rect x="200" y="128" width="50" height="22" fill="var(--gold)" fillOpacity="0.45" /><rect x="250" y="128" width="140" height="22" fill="var(--sky-soft)" /><rect x="390" y="128" width="35" height="22" fill="var(--bad)" fillOpacity="0.25" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="10" fill="currentColor" textAnchor="middle">
+    <text x="320" y="29">HTTP request</text>
+    <text x="225" y="67">TCP</text><text x="320" y="67">HTTP request</text>
+    <text x="175" y="105">IP</text><text x="225" y="105">TCP</text><text x="320" y="105">HTTP request</text>
+    <text x="122" y="143">Ethernet</text><text x="175" y="143">IP</text><text x="225" y="143">TCP</text><text x="320" y="143">HTTP request</text><text x="407" y="143">FCS</text>
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="ip" kind="computation" title="IP: addresses, packets and routing">
+
+The **Internet Protocol** gives every host an address and delivers **packets** from one address to another, across as many intermediate networks as necessary. It promises very little: packets may be lost, duplicated, delayed or reordered (this is called *best-effort* delivery). Everything more reliable is built on top.
+
+**Addresses.** An IPv4 address is 32 bits, written as four bytes in decimal: `198.51.100.7`. That allows about 4.3 billion addresses, far too few for today's Internet, which is why **IPv6** (RFC 8200) uses 128-bit addresses written as eight groups of four hex digits, with runs of zeros abbreviated: `2001:db8::1`. Addresses are allocated in blocks written in **CIDR** notation: `203.0.113.0/26` means "the addresses whose first 26 bits equal those of 203.0.113.0", a block of $2^{32-26} = 64$ addresses. Some blocks are reserved: `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` are **private** (RFC 1918) and are reused inside homes and companies, whose routers translate them to a shared public address (**NAT**). (This lesson's examples use the blocks reserved for documentation, such as `192.0.2.0/24` and `2001:db8::/32`.)
+
+**Packets.** Every IPv4 packet starts with a header of at least 20 bytes: version, length, a **time to live** that each router decrements (a packet whose TTL reaches zero is discarded, so routing loops cannot keep packets alive for ever), the protocol of the payload (6 for TCP, 17 for UDP), source and destination addresses, and a checksum over the header. The block below builds one byte by byte, in network byte order (big-endian, as in <LessonLink slug="bits-and-bytes">Representing data</LessonLink>), and computes the checksum the way RFC 1071 specifies.
+
+```python run
+import ipaddress, struct
+
+def internet_checksum(data):
+    """RFC 1071: the one's-complement sum of 16-bit big-endian words, then inverted."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    while total > 0xFFFF:
+        total = (total & 0xFFFF) + (total >> 16)     # fold the carries back in
+    return ~total & 0xFFFF
+
+def ipv4_header(src, dst, payload_len, protocol=6, ttl=64, ident=0x1C46):
+    """A minimal 20-byte IPv4 header (RFC 791), all fields in network byte order."""
+    version_ihl = (4 << 4) | 5                        # version 4, header length 5 x 32-bit words
+    fields = [version_ihl, 0, 20 + payload_len, ident, 0x4000, ttl, protocol, 0,
+              ipaddress.IPv4Address(src).packed, ipaddress.IPv4Address(dst).packed]
+    header = struct.pack("!BBHHHBBH4s4s", *fields)    # checksum field 0 while computing
+    checksum = internet_checksum(header)
+    return header[:10] + struct.pack("!H", checksum) + header[12:]
+
+hdr = ipv4_header("192.0.2.10", "198.51.100.7", payload_len=40)
+print("header bytes:", hdr.hex(" "))
+
+v_ihl, tos, length, ident, flags_frag, ttl, proto, csum, src, dst = struct.unpack("!BBHHHBBH4s4s", hdr)
+print(f"version {v_ihl >> 4}, header {4 * (v_ihl & 15)} bytes, total length {length}, TTL {ttl}, "
+      f"protocol {proto} ({ {6: 'TCP', 17: 'UDP'}[proto] }), don't fragment {bool(flags_frag & 0x4000)}")
+print(f"from {ipaddress.IPv4Address(src)} to {ipaddress.IPv4Address(dst)}, checksum {csum:#06x}")
+print("receiver's check (should be 0):", internet_checksum(hdr))
+
+damaged = bytearray(hdr)
+damaged[8] -= 1                                       # a router decrements the TTL ...
+print("after changing the TTL without fixing the checksum:", internet_checksum(bytes(damaged)))
+```
+
+The checksum is designed so that the receiver can simply checksum the whole header, checksum included, and expect 0. Because every router decrements the TTL, every router must also update the checksum; IPv6 dropped the header checksum altogether and leaves error detection to the link and transport layers.
+
+**Routing.** A router does not know the whole Internet. It has a **forwarding table** mapping address prefixes to next hops, and for each packet it chooses the entry with the **longest matching prefix**: the most specific route wins, and a default route `0.0.0.0/0` catches everything else. Inside one organisation, routers fill these tables by computing shortest paths over the network's graph, the algorithms of <LessonLink slug="shortest-paths">Shortest paths</LessonLink> (OSPF, a common interior protocol, runs Dijkstra's algorithm). Between the tens of thousands of independently run networks that make up the Internet, called **autonomous systems**, routes are exchanged with **BGP** (RFC 4271), in which each network announces which prefixes it can reach and chooses among offered routes by its own policies and business agreements. Fast routers implement longest-prefix match in hardware or with tries over address bits, the structure from <LessonLink slug="string-algorithms">String algorithms</LessonLink>.
+
+```python run
+import ipaddress
+
+net = ipaddress.ip_network("203.0.113.0/26")
+print(f"{net}: {net.num_addresses} addresses, mask {net.netmask}, first {net[0]}, last {net[-1]}")
+print("10.20.30.40 is private (RFC 1918):", ipaddress.ip_address("10.20.30.40").is_private,
+      "  2001:db8::1 is IP version", ipaddress.ip_address("2001:db8::1").version)
+
+# A router's forwarding table: prefix -> where to send the packet next.
+table = {
+    "0.0.0.0/0":        "upstream ISP (default route)",
+    "198.51.100.0/24":  "link to partner network",
+    "198.51.100.128/25": "link to partner's data centre",
+    "203.0.113.0/26":   "office LAN, port 1",
+    "203.0.113.64/26":  "office Wi-Fi, port 2",
+    "203.0.113.70/32":  "the printer, special route",
+}
+routes = [(ipaddress.ip_network(p), hop) for p, hop in table.items()]
+
+def next_hop(destination):
+    """Longest-prefix match: of all the prefixes containing the address, the most specific wins."""
+    addr = ipaddress.ip_address(destination)
+    matches = [(n.prefixlen, n, hop) for n, hop in routes if addr in n]
+    length, network, hop = max(matches, key=lambda m: m[0])
+    return network, hop
+
+for dest in ["203.0.113.9", "203.0.113.70", "203.0.113.99", "198.51.100.200", "198.51.100.5", "8.8.8.8"]:
+    network, hop = next_hop(dest)
+    print(f"{dest:15} matches {str(network):18} -> {hop}")
+```
+
+</Section>
+
+<Section id="transport" kind="human" title="TCP and UDP, ports and sockets">
+
+IP delivers packets between *hosts*. Transport protocols deliver data between *programs* on those hosts, and decide how much reliability to add.
+
+**Ports and sockets.** A host may run a web server, a mail server and a hundred client programs at once. Transport headers carry 16-bit **port numbers** to say which program a packet belongs to. Servers listen on well-known ports (80 for HTTP, 443 for HTTPS, 53 for DNS, 22 for SSH); clients get a temporary **ephemeral port** from the operating system. A connection is identified by five values: protocol, source address, source port, destination address and destination port. Programs reach all this through the **socket** API that the operating system provides (<LessonLink slug="operating-systems">Operating systems</LessonLink>): a socket is a file descriptor for a network endpoint. A minimal TCP server, which cannot run in this sandbox, looks like this:
+
+```python
+import socket
+
+with socket.create_server(("0.0.0.0", 8080)) as server:    # socket(), bind(), listen()
+    while True:
+        conn, (client_ip, client_port) = server.accept()    # wait for a client to connect
+        with conn:
+            data = conn.recv(4096)                          # read up to 4096 bytes
+            conn.sendall(b"echo: " + data)                  # write them back
+```
+
+**UDP** (RFC 768) adds almost nothing to IP: ports, a length and a checksum. Each `send` becomes one **datagram**, which may be lost, duplicated or reordered, and nothing is set up in advance. That is exactly right when a late answer is useless anyway (live voice and video, games), when one request fits in one packet and can simply be retried (DNS), or when the application wants to build its own reliability.
+
+**TCP** (RFC 9293) turns the unreliable packet service into a reliable, ordered **byte stream** between two programs:
+
+- **Connection set-up.** The client sends SYN, the server replies SYN-ACK, the client sends ACK: the **three-way handshake**, which costs one round trip before any data flows, and lets both sides agree on initial sequence numbers.
+- **Sequence numbers and acknowledgements.** Every byte has a sequence number; the receiver acknowledges what it has received; the sender **retransmits** anything not acknowledged in time, and the receiver uses the numbers to discard duplicates and put segments back in order.
+- **Flow control.** The receiver advertises a *window*, how much more it can buffer, so a fast sender cannot overwhelm a slow receiver.
+- **Congestion control.** The sender also limits itself to protect the *network*: it starts slowly, grows its sending rate while acknowledgements arrive, and cuts back sharply when packets are lost (additive increase, multiplicative decrease). Algorithms such as CUBIC (RFC 9438), the default on Linux, and Google's BBR differ in how they probe for bandwidth. Congestion control is why the Internet does not collapse when everyone downloads at once.
+
+TCP's guarantee has a cost: if one segment is lost, everything behind it waits until the retransmission arrives (**head-of-line blocking**). **QUIC** (RFC 9000), now used by HTTP/3, runs over UDP and reimplements reliability, congestion control and encryption in one protocol with many independent streams, so one lost packet stalls only its own stream, and the connection and encryption handshakes are combined into a single round trip.
+
+</Section>
+
+<Section id="dns" kind="computation" title="DNS: names to addresses">
+
+People use names like `www.example.org`; IP uses addresses. The **Domain Name System** (RFC 1034 and 1035) is a distributed, hierarchical database that maps one to the other. The namespace is a tree: the root, then top-level domains (`org`, `ke`, `br`), then names registered under them, each part administered by whoever owns it. **Authoritative servers** hold the records for their part of the tree. Your device asks a **recursive resolver** (run by your network provider, or a public one), which, if it does not already know the answer, asks a root server where to find `org`, asks an `org` server where to find `example.org`, and asks that server for `www.example.org`.
+
+Every answer carries a **time to live**, and resolvers and devices **cache** answers for that long. Caching is what makes DNS fast (most lookups never leave your resolver) and also why DNS changes take time to spread. The common record types are **A** (an IPv4 address), **AAAA** (IPv6), **CNAME** (an alias for another name), **MX** (mail servers for a domain), **NS** (the name servers for a zone) and **TXT** (free text, used for domain verification and email security).
+
+A DNS query is usually a single UDP datagram to port 53. The block below builds one in the RFC 1035 format, then builds and parses the kind of answer a resolver sends back, including the format's **name compression**, where a name can end with a two-byte pointer to a name earlier in the message.
+
+```python run
+import struct
+
+def encode_name(name):
+    """DNS names are sequences of labels, each prefixed by its length, ending with a zero byte."""
+    out = b""
+    for label in name.rstrip(".").split("."):
+        out += bytes([len(label)]) + label.encode("ascii")
+    return out + b"\x00"
+
+def build_query(ident, name, qtype=1):                 # qtype 1 = A (an IPv4 address)
+    header = struct.pack("!HHHHHH", ident, 0x0100, 1, 0, 0, 0)   # flags: recursion desired; 1 question
+    return header + encode_name(name) + struct.pack("!HH", qtype, 1)   # class 1 = IN (Internet)
+
+def read_name(msg, pos):
+    """Read a possibly compressed name; returns (name, position just after it)."""
+    labels, end = [], None
+    while True:
+        length = msg[pos]
+        if length & 0xC0 == 0xC0:                        # a pointer to a name earlier in the message
+            if end is None:
+                end = pos + 2
+            pos = struct.unpack("!H", msg[pos:pos + 2])[0] & 0x3FFF
+        elif length == 0:
+            return ".".join(labels), (end if end is not None else pos + 1)
+        else:
+            labels.append(msg[pos + 1:pos + 1 + length].decode("ascii"))
+            pos += 1 + length
+
+query = build_query(0xBEEF, "www.example.org")
+print(f"query ({len(query)} bytes, one UDP datagram to port 53):")
+print(" ", query.hex(" "))
+
+# What a resolver might send back: the question, then a CNAME and an A record, using name compression.
+answer = (query[:2] + struct.pack("!HHHHH", 0x8180, 1, 2, 0, 0) + query[12:]
+          + b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 3600, 6) + b"\x03web" + b"\xc0\x10"
+          + b"\xc0\x2d" + struct.pack("!HHIH", 1, 1, 300, 4) + bytes([192, 0, 2, 44]))
+
+ident, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", answer[:12])
+print(f"\nresponse id {ident:#06x}, is a response: {bool(flags & 0x8000)}, error code {flags & 0xF}, answers {an}")
+pos = 12
+qname, pos = read_name(answer, pos)
+pos += 4                                                 # skip the question's type and class
+for _ in range(an):
+    name, pos = read_name(answer, pos)
+    rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", answer[pos:pos + 10])
+    pos += 10
+    if rtype == 1:
+        data = ".".join(str(b) for b in answer[pos:pos + rdlength])
+    else:
+        data = read_name(answer, pos)[0]
+    pos += rdlength
+    print(f"  {name:16} {({1: 'A', 5: 'CNAME'})[rtype]:5} TTL {ttl:5} s  -> {data}")
+```
+
+The 16-bit ID lets the client match the answer to its question. `www.example.org` turns out to be an alias for `web.example.org`, whose address is `192.0.2.44`; the client may cache the alias for an hour and the address for five minutes. Classic DNS is unencrypted, so anyone on the path can see which names you look up; DNS over HTTPS (RFC 8484) and DNS over TLS carry the same messages inside an encrypted connection.
+
+</Section>
+
+<Section id="http" kind="examples" title="HTTP: requests and responses">
+
+The **Hypertext Transfer Protocol** is how browsers, apps and services ask each other for resources. Its meaning (RFC 9110) is the same in all three versions in use; what differs is how messages are carried. In **HTTP/1.1** (RFC 9112) messages are text: a start line, header lines, a blank line, and an optional body, with lines ending in CRLF (`\r\n`). **HTTP/2** (RFC 9113) encodes the same messages in binary frames and multiplexes many requests over one TCP connection; **HTTP/3** (RFC 9114) does the same over QUIC.
+
+A **request** names a **method** and a **target**. `GET` retrieves a resource and `HEAD` retrieves only its headers; both are **safe** (they should not change anything on the server). `POST` submits data to be processed; `PUT` replaces a resource and `DELETE` removes one, and both are **idempotent** (doing them twice has the same effect as once), which matters when a client must retry after a timeout. A **response** carries a three-digit **status code**, whose first digit gives its class:
+
+| Class | Meaning | Common codes |
+| --- | --- | --- |
+| 1xx | informational | 101 Switching Protocols |
+| 2xx | success | 200 OK, 201 Created, 204 No Content |
+| 3xx | redirection | 301 Moved Permanently, 304 Not Modified |
+| 4xx | client error | 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 429 Too Many Requests |
+| 5xx | server error | 500 Internal Server Error, 502 Bad Gateway, 503 Service Unavailable |
+
+**Headers** carry everything else: `Host` (which site, since one address may serve many), `Content-Type` and `Content-Length` (what the body is and how long), `Cache-Control` and `ETag` (whether and how long the response may be cached, and how to revalidate it, which is where 304 comes from), `Location` (where a new or moved resource is), and `Cookie` and `Set-Cookie` (RFC 6265). HTTP itself is **stateless**: each request stands alone, and cookies are how sites remember who you are between requests.
+
+```python run
+import json
+
+def build_request(method, host, path, headers=None, body=b""):
+    """An HTTP/1.1 request is text: a request line, header lines, a blank line, then the body."""
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {host}"]
+    for name, value in (headers or {}).items():
+        lines.append(f"{name}: {value}")
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
+
+def parse_response(raw):
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status_line, *header_lines = head.decode("iso-8859-1").split("\r\n")
+    version, code, reason = status_line.split(" ", 2)
+    headers = {}
+    for line in header_lines:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()      # header names are case-insensitive
+    length = int(headers.get("content-length", len(body)))
+    return int(code), reason, headers, body[:length]
+
+payload = json.dumps({"city": "Kigali", "guests": 3}).encode()
+request = build_request("POST", "api.example.org", "/bookings",
+                        {"Content-Type": "application/json", "Accept": "application/json"}, payload)
+print(request.decode())
+
+raw = (b"HTTP/1.1 201 Created\r\n"
+       b"Content-Type: application/json\r\n"
+       b"Location: /bookings/4711\r\n"
+       b"Cache-Control: no-store\r\n"
+       b"Content-Length: 28\r\n"
+       b"\r\n"
+       b'{"id": 4711, "status": "ok"}')
+code, reason, headers, body = parse_response(raw)
+kind = {1: "informational", 2: "success", 3: "redirection", 4: "client error", 5: "server error"}[code // 100]
+print(f"\nstatus {code} {reason} ({kind}); new resource at {headers['location']}")
+print("body:", body)
+```
+
+Real HTTP parsers handle much more (chunked bodies of unknown length, persistent connections carrying many requests, malformed input from attackers), which is why you use a library such as `http.client`, `urllib`, or a framework, rather than this sketch. But every one of them reads and writes exactly this format.
+
+</Section>
+
+<Section id="tls" kind="intuition" title="TLS, at the level of ideas">
+
+Everything above travels as plain bytes that any router, Wi-Fi hotspot or network provider along the path could read or change. **TLS** (Transport Layer Security, version 1.3 in RFC 8446) sits between TCP and HTTP, and HTTPS is simply HTTP inside TLS. It provides three guarantees:
+
+- **Confidentiality**: only the two endpoints can read the data.
+- **Integrity**: any change in transit is detected.
+- **Authentication**: the client can verify that it is talking to the real `example.org`, not an impostor.
+
+In outline: during the **handshake** the client and server perform a key exchange (usually elliptic-curve Diffie–Hellman) that lets them agree on fresh secret keys over a public channel, without ever sending the keys. The server proves its identity with a **certificate**: a statement, digitally signed by a **certificate authority** that the client's operating system or browser trusts, binding the server's public key to its domain name. From then on, every record is encrypted and authenticated with symmetric keys. TLS 1.3 completes all this in one round trip, and resumed connections can even send data in the first flight. What TLS does not hide: the server's IP address, the amount and timing of traffic, and, unless the newer *Encrypted Client Hello* extension is in use, the name of the site in the handshake. How the mathematics works, and why each piece is needed, is the subject of <LessonLink slug="applied-cryptography">Applied cryptography</LessonLink>; the attacks it defends against are in <LessonLink slug="security">Security</LessonLink>.
+
+</Section>
+
+<Section id="page-load" kind="examples" title="Opening a web page, step by step">
+
+Now put the layers together. You type `https://www.example.org/menu` and press Enter.
+
+1. **Parse the URL.** The browser extracts the scheme (`https`, so port 443 and TLS), the host and the path, and checks its own cache: if a fresh copy of the page is stored, it may not need the network at all.
+2. **Resolve the name.** If the address is not cached, the operating system asks the recursive resolver, which may walk the DNS tree. Cost: from nothing (cached) to several round trips.
+3. **Connect.** The kernel picks an ephemeral port and sends a TCP SYN to the server's address on port 443. Every packet is routed hop by hop by longest-prefix match. Cost: one round trip for the handshake.
+4. **Secure the connection.** The TLS handshake agrees keys and checks the certificate. Cost: one more round trip with TLS 1.3. (With HTTP/3 over QUIC, steps 3 and 4 share a single round trip.)
+5. **Request.** The browser sends `GET /menu` with headers such as `Host`, `Accept`, cookies and caching validators. The server, perhaps a fleet behind a load balancer and a content delivery network (<LessonLink slug="system-design">System design</LessonLink>), produces a response. Cost: one round trip plus the server's own time.
+6. **Receive and render.** The HTML arrives in TCP segments, reassembled in order. As the browser parses it, it discovers stylesheets, scripts, images and fonts, and fetches those too, many in parallel over the same HTTP/2 or HTTP/3 connection, some from other hosts that need their own DNS lookups and handshakes. Then it lays out the page and paints pixels.
+
+<Example title="A latency budget">
+
+Suppose the round-trip time to the server is 80 ms and nothing is cached. DNS (1 round trip to a resolver that has the answer cached) + TCP (1) + TLS 1.3 (1) + the HTTP request (1) is about 4 round trips, so roughly 320 ms before the first byte of HTML arrives, even if the server answers instantly and the bandwidth is infinite. Every saved round trip saves 80 ms, which is why the industry worked so hard on TLS 1.3, QUIC, connection reuse and content delivery networks that put servers within a few milliseconds of users. Recall from <LessonLink slug="memory-hierarchy">The memory hierarchy</LessonLink> that the speed of light puts a hard floor under each round trip.
+
+</Example>
+
+**Tools for looking inside.** `curl -v https://example.org` shows the TLS handshake summary and HTTP headers; `dig example.org` shows DNS answers and TTLs; `traceroute` (or `mtr`) shows the routers along a path, using the TTL field you built above; Wireshark and `tcpdump` capture and decode every packet; and your browser's developer tools draw the timing of each request, DNS, connect, TLS, waiting and download, as a waterfall.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The Internet and the web are the same thing."** The Internet is the global network of networks that carries IP packets. The web is one application running over it, using HTTP; email, video calls, games and DNS itself are others.
+
+</Misconception>
+
+<Misconception>
+
+**"TCP guarantees that data arrives."** No protocol can guarantee delivery over a network that can be cut. TCP guarantees that what arrives is complete, in order and without duplicates, or that the connection reports an error. Applications still need timeouts and retries, and must think about requests that may or may not have been processed (which is why idempotency matters).
+
+</Misconception>
+
+<Misconception>
+
+**"UDP is unreliable, so it is useless."** UDP's lack of retransmission is a feature where late data is worthless (live media) and a foundation where the application wants its own reliability (QUIC, and therefore HTTP/3, runs over UDP).
+
+</Misconception>
+
+<Misconception>
+
+**"More bandwidth makes every page faster."** Once bandwidth is adequate, page loads are usually limited by **latency**: the number of round trips times the round-trip time. A faster link does not shorten the distance to the server.
+
+</Misconception>
+
+<Misconception>
+
+**"HTTPS hides which sites I visit."** It hides the content and the path within the site. The server's address, the timing and size of traffic, unencrypted DNS lookups, and (without Encrypted Client Hello) the site name in the handshake are all visible to the network.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+The ARPANET, funded by the US Department of Defense's research agency, sent its first message between two universities in 1969, using packet switching, an idea developed independently by Paul Baran in the United States and Donald Davies in the United Kingdom. In 1974 Vint Cerf and Bob Kahn described how to connect *different* packet networks into one, the design that became TCP/IP, and on 1 January 1983 the ARPANET switched over to it. DNS replaced a single shared list of host names in the 1980s. In 1989, at CERN near Geneva, Tim Berners-Lee proposed a system of linked documents; by the end of 1990 he had written the first web server and browser, and the first website, `info.cern.ch`, can still be visited. Since then the protocols have been revised continually in the open, by the IETF and W3C, from HTTP/1.0 to HTTP/3 and from SSL to TLS 1.3, while the basic layered design has carried a growth in traffic of many orders of magnitude.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

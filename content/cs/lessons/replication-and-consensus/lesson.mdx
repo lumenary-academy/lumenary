@@ -1,0 +1,564 @@
+---
+title: Replication and consensus
+subtitle: Keeping several copies of the same data in agreement while machines crash and messages arrive late.
+minutes: 80
+objectives:
+  - Compare synchronous and asynchronous leader–follower replication and say what each loses when the leader fails
+  - Use the quorum condition R + W > N to reason about which reads are guaranteed to see which writes
+  - Explain split brain and why majorities and terms prevent two leaders from both making progress
+  - State the FLP impossibility result and what practical consensus protocols give up because of it
+  - Trace Raft's leader election and log replication, and explain the rules that keep it safe
+  - Distinguish linearizability from eventual consistency, and say where consensus is used in real systems
+prerequisites: [distributed-systems, databases]
+related: [math.prob.probability-rules, math.comp.formal-methods]
+references:
+  - title: "In Search of an Understandable Consensus Algorithm (Extended Version)"
+    author: Diego Ongaro and John Ousterhout
+    year: 2014
+    url: https://raft.github.io/raft.pdf
+    note: The Raft paper. Section 5 is the protocol; Figure 2 is the whole algorithm on one page.
+  - title: The Raft Consensus Algorithm
+    url: https://raft.github.io/
+    note: An interactive visualisation, talks, and a list of production implementations.
+  - title: Paxos Made Simple
+    author: Leslie Lamport
+    year: 2001
+    url: https://lamport.azurewebsites.net/pubs/paxos-simple.pdf
+    note: Paxos explained in plain prose in about a dozen pages.
+  - title: "Impossibility of Distributed Consensus with One Faulty Process"
+    author: Michael J. Fischer, Nancy A. Lynch and Michael S. Paterson
+    year: 1985
+    url: https://doi.org/10.1145/3149.214121
+    note: The FLP result, in the Journal of the ACM.
+  - title: "Linearizability: A Correctness Condition for Concurrent Objects"
+    author: Maurice Herlihy and Jeannette Wing
+    year: 1990
+    url: https://doi.org/10.1145/78969.78972
+  - title: "Dynamo: Amazon's Highly Available Key-value Store"
+    author: DeCandia et al.
+    year: 2007
+    url: https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+    note: Leaderless replication with sloppy quorums, hinted handoff and vector clocks.
+  - title: "Spanner: Google's Globally Distributed Database"
+    author: Corbett et al.
+    year: 2012
+    url: https://research.google/pubs/spanner-googles-globally-distributed-database/
+    note: Paxos groups per shard plus TrueTime for externally consistent transactions.
+  - title: The Chubby lock service for loosely-coupled distributed systems
+    author: Mike Burrows
+    year: 2006
+    url: https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/
+  - title: "Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service"
+    year: 2022
+    url: https://www.usenix.org/conference/atc22/presentation/elhemali
+    note: How the managed service replicates each partition with Multi-Paxos — quite different from the 2007 Dynamo paper.
+  - title: etcd documentation
+    url: https://etcd.io/docs/
+  - title: "ZooKeeper: Because Coordinating Distributed Systems is a Zoo"
+    url: https://zookeeper.apache.org/doc/current/zookeeperOver.html
+  - title: "Jepsen: Consistency Models"
+    url: https://jepsen.io/consistency
+    note: A map of consistency models with careful definitions, from a team that tests real databases against them.
+---
+
+<Section id="motivation" kind="motivation" title="Why keep copies, and why copies disagree">
+
+Imagine a mobile-money service used across East Africa. When Wanjiru in Nairobi sends money to her brother in Kisumu, the service must remember that transfer forever, keep working when one server dies, and answer quickly. One machine cannot promise any of that: disks fail, power supplies fail, whole data centres lose their network link. So the service keeps **replicas** — several copies of the same data on different machines, ideally in different buildings.
+
+Replication buys three things:
+
+- **Durability**: a write survives the loss of a machine.
+- **Availability**: the service keeps answering while some machines are down.
+- **Read capacity and latency**: more copies can serve more reads, and a copy near the user answers faster.
+
+The price is that copies can disagree: a write reaches one replica before another, a message is delayed, a machine crashes halfway through. In <LessonLink slug="distributed-systems">Distributed systems</LessonLink> you saw that you cannot tell a crashed machine from a slow one. This lesson is about how replicas are kept in step, what each scheme promises, and how machines can **agree** on one history even when some of them fail — the problem of **consensus**, which sits under almost every strongly consistent system at a large company.
+
+</Section>
+
+<Section id="leader-follower" kind="definitions" title="Leader–follower replication">
+
+The simplest scheme gives one replica a special job.
+
+<Definition term="Leader–follower replication">
+
+One replica, the **leader** (also called primary), accepts all writes. It appends each change to a **replication log** and sends the log to the other replicas, the **followers** (secondaries, replicas), which apply the changes in the same order. Reads may go to the leader or, if slightly stale data is acceptable, to followers.
+
+</Definition>
+
+Every follower passes through the same sequence of states, perhaps a little behind. PostgreSQL, MySQL and MongoDB replica sets all work this way; the "log" is often literally the database's write-ahead log.
+
+The crucial design question is **when the leader tells the client "done"**.
+
+| Mode | The leader acknowledges after… | If the leader dies right after acknowledging | Cost |
+| --- | --- | --- | --- |
+| Asynchronous | writing locally | acknowledged writes not yet shipped are **lost** | fastest; followers may lag seconds or more |
+| Synchronous | every follower confirms | nothing acknowledged is lost | one slow or dead follower stalls all writes |
+| Semi-synchronous | one (or some) followers confirm | nothing lost if a confirmed follower takes over | a middle ground, common in practice |
+
+Asynchronous replication is fast and a follower outage never blocks writes, but the client may be told a write succeeded that then vanishes — acceptable for a "like", unacceptable for Wanjiru's transfer.
+
+Even without failures, lagging followers surprise users. Diego edits his profile, refreshes, hits a lagging follower, and his edit seems gone; the usual fix (**read-your-writes**) is to read a user's own data from the leader for a while after they write. Priya refreshes twice and a comment she just saw vanishes, because the second read hit a staler follower; pinning each user to one follower gives **monotonic reads**.
+
+When the leader dies, the system must **detect** it (by timeout — it can only *suspect* failure), **choose** a new leader (ideally the most up-to-date follower) and **reconfigure** everyone to use it. A short timeout causes needless failovers during load spikes; a long one prolongs outages. And the old leader may not be dead at all, merely cut off — which brings us to split brain, after a detour.
+
+</Section>
+
+<Section id="quorums" kind="intuition" title="Quorums: when reads meet writes">
+
+Some systems have no leader. In the design described by Amazon's 2007 **Dynamo** paper — and followed by Apache Cassandra and Riak — a client (or a coordinator acting for it) sends each write to all $N$ replicas of a key and waits for $W$ of them to confirm; it sends each read to the replicas and waits for $R$ answers, keeping the value with the newest version.
+
+<Theorem name="Quorum intersection">
+
+If $R + W > N$, then every set of $R$ replicas shares at least one replica with every set of $W$ replicas.
+
+</Theorem>
+
+<Proof>
+
+Suppose a read set $A$ with $|A| = R$ and a write set $B$ with $|B| = W$ had no replica in common. Then $A$ and $B$ would be disjoint subsets of the $N$ replicas, so $|A| + |B| \le N$, that is $R + W \le N$ — contradicting $R + W > N$. ∎
+
+</Proof>
+
+So with $N = 3$, $W = 2$, $R = 2$, every read reaches at least one replica that holds the latest successful write, and the version numbers let it recognise that value as newest. The common choices trade read cost against write cost: $W = N, R = 1$ makes reads cheap and writes fragile; $W = 1, R = N$ the reverse; $W = R = \lceil (N+1)/2 \rceil$ balances them. The block below checks the theorem by brute force for $N = 5$ and shows how often a read misses the newest write when the condition fails.
+
+```python run
+from itertools import combinations
+import random
+
+def always_overlap(n, r, w):
+    """True if every set of r replicas shares at least one replica with every set of w."""
+    return all(set(read) & set(write)
+               for write in combinations(range(n), w)
+               for read in combinations(range(n), r))
+
+n = 5
+print("N = 5. Does every read quorum meet every write quorum?")
+print("      " + "".join(f"R={r}".center(6) for r in range(1, n + 1)))
+for w in range(1, n + 1):
+    print(f"  W={w} " + "".join(("yes" if always_overlap(n, r, w) else "-").center(6) for r in range(1, n + 1)))
+
+# When the quorums need not overlap, how often does a read miss the newest write?
+rng = random.Random(42)
+def miss_rate(n, r, w, trials=20000):
+    misses = 0
+    for _ in range(trials):
+        written = set(rng.sample(range(n), w))   # replicas that stored the new value
+        asked = set(rng.sample(range(n), r))     # replicas that answered the read
+        misses += not (written & asked)
+    return misses / trials
+
+print()
+for r, w in [(1, 1), (2, 2), (1, 3), (2, 3), (3, 3)]:
+    print(f"R={r}, W={w} (R+W={r + w}): the read misses the write {miss_rate(n, r, w):5.1%} of the time")
+```
+
+The "yes" region is exactly $R + W \ge 6$. Below it, misses are not rare: with $R = W = 2$ almost a third of reads miss the write entirely.
+
+The theorem is narrower than it looks: a read *meets* the newest successful write, but concurrent writes still need a winner (Dynamo returned both versions to the application; Cassandra keeps the one with the later, possibly skewed, timestamp), and a write that reached fewer than $W$ replicas is reported as failed yet may surface in later reads. Many deployments also use **sloppy quorums** — when home replicas are unreachable, stand-ins accept the write and hand it back later (**hinted handoff**) — which keeps writes available but suspends the guarantee.
+
+</Section>
+
+<Section id="split-brain" kind="intuition" title="Split brain">
+
+Suppose the network between two data centres fails. Followers on the far side stop hearing from the leader, time out, and promote one of themselves, while the old leader, perfectly healthy, keeps accepting writes on its side. Two leaders now accept writes the other never sees: **split brain**. When the network heals, some acknowledged writes must be thrown away or merged by hand.
+
+<Figure caption="A partition splits five replicas into a side of two and a side of three. Only the side of three can form a majority, so only it can elect a leader that makes progress.">
+
+<svg viewBox="0 0 480 200" role="img" aria-label="Five circles labelled A to E. A dashed vertical line separates A and B on the left from C, D and E on the right. The left side is labelled 2 of 5, no majority. The right side is labelled 3 of 5, majority.">
+  <line x1="200" y1="15" x2="200" y2="185" stroke="currentColor" strokeWidth="2" strokeDasharray="6 5" />
+  <circle cx="70" cy="70" r="24" fill="none" stroke="var(--human)" strokeWidth="2.5" />
+  <circle cx="130" cy="130" r="24" fill="none" stroke="var(--human)" strokeWidth="2.5" />
+  <circle cx="280" cy="60" r="24" fill="none" stroke="var(--sky)" strokeWidth="2.5" />
+  <circle cx="380" cy="80" r="24" fill="none" stroke="var(--sky)" strokeWidth="2.5" />
+  <circle cx="320" cy="145" r="24" fill="none" stroke="var(--sky)" strokeWidth="2.5" />
+  <text x="70" y="75" fontSize="15" textAnchor="middle" fill="currentColor">A</text>
+  <text x="130" y="135" fontSize="15" textAnchor="middle" fill="currentColor">B</text>
+  <text x="280" y="65" fontSize="15" textAnchor="middle" fill="currentColor">C</text>
+  <text x="380" y="85" fontSize="15" textAnchor="middle" fill="currentColor">D</text>
+  <text x="320" y="150" fontSize="15" textAnchor="middle" fill="currentColor">E</text>
+  <text x="100" y="188" fontSize="13" textAnchor="middle" fill="currentColor">2 of 5: no majority</text>
+  <text x="340" y="188" fontSize="13" textAnchor="middle" fill="currentColor">3 of 5: majority</text>
+</svg>
+
+</Figure>
+
+Two ideas prevent split brain, and every protocol in the rest of this lesson uses both.
+
+1. **Majorities.** Require any leader to be chosen by, and any write to be confirmed by, a strict majority of a fixed set of replicas. Two disjoint majorities of the same set cannot exist (this is the quorum theorem with $R = W = \lfloor N/2 \rfloor + 1$), so at most one side of any partition can make progress.
+2. **Epochs.** Number each leadership period with an increasing integer (a Raft **term**, a Paxos **ballot**). Replicas reject messages from older epochs, so a deposed leader cannot overwrite newer decisions. For resources outside the system, the epoch travels with each request as a **fencing token**, and the resource refuses tokens older than the newest it has seen.
+
+So $2f + 1$ replicas tolerate $f$ failures: three survive one, five survive two, and four still survive only one.
+
+</Section>
+
+<Section id="consensus" kind="definitions" title="Consensus, and why it is hard">
+
+<Definition term="Consensus">
+
+Several processes each propose a value, and each non-faulty process must eventually **decide** a value, such that:
+
+- **Agreement**: no two processes decide different values;
+- **Validity**: the decided value was proposed by some process;
+- **Termination**: every process that does not crash eventually decides.
+
+</Definition>
+
+Many problems turn out to be this one. Electing one leader is consensus on "who leads"; keeping replicas in step is consensus on "the next log entry", repeated — a **replicated log** or **total order broadcast**; a lock or an atomic compare-and-set is consensus in disguise.
+
+Agreement and validity are **safety** properties: nothing bad ever happens. Termination is a **liveness** property: something good eventually happens. The famous result says you cannot always have both.
+
+<Theorem name="FLP impossibility (Fischer, Lynch and Paterson, 1985)">
+
+In an asynchronous message-passing system — one with no bound on message delays or on relative processing speeds — there is no deterministic algorithm that solves consensus in every execution if even one process may fail by crashing.
+
+</Theorem>
+
+The intuition: a crashed process and a very slow one look identical, and the proof shows that an adversary controlling message timing can keep the outcome undecided forever by delaying exactly the message that would settle it.
+
+FLP does **not** say consensus is impossible in practice. Paxos and Raft **always** keep safety and guarantee termination only when the network behaves well enough for long enough, so that timeouts and randomness let one leader emerge: *they may stall, but they never lie.* (Randomised algorithms, which terminate with probability 1, are another escape route.)
+
+</Section>
+
+<Section id="raft" kind="computation" title="Raft: consensus you can follow">
+
+Raft was designed by Diego Ongaro and John Ousterhout at Stanford, published in 2014, with **understandability** as an explicit goal. It solves the replicated-log problem: a cluster of servers (usually 3 or 5) agrees on a sequence of commands, and each server feeds the committed commands, in order, to a deterministic **state machine** — a key–value store, say. Same commands in the same order give the same state on every server.
+
+Each server is a **follower**, a **candidate** or the **leader**. Time is divided into **terms** numbered 1, 2, 3, … Each term begins with an election and has at most one leader. Every message carries the sender's term; a server that sees a higher term than its own adopts it and becomes a follower, and a server that receives a message from an older term rejects it.
+
+### Leader election
+
+A leader sends periodic **heartbeats** (empty `AppendEntries` messages). A follower that hears nothing for an **election timeout** assumes the leader is gone. It increments its term, becomes a candidate, votes for itself, and sends `RequestVote` to everyone. A server grants its vote if:
+
+1. the candidate's term is at least its own,
+2. it has not already voted for someone else in this term (one vote per term, remembered on disk), and
+3. the candidate's log is **at least as up to date** as its own: the candidate's last entry has a higher term, or the same last term and a log at least as long.
+
+A candidate with votes from a majority becomes leader and starts sending heartbeats. If two candidates split the vote, nobody wins, the term ends without a leader, and someone times out again. Raft makes repeated splits unlikely with one small idea: each server picks its election timeout **at random** from a range such as 150–300 ms, so usually one server times out clearly first and wins before anyone else starts.
+
+The simulation below runs Raft's election rules (without logs) on five servers with random message delays. It elects a leader, crashes it, elects another, revives the old leader — which still believes it leads — and then partitions the cluster. Finally it measures how quickly a first leader emerges for different timeout ranges.
+
+```python run
+import heapq
+import random
+
+class Node:
+    def __init__(self, nid):
+        self.id = nid
+        self.term = 0            # the latest term this node has seen
+        self.voted_for = None    # whom it voted for in that term
+        self.role = "follower"
+        self.votes = set()
+        self.up = True
+        self.timer = 0           # bumped to cancel an outstanding election timeout
+
+class Cluster:
+    """A discrete-event simulation of Raft leader election (logs are left out)."""
+
+    def __init__(self, n, seed, timeout=(150, 300), heartbeat=50, delay=(2, 12), verbose=True):
+        self.rng = random.Random(seed)
+        self.nodes = [Node(i) for i in range(n)]
+        self.timeout, self.heartbeat, self.delay = timeout, heartbeat, delay
+        self.queue, self.seq, self.now = [], 0, 0
+        self.verbose = verbose
+        self.elections = []      # (term, winner, time)
+        self.side = None         # during a partition: the set of nodes cut off from the rest
+        for node in self.nodes:
+            self.reset_timer(node)
+
+    def log(self, text):
+        if self.verbose:
+            print(f"t={self.now:5d} ms  {text}")
+
+    def at(self, time, kind, *args):
+        self.seq += 1
+        heapq.heappush(self.queue, (time, self.seq, kind, args))
+
+    def reset_timer(self, node):
+        node.timer += 1
+        self.at(self.now + self.rng.randint(*self.timeout), "timeout", node.id, node.timer)
+
+    def send(self, src, dst, msg):
+        if self.side is not None and ((src in self.side) != (dst in self.side)):
+            return                                   # dropped by the partition
+        self.at(self.now + self.rng.randint(*self.delay), "deliver", src, dst, msg)
+
+    def step_down(self, node, term):
+        if term > node.term:
+            node.term, node.voted_for = term, None
+        if node.role != "follower":
+            self.log(f"node {node.id} hears of term {term} and steps down")
+            node.role = "follower"
+
+    # --- what a node does when something happens --------------------------
+    def on_timeout(self, nid, timer):
+        node = self.nodes[nid]
+        if not node.up or timer != node.timer or node.role == "leader":
+            return
+        node.term += 1
+        node.role, node.voted_for, node.votes = "candidate", nid, {nid}
+        self.log(f"node {nid} times out -> candidate for term {node.term}")
+        for other in self.nodes:
+            if other.id != nid:
+                self.send(nid, other.id, ("RequestVote", node.term))
+        self.reset_timer(node)                       # if the vote splits, try again later
+
+    def on_deliver(self, src, dst, msg):
+        node = self.nodes[dst]
+        if not node.up:
+            return
+        kind, term = msg[0], msg[1]
+        if term > node.term:
+            self.step_down(node, term)
+        if kind == "RequestVote":
+            grant = term == node.term and node.voted_for in (None, src)
+            if grant:
+                node.voted_for = src
+                self.reset_timer(node)
+            self.send(dst, src, ("Vote", node.term, grant))
+        elif kind == "Vote":
+            if node.role == "candidate" and term == node.term and msg[2]:
+                node.votes.add(src)
+                if len(node.votes) > len(self.nodes) // 2:
+                    node.role = "leader"
+                    self.elections.append((node.term, dst, self.now))
+                    self.log(f"node {dst} wins term {node.term} with votes from {sorted(node.votes)}")
+                    self.at(self.now, "heartbeat", dst, node.term)
+        elif kind == "AppendEntries":                # a heartbeat from a leader
+            if term < node.term:
+                self.send(dst, src, ("Reject", node.term))   # tell a stale leader the news
+            else:
+                self.step_down(node, term)
+                self.reset_timer(node)
+
+    def on_heartbeat(self, nid, term):
+        node = self.nodes[nid]
+        if node.up and node.role == "leader" and node.term == term:
+            for other in self.nodes:
+                if other.id != nid:
+                    self.send(nid, other.id, ("AppendEntries", term))
+            self.at(self.now + self.heartbeat, "heartbeat", nid, term)
+
+    # --- the outside world -----------------------------------------------
+    def crash(self, nid):
+        self.nodes[nid].up = False
+        self.log(f"node {nid} CRASHES")
+
+    def recover(self, nid):
+        node = self.nodes[nid]
+        node.up = True
+        self.log(f"node {nid} recovers as {node.role} of term {node.term}")
+        self.reset_timer(node)
+        if node.role == "leader":
+            self.at(self.now, "heartbeat", nid, node.term)
+
+    def partition(self, side):
+        self.side = set(side)
+        self.log(f"PARTITION: {sorted(self.side)} cut off from the others")
+
+    def heal(self):
+        self.side = None
+        self.log("partition healed")
+
+    def run(self, until):
+        while self.queue and self.queue[0][0] <= until:
+            self.now, _, kind, args = heapq.heappop(self.queue)
+            getattr(self, "on_" + kind)(*args)
+        self.now = until
+
+    def leaders(self):
+        return [(n.id, n.term) for n in self.nodes if n.up and n.role == "leader"]
+
+# Scene 1: elect a leader, crash it, elect another, bring the old one back.
+sim = Cluster(n=5, seed=3)
+sim.run(until=700)
+old = sim.leaders()[0][0]
+sim.crash(old)
+sim.run(until=1500)
+sim.recover(old)
+sim.run(until=2000)
+print("believe they lead (node, term):", sim.leaders())
+
+# Scene 2: cut the leader and one follower off from the other three.
+print()
+leader = sim.leaders()[0][0]
+buddy = next(n.id for n in sim.nodes if n.id != leader)
+sim.partition({leader, buddy})
+sim.run(until=3000)
+print("believe they lead (node, term):", sim.leaders())
+sim.heal()
+sim.run(until=3300)
+print("believe they lead (node, term):", sim.leaders())
+
+# Experiment: why are election timeouts random?
+print()
+for spread in (0, 5, 20, 150):
+    elected, terms = 0, 0
+    for seed in range(200):
+        s = Cluster(n=5, seed=seed, timeout=(150, 150 + spread), verbose=False)
+        s.run(until=3000)
+        if s.elections:
+            elected += 1
+            terms += s.elections[0][0]
+    note = f"{terms / elected:.2f} terms on average" if elected else "never"
+    print(f"timeouts in [150, {150 + spread:3d}] ms: leader within 3 s in {elected / 2:.0f}% of runs; first leader after {note}")
+```
+
+In scene 2, for a while **two** servers believe they lead — in different terms, and only the newer one has a majority. The stale leader cannot commit anything (committing needs a majority), and steps down as soon as it hears the newer term. Raft does not stop a deposed leader *believing* it leads, which no protocol can; it makes the belief harmless. The experiment shows why timeouts are random: with identical timeouts everyone becomes a candidate at once, votes for itself, and no one ever wins.
+
+### Log replication
+
+Once elected, the leader handles every client request. It appends the command to its own log as an entry tagged with the current term, and sends `AppendEntries` to the followers carrying the new entries plus two numbers: `prevLogIndex` and `prevLogTerm`, the position and term of the entry just before the new ones. A follower accepts only if its own log has an entry at `prevLogIndex` with that term. This **consistency check**, applied inductively, guarantees the **Log Matching** property: if two logs contain an entry with the same index and term, the logs are identical up to that index.
+
+When a follower rejects, the leader steps back one entry and retries, until it finds the last point where the logs agree; the follower then discards everything after that point and takes the leader's entries. The leader never deletes or overwrites its own log — the followers are brought into line with it.
+
+```python run
+# A log entry is (term, command). Raft numbers entries from 1.
+leader = [(1, "x=1"), (1, "y=2"), (2, "x=3"), (4, "z=1"), (4, "y=7"), (5, "x=0"), (5, "z=9")]
+
+followers = {
+    "Amara (behind)": [(1, "x=1"), (1, "y=2"), (2, "x=3"), (4, "z=1")],
+    "Bilal (diverged)": [(1, "x=1"), (1, "y=2"), (2, "x=3"), (3, "y=5"), (3, "y=6"), (3, "z=2")],
+    "Chen (empty)": [],
+}
+
+def append_entries(log, prev_index, prev_term, entries):
+    """The follower's side of AppendEntries: (accepted?, log afterwards)."""
+    if prev_index > len(log):
+        return False, log                    # a gap: we lack the entry just before these
+    if prev_index > 0 and log[prev_index - 1][0] != prev_term:
+        return False, log                    # we hold a different entry at prev_index
+    # Simplified: the leader always sends its whole suffix, so keep the agreed
+    # prefix and replace everything after it. (Real Raft truncates only at the
+    # first conflicting entry, so that a delayed, duplicate message is harmless.)
+    return True, log[:prev_index] + entries
+
+for name, log in followers.items():
+    next_index = len(leader) + 1             # the leader starts optimistic
+    trips = 0
+    while True:
+        trips += 1
+        prev_index = next_index - 1
+        prev_term = leader[prev_index - 1][0] if prev_index > 0 else 0
+        ok, log = append_entries(log, prev_index, prev_term, leader[prev_index:])
+        if ok:
+            break
+        next_index -= 1                      # rejected: step back one entry and retry
+    print(f"{name:17s} {trips} round trips; terms now {[t for t, _ in log]}; same as leader: {log == leader}")
+```
+
+Bilal's three entries from term 3 were written by a leader that never got them onto a majority; they were never committed, so discarding them breaks no promise. Stepping back one entry per round trip is slow for a far-behind follower like Chen, so real implementations let the follower reply with hints (the conflicting term and its first index) to skip back in larger jumps, and send a **snapshot** of the state machine when the follower is very far behind.
+
+### Commitment and safety
+
+An entry is **committed** once the leader that created it has stored it on a majority of servers. The leader then applies it to its state machine, answers the client, and tells the followers (in later messages) how far the log is committed so they can apply it too.
+
+The paper proves five properties: **Election Safety** (at most one leader per term), **Leader Append-Only**, **Log Matching**, **Leader Completeness** (a committed entry is in the log of every later leader) and **State Machine Safety** (no two servers apply different entries at the same index).
+
+Leader Completeness is where the voting rule earns its keep: a committed entry sits on a majority, a winner needs a majority's votes, the two share a server, and that server refuses any candidate whose log is less up to date than its own.
+
+One subtlety catches almost everyone. A new leader may find on a majority an entry from an *earlier* term that was never known to be committed. Counting replicas is not enough to commit it, because the paper shows a sequence of crashes in which such an entry is overwritten later. Raft's rule is that a leader counts replicas only for entries from **its own current term**; once one of those is committed, everything before it is committed too, by Log Matching. You will implement this rule in the exercises.
+
+Production Raft adds safe membership changes, snapshots, and **linearizable reads**: a leader must confirm it still leads (a round of heartbeats, or a lease) before answering from local state.
+
+</Section>
+
+<Section id="paxos" kind="human" title="Paxos, at the level of ideas">
+
+Paxos, devised by Leslie Lamport in the late 1980s and published in 1998, is the older protocol; Raft can be read as a carefully structured way of running it. **Single-decree Paxos** decides one value. **Proposers** suggest values, **acceptors** vote, **learners** find out the result. It runs in two phases, each needing a majority of acceptors:
+
+1. **Prepare.** A proposer picks a ballot number $b$ higher than any it has used and asks the acceptors to *promise* to ignore ballots lower than $b$. Each acceptor that promises also reports the highest-numbered proposal it has already accepted, if any.
+2. **Accept.** With promises from a majority, the proposer asks the acceptors to accept $(b, v)$ — and here is the heart of Paxos — where $v$ must be the value of the highest-numbered proposal reported in phase 1, if there was one. Only if none was reported may it propose its own value. An acceptor accepts unless it has since promised a higher ballot. A value is **chosen** once a majority has accepted the same ballot.
+
+The rule in phase 2 is what makes Paxos safe: if some value might already have been chosen, any later proposer is forced to rediscover it and carry it forward, because its majority of promises overlaps the majority that accepted it. Two proposers can keep pre-empting each other with ever-higher ballots, which is FLP showing through; in practice one **distinguished proposer** — a leader — runs the protocol.
+
+**Multi-Paxos** decides a whole log: a stable leader runs phase 1 once for all future slots, then needs one phase-2 round trip per entry — essentially Raft, with terms as ballots and stricter rules on who may lead. Lamport's "Paxos Made Simple" is short and worth reading next.
+
+<Reflection title="Promises that bind">
+
+At the centre of Paxos is a promise: an acceptor that tells a proposer "I will not accept anything older than ballot $b$" must keep its word even when that is inconvenient, and must write the promise to disk before replying so that it survives a crash. The whole edifice of agreement rests on many small, faithfully kept commitments. "Let your yea be yea; and your nay, nay," says the letter of James (5:12, King James Version). It is a fair description of what makes a group of machines — or of people — trustworthy together.
+
+</Reflection>
+
+</Section>
+
+<Section id="consistency" kind="definitions" title="Linearizability versus eventual consistency">
+
+What exactly does a replicated system promise a client? Two models sit at opposite ends.
+
+<Definition term="Linearizability">
+
+Every operation appears to take effect atomically at some single instant between the moment it was invoked and the moment it returned, and the order of those instants respects real time: if one operation finished before another started, it comes first. The system behaves as if there were one copy of the data.
+
+</Definition>
+
+<Definition term="Eventual consistency">
+
+If no new writes are made, all replicas eventually return the same value. Nothing is promised about what a read returns in the meantime.
+
+</Definition>
+
+<Example title="One timeline, two models">
+
+Kofi writes `balance = 70` and receives "OK" at 10:00:01. At 10:00:02 Elena reads the balance.
+
+- Under **linearizability**, Elena must see 70 (or a later value). The write finished before her read began, so it must be ordered first.
+- Under **eventual consistency**, Elena may see the old balance, 100, if her read reached a replica the write has not reached yet. If writes stop, she will see 70 eventually.
+
+</Example>
+
+Between them sit read-your-writes, monotonic reads, and **causal consistency** (if one write could have influenced another, everyone sees them in that order); Jepsen's map, linked below, relates them all. And as the CAP theorem from <LessonLink slug="distributed-systems">Distributed systems</LessonLink> says, during a partition a linearizable system must refuse some requests on the minority side.
+
+Linearizability costs coordination — a majority round trip per write, about a millisecond within a data centre but 100 ms or more across continents. Eventual consistency lets each replica answer at once, which is why carts, like counters and feeds often accept it, with conflict resolution designed for the data (merge two carts rather than pick one).
+
+</Section>
+
+<Section id="practice" kind="human" title="Where consensus lives in practice">
+
+Consensus is expensive, so large systems use it deliberately, in two main places.
+
+**Coordination services** hold small, critical metadata — shard leaders, configuration, locks, leases. Google's **Chubby** is a Paxos-based lock service that Bigtable used to elect its master. **Apache ZooKeeper** uses its own protocol, Zab, and long coordinated Hadoop and Kafka clusters (recent Kafka versions replaced it with **KRaft**, a built-in Raft quorum). **etcd** uses Raft and holds all of a Kubernetes cluster's state.
+
+**Strongly consistent databases** give each shard its own consensus group. Spanner runs a Paxos group per split and adds **TrueTime** — clocks with a known error bound, kept tight by GPS and atomic clocks — so transactions get a global order consistent with real time. CockroachDB and TiKV run a Raft group per key range; Amazon DynamoDB, despite its name, replicates each partition with Multi-Paxos rather than the 2007 Dynamo design. <LessonLink slug="storage-at-scale">Storage at scale</LessonLink> shows how shards and replicas combine.
+
+The professional habits that go with this:
+
+- **Never write your own consensus protocol for production.** Use etcd, ZooKeeper, a proven Raft library, or a database that embeds one; bugs here surface years later under rare failure sequences.
+- **Keep the group small and its data small**: three or five voters, holding metadata rather than bulk data.
+- **Fence external resources**, because a lock holder can be paused (by garbage collection, say) until its lease expires and someone else takes over.
+- **Test under failure.** Jepsen's analyses have found consistency violations in many well-known databases by injecting partitions and clock skew; Amazon has written about checking designs with the TLA+ specification language before building them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"With $R + W > N$, reads are linearizable."** A read *meets* the latest successful write, but concurrent writes, partially failed writes and sloppy quorums break the single-copy illusion, and two reads overlapping a write can see the new value and then the old. Linearizable quorum systems need extra machinery, such as readers writing back what they read.
+
+</Misconception>
+
+<Misconception>
+
+**"FLP proves consensus is impossible, so systems like etcd must be cheating."** FLP rules out a deterministic algorithm that *always terminates* in a fully asynchronous system. Raft and Paxos always preserve agreement and terminate whenever the network is calm enough for long enough — which, in a healthy data centre, is nearly always.
+
+</Misconception>
+
+<Misconception>
+
+**"Raft guarantees that only one server believes it is the leader."** It guarantees at most one leader *per term*. A deposed leader in an older term may still believe it leads until it hears from the others; it simply cannot commit anything, because it cannot gather a majority.
+
+</Misconception>
+
+<Misconception>
+
+**"An entry stored on a majority is committed."** Only for entries from the leader's current term. An older-term entry on a majority can still be overwritten after a further failure; it becomes committed when a current-term entry after it is committed.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

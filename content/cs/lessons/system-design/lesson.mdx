@@ -1,0 +1,385 @@
+---
+title: System design
+subtitle: A method for designing large services, the building blocks they share, and two designs worked end to end.
+minutes: 85
+objectives:
+  - Follow a repeatable method from requirements to trade-offs when designing a service
+  - Make back-of-the-envelope estimates of traffic, storage and bandwidth, and state their assumptions
+  - Explain load balancers, caches, CDNs and queues, and when each helps
+  - Implement a token-bucket rate limiter and compare it with a fixed window
+  - Design a URL shortener and a news feed end to end, and defend the trade-offs
+prerequisites: [storage-at-scale, data-processing, replication-and-consensus]
+related: [math.applied.modelling-with-functions, math.prob.probability-rules]
+references:
+  - title: Design Docs at Google
+    author: Malte Ubl
+    url: https://www.industrialempathy.com/posts/design-docs-at-google/
+    note: How design work is written down and reviewed at a large company — the real-world form of a system design interview.
+  - title: "Google SRE book: Load Balancing at the Frontend"
+    url: https://sre.google/sre-book/load-balancing-frontend/
+  - title: "Google SRE book: Load Balancing in the Datacenter"
+    url: https://sre.google/sre-book/load-balancing-datacenter/
+  - title: "Maglev: A Fast and Reliable Software Network Load Balancer"
+    year: 2016
+    url: https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/
+  - title: Scaling Memcache at Facebook
+    author: Nishtala et al.
+    year: 2013
+    url: https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala
+    note: Cache-aside at enormous scale, with leases against stale sets and thundering herds.
+  - title: Caching challenges and strategies
+    url: https://aws.amazon.com/builders-library/caching-challenges-and-strategies/
+    note: From the Amazon Builders' Library.
+  - title: Avoiding insurmountable queue backlogs
+    url: https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/
+  - title: Scaling your API with rate limiters
+    url: https://stripe.com/blog/rate-limiters
+    note: Stripe's engineering blog on the four limiters it runs in production.
+  - title: Timelines at Scale
+    author: Raffi Krikorian
+    year: 2013
+    url: https://www.infoq.com/presentations/Twitter-Timeline-Scalability/
+    note: A talk on how Twitter delivered home timelines with fan-out on write.
+---
+
+<Section id="motivation" kind="motivation" title="Design is choosing under constraints">
+
+"Design a URL shortener" fits on one line, and the first answer that comes to mind — a table mapping codes to URLs — is not wrong. What separates a senior engineer's design is everything around it: how many links, how fast, what happens when a link goes viral, what breaks first, what it costs, what you would change if the numbers were ten times bigger. System design is the craft of turning a vague goal into a concrete architecture whose **trade-offs are deliberate and written down**.
+
+At large companies this happens in **design documents** reviewed by peers before code is written, and in **system design interviews** that compress the same conversation into 45 minutes. Both reward the same habits: clarify before building, estimate before choosing, start simple, and say why. There is rarely one right answer; there are answers that fit the requirements and answers that do not, and the reasoning matters more than the boxes on the whiteboard.
+
+This lesson gives a method, the numbers and building blocks you need, and two designs worked through in full. It leans on everything in this level: replication and consensus, partitioning, and the batch and stream pipelines of <LessonLink slug="data-processing">Batch and stream processing</LessonLink>.
+
+</Section>
+
+<Section id="method" kind="definitions" title="A method in seven steps">
+
+1. **Requirements.** *Functional*: what the system does (create a short link; redirect; show click counts). *Non-functional*: scale, latency targets (say, redirect within 50 ms at the 99th percentile), availability, consistency, durability, cost, privacy and abuse. Ask; do not assume. Write down what is out of scope.
+2. **Estimates.** Requests per second (average and peak), read/write ratio, data size over the system's lifetime, bandwidth, memory for caching. These numbers decide the architecture: 50 writes per second and 50,000 are different systems.
+3. **API.** The operations clients call, with inputs, outputs and errors. `POST /links {url} → {code}`, `GET /{code} → 302 Location`. An API forces precision about what the system promises.
+4. **Data model.** Entities, keys, and the access pattern for each query. Choose storage *from* the access patterns, as <LessonLink slug="storage-at-scale">Storage at scale</LessonLink> argued.
+5. **High-level design.** The boxes and arrows: clients, load balancers, stateless services, caches, databases, queues, pipelines. Trace one request of each kind through it.
+6. **Deep dives.** Pick the two or three hardest parts — the hot key, the consistency question, the failure mode — and design them properly.
+7. **Trade-offs and evolution.** What you chose, what you gave up, what you would monitor, and what you would change at ten times the scale.
+
+The steps are a checklist, not a script. In practice you loop: an estimate in step 2 may send you back to renegotiate a requirement in step 1.
+
+</Section>
+
+<Section id="estimation" kind="computation" title="Back-of-the-envelope estimation">
+
+Estimation is arithmetic with honest assumptions, aiming at the right **order of magnitude**, not three significant figures. A few facts carry most of the weight:
+
+- A day has 86,400 seconds; round it to $10^5$. So **1 million requests per day is about 12 per second**, and 1 billion per day is about 12,000 per second.
+- Traffic is not flat. Peak is often 2–10 times the daily average, and launches and news events spike higher.
+- Rough latencies, each about two orders of magnitude apart: main memory about 100 nanoseconds; an SSD random read about 100 microseconds; a network round trip inside a data centre about half a millisecond; across a continent tens of milliseconds; between continents 100–200 ms. Hardware changes, but these ratios have been stable enough to reason with for years.
+- One well-written server handles thousands to tens of thousands of simple requests per second; one database server with indexes in memory handles thousands to tens of thousands of point queries per second. Treat these as starting guesses to be replaced by measurements.
+
+```python run
+SECONDS_PER_DAY = 86_400                     # about 10^5: the number to remember
+
+def human(n, unit=""):
+    for size, suffix in ((1e15, "P"), (1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if n >= size:
+            return f"{n / size:.1f} {suffix}{unit}"
+    return f"{n:.1f} {unit}"
+
+# Assumptions for a URL shortener: write every one down, so others can challenge them.
+new_links_per_month = 120e6
+reads_per_write = 50                         # each link is clicked 50 times on average
+peak_factor = 3                              # the busiest hour vs the daily average
+bytes_per_link = 500                         # long URL, code, owner, timestamps, overheads
+years_kept = 5
+replicas = 3
+
+writes_per_s = new_links_per_month / 30 / SECONDS_PER_DAY
+reads_per_s = writes_per_s * reads_per_write
+links_stored = new_links_per_month * 12 * years_kept
+storage = links_stored * bytes_per_link * replicas
+read_bandwidth = reads_per_s * peak_factor * bytes_per_link
+
+print(f"writes:  {writes_per_s:8.0f} /s on average, {writes_per_s * peak_factor:8.0f} /s at peak")
+print(f"reads:   {reads_per_s:8.0f} /s on average, {reads_per_s * peak_factor:8.0f} /s at peak")
+print(f"links stored after {years_kept} years: {human(links_stored)}")
+print(f"storage with {replicas} replicas: {human(storage, 'B')}")
+print(f"peak read bandwidth from storage (if nothing is cached): {human(read_bandwidth, 'B')}/s")
+
+# How much memory to cache the hottest 20% of a day's clicked links?
+hot_links = 0.2 * reads_per_s * SECONDS_PER_DAY      # generous: treats every click as a distinct link
+print(f"cache for 20% of a day's clicks: {human(hot_links * bytes_per_link, 'B')}")
+```
+
+The output says a lot. About 140 writes per second at peak is small — one relational database could take it — and 11 TB over five years with replication is modest. Reads dominate at about 7,000 per second at peak, and a cache of tens of gigabytes would absorb most of them. So the hard parts of a URL shortener are **not** raw scale; they are the read path's latency, code generation, and abuse. Estimation just saved us from over-engineering.
+
+</Section>
+
+<Section id="building-blocks" kind="intuition" title="Building blocks: load balancers, caches and queues">
+
+### Load balancers
+
+A **load balancer** spreads requests over a pool of interchangeable servers and stops sending to servers that fail **health checks**. A **layer-4** balancer routes TCP or UDP connections by address and port, fast and protocol-agnostic; a **layer-7** balancer understands HTTP, so it can route by path or header, terminate TLS, and retry idempotent requests. Common policies are round robin, least outstanding requests, and "pick two servers at random and use the less loaded" (the **power of two choices**, which gets most of the benefit of least-loaded with little coordination). When requests for the same key should reach the same server — for its warm cache — balancers use consistent hashing. Globally, **DNS** and **anycast** steer users to a nearby data centre. Google's Maglev and the SRE book chapters linked below describe both layers in production.
+
+Load balancing works best in front of **stateless** services: any server can handle any request because state lives in databases and caches. Keeping services stateless is what makes them easy to scale out and to replace.
+
+### Caches
+
+A cache keeps copies of hot data in fast storage (memory, usually Redis or Memcached) to cut latency and protect the database. The dominant pattern is **cache-aside**:
+
+1. On a read, look in the cache. On a hit, return.
+2. On a miss, read from the database, put the result in the cache with a **time-to-live** (TTL), return it.
+3. On a write, update the database, then **delete** the cache entry (rather than updating it, which races with concurrent reads that can put an old value back).
+
+The expected latency with hit ratio $h$ is roughly $h \cdot t_{\text{cache}} + (1 - h)(t_{\text{cache}} + t_{\text{db}})$, so going from 90% to 99% hits can cut database load tenfold. The hard part is **invalidation**: stale reads between a write and the delete, values cached from a lagging replica, and the **thundering herd** when a hot key expires and thousands of requests miss at once and all hit the database. Remedies include request coalescing (one request fetches, the others wait for it), leases (Facebook's memcache paper), and jittered TTLs so hot keys do not all expire together. Read-through, write-through and write-behind variants move these duties into the cache layer, with their own trade-offs.
+
+A **content delivery network** (CDN) is a cache run at hundreds of locations near users. It serves static assets — images, video segments, scripts — and increasingly whole cacheable pages, from a server a few milliseconds away. You control it with cache keys, TTLs and purges, and you design URLs with versions (`app.3f9a1c.js`) so content can be cached forever and changed by changing its name.
+
+### Queues
+
+A **message queue** (Amazon SQS, Google Cloud Pub/Sub, RabbitMQ, or a Kafka topic) lets a producer hand work to consumers without waiting for it. Queues **decouple** services so one can be down while the other keeps accepting work, **absorb bursts** so consumers run at a steady rate, and let slow work (sending email, resizing images, updating search indexes) happen off the request path. They usually deliver **at least once**, so consumers must be idempotent, and messages that keep failing go to a **dead-letter queue** for inspection.
+
+Queues hide overload until they do not. **Little's law** says the average number of items in a system equals arrival rate times average time in the system, $L = \lambda W$. If 200 jobs per second arrive and each spends 0.5 s in the system, 100 are in flight on average; if consumers fall behind, $W$ grows without bound and so does the backlog. Monitor queue age, not just length, and decide in advance what to drop when the queue is full.
+
+</Section>
+
+<Section id="rate-limiting" kind="computation" title="Rate limiting">
+
+A **rate limiter** caps how many requests a client (by API key, user or IP address) may make, protecting the service from abuse, runaway scripts and one tenant starving the others. Rejected requests get HTTP **429 Too Many Requests**, ideally with a `Retry-After` header.
+
+<Definition term="Token bucket">
+
+A bucket holds at most $b$ tokens and gains $r$ tokens per second. Each request removes one token; a request that finds the bucket empty is rejected. The bucket allows bursts of up to $b$ requests and an average of $r$ per second over long periods.
+
+</Definition>
+
+There is no need for a timer: on each request, add $r \times$ (time since the last request) tokens, capped at $b$, then try to spend one. Other algorithms make other trade-offs. A **fixed window** counts requests per clock interval — simple, but a burst straddling a boundary gets through twice. A **sliding log** stores every timestamp — exact, but memory-hungry. A **sliding window counter** interpolates between two fixed windows — a good approximation for little memory. A **leaky bucket** queues requests and releases them at a constant rate, smoothing output rather than rejecting.
+
+```python run
+class TokenBucket:
+    """Allows bursts of up to `capacity` requests and `rate` requests per second on average."""
+
+    def __init__(self, rate, capacity):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.last = capacity, 0.0       # start full
+
+    def allow(self, now, cost=1):
+        # Refill lazily: no background timer, just credit the time since the last call.
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= cost:
+            self.tokens -= cost
+            return True
+        return False
+
+class FixedWindow:
+    """At most `limit` requests in each window [k*size, (k+1)*size)."""
+
+    def __init__(self, limit, size):
+        self.limit, self.size, self.window, self.count = limit, size, None, 0
+
+    def allow(self, now):
+        w = int(now // self.size)
+        if w != self.window:
+            self.window, self.count = w, 0
+        if self.count < self.limit:
+            self.count += 1
+            return True
+        return False
+
+def show(name, limiter, times):
+    marks = "".join("+" if limiter.allow(t) else "." for t in times)
+    print(f"{name:13s} {marks}  accepted {marks.count('+')} of {len(times)}")
+
+# A client sends a burst of 15 requests at t = 0.0-0.7 s, then one every 0.25 s.
+times = [i * 0.05 for i in range(15)] + [1.0 + i * 0.25 for i in range(16)]
+print("'+' accepted, '.' rejected (HTTP 429)\n")
+show("token bucket", TokenBucket(rate=2, capacity=5), times)
+show("fixed window", FixedWindow(limit=5, size=2.5), times)
+
+# The fixed window's weakness: a burst straddling a boundary gets twice the limit through.
+edge = [2.40 + i * 0.01 for i in range(10)] + [2.50 + i * 0.01 for i in range(10)]
+print("\n20 requests within 0.2 s, straddling the window boundary at t = 2.5 s:")
+show("token bucket", TokenBucket(rate=2, capacity=5), edge)
+show("fixed window", FixedWindow(limit=5, size=2.5), edge)
+```
+
+Both limiters were configured for an average of two requests per second. The token bucket lets the initial burst of five through, then settles to one request every half second; the fixed window admits twice its limit when a burst straddles its boundary.
+
+In a fleet of servers, a limit "per user" needs shared state. One approach keeps counters in a central store such as Redis, updated atomically in one round trip; another gives each of $n$ servers a local limit of roughly $1/n$ of the total, accepting some imprecision for no extra latency. Stripe's engineering blog describes the several kinds of limiter it runs — per-user rate limits, concurrency limits, and load shedders that protect critical traffic first.
+
+</Section>
+
+<Section id="url-shortener" kind="examples" title="Design 1: a URL shortener">
+
+<Example title="Requirements and estimates">
+
+**Functional**: create a short code for a long URL, optionally with a custom alias and an expiry; redirect `GET /{code}` to the long URL; show the owner click counts. **Non-functional**: redirects fast (p99 under 50 ms in-region) and highly available — a broken short link in a printed poster cannot be fixed; creation can be slower; links never silently change destination. **Out of scope**: link previews, user accounts beyond an owner id.
+
+The estimates computed above: about 140 writes and 7,000 reads per second at peak, 7 billion links and about 11 TB over five years with three replicas.
+
+</Example>
+
+**API.** `POST /links {long_url, alias?, expires_at?} → 201 {code}`; `GET /{code} → 302` with a `Location` header, or 404/410; `GET /links/{code}/stats → {clicks_by_day}`.
+
+Should the redirect be **301** (permanent) or **302** (temporary)? Browsers cache a 301 and stop asking, which saves traffic but means later clicks are invisible to the analytics and an expired link cannot be turned off. A 302 keeps every click visible. Most shorteners choose 302, or a 301 with a short cache lifetime: a trade-off between load and control, decided by the requirements.
+
+**Generating codes.** Three designs, each defensible:
+
+- **Hash the URL** and take the first 7 characters. The same URL always gets the same code (handy for deduplication), but distinct URLs can collide, and two users shortening the same URL share one code and its statistics.
+- **Random codes**, inserted with a conditional write ("put if absent") and retried on collision. Collisions somewhere become certain as links accumulate, but the chance that any *particular* new code collides stays tiny, so retries are rare.
+- **A counter**, encoded in base 62. Unique by construction and compact. A single counter is a bottleneck and a single point of failure, so a strongly consistent store hands out **ranges** of 1,000 ids to each application server, which spends them locally. Sequential codes are guessable — someone can walk through every link — so many designs scramble the id with a bijection first.
+
+```python run
+import math
+import random
+
+ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"   # 62 symbols
+
+def base62(n):
+    if n == 0:
+        return ALPHABET[0]
+    digits = []
+    while n:
+        n, r = divmod(n, 62)
+        digits.append(ALPHABET[r])
+    return "".join(reversed(digits))
+
+def unbase62(code):
+    n = 0
+    for ch in code:
+        n = n * 62 + ALPHABET.index(ch)
+    return n
+
+class RangeAllocator:
+    """A central counter hands out blocks of ids; each app server spends its block locally.
+    The counter (in a strongly consistent store) is touched once per block, not once per link."""
+
+    def __init__(self, block=1000):
+        self.next_block, self.block = 0, block
+
+    def lease(self):
+        start = self.next_block
+        self.next_block += self.block
+        return iter(range(start, start + self.block))
+
+alloc = RangeAllocator()
+servers = {name: alloc.lease() for name in ("app-lagos", "app-lima", "app-seoul")}
+for name, ids in servers.items():
+    first = next(ids)
+    print(f"{name}: id {first:5d} -> code {base62(first)!r:6s}  next id {next(ids)}")
+
+for n in (61, 62, 3843, 3844, 56_800_235_583, 56_800_235_584):
+    assert unbase62(base62(n)) == n
+    print(f"{n:>15,d} -> {base62(n)}")
+
+print(f"\n7 characters give 62^7 = {62 ** 7:,} codes")
+
+# Consecutive ids give guessable codes. Any bijection on the id space keeps codes unique; multiplying
+# by a number coprime to 62^7 (mod 62^7) is a toy one. It hides the order; it is NOT encryption.
+M, K = 62 ** 7, 3_141_592_653
+assert math.gcd(K, M) == 1
+print("scrambled codes for ids 1-4:", [base62(i * K % M).rjust(7, "0") for i in range(1, 5)])
+
+# The alternative: random 7-character codes, checked for uniqueness when stored.
+print()
+space = 62 ** 7
+for n in (10**6, 10**8, 10**10):
+    p_any = 1 - math.exp(-n * (n - 1) / (2 * space))     # birthday approximation
+    print(f"{n:>14,d} links stored: P(some pair collides) = {p_any:.3f};"
+          f" P(the next new code collides) = {n / space:.1e}")
+```
+
+**Data model and storage.** One table, `links(code PRIMARY KEY, long_url, owner_id, created_at, expires_at)`, read by key only. That access pattern suits a key–value store partitioned by hash of `code`, or a relational database — at these numbers, a primary with read replicas is enough for years, and partitioning by code is easy to add later because every query is by code. Custom aliases need a uniqueness check, which a conditional insert on the primary key provides.
+
+**High-level design.** Clients hit a global load balancer, then stateless API servers. Redirects check a cache (cache-aside, keyed by code, with a TTL) before the database; the cache absorbs almost all reads because link popularity is extremely skewed. Every redirect also emits a click event to a log such as Kafka; a stream job aggregates clicks per code per day into the statistics table. Analytics never sit on the redirect's critical path.
+
+**Deep dives.** *A link goes viral*: one hot key; the cache holds it, and the API servers can keep a small in-process cache for the very hottest codes. *Abuse*: shorteners are used to disguise phishing and malware; check new URLs against a safe-browsing list, rate-limit creation per user and per IP, and be able to disable a code. *Expiry*: check `expires_at` at read time, and clean up in a background batch job. *Availability*: the redirect path depends only on the cache and a replicated read store, so it can survive the write path being down.
+
+</Section>
+
+<Section id="news-feed" kind="examples" title="Design 2: a news feed">
+
+<Example title="Requirements and estimates">
+
+**Functional**: users follow other users; they post text and photos; the home feed shows recent posts from followed accounts, ranked, newest-ish first, with pagination. **Non-functional**: feed loads in under 200 ms at p99; a new post appears in followers' feeds within seconds (but need not be instant); availability over consistency — a feed briefly missing one post is acceptable; a user always sees their own new post.
+
+**Estimates** (assumed): 300 million daily active users opening the feed 6 times a day — 1.8 billion feed reads, about 21,000 per second on average and perhaps 60,000 at peak. If each user posts 0.8 times a day and has 200 followers on average, posts arrive at about 2,800 per second, each reaching hundreds of feeds.
+
+</Example>
+
+The central decision is **when to assemble a feed**.
+
+- **Fan-out on write (push).** When someone posts, append the post id to the precomputed feed ("inbox") of each follower, stored in a fast key–value store or cache. Reading a feed is then one lookup. Writing is expensive: one post becomes as many writes as the author has followers.
+- **Fan-out on read (pull).** Store each user's own posts only. To read a feed, fetch recent posts from every account the reader follows and merge them. Writes are cheap; every read touches hundreds of accounts.
+- **Hybrid.** Push for ordinary accounts; for accounts with very many followers, pull at read time and merge their recent posts into the precomputed inbox.
+
+Why hybrid? Follower counts are heavy-tailed. The simulation below draws follower counts for a million accounts from a heavy-tailed distribution and compares the strategies.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(2026)
+users = 1_000_000
+# Follower counts are heavy-tailed: most accounts have dozens, a handful have hundreds of thousands.
+followers = np.minimum((rng.pareto(1.2, users) + 1) * 40, users - 1).astype(np.int64)
+posts_per_day = rng.poisson(0.8, users)               # posts each user makes in a day
+follows_per_user = followers.sum() / users            # each follow edge counted once from each side
+
+print(f"followers: median {int(np.median(followers))}, mean {followers.mean():.0f}, max {followers.max():,}")
+print(f"so each user follows {follows_per_user:.0f} accounts on average\n")
+
+def costs(threshold):
+    """Push posts of accounts with at most `threshold` followers; pull the others when reading."""
+    pushed = followers <= threshold
+    writes = int((posts_per_day * followers)[pushed].sum())
+    biggest_burst = int(followers[pushed & (posts_per_day > 0)].max(initial=0))
+    pulled = int((~pushed).sum())
+    # Share of all follow edges that point at pulled accounts = fetches a reader makes per feed load.
+    fetches = follows_per_user * followers[~pushed].sum() / followers.sum()
+    return writes, biggest_burst, pulled, fetches
+
+print(f"{'strategy':33s} {'inbox writes/day':>16s} {'largest burst':>14s} {'pulled accts':>13s} {'fetches/read':>13s}")
+for name, threshold in [("push for everyone", np.inf),
+                        ("hybrid: pull if > 100k followers", 100_000),
+                        ("hybrid: pull if > 10k followers", 10_000),
+                        ("pull for everyone", -1)]:
+    w, burst, pulled, fetches = costs(threshold)
+    print(f"{name:33s} {w:16,d} {burst:14,d} {pulled:13,d} {fetches:13.1f}")
+```
+
+Pure push costs the most writes and, worse, produces enormous bursts: one celebrity post means a million inbox writes, delaying that post for everyone else in the queue. Pure pull multiplies the cost of every read, and reads outnumber posts. The hybrid caps the burst at the threshold while adding only a few dozen fetches per read — and those fetches are cache-friendly, because every reader asks for the *same* celebrity posts. Twitter's "Timelines at Scale" talk, linked below, describes fan-out on write into in-memory timelines and the strain that accounts with very large followings put on it.
+
+**The rest of the design**, briefly. Posts are stored in a partitioned store keyed by post id; media go to object storage behind a CDN, uploaded directly by the client with a pre-signed URL. The social graph (who follows whom) lives in its own partitioned store, queried in both directions. Fan-out runs asynchronously from a queue, so posting returns quickly. Ranking reads a few hundred candidate post ids from the inbox, fetches features, scores them with a model, filters (blocked users, already-seen posts) and returns a page; pagination uses an opaque **cursor** rather than page numbers, so new posts do not shift pages. The author's own post is inserted into their feed on the write path, so they see it immediately — read-your-writes where it matters, eventual consistency elsewhere. Deletions must remove the post from inboxes, or be filtered at read time.
+
+</Section>
+
+<Section id="trade-offs" kind="human" title="Trade-offs, not answers">
+
+Notice what the two designs had in common: a fast, simple read path with a cache in front; slow or heavy work moved to queues and pipelines; storage chosen from the access pattern; consistency spent only where users notice it. And notice that every choice had a price: 302 redirects cost load, ranges cost a coordination service, hybrid fan-out costs code complexity.
+
+Good design writing states those prices. A useful habit is a short table of **decisions, alternatives and the evidence that would change your mind**: "We use a single relational primary. We would partition by code when sustained writes exceed what one primary handles with headroom, which our estimates put years away." Interviewers and reviewers look for exactly this: not the "right" architecture, but a sound one whose author knows its limits.
+
+<Misconception>
+
+**"A senior design has many components."** Every box is something to build, run, secure and debug at 3 a.m. Start with the simplest design that meets the requirements, and add components when a number demands them.
+
+</Misconception>
+
+<Misconception>
+
+**"Add a cache and the database problem is solved."** Caches add staleness, invalidation bugs and new failure modes — including the database collapsing when a cold or failed cache sends it all the traffic at once. Design for the cache being empty.
+
+</Misconception>
+
+<Misconception>
+
+**"Estimates have to be accurate."** They have to be the right order of magnitude, with assumptions stated so others can correct them. A design that changes when an estimate moves by a factor of two was too finely balanced anyway.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

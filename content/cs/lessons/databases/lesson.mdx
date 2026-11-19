@@ -1,0 +1,462 @@
+---
+title: Databases
+subtitle: Shared, durable, queryable state, and the guarantees that make it trustworthy.
+minutes: 75
+objectives:
+  - Describe the relational model — relations, attributes, keys — and how SQL tables differ from it
+  - Write SQL queries with SELECT, JOIN, GROUP BY and subqueries, and run them from Python's sqlite3
+  - Normalise a schema to remove update anomalies, and recognise when denormalising is the right call
+  - Explain why databases index with B-trees and read a query plan with EXPLAIN QUERY PLAN
+  - State what atomicity, consistency, isolation and durability promise, and name the classic isolation anomalies
+  - Judge when a non-relational store fits a problem better than a relational one
+prerequisites: [complexity, hash-tables, trees, memory-hierarchy, concurrency]
+related: [math.found.sets, math.found.equivalence-relations, math.found.first-order-logic]
+references:
+  - title: "A Relational Model of Data for Large Shared Data Banks"
+    author: E. F. Codd
+    year: 1970
+    url: https://dl.acm.org/doi/10.1145/362384.362685
+    note: The paper that started it all. Short, readable, and still the clearest statement of data independence.
+  - title: SQLite documentation
+    url: https://www.sqlite.org/docs.html
+    note: The engine every example in this lesson runs on. The pages on the query planner and on EXPLAIN QUERY PLAN are excellent.
+  - title: "SQLite: EXPLAIN QUERY PLAN"
+    url: https://www.sqlite.org/eqp.html
+  - title: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/
+    note: The reference for the most widely used open-source server database. Start with the chapters on indexes and on concurrency control.
+  - title: "PostgreSQL: Transaction Isolation"
+    url: https://www.postgresql.org/docs/current/transaction-iso.html
+    note: A precise account of which anomalies each isolation level allows in a real system.
+  - title: "A Critique of ANSI SQL Isolation Levels"
+    author: Berenson, Bernstein, Gray, Melton, O'Neil and O'Neil
+    year: 1995
+    url: https://arxiv.org/abs/cs/0701157
+    note: Why the standard's definitions of isolation were not enough, and where snapshot isolation fits.
+  - title: "Python: sqlite3 — DB-API 2.0 interface for SQLite databases"
+    url: https://docs.python.org/3/library/sqlite3.html
+  - title: Use The Index, Luke
+    author: Markus Winand
+    url: https://use-the-index-luke.com/
+    note: A free, practical guide to indexing for application developers, across several database engines.
+---
+
+<Section id="motivation" kind="motivation" title="Why not just a dictionary in a file?">
+
+Suppose you are building the stock system for a small chain of bakeries. Your first version keeps a Python dictionary in memory and writes it to a JSON file every few seconds. It works on your laptop. Then reality arrives:
+
+- **Two cashiers sell the last loaf at the same moment.** Both processes read "1 left", both write "0 left", and you have sold a loaf you did not have.
+- **The power fails halfway through a write.** The file is now half old data and half new, and it does not parse.
+- **The owner asks a new question:** "which product sold best in each city last month?" Your code has no answer until someone writes, tests and deploys a new function.
+- **The data outlives the code.** Three years later the program has been rewritten twice, and the data is still the same data.
+
+A **database management system** is the piece of software that takes these problems away from every application, once and properly. It keeps state that is *shared* by many clients, *durable* across crashes, *queryable* by questions nobody anticipated, and *protected* by rules (constraints) that no buggy client can break.
+
+In 1970 Edgar Codd, a mathematician at IBM, proposed organising that state as **relations** — tables — and letting programs say *what* data they want instead of *how* to walk pointers to find it. That separation, which he called **data independence**, is why a query written in 1995 still runs today on storage engines that did not exist then. This lesson works from Codd's model through SQL, schema design, indexes and transactions, and ends with the honest question every senior engineer asks: is a relational database the right tool here at all?
+
+</Section>
+
+<Section id="relational-model" kind="definitions" title="The relational model">
+
+<Definition term="Relation, attribute, tuple">
+
+A **relation** over attributes $A_1, \dots, A_n$, where attribute $A_i$ takes values from a domain $D_i$, is a finite subset of $D_1 \times \dots \times D_n$. Each element is a **tuple** (a row). The list of attribute names and domains is the relation's **schema**; the set of tuples at a given moment is its **instance**.
+
+</Definition>
+
+Because a relation is a *set*, it has no duplicate rows and no row order, and its columns are identified by name rather than position. Queries are built from a small algebra of operations that take relations to relations: **selection** (keep the rows satisfying a predicate), **projection** (keep some columns), **join** (combine rows of two relations that agree on some attributes), plus union, difference and renaming. Closure under these operations is what lets queries nest: the output of any query can be the input of another.
+
+<Definition term="Keys">
+
+A **superkey** of a relation is a set of attributes whose values identify at most one tuple. A **candidate key** is a minimal superkey: remove any attribute and it stops being one. The **primary key** is the candidate key the designer chooses as the row's identity. A **foreign key** is a set of attributes in one relation whose values must appear as a key in another — a reference the database enforces.
+
+</Definition>
+
+Keys are *claims about the world* that the database will police. Declaring `email` unique says "two accounts never share an email"; the database then rejects any insert that would make that false, no matter which of your twelve services sends it.
+
+<Misconception>
+
+**"An SQL table is a relation."** Close, but not quite. SQL tables are *bags* (multisets): without a primary key or `UNIQUE` constraint they can hold duplicate rows, and `SELECT` does not remove duplicates unless you write `SELECT DISTINCT`. SQL also has `NULL`, which the pure model lacks, and `NULL` brings three-valued logic: `NULL = NULL` is not true but *unknown*, so `WHERE x = NULL` matches nothing and you must write `WHERE x IS NULL`. Most surprising SQL results trace back to one of these two departures.
+
+</Misconception>
+
+</Section>
+
+<Section id="sql" kind="computation" title="SQL by example">
+
+SQL is declarative: you describe the result, and the database's **query planner** decides how to compute it. Here is a small schema for the bakery chain, with prices stored as **integer cents**. (Never store money in binary floating point: $0.1 + 0.2 \neq 0.3$ in IEEE 754, as you saw in <LessonLink slug="bits-and-bytes">Bits and bytes</LessonLink>.) Run it, then change the queries.
+
+```python run
+import sqlite3
+
+db = sqlite3.connect(":memory:")          # a private database that lives in RAM
+db.executescript("""
+CREATE TABLE shops (
+    id      INTEGER PRIMARY KEY,
+    city    TEXT NOT NULL,
+    country TEXT NOT NULL
+);
+CREATE TABLE products (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    price_cents INTEGER NOT NULL CHECK (price_cents > 0)
+);
+CREATE TABLE sales (
+    id         INTEGER PRIMARY KEY,
+    shop_id    INTEGER NOT NULL REFERENCES shops(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    qty        INTEGER NOT NULL CHECK (qty > 0),
+    sold_on    TEXT NOT NULL                      -- ISO 8601 date
+);
+""")
+db.executemany("INSERT INTO shops VALUES (?, ?, ?)", [
+    (1, "Lagos", "Nigeria"), (2, "Lima", "Peru"), (3, "Osaka", "Japan"),
+    (4, "Kraków", "Poland"), (5, "Pune", "India"),
+])
+db.executemany("INSERT INTO products VALUES (?, ?, ?)", [
+    (1, "sourdough loaf", 450), (2, "melonpan", 220), (3, "chapati (5)", 300),
+    (4, "pączek", 180), (5, "pan de yema", 150),
+])
+db.executemany(
+    "INSERT INTO sales (shop_id, product_id, qty, sold_on) VALUES (?, ?, ?, ?)", [
+    (1, 1, 12, "2026-03-02"), (1, 3, 30, "2026-03-02"), (2, 5, 40, "2026-03-02"),
+    (2, 1, 8, "2026-03-03"), (3, 2, 55, "2026-03-03"), (3, 1, 5, "2026-03-04"),
+    (4, 4, 60, "2026-03-04"), (4, 1, 10, "2026-03-04"), (1, 3, 25, "2026-03-05"),
+])
+
+def show(title, sql):
+    print(f"-- {title}")
+    for row in db.execute(sql):
+        print("  ", row)
+    print()
+
+show("Selection and projection: cheap products, cheapest first", """
+    SELECT name, price_cents FROM products
+    WHERE price_cents < 300
+    ORDER BY price_cents""")
+
+show("Join: every sale with its city and product", """
+    SELECT s.city, p.name, x.qty
+    FROM sales AS x
+    JOIN shops AS s    ON s.id = x.shop_id
+    JOIN products AS p ON p.id = x.product_id
+    ORDER BY x.sold_on, s.city""")
+
+show("Group by and having: shops that took at least 100.00", """
+    SELECT s.city, SUM(x.qty * p.price_cents) AS revenue_cents
+    FROM sales AS x
+    JOIN shops AS s    ON s.id = x.shop_id
+    JOIN products AS p ON p.id = x.product_id
+    GROUP BY s.id
+    HAVING revenue_cents >= 10000
+    ORDER BY revenue_cents DESC""")
+
+show("Left join: every shop, even one with no sales", """
+    SELECT s.city, COUNT(x.id) AS n_sales
+    FROM shops AS s
+    LEFT JOIN sales AS x ON x.shop_id = s.id
+    GROUP BY s.id
+    ORDER BY n_sales DESC, s.city""")
+
+show("Subquery: products dearer than the average product", """
+    SELECT name FROM products
+    WHERE price_cents > (SELECT AVG(price_cents) FROM products)""")
+
+show("Correlated subquery over a CTE: each shop's best seller", """
+    WITH units AS (
+        SELECT shop_id, product_id, SUM(qty) AS n
+        FROM sales GROUP BY shop_id, product_id
+    )
+    SELECT s.city, p.name, u.n
+    FROM units AS u
+    JOIN shops AS s    ON s.id = u.shop_id
+    JOIN products AS p ON p.id = u.product_id
+    WHERE u.n = (SELECT MAX(n) FROM units WHERE shop_id = u.shop_id)
+    ORDER BY s.city""")
+```
+
+A few things worth noticing, because they are where people go wrong:
+
+- **Logical order of evaluation.** Conceptually, a query is evaluated `FROM`/`JOIN` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` → `ORDER BY` → `LIMIT`. That is why `WHERE` cannot filter on an aggregate (the groups do not exist yet) and `HAVING` can. (SQLite lets `HAVING` and `ORDER BY` refer to a `SELECT` alias like `revenue_cents`; PostgreSQL accepts the alias in `ORDER BY` but wants the expression repeated in `HAVING`.)
+- **Inner versus outer joins.** The inner `JOIN`s drop Pune, which has no sales. The `LEFT JOIN` keeps every shop and fills the missing sale columns with `NULL`; `COUNT(x.id)` counts non-null values, so Pune gets 0. `COUNT(*)` would have given 1, counting the padded row — a classic bug.
+- **A correlated subquery** (the last query) refers to the outer row (`u.shop_id`), so conceptually it runs once per outer row. Planners are good at turning such queries into joins, but not perfect; when one is slow, `EXPLAIN` it.
+- **Parameters, never string formatting.** Values go in through `?` placeholders. Building SQL by pasting strings together is the root of SQL injection, which <LessonLink slug="security">Security fundamentals</LessonLink> demonstrates on a toy table.
+
+<Note>
+
+Window functions (`ROW_NUMBER() OVER (PARTITION BY shop_id ORDER BY n DESC)`) give a cleaner "best per group" query and are supported by SQLite since 3.25 and by PostgreSQL. They are worth learning next; the [SQLite window function page](https://www.sqlite.org/windowfunctions.html) is a good start.
+
+</Note>
+
+</Section>
+
+<Section id="normalisation" kind="human" title="Keys and normalisation: one fact in one place">
+
+Imagine the bakery's first schema was a single spreadsheet-like table:
+
+| sale_id | city | country | product | price_cents | qty |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Lagos | Nigeria | sourdough loaf | 450 | 12 |
+| 2 | Lima | Peru | pan de yema | 150 | 40 |
+| 3 | Lima | Peru | sourdough loaf | 450 | 8 |
+
+It answers every question, but it stores the price of a sourdough loaf once *per sale*. Raise the price and you must update thousands of rows; miss one and the table now disagrees with itself (an **update anomaly**). You cannot record a new product until someone buys it (**insertion anomaly**), and deleting the last sale in Lima forgets that the Lima shop exists (**deletion anomaly**).
+
+The cure is to notice the **functional dependencies**: `product → price_cents` and `city → country` hold no matter which sale we look at. A dependency $X \to Y$ says that any two rows agreeing on $X$ agree on $Y$. Normalisation splits tables so that every non-trivial dependency's left-hand side is a key:
+
+- **First normal form (1NF):** every column holds a single value — no lists of phone numbers in one cell.
+- **Second and third normal forms (2NF, 3NF):** no non-key column depends on only part of a key, or on another non-key column. In our table, `price_cents` depends on `product`, which is not a key of the sales table; so prices move to their own `products` table.
+- **Boyce–Codd normal form (BCNF):** the left side of *every* non-trivial dependency is a superkey. For most practical schemas, 3NF and BCNF coincide.
+
+The schema you ran above is the result: `shops`, `products` and `sales`, each fact stored once, joined back together when a query needs them.
+
+### When to break the rules
+
+Normalisation optimises for *correct writes*. Sometimes reads matter more. An analytics warehouse may keep a wide, denormalised "fact table" because it is loaded once and queried millions of times; a busy web page may cache a precomputed count of comments instead of counting on every view. Denormalising is a legitimate engineering decision when you also decide **who keeps the copies in sync** — a trigger, a batch job, or an event stream — and what happens when they briefly disagree. Doing it by accident is how databases rot.
+
+<Misconception>
+
+**"Every table needs an auto-increment `id`, and that is its key."** A surrogate `id` is often a good primary key, but it does not replace the *natural* constraints. If two rows in `products` must never share a name, declare `name UNIQUE` as well; otherwise the surrogate key will happily let you insert "pączek" twice with different prices.
+
+</Misconception>
+
+</Section>
+
+<Section id="indexes" kind="intuition" title="Indexes: B-trees and query plans">
+
+Without help, `SELECT … WHERE sensor = 's0042'` must read every row: a **full table scan**, $O(n)$. An **index** is a second data structure, kept in step with the table, that maps column values to rows. You met the candidates in <LessonLink slug="hash-tables">Hash tables</LessonLink> and <LessonLink slug="trees">Trees</LessonLink>; databases overwhelmingly choose the **B-tree** (in practice the B+-tree variant), and the reason is the <LessonLink slug="memory-hierarchy">memory hierarchy</LessonLink>.
+
+Storage is read in **pages** (typically 4–16 KiB), and fetching a page from disk costs vastly more than searching inside it. A binary search tree touches one key per node, so a lookup among a billion keys visits about 30 nodes, each potentially a separate page read. A B-tree packs hundreds of keys into each node, one node per page. With fan-out $f$, a tree of height $h$ reaches $f^h$ leaves, so
+
+$$
+h = \lceil \log_f N \rceil .
+$$
+
+With $f = 500$ and $N = 10^9$ rows, $h = 4$, and the top two levels are almost always cached in memory. The leaves are kept in key order and linked to their neighbours, so **range queries** (`WHERE taken_at BETWEEN …`, `ORDER BY`) walk the leaves sideways — something a hash index cannot do.
+
+<Figure caption="A B+-tree. Internal nodes hold separator keys and child pointers; all row references live in the leaves, which are linked left to right for range scans.">
+
+<svg viewBox="0 0 560 210" role="img" aria-label="A B+-tree with one root, three internal nodes and linked leaf pages" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, monospace" font-size="12">
+  <g fill="none" stroke="currentColor" stroke-width="1.5">
+    <rect x="215" y="12" width="130" height="30" rx="4"/>
+    <rect x="30" y="82" width="130" height="30" rx="4"/>
+    <rect x="215" y="82" width="130" height="30" rx="4"/>
+    <rect x="400" y="82" width="130" height="30" rx="4"/>
+    <line x1="245" y1="42" x2="95" y2="82"/>
+    <line x1="280" y1="42" x2="280" y2="82"/>
+    <line x1="315" y1="42" x2="465" y2="82"/>
+    <rect x="10" y="160" width="80" height="30" rx="4"/>
+    <rect x="100" y="160" width="80" height="30" rx="4"/>
+    <rect x="200" y="160" width="80" height="30" rx="4"/>
+    <rect x="290" y="160" width="80" height="30" rx="4"/>
+    <rect x="390" y="160" width="80" height="30" rx="4"/>
+    <rect x="475" y="160" width="80" height="30" rx="4"/>
+    <line x1="70" y1="112" x2="50" y2="160"/>
+    <line x1="120" y1="112" x2="140" y2="160"/>
+    <line x1="255" y1="112" x2="240" y2="160"/>
+    <line x1="305" y1="112" x2="330" y2="160"/>
+    <line x1="440" y1="112" x2="430" y2="160"/>
+    <line x1="490" y1="112" x2="515" y2="160"/>
+  </g>
+  <g fill="currentColor" text-anchor="middle">
+    <text x="280" y="32">40 | 80</text>
+    <text x="95" y="102">12 | 25</text>
+    <text x="280" y="102">51 | 66</text>
+    <text x="465" y="102">88 | 95</text>
+    <text x="50" y="180">3 7 11</text>
+    <text x="140" y="180">12 19 25</text>
+    <text x="240" y="180">40 47 51</text>
+    <text x="330" y="180">58 66 72</text>
+    <text x="430" y="180">80 84 88</text>
+    <text x="515" y="180">91 95</text>
+  </g>
+  <g stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" fill="none">
+    <line x1="90" y1="175" x2="100" y2="175"/>
+    <line x1="180" y1="175" x2="200" y2="175"/>
+    <line x1="280" y1="175" x2="290" y2="175"/>
+    <line x1="370" y1="175" x2="390" y2="175"/>
+    <line x1="470" y1="175" x2="475" y2="175"/>
+  </g>
+</svg>
+
+</Figure>
+
+You never call the index yourself. You declare it, and the planner decides whether to use it. `EXPLAIN QUERY PLAN` shows that decision. The exact wording varies between SQLite versions, but you will see `SCAN` (read everything) turn into `SEARCH … USING INDEX` (descend the tree):
+
+```python run
+import random, sqlite3, time
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE readings (id INTEGER PRIMARY KEY, sensor TEXT, taken_at INTEGER, celsius REAL)")
+rng = random.Random(7)
+db.executemany(
+    "INSERT INTO readings (sensor, taken_at, celsius) VALUES (?, ?, ?)",
+    ((f"s{rng.randrange(1000):04d}", t, round(rng.uniform(-5, 35), 1)) for t in range(100_000)),
+)
+
+def plan(sql, *args):
+    for row in db.execute("EXPLAIN QUERY PLAN " + sql, args):
+        print("    plan:", row[-1])
+
+def ms_per_query(sql, *args, repeat=20):
+    start = time.perf_counter()
+    for _ in range(repeat):
+        db.execute(sql, args).fetchall()
+    return (time.perf_counter() - start) / repeat * 1000
+
+by_sensor = "SELECT COUNT(*), AVG(celsius) FROM readings WHERE sensor = ?"
+
+print("No index:")
+plan(by_sensor, "s0042")
+print(f"    {ms_per_query(by_sensor, 's0042'):.2f} ms per query")
+
+db.execute("CREATE INDEX readings_sensor ON readings(sensor)")
+print("Index on (sensor):")
+plan(by_sensor, "s0042")
+print(f"    {ms_per_query(by_sensor, 's0042'):.3f} ms per query")
+
+db.execute("CREATE INDEX readings_sensor_celsius ON readings(sensor, celsius)")
+print("Composite index on (sensor, celsius): the index alone answers the query")
+plan(by_sensor, "s0042")
+
+hot = "SELECT COUNT(*) FROM readings WHERE celsius > ?"
+print("A filter on celsius alone: no SEARCH, because the index starts with sensor")
+plan(hot, 34.5)
+```
+
+The last two plans illustrate the rules you will use daily:
+
+- A **composite index** on `(sensor, celsius)` is sorted by sensor, then by temperature within each sensor. It serves `WHERE sensor = ?` and `WHERE sensor = ? AND celsius > ?`, but it cannot *jump* to `WHERE celsius > ?` alone — just as a phone book sorted by surname, then given name, is no help in finding everyone called "Wei". This is the **leftmost-prefix rule**. In the last plan SQLite still `SCAN`s: it reads the whole composite index, which is smaller than the table and holds every column the query needs, from end to end.
+- When the index contains every column the query needs, it is a **covering index**, and the table itself is never touched.
+- Indexes are not free. Every `INSERT`, `UPDATE` and `DELETE` must update every index on the table, and each one costs storage and cache space. Index the queries you actually run, measured on realistic data; drop the indexes nothing uses.
+
+PostgreSQL's `EXPLAIN ANALYZE` goes further and *runs* the query, reporting actual row counts and timings next to the planner's estimates. When estimates and reality differ by orders of magnitude, stale statistics are the usual culprit. See [Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html) in the PostgreSQL documentation.
+
+</Section>
+
+<Section id="transactions" kind="definitions" title="Transactions and ACID">
+
+<Definition term="Transaction">
+
+A **transaction** is a sequence of reads and writes that the database treats as a single unit: it either **commits**, making all its effects permanent and visible, or **aborts** (rolls back), leaving no effect at all.
+
+</Definition>
+
+The guarantees around transactions go by the acronym **ACID**:
+
+- **Atomicity** — all or nothing. A crash or error halfway through leaves no partial effects. (This is about *failure*, not concurrency; "abortability" would be a better name.)
+- **Consistency** — a transaction takes the database from one state satisfying its constraints to another. The database enforces the constraints you declare (keys, `CHECK`, foreign keys); invariants you do not declare are your application's job.
+- **Isolation** — concurrent transactions do not see each other's half-finished work. The strongest form, **serialisability**, means the result equals *some* one-at-a-time ordering of the transactions.
+- **Durability** — once a commit returns, the data survives a crash. Engines achieve this with a **write-ahead log**: describe the change in an append-only log and force it to stable storage (`fsync`) before acknowledging, so recovery can redo or undo work after a crash.
+
+Atomicity is easiest to appreciate when it is missing. Below, a transfer credits the recipient *before* debiting the sender, and the `CHECK` constraint makes the debit fail. Watch what happens with and without a transaction:
+
+```python run
+import sqlite3
+
+def fresh(**kwargs):
+    db = sqlite3.connect(":memory:", **kwargs)
+    db.execute("CREATE TABLE accounts (owner TEXT PRIMARY KEY, "
+               "balance INTEGER NOT NULL CHECK (balance >= 0))")
+    db.executemany("INSERT INTO accounts VALUES (?, ?)", [("Amara", 100), ("Bao", 20)])
+    return db
+
+def balances(db):
+    return dict(db.execute("SELECT owner, balance FROM accounts ORDER BY owner"))
+
+def transfer(db, src, dst, amount):
+    db.execute("UPDATE accounts SET balance = balance + ? WHERE owner = ?", (amount, dst))
+    db.execute("UPDATE accounts SET balance = balance - ? WHERE owner = ?", (amount, src))
+
+# 1. Autocommit mode: every statement is its own transaction.
+db = fresh(isolation_level=None)
+try:
+    transfer(db, "Bao", "Amara", 50)          # Bao only has 20
+except sqlite3.IntegrityError as e:
+    print("failed:", e)
+print("without a transaction:", balances(db), "<- 50 created from nothing")
+
+# 2. One transaction: `with db:` commits on success and rolls back on an exception.
+db = fresh()
+db.commit()
+try:
+    with db:
+        transfer(db, "Bao", "Amara", 50)
+except sqlite3.IntegrityError as e:
+    print("failed:", e)
+print("inside a transaction:  ", balances(db), "<- nothing happened, as it should")
+
+with db:
+    transfer(db, "Amara", "Bao", 30)
+print("a transfer that fits:  ", balances(db))
+```
+
+<Note>
+
+Python's `sqlite3` module has its own transaction rules: by default it opens a transaction implicitly before data-modifying statements and leaves it open until you commit. Using the connection as a context manager (`with db:`) is the clearest way to delimit one. Python 3.12 added an `autocommit` attribute that makes the behaviour explicit; see the [sqlite3 documentation](https://docs.python.org/3/library/sqlite3.html) on transaction control.
+
+</Note>
+
+### Isolation, and what goes wrong without it
+
+Full serialisability is expensive, so databases offer weaker **isolation levels** and let you choose. Each weaker level permits some **anomalies** — interleavings whose results no serial order could produce. At the level of ideas:
+
+| Anomaly | What happens |
+| --- | --- |
+| **Dirty read** | T1 reads a value T2 has written but not committed; T2 then aborts, so T1 acted on data that never existed. |
+| **Non-repeatable read** | T1 reads a row twice and gets different values, because T2 committed an update in between. |
+| **Phantom** | T1 runs the same `WHERE` query twice and gets a different *set* of rows, because T2 inserted a matching row. |
+| **Lost update** | T1 and T2 both read a counter as 7, both write 8; one increment vanishes. (The cashiers and the last loaf.) |
+| **Write skew** | T1 and T2 each check a condition over several rows, each sees it holds, and each writes a *different* row; together they break the condition. |
+
+Write skew is the subtle one. A meeting room may be booked by at most one team at 10:00. Two transactions each run "is there a booking for room 4 at 10:00?", each sees none, and each inserts its own booking. Neither overwrote the other, so row-level locking of what was *written* does not catch it; only serialisable isolation (or a constraint, such as a `UNIQUE (room, slot)` index) does.
+
+The SQL standard names four levels — Read Uncommitted, Read Committed, Repeatable Read, Serializable — but real engines implement them differently. PostgreSQL's default is Read Committed; its Repeatable Read is **snapshot isolation**, where each transaction reads from a consistent snapshot taken at its start (which prevents lost updates in PostgreSQL but still permits write skew); and its Serializable level uses *serialisable snapshot isolation*, which detects dangerous patterns and aborts one transaction, so applications must be ready to **retry**. SQLite takes a simpler path: one writer at a time, which makes its transactions serialisable. Read your engine's documentation rather than the standard; the Berenson et al. paper in the references explains why the standard's definitions were never enough.
+
+<Misconception>
+
+**"The C in ACID is the C in CAP."** They are unrelated words. ACID's consistency means "constraints hold". The consistency in the CAP theorem, which <LessonLink slug="distributed-systems">Distributed systems</LessonLink> covers, is about replicas agreeing on the latest value — closer to ACID's *isolation* than to its consistency.
+
+</Misconception>
+
+</Section>
+
+<Section id="nosql" kind="human" title="When to reach for something else">
+
+"NoSQL" is a label for a family of stores that dropped some part of the relational package — usually joins, a fixed schema, or multi-row transactions — in exchange for something else, usually horizontal scale or a data model closer to one specific access pattern.
+
+| Kind | Model | Typical fit | Examples |
+| --- | --- | --- | --- |
+| Key–value | opaque value per key | sessions, caches, carts, very high request rates | Redis, Amazon DynamoDB |
+| Document | nested JSON-like documents | records read and written whole, varied shapes | MongoDB, Couchbase |
+| Wide-column | rows of sparse, sorted columns, partitioned by key | huge write-heavy datasets: events, telemetry | Apache Cassandra, Google Bigtable |
+| Graph | nodes and edges with properties | many-hop relationship queries | Neo4j |
+| Search | inverted indexes over text | full-text search, relevance ranking | Elasticsearch, OpenSearch |
+| Time series | timestamped measurements | metrics, sensor data, downsampling | Prometheus, InfluxDB |
+
+The judgement a senior engineer brings is mostly about *defaults* and *access patterns*:
+
+- **Default to a relational database.** PostgreSQL (or SQLite, for a single machine or an embedded app) gives you transactions, constraints, ad-hoc queries, JSON columns and full-text search in one well-understood system. Most products never outgrow a single well-tuned server with replicas.
+- **Choose a specialised store for a named reason**: a request rate or data volume one machine cannot serve, an access pattern that is always "get by key", a need for text relevance or many-hop graph traversal. Write the reason down.
+- **Design for the queries.** Key–value and wide-column stores are fast precisely because they make you decide your access patterns up front, in the choice of partition and sort keys. Ad-hoc questions later become batch jobs.
+- **The lines have blurred.** Many document and key–value stores now offer transactions; distributed SQL databases such as Google Spanner and CockroachDB scale relational schemas horizontally. Compare guarantees, not labels — and remember that every extra store is something to operate, back up, secure and keep consistent with the others.
+
+How data is replicated and partitioned across machines is the subject of <LessonLink slug="replication-and-consensus">Replication and consensus</LessonLink> and <LessonLink slug="storage-at-scale">Storage at scale</LessonLink>.
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Before Codd, databases were **navigational**: IBM's IMS stored hierarchies, and the CODASYL standard stored networks of records that programs traversed pointer by pointer. Change the storage layout and every program broke. Codd's 1970 paper proposed relations and a declarative query language, and two research projects proved it could be fast: **System R** at IBM, which produced SQL and the cost-based query optimiser, and **Ingres** at Berkeley, led by Michael Stonebraker, whose successor project became **PostgreSQL**. SQL became an ANSI standard in 1986. Jim Gray's work on transactions and recovery gave the field its vocabulary of atomic, durable commits; he received the Turing Award for it in 1998, as Codd had in 1981 and Stonebraker would in 2014.
+
+D. Richard Hipp released **SQLite** in 2000 as a small library that stores a whole database in one file. It now ships inside phones, browsers, aircraft and the Python standard library, and its developers make the case that it is [the most widely deployed database engine](https://www.sqlite.org/mostdeployed.html).
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+The Python exercises give you an in-memory SQLite database already filled with data; you write the SQL. Use `?` placeholders for any values you pass in.
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,388 @@
+---
+title: Batch and stream processing
+subtitle: Computing over data too big for one machine, whether it sits still or never stops arriving.
+minutes: 75
+objectives:
+  - Express a computation as map, shuffle and reduce, and explain how MapReduce survives failures
+  - Explain how dataflow systems such as Spark and Beam generalise MapReduce
+  - Choose between shuffle and broadcast joins, and handle a skewed key
+  - Distinguish event time from processing time, and use windows and watermarks to aggregate a stream
+  - Explain why a replicated log such as Kafka sits at the centre of many data platforms
+  - Say what "exactly-once" really means in practice and how systems achieve it
+prerequisites: [storage-at-scale, replication-and-consensus]
+related: [math.comp.algorithm-design]
+references:
+  - title: "MapReduce: Simplified Data Processing on Large Clusters"
+    author: Jeffrey Dean and Sanjay Ghemawat
+    year: 2004
+    url: https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/
+  - title: "Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing"
+    author: Matei Zaharia et al.
+    year: 2012
+    url: https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia
+    note: The paper behind Apache Spark.
+  - title: Apache Spark documentation
+    url: https://spark.apache.org/docs/latest/
+  - title: "The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing"
+    author: Tyler Akidau et al.
+    year: 2015
+    url: https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/
+    note: Event time, windows, watermarks and triggers, from Google; the basis of Apache Beam.
+  - title: Apache Beam programming guide
+    url: https://beam.apache.org/documentation/programming-guide/
+  - title: "MillWheel: Fault-Tolerant Stream Processing at Internet Scale"
+    year: 2013
+    url: https://research.google/pubs/millwheel-fault-tolerant-stream-processing-at-internet-scale/
+  - title: Apache Kafka documentation
+    url: https://kafka.apache.org/documentation/
+    note: The design section explains the log, partitions, consumer groups and delivery semantics.
+  - title: "Apache Flink: Timely Stream Processing"
+    url: https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/
+  - title: "Exactly-Once Semantics Are Possible: Here's How Apache Kafka Does It"
+    url: https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/
+    note: Idempotent producers and transactions, from Kafka's original developers.
+---
+
+<Section id="motivation" kind="motivation" title="Questions over data that will not fit">
+
+A national library in Seoul has digitised ten million books and wants a word-frequency table for every decade. A payments company wants yesterday's revenue by country, joined from two billion payments and two million merchants. A metro system wants the number of passengers entering each station, minute by minute, *now*.
+
+Each question is easy to state and easy to answer for a small file on a laptop. At scale, it is not: a disk reads perhaps a few hundred megabytes per second, so one machine needs most of a day just to *read* 20 TB, let alone compute. The answer is to split the work over hundreds of machines, which raises the problems of the previous lessons — partitions, failures, stragglers — in a new form.
+
+Two shapes of data organise this lesson. **Batch** processing works on **bounded** data: a fixed input, such as yesterday's logs, that the job reads to the end and then reports. **Stream** processing works on **unbounded** data: events that keep arriving, where there is never an "end" to wait for. They share more ideas than their names suggest, and modern systems increasingly treat batch as a special case of streaming.
+
+</Section>
+
+<Section id="mapreduce" kind="computation" title="MapReduce">
+
+In 2004 Jeffrey Dean and Sanjay Ghemawat described the system Google used to build its search index and run thousands of other jobs. Its insight was that a large class of computations fit one shape, and if programmers write just two functions in that shape, the framework can handle distribution, scheduling and failure for them.
+
+<Definition term="MapReduce">
+
+The input is split into chunks. A user-supplied **map** function turns each input record into zero or more intermediate `(key, value)` pairs. The framework **shuffles** the pairs so that all values with the same key meet in one place, sorted by key. A user-supplied **reduce** function receives each key with the list of its values and produces the output.
+
+</Definition>
+
+The machinery in between is where the engineering lives:
+
+1. **Splitting and scheduling.** The input (in a distributed file system like Google's GFS or Hadoop's HDFS) is cut into splits of tens of megabytes. A coordinator assigns map tasks to workers, preferring workers that already store the split on local disk — moving computation to the data rather than data to the computation.
+2. **Partitioning.** Each mapper divides its output into $R$ buckets with a **partition function**, usually `hash(key) mod R`, and writes them to local disk. Every mapper uses the same function, so every pair with a given key lands in the same bucket number.
+3. **Shuffle and sort.** Reducer $r$ fetches bucket $r$ from every mapper, sorts the pairs by key, and groups equal keys.
+4. **Reduce.** Each group goes through the reduce function; the results are written back to the distributed file system.
+
+An optional **combiner** runs the reduce logic on each mapper's output before the shuffle. For word count, a mapper that sees "the" fifty times sends one pair `("the", 50)` instead of fifty `("the", 1)` pairs. It is valid when the reduce operation is associative and commutative, like a sum or a maximum.
+
+```python run
+import hashlib
+import re
+from collections import defaultdict
+
+# The input: one "split" per mapper. (In a real cluster, each split is a 64-128 MB block of a file.)
+splits = [
+    "the river rises and the river falls",
+    "rain on the river and rain on the road",
+    "the road to the market is long",
+    "market day brings rain and the river rises",
+]
+R = 3                                            # number of reduce tasks
+
+def map_fn(_, text):
+    for word in re.findall(r"[a-z']+", text.lower()):
+        yield word, 1
+
+def reduce_fn(word, counts):
+    yield word, sum(counts)
+
+def partition(key, r):
+    digest = hashlib.md5(key.encode()).digest()  # a stable hash, so every mapper agrees
+    return int.from_bytes(digest[:4], "big") % r
+
+def run(use_combiner):
+    # Map phase: each mapper writes R local buckets, one per reducer.
+    buckets = [[[] for _ in range(R)] for _ in splits]
+    for m, text in enumerate(splits):
+        out = list(map_fn(m, text))
+        if use_combiner:                         # pre-aggregate on the mapper: same function as reduce
+            local = defaultdict(list)
+            for k, v in out:
+                local[k].append(v)
+            out = [kv for k, vs in local.items() for kv in reduce_fn(k, vs)]
+        for k, v in out:
+            buckets[m][partition(k, R)].append((k, v))
+    shuffled = sum(len(b) for mb in buckets for b in mb)
+
+    # Shuffle and sort: reducer r fetches bucket r from every mapper, sorts, and groups by key.
+    results = {}
+    for r in range(R):
+        pairs = sorted(kv for mb in buckets for kv in mb[r])
+        groups = defaultdict(list)
+        for k, v in pairs:
+            groups[k].append(v)
+        for k, vs in groups.items():             # Reduce phase
+            for word, total in reduce_fn(k, vs):
+                results[word] = total
+    return results, shuffled
+
+plain, n_plain = run(use_combiner=False)
+combined, n_comb = run(use_combiner=True)
+assert plain == combined
+top = sorted(plain.items(), key=lambda kv: (-kv[1], kv[0]))[:6]
+print("most frequent words:", top)
+print(f"pairs sent through the shuffle: {n_plain} without a combiner, {n_comb} with one")
+for r in range(R):
+    print(f"reducer {r} handles: {sorted(w for w in plain if partition(w, R) == r)}")
+```
+
+**Failure handling** is the part that made MapReduce practical on thousands of commodity machines. Map and reduce functions are required to be deterministic and free of side effects, and inputs are stored replicated, so a failed task is simply **run again** on another machine. If a mapper's machine dies, even its completed output is lost (it lived on local disk), so its tasks are re-run too. And because one slow machine — a failing disk, a noisy neighbour — can hold up the whole job, near the end the coordinator launches **backup copies** of the remaining tasks and takes whichever finishes first. The paper reports that this significantly shortens long jobs.
+
+Hadoop, an open-source implementation started in 2006, brought the model to the rest of the industry.
+
+</Section>
+
+<Section id="dataflow" kind="human" title="Beyond MapReduce: dataflow systems">
+
+Real pipelines are rarely one MapReduce. Clean the logs, join them with user data, aggregate, rank: four jobs, each writing its full output to the replicated file system for the next to read. That is slow, and awkward to write.
+
+**Dataflow systems** describe the whole computation as a graph of operators, then plan and run it as a unit. **Apache Spark**, from Matei Zaharia and colleagues at Berkeley (2012), introduced **resilient distributed datasets**: immutable, partitioned collections built by transformations such as `map`, `filter`, `join` and `groupBy`. Transformations are **lazy**: Spark records the graph and runs it only when an action (`count`, `write`) needs a result. It can then keep intermediate data in memory, fuse operators, and cut the graph into **stages** at the points where data must be shuffled. Operators where each output partition depends on one input partition (**narrow** dependencies, like `map`) run together in a stage; operators needing data from all partitions (**wide** dependencies, like `groupBy`) need a shuffle. For fault tolerance Spark keeps the **lineage** — the recipe for each partition — and recomputes lost partitions rather than replicating them.
+
+Most Spark code today uses the higher-level DataFrame API, whose optimiser rewrites queries much as a database does. Word count on a whole bucket of logs looks like this (not runnable here: it needs a Spark cluster):
+
+```python
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.appName("word-count").getOrCreate()
+lines = spark.read.text("gs://example-bucket/logs/*.txt")
+counts = (lines
+          .select(F.explode(F.split(F.lower(F.col("value")), r"[^a-z']+")).alias("word"))
+          .where(F.col("word") != "")
+          .groupBy("word")
+          .count()
+          .orderBy(F.desc("count")))
+counts.write.parquet("gs://example-bucket/word-counts/")
+```
+
+Google's own path went from MapReduce to **FlumeJava** (pipelines of parallel collections) and **MillWheel** (low-latency streaming) to the **Dataflow model** (2015), which treats batch and streaming with one set of concepts. Its open-source form is **Apache Beam**: you write a pipeline once and run it on a **runner** — Google Cloud Dataflow, Apache Flink or Apache Spark. The same pipeline can read a bounded file or an unbounded stream.
+
+</Section>
+
+<Section id="joins" kind="computation" title="Joins at scale">
+
+Joining two large datasets is where distributed jobs most often spend their time and money. Suppose we join 50,000 payments with 2,000 merchants to get each payment's country (multiply the sizes by a million for the real thing). Two main strategies exist.
+
+- **Shuffle join** (also called a repartition or sort-merge join). Repartition *both* inputs by the join key, so that all payments for merchant 17 and the row for merchant 17 land on the same worker; then join locally, by hashing one side or by sorting both and merging. It works for any sizes, but both inputs cross the network.
+- **Broadcast join** (map-side join). If one side is small enough to fit in each worker's memory, copy it to every worker and leave the big side where it is. Each worker joins its share of the big side against its local copy. No shuffle of the big side at all.
+
+A third trick avoids the shuffle entirely when both inputs are already partitioned (**bucketed**) by the join key into the same number of partitions: matching partitions are simply joined pairwise.
+
+Joins also expose **skew**. If one merchant accounts for 30% of all payments, the worker that receives that merchant's key does 30% of the work while others idle, and the job is only as fast as that worker. The usual fix is **salting**: append a random salt (0 to $s - 1$) to the hot key on the big side, spreading its rows over $s$ workers, and copy the small side's row for that key $s$ times, once per salt.
+
+```python run
+import random
+from collections import Counter, defaultdict
+
+rng = random.Random(5)
+P = 8                                                    # number of workers
+
+countries = {"KE": "Kenya", "PE": "Peru", "VN": "Vietnam", "NO": "Norway", "MA": "Morocco"}
+merchants = [(m, rng.choice(list(countries))) for m in range(2000)]   # (merchant_id, country)
+# Payments: (payment_id, merchant_id, amount). Merchant 0 is a giant with 30% of all payments.
+payments = []
+for p in range(50000):
+    m = 0 if rng.random() < 0.30 else rng.randrange(1, 2000)
+    payments.append((p, m, rng.randint(1, 500)))
+
+def join_locally(rows, table):
+    return [(p, m, a, table[m]) for p, m, a in rows if m in table]
+
+def shuffle_join(payments, merchants, hot=(), salts=1):
+    """Repartition BOTH sides by merchant id. Rows of hot merchants get a random salt,
+    and the matching merchant row is copied to every salted worker."""
+    left, right = defaultdict(list), defaultdict(dict)
+    for p, m, a in payments:
+        salt = rng.randrange(salts) if m in hot else 0
+        left[(m + salt) % P].append((p, m, a))
+    sent = len(payments)
+    for m, c in merchants:
+        for salt in (range(salts) if m in hot else [0]):
+            right[(m + salt) % P][m] = c
+            sent += 1
+    out = []
+    for w in range(P):
+        out += join_locally(left[w], right[w])
+    return out, [len(left[w]) for w in range(P)], sent
+
+def broadcast_join(payments, merchants):
+    """Copy the SMALL side to every worker; the big side stays where it already is."""
+    table = dict(merchants)
+    chunks = [payments[i::P] for i in range(P)]
+    out = [row for chunk in chunks for row in join_locally(chunk, table)]
+    return out, [len(c) for c in chunks], len(merchants) * P
+
+results = {
+    "shuffle join": shuffle_join(payments, merchants),
+    "shuffle join, hot key salted": shuffle_join(payments, merchants, hot={0}, salts=P),
+    "broadcast join": broadcast_join(payments, merchants),
+}
+answers = [sorted(r[0]) for r in results.values()]
+assert answers[0] == answers[1] == answers[2]            # all three compute the same join
+
+totals = Counter()
+for _, _, amount, country in answers[0]:
+    totals[countries[country]] += amount
+print("revenue by country:", dict(totals.most_common()))
+print()
+for name, (_, load, sent) in results.items():
+    print(f"{name:29s} rows sent: {sent:6d}   busiest worker: {max(load):5d} rows   quietest: {min(load):5d}")
+```
+
+All three plans compute the same answer. The broadcast join moves far fewer rows here because the small table is tiny; with a table of a few gigabytes, copying it to hundreds of workers would cost more than shuffling. Query optimisers in Spark and BigQuery choose between these strategies using size estimates — and when the estimates are wrong, a senior engineer reading the query plan is often the fix.
+
+</Section>
+
+<Section id="streams" kind="computation" title="Streams: event time, windows and watermarks">
+
+A stream processor consumes events as they arrive and keeps results continuously up to date. The new difficulty is **time**, because every event has two timestamps.
+
+<Definition term="Event time and processing time">
+
+**Event time** is when the event actually happened, recorded by the device that saw it. **Processing time** is when the stream processor handles it. The gap between them — the **skew** — is usually small, but can be minutes or days: a phone that was offline in a tunnel, a batch upload from a field station, a retry after an outage.
+
+</Definition>
+
+If you want "taps at gate 7 between 08:00 and 08:01", you mean event time. Grouping by processing time is easier — just count what arrives each minute — but it answers a different question, and its answers change whenever delivery delays change.
+
+Aggregations over an unbounded stream need **windows**, which cut it into finite pieces:
+
+- **Tumbling** windows: fixed-size, non-overlapping (every minute, 08:00–08:01, 08:01–08:02, …).
+- **Sliding** (hopping) windows: fixed-size and overlapping (the last 10 minutes, recomputed every minute).
+- **Session** windows: per key, a burst of activity separated from the next by a gap of inactivity (one user's visit to a website), so their length depends on the data.
+
+The hardest question is **when a window is complete**. Events for 08:00–08:01 may still be in flight at 08:05. A **watermark** is the processor's running estimate of event-time progress: an assertion "I do not expect any more events with event time earlier than $W$". When the watermark passes the end of a window, the window's result can be emitted. Watermarks are **heuristics**: a simple one is "the latest event time seen, minus a fixed allowed delay". Too aggressive and late events miss their window; too cautious and results come late. Systems add **allowed lateness** (keep window state a while longer and emit corrections) and **triggers** (emit early, speculative results before the watermark, then refine them).
+
+The block below counts metro taps per one-minute event-time window, with two watermark settings, and compares both with the true counts and with naive counting by arrival time.
+
+```python run
+import random
+from collections import Counter
+
+rng = random.Random(11)
+# Tap-ins at a metro gate over five minutes. Each event carries the time it HAPPENED (event time);
+# it reaches the processor some time later. A few phones sync late after a stretch underground.
+events = []
+for i in range(600):
+    happened = rng.uniform(0, 300)
+    delay = rng.expovariate(1 / 2.0)               # usually a second or two
+    if rng.random() < 0.04:
+        delay += rng.uniform(40, 120)              # offline for a while
+    events.append((happened + delay, happened))    # (arrival time, event time)
+events.sort()                                       # the processor sees them in arrival order
+
+WINDOW = 60                                         # one-minute tumbling windows
+def window(t):
+    return int(t // WINDOW) * WINDOW
+
+truth = Counter(window(et) for _, et in events)
+by_arrival = Counter(window(arr) for arr, _ in events)
+
+def event_time_counts(events, allowed_delay):
+    """Count per event-time window. Watermark = latest event time seen minus allowed_delay.
+    A window's result is emitted once the watermark passes its end; later events for it are dropped."""
+    open_, done, latest, dropped = Counter(), {}, float("-inf"), 0
+    for arrival, et in events:
+        w = window(et)
+        if w in done:
+            dropped += 1                            # too late: the result is already out
+            continue
+        open_[w] += 1
+        latest = max(latest, et)
+        watermark = latest - allowed_delay
+        for start in sorted(open_):
+            if start + WINDOW <= watermark:
+                done[start] = (open_.pop(start), arrival - (start + WINDOW))
+    for start in sorted(open_):                     # end of input: flush what is left
+        done[start] = (open_.pop(start), None)
+    return done, dropped
+
+fast, lost_fast = event_time_counts(events, allowed_delay=5)
+slow, lost_slow = event_time_counts(events, allowed_delay=130)
+
+def show(result):
+    count, wait = result
+    return f"{count:5d} {'at end' if wait is None else f'{wait:5.1f} s':>8s}"
+
+print("                       watermark = latest - 5 s   watermark = latest - 130 s")
+print("window   true  arrival   count  emitted after       count  emitted after")
+for w in sorted(truth):
+    print(f"{w:3d}-{w + WINDOW:<3d} {truth[w]:5d} {by_arrival[w]:8d}   {show(fast[w])}           {show(slow[w])}")
+print(f"events dropped as late: {lost_fast} with a 5 s watermark, {lost_slow} with a 130 s watermark")
+```
+
+The 5-second watermark reports each window about six seconds after it closes, but drops 19 late taps, almost all from phones that had been offline. The 130-second watermark is complete but slow. Counting by arrival is fast and simply wrong for the question asked. No setting is right for every use: a fraud detector may prefer fast and slightly incomplete, an invoice must be complete. In Beam, the window is one line of the pipeline — `beam.WindowInto(beam.window.FixedWindows(60))` — and the watermark, triggers and lateness are configured beside it; Flink offers the same concepts with its own API.
+
+</Section>
+
+<Section id="logs" kind="human" title="Logs as the backbone">
+
+You have now met the append-only log three times: the write-ahead log of a storage engine, the replicated log of Raft, and the event stream above. **Apache Kafka**, built at LinkedIn and open-sourced in 2011, turns the log into shared infrastructure.
+
+- A **topic** is a named log, split into **partitions** for scale. Each partition is an ordered, append-only sequence of records, each with an **offset** — its position.
+- **Producers** append records. A record's **key** chooses its partition (by hash), so all events for one key keep their order.
+- Records are retained for a configured time or size — days or forever — whether or not anyone has read them. **Log compaction** can instead keep only the latest record for each key, turning a topic into a durable table of current values.
+- **Consumers** read sequentially and track their own offsets. Consumers in one **consumer group** divide the partitions among themselves, each partition read by one member at a time; different groups read the same topic independently.
+- Each partition is replicated across brokers, with a leader and followers in the manner of the previous lessons.
+
+Kafka guarantees order **within a partition**, not across a topic. Its power is **decoupling**: the payments service writes each payment once, and the fraud detector, the ledger, the search indexer and the data warehouse loader each consume it at their own pace, and can **replay** from an old offset after a bug fix. **Change data capture** tools publish every row change from a database's own replication log into topics, so other systems can follow the database without querying it. Many companies organise their data platform around this pattern; some keep only a stream pipeline and reprocess history by replaying the log, rather than maintaining separate batch and streaming code paths.
+
+</Section>
+
+<Section id="exactly-once" kind="definitions" title="Exactly-once, in practice">
+
+Messages get lost, and retries create duplicates. A consumer can crash after doing its work but before recording its offset, then redo the work after restarting. So what can a pipeline promise?
+
+- **At-most-once**: record the offset, then process. A crash in between loses the message.
+- **At-least-once**: process, then record the offset. A crash in between processes the message twice.
+- **Exactly-once**: every message *affects the result* once.
+
+No network can deliver a message exactly once in all failure cases; the sender cannot distinguish a lost message from a lost acknowledgement. What systems mean by exactly-once is **effectively-once processing**: at-least-once delivery, plus a way to make duplicates harmless. Three techniques do this.
+
+1. **Idempotent operations.** Writing "balance of account 42 is 70" twice is harmless; "add 30 to account 42" is not. Prefer operations that can be repeated safely — set rather than increment, upsert by key.
+2. **Deduplication by id.** Give every event a unique id when it is created and have the consumer remember which ids it has applied. Kafka's idempotent producer does this for retried sends, using a producer id and sequence numbers.
+3. **Atomic commit of results and progress.** Store the output and the consumed offset in one transaction, so they cannot disagree after a crash. Kafka transactions commit output records and consumer offsets together; Flink takes consistent **checkpoints** of all operator state plus input offsets, and uses two-phase commit with sinks that support it.
+
+The guarantee is only as strong as its weakest link. If the pipeline sends an email or charges a card — an effect outside its transactional boundary — the external system must itself deduplicate, usually by an **idempotency key** carried with the request. Exactly-once is an end-to-end property you design, not a checkbox you tick.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Exactly-once means the network delivers each message once."** It means each message affects the result once, achieved by retries plus idempotence, deduplication or atomic commits. Duplicated delivery still happens underneath.
+
+</Misconception>
+
+<Misconception>
+
+**"A watermark guarantees no more late data."** It is an estimate. Data can arrive behind it; the system must decide whether to drop it, update the result, or send it elsewhere for separate handling.
+
+</Misconception>
+
+<Misconception>
+
+**"Kafka keeps my events in order."** Only within a partition. Events for different keys in different partitions can be read in any relative order, and changing the number of partitions changes which partition a key maps to.
+
+</Misconception>
+
+<Misconception>
+
+**"Spark is always faster than MapReduce."** Spark avoids writing intermediate results to replicated storage and keeps data in memory, which helps multi-stage and iterative jobs enormously. A single enormous shuffle that spills to disk anyway costs about the same in either.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

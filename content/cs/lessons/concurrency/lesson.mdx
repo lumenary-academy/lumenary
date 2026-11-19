@@ -1,0 +1,401 @@
+---
+title: Concurrency
+subtitle: "Doing many things at once without corrupting shared data: races, locks, deadlock, event loops, message passing, and Python's GIL."
+minutes: 65
+objectives:
+  - Distinguish concurrency from parallelism, and threads from processes
+  - Explain race conditions by enumerating interleavings, and prevent them with locks
+  - State the four conditions for deadlock and prevent deadlock with a global lock order
+  - Write concurrent I/O code with async/await, asyncio.gather and asyncio.Queue
+  - Explain message passing as an alternative to shared memory
+  - Explain what the GIL does and does not guarantee, and what free-threaded Python (PEP 703) changes
+prerequisites: [operating-systems, logic-to-processor, lists-stacks-queues]
+related: [math.comp.formal-methods, math.discrete.graph-basics]
+references:
+  - title: Concurrency is not parallelism
+    author: Rob Pike
+    year: 2012
+    url: https://go.dev/blog/waza-talk
+    note: A talk that draws the distinction this lesson starts with.
+  - title: System deadlocks
+    author: E. G. Coffman Jr., M. J. Elphick and A. Shoshani
+    year: 1971
+    url: https://doi.org/10.1145/356586.356588
+    note: The four necessary conditions for deadlock.
+  - title: Hierarchical ordering of sequential processes (EWD 310)
+    author: Edsger W. Dijkstra
+    year: 1971
+    url: https://www.cs.utexas.edu/~EWD/transcriptions/EWD03xx/EWD310.html
+    note: Where the dining philosophers first appear.
+  - title: Communicating sequential processes
+    author: C. A. R. Hoare
+    year: 1978
+    url: https://doi.org/10.1145/359576.359585
+    note: The foundation of message passing through channels.
+  - title: "PEP 703: Making the global interpreter lock optional in CPython"
+    author: Sam Gross
+    url: https://peps.python.org/pep-0703/
+  - title: "PEP 779: Criteria for supported status for free-threaded Python"
+    url: https://peps.python.org/pep-0779/
+  - title: Python support for free threading (HOWTO)
+    url: https://docs.python.org/3/howto/free-threading-python.html
+  - title: "asyncio: asynchronous I/O"
+    url: https://docs.python.org/3/library/asyncio.html
+  - title: "threading: thread-based parallelism"
+    url: https://docs.python.org/3/library/threading.html
+---
+
+<Section id="motivation" kind="motivation" title="Many things at once">
+
+A web server holds ten thousand open connections, most of them idle, a few sending requests at any moment. A phone app must keep its screen responsive while it downloads a photo. A data pipeline wants to use all 16 cores of a laptop. A bank's database serves thousands of transfers per second, and two of them may touch the same account at the same instant.
+
+All of these programs do several things *at once*, and since the mid-2000s, when processors stopped getting faster per core and started getting more cores instead (<LessonLink slug="logic-to-processor">From logic gates to a processor</LessonLink>), almost every serious program has had to. The difficulty is not starting several activities; it is that they **share** things, such as memory, files, accounts and connections, and the order in which their steps interleave is not under your control. A program that is correct when run alone can be wrong when two copies run together, and wrong only one time in a million, which makes the bug nearly impossible to reproduce.
+
+This lesson teaches the core vocabulary and the core tools: races and how to see them, locks and the deadlocks they can cause, event loops and `async`/`await`, message passing, and the special situation of Python and its global interpreter lock. The browser cannot run real threads, so we study races the way verification tools do, by **enumerating interleavings** deterministically; the asynchronous examples run for real.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Concurrency, parallelism, threads">
+
+<Definition term="concurrency, parallelism">
+
+A program is **concurrent** if it is structured as several activities whose lifetimes overlap: each may start before another has finished. It runs in **parallel** if two activities actually execute at the same instant, on different cores or machines.
+
+</Definition>
+
+Concurrency is about *structure* and parallelism about *execution*. One core can run a concurrent program by switching between its activities; that is how every operating system has run many programs on one processor since the 1960s. A parallel program needs several cores, but a concurrent design is what lets it use them.
+
+<Figure caption="Two tasks, A and B. On one core, they run concurrently but not in parallel: the core switches between them, and each is sometimes paused. On two cores, they run in parallel. In both cases the tasks' steps can interleave in ways the programmer does not control.">
+<svg viewBox="0 0 430 130" role="img" aria-label="Two timelines. The top one, labelled one core, shows alternating blocks of A and B on a single track. The bottom one, labelled two cores, shows A running continuously on one track and B continuously on a second track at the same time.">
+  <g fontFamily="sans-serif" fontSize="11" fill="currentColor">
+    <text x="10" y="32">one core</text>
+    <text x="10" y="84">two cores</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="90" y="20" width="50" height="20" fill="var(--compute)" fillOpacity="0.4" />
+    <rect x="140" y="20" width="50" height="20" fill="var(--gold)" fillOpacity="0.5" />
+    <rect x="190" y="20" width="50" height="20" fill="var(--compute)" fillOpacity="0.4" />
+    <rect x="240" y="20" width="50" height="20" fill="var(--gold)" fillOpacity="0.5" />
+    <rect x="290" y="20" width="50" height="20" fill="var(--compute)" fillOpacity="0.4" />
+    <rect x="340" y="20" width="50" height="20" fill="var(--gold)" fillOpacity="0.5" />
+    <rect x="90" y="70" width="150" height="20" fill="var(--compute)" fillOpacity="0.4" />
+    <rect x="90" y="94" width="150" height="20" fill="var(--gold)" fillOpacity="0.5" />
+  </g>
+  <g fontFamily="sans-serif" fontSize="11" fill="currentColor" textAnchor="middle">
+    <text x="115" y="34">A</text><text x="165" y="34">B</text><text x="215" y="34">A</text><text x="265" y="34">B</text><text x="315" y="34">A</text><text x="365" y="34">B</text>
+    <text x="165" y="84">A</text><text x="165" y="108">B</text>
+  </g>
+  <line x1="90" y1="124" x2="400" y2="124" stroke="currentColor" strokeWidth="1" />
+  <text x="400" y="120" fontFamily="sans-serif" fontSize="10" fill="currentColor" textAnchor="end">time</text>
+</svg>
+</Figure>
+
+<Definition term="thread">
+
+A **thread** is an independent flow of execution within a process: it has its own program counter, registers and stack, and it shares the process's memory, open files and other resources with the process's other threads. The operating system schedules threads onto cores and may **preempt** one at any instruction to run another.
+
+</Definition>
+
+As you saw in <LessonLink slug="operating-systems">Operating systems</LessonLink>, separate processes are isolated by virtual memory and can only communicate through the kernel (pipes, sockets, files, explicitly shared memory). Threads share everything by default. That makes communication between threads cheap and easy, and it makes it dangerously easy to corrupt shared data.
+
+</Section>
+
+<Section id="races" kind="computation" title="Race conditions, made visible">
+
+Consider the most innocent line of code there is: `counter += 1`, run by two threads that each want to count one event. To the processor it is three steps: **load** the value from memory into a register, **add** 1 in the register, **store** the register back to memory. A thread switch, or simply the other core, can act between any two of those steps.
+
+The program below models each thread as a Python generator that performs one step each time it is advanced. A *schedule* such as `"ABABAB"` says which thread takes each step. Then it tries every possible schedule: of the 6 time slots, choose the 3 that belong to thread A, giving $\binom{6}{3} = 20$ interleavings.
+
+```python run
+from collections import Counter
+from itertools import combinations
+
+def increment(shared, name):
+    """counter += 1, written as the three steps the processor really performs.
+    Each call to next() performs one step; a thread switch can happen between any two."""
+    reg = shared["counter"]
+    yield f"{name} loads {reg}"
+    reg = reg + 1
+    yield f"{name} adds 1, has {reg}"
+    shared["counter"] = reg
+    yield f"{name} stores {reg}"
+
+def run(schedule, verbose=False):
+    shared = {"counter": 0}
+    threads = {"A": increment(shared, "A"), "B": increment(shared, "B")}
+    for who in schedule:
+        step = next(threads[who])
+        if verbose:
+            print("   ", step)
+    return shared["counter"]
+
+print("one after the other:")
+print("  final counter =", run("AAABBB", verbose=True))
+print("interleaved:")
+print("  final counter =", run("ABABAB", verbose=True))
+
+# Every possible interleaving: choose which 3 of the 6 time slots belong to A.
+outcomes = Counter()
+for slots in combinations(range(6), 3):
+    schedule = "".join("A" if i in slots else "B" for i in range(6))
+    outcomes[run(schedule)] += 1
+print("all 20 interleavings:", dict(outcomes))
+```
+
+Only 2 of the 20 interleavings give the right answer: the two where one thread finishes before the other starts. In the other 18, both threads load 0, both compute 1, and the second store overwrites the first. One increment is lost. In a real program the bad interleavings are usually *rare*, because the window between load and store is a few nanoseconds, which is exactly why such bugs survive testing and surface in production under load.
+
+<Definition term="race condition, data race, critical section">
+
+A **race condition** is a bug where the result depends on the relative timing of concurrent activities. A **data race** is the low-level kind: two threads access the same memory location without synchronisation, and at least one access is a write. A **critical section** is a piece of code that accesses shared state and must not be interleaved with other critical sections on the same state.
+
+</Definition>
+
+Races are not only about counters. The pattern **check-then-act**, "if the file does not exist, create it", "if the seat is free, book it", "if the balance is enough, withdraw", is a race whenever another activity can act between the check and the action. Security people call the file-system version TOCTOU, *time of check to time of use*.
+
+</Section>
+
+<Section id="locks" kind="examples" title="Locks, and the deadlocks they cause">
+
+<Definition term="mutual exclusion lock (mutex)">
+
+A **lock** (or **mutex**) is an object with two operations. **acquire** succeeds immediately if the lock is free, making the caller its holder; otherwise the caller waits until the holder calls **release**. At most one thread holds a lock at a time, so code between acquire and release that is protected by the same lock never interleaves.
+
+</Definition>
+
+Hardware makes locks possible with **atomic instructions** such as compare-and-swap, which read and update a memory word as one indivisible step that no other core can split. In Python you use `threading.Lock`, normally with a `with` block, which releases the lock even if an exception is raised:
+
+```python
+import threading
+
+counter = 0
+counter_lock = threading.Lock()
+
+def record_event():
+    global counter
+    with counter_lock:        # acquire ... release, even on an exception
+        counter += 1          # the critical section
+```
+
+### Exploring every interleaving
+
+To check that a lock really fixes the race, and to see what new problems locks bring, we can do what *model checkers* do: explore every interleaving systematically. The explorer below represents each thread as a list of steps and searches all orders in which the steps can run, respecting the rule that a thread cannot pass an `acquire` of a lock someone else holds. If it reaches a state where some thread still has work but no thread can move, it has found a **deadlock**.
+
+```python run
+from collections import Counter
+
+def explore(programs):
+    """Try every interleaving of the threads' steps (a tiny model checker).
+    Steps: ("load", var) and ("store", var) move between memory and the thread's register,
+    ("add", k) adds to the register, ("acquire", lock) and ("release", lock) use mutexes.
+    A thread whose next step is to acquire a lock held by another thread cannot move."""
+    finals, deadlocks = Counter(), []
+
+    def dfs(pcs, regs, memory, holder, trace):
+        movable = []
+        for t, prog in programs.items():
+            if pcs[t] < len(prog):
+                op, arg = prog[pcs[t]]
+                if op != "acquire" or holder.get(arg) is None:
+                    movable.append(t)
+        if not movable:
+            if all(pcs[t] == len(p) for t, p in programs.items()):
+                finals[memory["x"]] += 1
+            else:
+                deadlocks.append(trace)          # someone still has work, but nobody can move
+            return
+        for t in movable:
+            op, arg = programs[t][pcs[t]]
+            p2, r2, m2, h2 = dict(pcs), dict(regs), dict(memory), dict(holder)
+            p2[t] += 1
+            if op == "load":      r2[t] = m2[arg]
+            elif op == "add":     r2[t] += arg
+            elif op == "store":   m2[arg] = r2[t]
+            elif op == "acquire": h2[arg] = t
+            elif op == "release": h2[arg] = None
+            dfs(p2, r2, m2, h2, trace + [f"{t}:{op} {arg}"])
+
+    dfs({t: 0 for t in programs}, {t: 0 for t in programs}, {"x": 0}, {}, [])
+    return finals, deadlocks
+
+inc = [("load", "x"), ("add", 1), ("store", "x")]
+locked_inc = [("acquire", "L")] + inc + [("release", "L")]
+
+finals, _ = explore({"A": inc, "B": inc})
+print("no lock:   ", dict(finals))
+finals, _ = explore({"A": locked_inc, "B": locked_inc, "C": locked_inc})
+print("with a lock, three threads:", dict(finals))
+
+# Two locks taken in opposite orders: a deadlock is possible.
+a = [("acquire", "L1"), ("acquire", "L2"), ("load", "x"), ("add", 1), ("store", "x"), ("release", "L2"), ("release", "L1")]
+b = [("acquire", "L2"), ("acquire", "L1"), ("load", "x"), ("add", 1), ("store", "x"), ("release", "L1"), ("release", "L2")]
+finals, deadlocks = explore({"A": a, "B": b})
+print(f"opposite lock order: {sum(finals.values())} interleavings finish, {len(deadlocks)} deadlock, e.g.", deadlocks[0])
+
+# The fix: every thread takes the locks in the same global order.
+finals, deadlocks = explore({"A": a, "B": a})
+print(f"same lock order:     {sum(finals.values())} interleavings finish, {len(deadlocks)} deadlock")
+```
+
+With the lock, every interleaving of three threads ends with `x = 3`. There are only 6 complete interleavings left, one per order in which the threads get the lock, because once a thread holds it the others can only wait. That loss of freedom is the price of locking: protected code runs one thread at a time, so heavily contended locks make parallel programs sequential.
+
+The second experiment shows the classic hazard. Thread A takes lock L1 then L2; thread B takes L2 then L1. If A gets L1 and B gets L2, each waits for the other's lock for ever.
+
+<Theorem name="The Coffman conditions (1971)">
+
+A deadlock can occur only if all four of these hold: **mutual exclusion** (a resource can be held by only one thread at a time); **hold and wait** (a thread holds one resource while waiting for another); **no preemption** (a resource cannot be taken away from its holder); and **circular wait** (there is a cycle of threads, each waiting for a resource held by the next).
+
+</Theorem>
+
+Break any one condition and deadlock is impossible. The most practical target is circular wait: give every lock a place in a **global order** and always acquire locks in that order. Then a cycle of waiting threads would need some thread to wait for a lock earlier in the order than one it holds, which the rule forbids; the explorer confirms that with a shared order no interleaving deadlocks. Other strategies: acquire all needed locks at once (breaking hold and wait), use `acquire(timeout=...)` and back off on failure (a form of preemption), or detect cycles in the *wait-for graph* and abort one thread, as databases do with transactions (cycle detection is the depth-first search of <LessonLink slug="graphs">Graphs</LessonLink>). Dijkstra's *dining philosophers*, five thinkers sharing five forks around a table, is the traditional puzzle for practising all of this.
+
+Locks are not the only synchronisation tools. **Condition variables** let a thread sleep until another signals that something changed; **semaphores** (Dijkstra, 1965) count available units of a resource; **atomic variables** and lock-free data structures use compare-and-swap directly. They all rest on the same ideas: identify the shared state, decide which operations must be indivisible, and make every thread follow the same protocol.
+
+</Section>
+
+<Section id="async" kind="computation" title="Event loops and async/await">
+
+Much concurrency is not about using more cores at all. A web server spends almost all of its time *waiting*: for a client to send the rest of a request, for the database, for a remote API. Giving each of ten thousand connections its own thread works, but threads cost memory (each has a stack) and switching costs time. The alternative is **cooperative** concurrency with an **event loop**.
+
+<Definition term="event loop, coroutine">
+
+An **event loop** runs many tasks on one thread. Each task is a **coroutine**, a function that can pause itself at an `await` and be resumed later. When a task awaits something that is not ready (a network reply, a timer), it hands control back to the loop, which runs another task that *is* ready. The loop asks the operating system to report which sockets and timers have become ready (Linux's `epoll`, for example) and resumes the tasks waiting on them.
+
+</Definition>
+
+In Python, `async def` defines a coroutine, `await` pauses it until the awaited operation finishes, and `asyncio.gather` runs several coroutines concurrently and returns their results in order. Runnable blocks on this site may use `await` at the top level, as below; in a script you would wrap the code in `async def main()` and call `asyncio.run(main())`.
+
+```python run
+import asyncio, time
+
+async def fetch(server, seconds):
+    """Pretend to wait for a reply over the network. While this task waits, others can run."""
+    print(f"  asking {server}")
+    await asyncio.sleep(seconds)          # hands control back to the event loop
+    print(f"  {server} replied after {seconds} s")
+    return f"{server}: ok"
+
+servers = [("Lagos", 0.3), ("Lima", 0.1), ("Lund", 0.2)]
+
+start = time.perf_counter()
+for name, delay in servers:               # one after another
+    await fetch(name, delay)
+print(f"sequential: {time.perf_counter() - start:.1f} s\n")
+
+start = time.perf_counter()
+results = await asyncio.gather(*(fetch(name, delay) for name, delay in servers))   # all at once
+print(f"concurrent: {time.perf_counter() - start:.1f} s, results in order: {results}\n")
+
+# Races still exist in async code, but only at the awaits.
+balance = {"amount": 100}
+
+async def withdraw(who, amount, lock=None):
+    async def critical():
+        current = balance["amount"]
+        await asyncio.sleep(0.01)             # e.g. checking a fraud service: other tasks run here
+        if current >= amount:
+            balance["amount"] = current - amount
+            return f"{who} took {amount}"
+        return f"{who} refused"
+    if lock is None:
+        return await critical()
+    async with lock:
+        return await critical()
+
+balance["amount"] = 100
+print(await asyncio.gather(withdraw("Ana", 80), withdraw("Ben", 80)), "balance:", balance["amount"])
+balance["amount"] = 100
+lock = asyncio.Lock()
+print(await asyncio.gather(withdraw("Ana", 80, lock), withdraw("Ben", 80, lock)), "balance:", balance["amount"])
+```
+
+Sequentially the three requests take the *sum* of their delays, 0.6 s; concurrently they take the *maximum*, 0.3 s, on a single thread, because the waits overlap. The replies arrive in order of their delays, but `gather` returns results in the order the coroutines were passed, which keeps the code simple.
+
+The second half shows that async code is not race-free. Both withdrawals read a balance of 100, both pause at the `await`, and both then withdraw 80, so 160 leaves an account that held 100. The difference from threads is *where* a switch can happen: only at an `await`, never in the middle of `current - amount`. That makes async races easier to reason about, and an `asyncio.Lock` around the read-check-write sequence fixes this one. The flip side of cooperation is that a task that computes for a long time without awaiting **blocks the whole loop**: every other task, including ones serving other users, waits. CPU-heavy work belongs in another thread or process (`asyncio.to_thread`, `concurrent.futures.ProcessPoolExecutor`).
+
+</Section>
+
+<Section id="messages" kind="human" title="Message passing: share memory by communicating">
+
+Every problem so far came from shared mutable state. A different style avoids most of them: activities do not share data at all, but send each other **messages** through **queues** (or *channels*). Each piece of data belongs to one activity at a time; handing it over is an explicit act. Tony Hoare's *communicating sequential processes* (1978) formalised the idea, Go builds its concurrency on channels, and Erlang and the **actor model** structure whole systems as independent actors with mailboxes. *Effective Go*, the Go project's style guide, puts it in one line: "Do not communicate by sharing memory; instead, share memory by communicating."
+
+The block below is a small **worker pool**: a producer puts jobs on a queue, three workers take jobs off it and put results on another. No task touches another's data; the queues are the only shared objects, and they are designed for exactly this. The job queue has a maximum size of 2, so a fast producer must wait when the workers fall behind. That **back-pressure** keeps a pipeline from piling up unbounded work in memory.
+
+```python run
+import asyncio
+
+async def producer(jobs, photos):
+    for name in photos:
+        await jobs.put(name)                  # send a message; waits if the queue is full
+    for _ in range(WORKERS):
+        await jobs.put(None)                  # one "no more work" message per worker
+
+async def worker(wid, jobs, results):
+    while True:
+        name = await jobs.get()               # receive a message; waits if the queue is empty
+        if name is None:
+            return
+        await asyncio.sleep(0.01 * len(name)) # pretend to resize a photo
+        await results.put((name, f"thumbnail by worker {wid}"))
+
+WORKERS = 3
+photos = ["kilimanjaro.jpg", "fjord.jpg", "atacama.jpg", "ganges.jpg", "uluru.jpg", "andes.jpg", "sahara.jpg"]
+jobs, results = asyncio.Queue(maxsize=2), asyncio.Queue()
+await asyncio.gather(producer(jobs, photos), *(worker(w, jobs, results) for w in range(WORKERS)))
+
+done = {}
+while not results.empty():
+    name, what = results.get_nowait()
+    done[name] = what
+for name in photos:
+    print(f"{name:16} {done[name]}")
+```
+
+Which worker handles which photo depends on timing, and the program does not care: correctness does not depend on the interleaving, which is the whole point. The same structure works with threads (`queue.Queue`), with processes (`multiprocessing.Queue`), and across machines, where the queue becomes a message broker such as Kafka or RabbitMQ and the workers become services. Message passing is the natural model for <LessonLink slug="distributed-systems">Distributed systems</LessonLink>, where there is no shared memory to fall back on. It does not abolish all concurrency bugs (two actors can still wait for each other's messages for ever), but it makes the shared state small and explicit.
+
+</Section>
+
+<Section id="gil" kind="human" title="Python's GIL, and free-threaded Python">
+
+The standard Python interpreter, CPython, has long had a **global interpreter lock** (GIL): a single lock that a thread must hold to execute Python bytecode. It made CPython's internals (reference counts, the memory allocator, built-in containers) safe without fine-grained locking, and made single-threaded code fast and C extensions simple to write. Its consequences:
+
+- **Threads still help with waiting.** The GIL is released during blocking I/O and `time.sleep`, so threads that mostly wait for networks and disks overlap their waits well.
+- **Threads do not speed up pure-Python computation.** Only one thread runs bytecode at a time, so four threads computing in Python take about as long as one, or longer. Use processes (`multiprocessing`, `concurrent.futures.ProcessPoolExecutor`), or libraries such as NumPy whose C code releases the GIL during long operations.
+- **The GIL does not make your code thread-safe.** The interpreter can switch threads between bytecodes, and `counter += 1` is several bytecodes: load, add, store. The race you enumerated above can happen in CPython with threads. Use locks for shared mutable state.
+
+**PEP 703**, by Sam Gross, proposed making the GIL optional, using techniques such as biased reference counting and per-object locks to keep the interpreter safe without it. It was accepted in 2023. Python 3.13 (2024) shipped an experimental **free-threaded** build, and with Python 3.14 (2025) that build became officially supported under PEP 779, though still as a separate, optional build rather than the default. In a free-threaded build, threads running Python code can use several cores in parallel. Single-threaded code may run somewhat slower, extension modules must declare that they support it (or the GIL is re-enabled), and code that relied on the GIL to hide its races will expose them. As of 2026 the ecosystem is still adapting, so check the official free-threading HOWTO for the current state. The deeper lesson is independent of Python's choices: correct concurrent code synchronises its shared state explicitly, whatever the runtime happens to guarantee.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"My tests pass, so there is no race."** Bad interleavings can be extremely rare. Races are found by reasoning about every interleaving (as the explorer does), by tools such as ThreadSanitizer, and by designs that make them impossible, not by running the tests again.
+
+</Misconception>
+
+<Misconception>
+
+**"Adding `sleep` fixes the race."** A sleep changes the timing so that the bad interleaving becomes rarer on your machine today. It does not make it impossible, and it makes the program slower.
+
+</Misconception>
+
+<Misconception>
+
+**"async makes code faster."** It lets *waiting* overlap. A CPU-bound computation written with `async def` runs no faster, and it blocks every other task while it runs.
+
+</Misconception>
+
+<Misconception>
+
+**"More threads, more speed."** Beyond the number of cores, extra CPU-bound threads only add switching costs and contention. Amdahl's law adds a hard limit: if 10% of a job is sequential, no number of cores can make it more than 10 times faster.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

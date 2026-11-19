@@ -1,0 +1,383 @@
+---
+title: Applied cryptography
+subtitle: Hashes, MACs, ciphers and signatures — what each guarantees, how TLS combines them, and why you should not build your own.
+minutes: 85
+objectives:
+  - State what confidentiality, integrity and authenticity mean against a passive and an active attacker
+  - Use cryptographic hash functions and explain preimage and collision resistance and the birthday bound
+  - Authenticate messages with HMAC and explain why encryption alone does not provide integrity
+  - Describe authenticated symmetric encryption (AES-GCM) and the danger of nonce reuse
+  - Explain Diffie–Hellman key exchange, RSA and digital signatures, with toy numbers you can compute
+  - Outline the TLS 1.3 handshake, NIST's 2024 post-quantum standards, and the rule "don't roll your own crypto"
+prerequisites: [bits-and-bytes, hash-tables, networking, security]
+related: [math.applied.cryptography, math.number.modular-arithmetic, math.number.congruences, math.number.divisibility-gcd, math.number.elementary-number-theory, math.algebra.groups]
+references:
+  - title: A Graduate Course in Applied Cryptography
+    author: Dan Boneh and Victor Shoup
+    url: https://toc.cryptobook.us/
+    note: A free, rigorous textbook covering everything in this lesson and much more.
+  - title: "Python: hashlib, hmac and secrets"
+    url: https://docs.python.org/3/library/crypto.html
+  - title: "RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3"
+    url: https://www.rfc-editor.org/rfc/rfc8446
+  - title: The Illustrated TLS 1.3 Connection
+    url: https://tls13.xargs.org/
+    note: Every byte of a real TLS 1.3 handshake, annotated.
+  - title: "RFC 2104: HMAC — Keyed-Hashing for Message Authentication"
+    url: https://www.rfc-editor.org/rfc/rfc2104
+  - title: "NIST Post-Quantum Cryptography project"
+    url: https://csrc.nist.gov/projects/post-quantum-cryptography
+  - title: "FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/203/final
+  - title: "FIPS 204: Module-Lattice-Based Digital Signature Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/204/final
+  - title: "FIPS 205: Stateless Hash-Based Digital Signature Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/205/final
+  - title: "pyca/cryptography"
+    url: https://cryptography.io/
+    note: The standard cryptography library for Python, with high-level recipes and lower-level primitives.
+---
+
+<Section id="motivation" kind="motivation" title="Secrets over an open channel">
+
+Every time you load a web page over HTTPS, send a message, pay by card, install a software update or push a signed commit, cryptography is doing something remarkable: letting two parties who may never have met communicate securely over a network that anyone can watch and some can tamper with.
+
+Modern cryptography rests on mathematics that has held up to decades of public attack, and the primitives in your standard library are, used correctly, far stronger than any attacker's budget. Yet systems using cryptography are broken all the time. Almost never is it because AES or SHA-256 failed. It is because a nonce was reused, a comparison leaked timing, a random number was predictable, a message was encrypted but not authenticated, or a certificate was not checked. **Applied cryptography is mostly the art of using sound primitives correctly**, and knowing which primitive provides which guarantee.
+
+This lesson builds that map: hash functions, message authentication codes, symmetric encryption, key exchange, public-key encryption and signatures, then how TLS assembles them and how the field is preparing for quantum computers. The mathematics behind the public-key parts — modular arithmetic, groups, primes — is developed properly in Lumenary Math's <TopicLink id="math.applied.cryptography">Cryptography</TopicLink> and <TopicLink id="math.number.modular-arithmetic">Modular arithmetic</TopicLink>; here we use it.
+
+</Section>
+
+<Section id="goals" kind="definitions" title="Goals and adversaries">
+
+<Definition term="Cryptographic goals">
+
+**Confidentiality**: only the intended parties can read a message. **Integrity**: any change to a message is detected. **Authenticity**: the recipient can verify who sent the message. A digital signature adds **non-repudiation**: a third party can verify the sender, so the sender cannot later deny it.
+
+</Definition>
+
+These goals are always stated against an adversary. A **passive** adversary only reads traffic — a Wi-Fi eavesdropper. An **active** adversary can also modify, drop, replay and inject messages — a compromised router, a malicious proxy — and can sit between two parties pretending to each to be the other (a *machine-in-the-middle*). Much of what makes protocols subtle is defending against the active adversary.
+
+Two principles frame everything. **Kerckhoffs's principle**: a system must remain secure when everything about it except the key is public. The algorithms in this lesson are all public, standardised and studied by thousands of researchers; only keys are secret. And **security levels**: a scheme has "128-bit security" if the best known attack needs about $2^{128}$ operations. For scale, $2^{128} \approx 3.4 \times 10^{38}$; a billion computers each doing a billion operations per second would need about $10^{13}$ years. Symmetric keys of 128 or 256 bits are therefore enough against classical computers; public-key systems need larger numbers for the same level (around 3072-bit RSA, or 256-bit elliptic curves, for 128-bit security), because the best attacks on them are cleverer than brute force.
+
+</Section>
+
+<Section id="hashes" kind="computation" title="Hash functions">
+
+A **cryptographic hash function** maps input of any length to a fixed-size digest — 256 bits for SHA-256 — and is designed so that:
+
+- **Preimage resistance**: given a digest $h$, finding any input $x$ with $H(x) = h$ is infeasible.
+- **Second-preimage resistance**: given an input $x$, finding a different $x'$ with $H(x') = H(x)$ is infeasible.
+- **Collision resistance**: finding *any* two different inputs with the same digest is infeasible.
+
+Hash tables (<LessonLink slug="hash-tables">Hash tables</LessonLink>) need none of these; Git's content addressing (<LessonLink slug="version-control">Version control</LessonLink>) needs all of them. Collisions are easier to find than preimages because of the **birthday paradox**: among $k$ random $n$-bit digests there are about $k^2/2$ pairs, each colliding with probability $2^{-n}$, so a collision becomes likely around $k \approx 2^{n/2}$. A 256-bit hash therefore offers 128-bit collision resistance. Watch both effects on SHA-256, and on a deliberately truncated version:
+
+```python run
+import hashlib
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+a, b = b"Pay Nadia 100 shillings", b"Pay Nadia 900 shillings"
+ha, hb = hashlib.sha256(a).digest(), hashlib.sha256(b).digest()
+differing_bits = sum(bin(x ^ y).count("1") for x, y in zip(ha, hb))
+print(sha256_hex(a))
+print(sha256_hex(b))
+print(f"one character changed -> {differing_bits} of 256 output bits differ (the avalanche effect)")
+
+# The birthday bound: truncate SHA-256 to 24 bits and search for a collision.
+def tiny_hash(data, bits=24):
+    return int.from_bytes(hashlib.sha256(data).digest(), "big") >> (256 - bits)
+
+seen = {}
+i = 0
+while True:
+    message = f"message number {i}".encode()
+    h = tiny_hash(message)
+    if h in seen:
+        print(f"24-bit collision after {i + 1} messages: {seen[h]!r} and {message!r}")
+        break
+    seen[h] = message
+    i += 1
+print(f"birthday estimate: about 2**12 = {2**12} messages; a preimage would need about 2**24 = {2**24:,}")
+```
+
+Uses of hash functions in practice include verifying downloads against a published digest (if you trust the source of the digest), content-addressed storage, commitments, and as building blocks inside MACs, signatures and key derivation. **MD5 and SHA-1 are broken** for collision resistance — practical collisions exist — and must not be used where collisions matter; SHA-256, SHA-512 and SHA-3 are current. Remember too that a plain hash is the wrong tool for passwords, which need the slow, salted functions from <LessonLink slug="security">Security fundamentals</LessonLink>.
+
+</Section>
+
+<Section id="macs" kind="computation" title="Message authentication codes">
+
+A hash proves integrity only if the digest itself arrives through a trusted channel: an active attacker who changes a message can simply recompute its hash. To authenticate messages over an untrusted channel, sender and receiver share a secret key and use a **message authentication code** (MAC): a tag computed from the key and the message, which nobody without the key can forge for any new message.
+
+The obvious construction, `sha256(key + message)`, is broken for SHA-256: because of the way SHA-2 processes messages in blocks, anyone who sees one valid tag can compute a valid tag for the message with extra data appended, without knowing the key (a *length-extension attack*). The standard construction **HMAC** hashes twice with derived keys and is secure for any good hash function. A very common use is a service that calls your web server (a "webhook") and signs each request so you can tell genuine calls from forged ones:
+
+```python run
+import hashlib
+import hmac
+import json
+import secrets
+
+shared_key = secrets.token_bytes(32)              # agreed once, out of band
+
+def sign(key, body):
+    return hmac.new(key, body, hashlib.sha256).hexdigest()
+
+def verify(key, body, tag):
+    return hmac.compare_digest(sign(key, body), tag)  # constant-time comparison
+
+body = json.dumps({"order": 7781, "status": "paid", "amount_cents": 125000}).encode()
+tag = sign(shared_key, body)
+
+print("genuine request:  ", verify(shared_key, body, tag))
+tampered = body.replace(b"125000", b"1250000")
+print("amount changed:   ", verify(shared_key, tampered, tag))
+print("attacker's key:   ", verify(secrets.token_bytes(32), body, tag))
+```
+
+Two details are easy to get wrong. Compare tags with `hmac.compare_digest`, never `==`: an ordinary comparison stops at the first differing character, and the time it takes can leak how many leading characters of a forged tag were right. And a valid MAC proves a message is *authentic*, not that it is *fresh*: an attacker can resend yesterday's genuine "paid" message. Real webhook schemes therefore sign a timestamp or unique ID along with the body and reject old or repeated ones.
+
+</Section>
+
+<Section id="symmetric" kind="human" title="Symmetric encryption">
+
+**Symmetric encryption** uses one shared key to encrypt and decrypt. The workhorse is **AES** (the Advanced Encryption Standard, FIPS 197), a *block cipher*: a keyed permutation of 128-bit blocks, with 128- or 256-bit keys, implemented in hardware on nearly every modern processor. A block cipher alone encrypts one block; a **mode of operation** extends it to messages of any length, and the choice of mode matters enormously. The naive mode, ECB, encrypts each block independently, so identical plaintext blocks give identical ciphertext blocks and patterns in the data shine through.
+
+The modern rule is simple: use **authenticated encryption with associated data** (AEAD), which provides confidentiality *and* integrity in one operation. **AES-GCM** and **ChaCha20-Poly1305** are the standard choices. Encryption takes a key, a **nonce** (a number used once), the plaintext, and optional *associated data* that is authenticated but not encrypted (a header, a record ID); decryption fails loudly if anything was modified. With the `cryptography` library it looks like this:
+
+```python
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+key = AESGCM.generate_key(bit_length=256)
+aead = AESGCM(key)
+nonce = os.urandom(12)                                  # never reuse with the same key
+ciphertext = aead.encrypt(nonce, b"patient 1043: allergic to penicillin", b"record-1043")
+plaintext = aead.decrypt(nonce, ciphertext, b"record-1043")   # raises InvalidTag if tampered
+```
+
+Why insist on authentication? Because encryption alone does not prevent tampering. Many modes, including the counter mode inside GCM, encrypt by XOR-ing the message with a **keystream**; flipping a bit of the ciphertext flips the same bit of the plaintext, so an attacker who knows the format can change "100" to "900" without decrypting anything. And the nonce must never repeat under one key: two messages encrypted with the same key and nonce share a keystream, which leaks their XOR, and in GCM also lets an attacker forge messages. The next block demonstrates the keystream problem with a toy cipher built for this purpose only.
+
+```python run
+import hashlib
+
+def toy_keystream(key, nonce, length):
+    """A teaching toy (SHA-256 in counter mode). Never use home-made ciphers for real data."""
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hashlib.sha256(key + nonce + counter.to_bytes(8, "big")).digest()
+        counter += 1
+    return out[:length]
+
+def xor(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
+key = b"a 32-byte key known to both ends"
+nonce = b"nonce-0001"
+m1 = b"Meet at the north gate at 06:00"
+m2 = b"Transfer 4,000 to account 55-21"
+c1 = xor(m1, toy_keystream(key, nonce, len(m1)))
+c2 = xor(m2, toy_keystream(key, nonce, len(m2)))       # the mistake: same key, same nonce
+
+print("c1 xor c2 == m1 xor m2:", xor(c1, c2) == xor(m1, m2))
+print("an eavesdropper who guesses m1 recovers m2:", xor(xor(c1, c2), m1).decode())
+
+flipped = bytearray(c2)
+flipped[9] ^= ord("4") ^ ord("9")                       # flip bits, no key needed
+print("tampered decryption:", xor(bytes(flipped), toy_keystream(key, nonce, len(m2))).decode())
+```
+
+The eavesdropper never learned the key, yet recovered a message and altered another — exactly why protocols use AEAD with unique nonces, and why libraries make nonce handling hard to get wrong.
+
+</Section>
+
+<Section id="public-key" kind="computation" title="Key exchange, RSA and signatures">
+
+Symmetric cryptography assumes both sides already share a key. For two strangers on the internet, getting that key to both of them is the hard part. **Public-key cryptography**, invented in the 1970s, solves it.
+
+**Diffie–Hellman key exchange.** Alice and Bob agree publicly on a large prime $p$ and a base $g$. Alice picks a secret $a$ and sends $A = g^a \bmod p$; Bob picks a secret $b$ and sends $B = g^b \bmod p$. Each can now compute the same number, because
+
+$$
+B^a \equiv (g^b)^a = g^{ab} = (g^a)^b \equiv A^b \pmod p .
+$$
+
+An eavesdropper sees $p$, $g$, $A$ and $B$, and to get $g^{ab}$ appears to need the **discrete logarithm** $a$ of $A$, which for well-chosen 2048-bit primes, or for elliptic-curve groups, is infeasible. (The algebra is that of a cyclic group; see <TopicLink id="math.algebra.groups">Groups</TopicLink>.) Note that plain Diffie–Hellman defeats only passive eavesdroppers: an active attacker in the middle can run one exchange with Alice and another with Bob. The fix is to **authenticate** the exchange with signatures, as TLS does.
+
+**RSA.** Choose two large primes $p, q$, let $n = pq$ and $\varphi = (p-1)(q-1)$, pick $e$ coprime to $\varphi$, and compute $d \equiv e^{-1} \pmod{\varphi}$. The public key is $(n, e)$; the private key is $d$. Because $ed \equiv 1 \pmod \varphi$, Euler's theorem gives $(m^e)^d \equiv m \pmod n$, so raising to the power $e$ and to the power $d$ undo each other. Anyone can compute with $e$; only the holder of $d$ can invert it — and finding $d$ from $(n, e)$ appears to require factoring $n$.
+
+**Digital signatures** use this asymmetry the other way round: the signer applies the *private* operation to a hash of the message, and anyone can check the result with the *public* key. A valid signature proves the message came from the key holder and was not modified — authenticity, integrity and non-repudiation. Here are both ideas with numbers small enough to read, and a demonstration of why real keys are huge:
+
+```python run
+import hashlib
+from math import gcd
+
+# --- Diffie-Hellman with a toy prime ---------------------------------------
+p, g = 7919, 7
+a, b = 3001, 4512                         # Alice's and Bob's secrets (real ones are random and huge)
+A, B = pow(g, a, p), pow(g, b, p)         # sent in the clear
+print("Diffie-Hellman: A =", A, " B =", B)
+print("  Alice computes", pow(B, a, p), "and Bob computes", pow(A, b, p))
+x = next(x for x in range(p) if pow(g, x, p) == A)          # Eve brute-forces a log
+print("  Eve finds an exponent", x, "for A, so she also gets", pow(B, x, p))
+
+# --- RSA signatures with toy primes ----------------------------------------
+P, Q, e = 101, 113, 17
+n, phi = P * Q, (P - 1) * (Q - 1)
+assert gcd(e, phi) == 1
+d = pow(e, -1, phi)                       # modular inverse (Python 3.8+)
+print(f"\nRSA: public key (n={n}, e={e}), private key d={d}")
+
+def digest_mod_n(message):                # hash-then-sign (toy: reduce the hash mod n)
+    return int.from_bytes(hashlib.sha256(message).digest(), "big") % n
+
+def sign(message):
+    return pow(digest_mod_n(message), d, n)
+
+def verify(message, signature):
+    return pow(signature, e, n) == digest_mod_n(message)
+
+msg = b"release v2.4.1, sha256 9f6c..."
+s = sign(msg)
+print("  signature:", s, "  valid:", verify(msg, s), "  for a changed message:", verify(b"release v2.4.2", s))
+
+# Factoring n by trial division takes microseconds at this size, and then the key is gone.
+f = next(k for k in range(2, n) if n % k == 0)
+forged_d = pow(e, -1, (f - 1) * (n // f - 1))
+print(f"  Eve factors n = {f} x {n // f} and recovers d = {forged_d}")
+```
+
+Real deployments differ from these toys in ways that matter. Keys are enormous (RSA moduli of 2048–4096 bits) or use elliptic curves (X25519 for key exchange, Ed25519 or ECDSA for signatures), which give the same security with much smaller keys and faster operations. And "textbook" RSA, as above, is insecure for encryption — it is deterministic and malleable — so real systems use padding schemes (OAEP for encryption, PSS for signatures) or, increasingly, avoid RSA encryption altogether in favour of Diffie–Hellman-based key agreement.
+
+</Section>
+
+<Section id="tls" kind="examples" title="Putting it together: TLS 1.3">
+
+**TLS** (Transport Layer Security) is the protocol beneath HTTPS and much else; version 1.3 ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446)) simplified and strengthened it. Its handshake combines every primitive in this lesson in one round trip:
+
+<Figure caption="The TLS 1.3 handshake (simplified). Braces mark messages already encrypted with keys derived from the key exchange.">
+
+<svg viewBox="0 0 560 270" role="img" aria-label="Sequence diagram: client sends ClientHello with key share; server replies with ServerHello and key share, then encrypted certificate, CertificateVerify and Finished; client sends encrypted Finished; then application data flows in both directions" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">
+  <defs>
+    <marker id="tls-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g fill="currentColor" text-anchor="middle" font-weight="600">
+    <text x="90" y="20">Client</text>
+    <text x="470" y="20">Server</text>
+  </g>
+  <g stroke="currentColor" stroke-width="1.2">
+    <line x1="90" y1="28" x2="90" y2="262"/>
+    <line x1="470" y1="28" x2="470" y2="262"/>
+  </g>
+  <g stroke="currentColor" stroke-width="1.5" fill="none" marker-end="url(#tls-arrow)">
+    <line x1="92" y1="55" x2="466" y2="75"/>
+    <line x1="468" y1="105" x2="94" y2="125"/>
+    <line x1="468" y1="150" x2="94" y2="170"/>
+    <line x1="92" y1="200" x2="466" y2="220"/>
+    <line x1="92" y1="245" x2="466" y2="245"/>
+    <line x1="466" y1="255" x2="94" y2="255"/>
+  </g>
+  <g fill="currentColor" text-anchor="middle" font-size="11">
+    <text x="280" y="55">ClientHello: versions, cipher suites, key share (X25519 …)</text>
+    <text x="280" y="105">ServerHello: chosen suite, server's key share</text>
+    <text x="280" y="148">\{Certificate, CertificateVerify (signature), Finished (MAC)\}</text>
+    <text x="280" y="200">\{Finished (MAC)\}</text>
+    <text x="280" y="239">\{application data, both directions\}</text>
+  </g>
+</svg>
+
+</Figure>
+
+1. **Key exchange.** The client's first message already carries a Diffie–Hellman key share, usually on the X25519 curve; the server answers with its own. Both derive the same secret, and from it, through a key-derivation function built on HMAC, separate encryption keys for each direction. Everything after the ServerHello is encrypted.
+2. **Server authentication.** The server sends its **certificate** — its public key and domain name, signed by a certificate authority — and a **CertificateVerify** message: a signature, with its private key, over the whole handshake so far. The client checks the certificate chain up to a root it trusts, checks that the name matches the site it wanted, and checks the signature. This is what defeats the machine-in-the-middle: an attacker can perform a key exchange, but cannot sign as the real server.
+3. **Handshake integrity.** Each side sends a **Finished** message, a MAC over the entire handshake transcript, so any tampering with the negotiation (for example, forcing weaker options) is detected.
+4. **Data.** Application data is protected with an AEAD cipher, AES-GCM or ChaCha20-Poly1305, with nonces derived from a record counter so they never repeat.
+
+Because the Diffie–Hellman keys are freshly generated for each connection and then discarded, recorded traffic stays safe even if the server's long-term private key is stolen later: **forward secrecy**, which TLS 1.3 makes mandatory. The certificate system, with its certificate authorities and the public *Certificate Transparency* logs that record every certificate issued, is the part of the system that establishes trust; free automated certificate authorities such as Let's Encrypt made HTTPS the default on the web.
+
+</Section>
+
+<Section id="post-quantum" kind="human" title="Post-quantum cryptography">
+
+A sufficiently large, fault-tolerant **quantum computer** running **Shor's algorithm** (1994) could factor integers and compute discrete logarithms efficiently, breaking RSA, Diffie–Hellman and elliptic-curve cryptography — essentially all public-key cryptography deployed today. Symmetric cryptography is far less affected: **Grover's algorithm** gives at most a square-root speed-up on brute-force search, so AES-256 and SHA-256-based constructions remain secure with their current sizes. As of 2026, no quantum computer is anywhere near large enough to threaten real keys, and estimates of when one might be vary widely.
+
+Why act now, then? Because of **"harvest now, decrypt later"**: an adversary can record encrypted traffic today and decrypt it when a quantum computer exists. Data that must stay secret for decades — medical, diplomatic, commercial — is already exposed to that risk. Signatures are less urgent, since a forged signature only matters once a quantum computer exists, but the systems that rely on them (firmware, certificates) take many years to change.
+
+After an open, eight-year international competition, NIST published its first three post-quantum standards in August 2024:
+
+| Standard | Algorithm | Purpose | Based on |
+| --- | --- | --- | --- |
+| [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final) | ML-KEM (from CRYSTALS-Kyber) | key establishment | module lattices |
+| [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) | ML-DSA (from CRYSTALS-Dilithium) | digital signatures | module lattices |
+| [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final) | SLH-DSA (from SPHINCS+) | digital signatures | hash functions only |
+
+**Lattice-based** schemes rest on problems such as *learning with errors*: recovering a secret vector from many noisy linear equations, which is believed to be hard even for quantum computers. **Hash-based** signatures rest only on the security of hash functions, a very conservative assumption, at the cost of larger signatures. NIST has also announced further algorithms to standardise, including a signature scheme based on Falcon (FN-DSA) and, in 2025, the code-based HQC as a backup key-establishment mechanism; see the [NIST PQC project](https://csrc.nist.gov/projects/post-quantum-cryptography) for the current state.
+
+Deployment is already under way, and it is **hybrid**: TLS key exchange combines classical X25519 with ML-KEM-768, so the connection is secure as long as *either* holds. Major browsers and content-delivery networks, and increasingly operating systems' own TLS libraries, have enabled hybrid post-quantum key exchange by default, and by 2025 a large share of web traffic was already protected this way. The engineering lessons for your own systems: inventory where you use public-key cryptography, prefer protocols and libraries that can switch algorithms (*crypto agility*), and migrate key establishment for long-lived secrets first.
+
+</Section>
+
+<Section id="dont-roll-your-own" kind="human" title="Don't roll your own crypto">
+
+The rule is famous because the failures are so consistent. Cryptographic code can pass every functional test — it encrypts, it decrypts, the round trip works — and still be completely insecure, because security is a property against an adversary, which ordinary tests do not model. Real-world failures from well-funded teams include:
+
+- **Bad randomness.** A change made to Debian's OpenSSL package in 2006, and discovered only in 2008, removed most of the entropy from key generation, so for nearly two years affected systems generated keys from a space small enough to enumerate.
+- **Nonce reuse.** In 2010 researchers showed that a games console's code-signing used the same random value in every ECDSA signature, which let them compute the platform's private signing key.
+- **Side channels.** Timing differences, cache behaviour and error messages have leaked keys from implementations of mathematically sound algorithms many times.
+- **Protocol design.** Combining sound primitives in a new protocol is where experts most often go wrong; TLS itself needed years of attacks and revisions to reach version 1.3.
+
+What to do instead:
+
+- **Use the highest-level tool that fits.** For data in transit, use TLS. For messaging, use an established protocol. For encrypting data at rest, use a high-level library recipe such as libsodium's `secretbox`, Google's Tink, or `cryptography`'s Fernet, which choose the algorithms, generate nonces and authenticate for you.
+- **Use `secrets` (or `os.urandom`) for keys, tokens and nonces**, never `random`, which is predictable by design.
+- **Do not design protocols** without review by people who do this for a living, and treat any custom cryptography as a high-risk component that needs external audit.
+- **Plan for change.** Record which algorithms protect what, so you can rotate keys and replace algorithms when needed, as the post-quantum transition now requires.
+
+"Don't roll your own" does not mean "don't learn how it works". Understanding the primitives, as in this lesson, is exactly what lets you choose the right library, configure it correctly, and recognise misuse in a code review.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Encrypted means tamper-proof."** Encryption without authentication is malleable: the toy demonstration changed a transfer amount without the key. Use authenticated encryption (AEAD), or add a MAC.
+
+</Misconception>
+
+<Misconception>
+
+**"Hashing is a kind of encryption."** Encryption is reversible with a key; hashing has no key and is not reversible. And Base64 is neither: it is an encoding that anyone can undo.
+
+</Misconception>
+
+<Misconception>
+
+**"Longer keys are always better."** Beyond the 128- or 256-bit security level, longer keys add cost without meaningful protection, and key lengths are not comparable across algorithms: a 256-bit elliptic-curve key is about as strong as a 3072-bit RSA key. Choose a security level, then the standard parameters for it.
+
+</Misconception>
+
+<Misconception>
+
+**"Quantum computers will break all cryptography."** Shor's algorithm breaks today's public-key schemes; symmetric ciphers and hash functions only need adequate sizes (AES-256 and SHA-256 are fine). Post-quantum public-key algorithms are standardised and already deployed.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+For most of history cryptography was a military and diplomatic craft of substitution and transposition ciphers, from Caesar's shifted alphabet to the Vigenère cipher and the rotor machines of the twentieth century; breaking the German Enigma at Bletchley Park, with key contributions from Polish mathematicians and from Alan Turing, shaped the Second World War. The modern, public science began in the 1970s: the Data Encryption Standard (1977); Whitfield Diffie and Martin Hellman's "New Directions in Cryptography" (1976), which introduced public-key cryptography and key exchange; and RSA, devised by Ron Rivest, Adi Shamir and Leonard Adleman in 1977. It later emerged that James Ellis, Clifford Cocks and Malcolm Williamson at Britain's GCHQ had discovered equivalent ideas a few years earlier, in secret. AES, designed by the Belgian cryptographers Joan Daemen and Vincent Rijmen, won an open NIST competition and was standardised in 2001; SHA-3 followed a similar competition in 2015, and the post-quantum standards of 2024 continued the tradition of open, international competitions.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

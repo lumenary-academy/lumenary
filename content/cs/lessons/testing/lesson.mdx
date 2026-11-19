@@ -1,0 +1,396 @@
+---
+title: Testing and correctness
+subtitle: Justified confidence that code does what it should, and the limits of every kind of evidence.
+minutes: 80
+objectives:
+  - Choose between unit, integration and end-to-end tests by weighing speed, fidelity and reliability
+  - Design test cases systematically with equivalence classes and boundary values
+  - Practise the test-driven development cycle and judge when it helps
+  - Implement a small property-based tester with shrinking, and write useful properties
+  - Use test doubles without letting them hide real bugs
+  - Interpret coverage honestly, state invariants with assertions, and describe what formal verification adds
+prerequisites: [debugging-and-testing, recursion, searching-and-sorting, version-control]
+related: [math.found.proof-techniques, math.comp.intro-lean, math.comp.formal-proof-lean]
+references:
+  - title: Hypothesis
+    url: https://hypothesis.readthedocs.io/
+    note: The property-based testing library for Python. Its documentation is an excellent tour of what properties to write.
+  - title: "QuickCheck: A Lightweight Tool for Random Testing of Haskell Programs"
+    author: Koen Claessen and John Hughes
+    year: 2000
+    url: https://dl.acm.org/doi/10.1145/351240.351266
+    note: The paper that introduced property-based testing.
+  - title: pytest documentation
+    url: https://docs.pytest.org/
+  - title: "Python: unittest.mock"
+    url: https://docs.python.org/3/library/unittest.mock.html
+  - title: Coverage.py
+    url: https://coverage.readthedocs.io/
+  - title: Software Engineering at Google
+    author: Titus Winters, Tom Manshreck and Hyrum Wright
+    year: 2020
+    url: https://abseil.io/resources/swe-book
+    note: Free online. The chapters on testing, test doubles and large tests describe practice at very large scale.
+  - title: Lean
+    url: https://lean-lang.org/
+    note: A proof assistant and programming language, used in Lumenary Math's formal lessons.
+---
+
+<Section id="motivation" kind="motivation" title="What is a test for?">
+
+In <LessonLink slug="debugging-and-testing">Debugging and testing</LessonLink> you wrote your first `assert` statements. This lesson is about doing that *professionally*: deciding what to test, how, and how much, and knowing what the result does and does not tell you.
+
+A test is **evidence**. It shows that on particular inputs, in a particular environment, the code behaved as expected. Edsger Dijkstra put the limitation memorably: testing can show the presence of bugs, never their absence. Every technique in this lesson is a way to make the evidence stronger — better-chosen inputs, many more inputs, checks that hold for *all* inputs — and the last section reaches the point where evidence becomes proof.
+
+Tests also serve purposes beyond catching bugs today:
+
+- **A safety net for change.** The real cost of software is changing it. A good suite lets you refactor a module with confidence, because if behaviour changes, a test fails within minutes rather than a customer noticing within weeks.
+- **An executable specification.** A test named `test_extra_cents_go_to_the_first_people` documents a decision more reliably than a comment, because it cannot silently go out of date.
+- **A design check.** Code that is hard to test is usually hard to use: it does too much, or reaches for global state. Writing the test first exposes that early.
+
+Bugs get more expensive the further they travel from the moment they were written: a failing test costs the author a minute, a bug found in review costs a colleague's time, a bug found in production costs users, money and sometimes much more.
+
+</Section>
+
+<Section id="kinds" kind="definitions" title="Unit, integration and end-to-end tests">
+
+<Definition term="Test scopes">
+
+A **unit test** exercises one small piece of code — a function, a class — in isolation, in milliseconds. An **integration test** checks that several components work together: your code with a real database, two services talking over a real protocol. An **end-to-end (E2E) test** drives the whole system as a user would, from the user interface or public API through every layer.
+
+</Definition>
+
+Each scope trades off three things:
+
+| | Unit | Integration | End-to-end |
+| --- | --- | --- | --- |
+| Speed | milliseconds | seconds | seconds to minutes |
+| Fidelity to production | low: real code, fake surroundings | medium | high |
+| Reliability | deterministic | mostly | prone to *flakiness* |
+| When it fails, the cause is | obvious | in a few components | anywhere |
+
+The common advice — many fast unit tests, fewer integration tests, a handful of end-to-end tests — is often drawn as a **test pyramid**. It is a heuristic, not a law: for a thin service that mostly glues a database to an API, integration tests against a real (containerised or in-memory) database may give more confidence per minute than unit tests full of fakes. Google classifies tests by the resources they use rather than by name — *small* (one process, no network or disk), *medium* (one machine), *large* (anything) — because what really matters is how fast and how deterministic a test is.
+
+A **flaky test** passes and fails on the same code: it depends on timing, ordering, shared state, the network or the clock. Flaky tests are corrosive. Once people learn that red sometimes means nothing, they stop believing red. Treat flakiness as a bug: fix it, or quarantine the test and track it until it is fixed.
+
+</Section>
+
+<Section id="test-design" kind="examples" title="Designing test cases">
+
+Testing every input is impossible, so we choose. Two classic techniques make the choice systematic.
+
+**Equivalence partitioning.** Divide the inputs into classes that the code should treat the same way, and test one representative of each class, including the invalid classes.
+
+**Boundary-value analysis.** Bugs cluster at the edges of classes: `<` written for `<=`, a loop that runs once too often. Test each boundary and its neighbours.
+
+Add to these a checklist of inputs that break code surprisingly often: empty collections, a single element, duplicates, zero, negative numbers, very large values, `None`, non-ASCII text (names like *Nguyễn* or *Søren*), and the ends of time ranges (midnight, month ends, leap days, daylight-saving changes).
+
+Here is a function that splits a restaurant bill, in cents, among `n` people as evenly as possible, and a unit-test suite designed from its equivalence classes. Python's standard `unittest` module runs it; with `pytest` you would write plain functions and `assert` statements instead.
+
+```python run
+import sys
+import unittest
+
+def split_bill(total_cents, n):
+    """Split total_cents among n people as evenly as possible.
+    Shares differ by at most one cent; the first people pay the extra cents."""
+    if n < 1:
+        raise ValueError("need at least one person")
+    if total_cents < 0:
+        raise ValueError("total cannot be negative")
+    base, extra = divmod(total_cents, n)
+    return [base + 1] * extra + [base] * (n - extra)
+
+class SplitBillTests(unittest.TestCase):
+    # Valid classes: divides evenly / has a remainder / fewer cents than people / zero / one person
+    def test_divides_evenly(self):
+        self.assertEqual(split_bill(900, 3), [300, 300, 300])
+
+    def test_extra_cents_go_to_the_first_people(self):
+        self.assertEqual(split_bill(1000, 3), [334, 333, 333])
+
+    def test_fewer_cents_than_people(self):
+        self.assertEqual(split_bill(2, 4), [1, 1, 0, 0])
+
+    def test_zero_total(self):
+        self.assertEqual(split_bill(0, 2), [0, 0])
+
+    def test_one_person_pays_everything(self):
+        self.assertEqual(split_bill(4599, 1), [4599])
+
+    # Invalid classes, at their boundaries
+    def test_zero_people_is_rejected(self):
+        with self.assertRaises(ValueError):
+            split_bill(100, 0)
+
+    def test_negative_total_is_rejected(self):
+        with self.assertRaises(ValueError):
+            split_bill(-1, 2)
+
+    # A general rule, checked exhaustively on a small range
+    def test_shares_sum_to_total_and_differ_by_at_most_one(self):
+        for total in range(0, 60):
+            for n in range(1, 9):
+                shares = split_bill(total, n)
+                self.assertEqual(sum(shares), total)
+                self.assertLessEqual(max(shares) - min(shares), 1)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(SplitBillTests)
+unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
+```
+
+Notice three habits. Each test checks **one behaviour** and is **named after it**, so a failure report reads like a sentence. Tests use **literal expected values** (`[334, 333, 333]`), not values recomputed with the same logic as the code — a test that repeats the implementation repeats its bugs. And the last test checks a **rule** over many inputs, which is a step towards property-based testing below.
+
+</Section>
+
+<Section id="tdd" kind="human" title="Test-driven development">
+
+**Test-driven development** (TDD), popularised by Kent Beck around 2000, reverses the usual order. You work in very short cycles:
+
+1. **Red.** Write a small test for behaviour that does not exist yet. Run it and watch it fail — this proves the test can fail, and that it tests what you think.
+2. **Green.** Write the simplest code that makes it pass. Resist adding anything the tests do not demand.
+3. **Refactor.** With all tests green, improve the code's structure, running the tests after each change.
+
+Built test-first, `split_bill` might grow like this: `split_bill(900, 3) == [300, 300, 300]` forces a division; `split_bill(1000, 3)` forces handling of the remainder; `split_bill(100, 0)` forces validation. Each test adds one requirement, and the design emerges from the uses rather than from guesses.
+
+The benefits are real: every line of code is covered by a test from birth, interfaces are designed from the caller's side, and you always know what to do next. So are the limits. TDD helps least when you are *exploring* — prototyping, or working out what an algorithm should even do — and some teams write tests immediately after the code instead, with similar results. What matters more than the order is the discipline: no behaviour change without a test that would catch its loss, and every bug fix starting with a test that reproduces the bug.
+
+</Section>
+
+<Section id="property-based" kind="computation" title="Property-based testing">
+
+Example-based tests check the cases you thought of. Bugs live in the cases you did not. **Property-based testing**, introduced by the QuickCheck library for Haskell in 2000, turns this around: you state a **property** that should hold for *all* valid inputs, and the tool generates hundreds of random inputs looking for a counterexample. When it finds one, it **shrinks** it — repeatedly tries simpler versions that still fail — and reports a minimal case.
+
+Here is a complete, if tiny, property tester. It finds a bug in an "obvious" implementation of bill splitting that gives the rounding difference to the last person:
+
+```python run
+import random
+
+def holds(prop, value):
+    try:
+        return bool(prop(value))
+    except Exception:                 # a crash counts as a failure
+        return False
+
+def simpler(value):
+    """Candidate simplifications of a value, simplest first."""
+    if isinstance(value, int):
+        if value < 0:
+            yield -value                                    # positive is simpler
+        size = abs(value)
+        # zero, then small powers of two, then half, then one less: smallest first
+        tries = {0, size // 2, size - 1} | {2 ** k for k in range(size.bit_length())}
+        for m in sorted(t for t in tries if t < size):
+            yield m if value > 0 else -m
+    elif isinstance(value, (list, tuple)):
+        if isinstance(value, list):
+            for i in range(len(value)):                # drop one element
+                yield value[:i] + value[i + 1:]
+        for i, item in enumerate(value):               # simplify one element
+            for smaller in simpler(item):
+                yield value[:i] + type(value)([smaller]) + value[i + 1:]
+
+def shrink(value, prop):
+    """Greedily replace the failing value by a simpler failing value until none is left."""
+    while True:
+        for candidate in simpler(value):
+            if not holds(prop, candidate):
+                value = candidate
+                break
+        else:
+            return value
+
+def for_all(generate, prop, runs=300, seed=1):
+    rng = random.Random(seed)
+    for i in range(1, runs + 1):
+        value = generate(rng)
+        if not holds(prop, value):
+            print(f"  falsified after {i} tests by {value}")
+            print(f"  shrunk to {shrink(value, prop)}")
+            return False
+    print(f"  passed {runs} tests")
+    return True
+
+# Two implementations of bill splitting
+def split_naive(total, n):
+    share = round(total / n)
+    return [share] * (n - 1) + [total - share * (n - 1)]   # last person absorbs the rounding
+
+def split_bill(total, n):
+    base, extra = divmod(total, n)
+    return [base + 1] * extra + [base] * (n - extra)
+
+def fair(split):
+    def prop(case):
+        total, n = case
+        if total < 0 or n < 1:                 # outside the function's domain
+            return True
+        shares = split(total, n)
+        return len(shares) == n and sum(shares) == total and max(shares) - min(shares) <= 1
+    return prop
+
+bills = lambda rng: (rng.randint(0, 10_000), rng.randint(1, 12))
+
+print("split_naive:")
+for_all(bills, fair(split_naive))
+print("split_bill:")
+for_all(bills, fair(split_bill))
+```
+
+The naive version passes the examples most people would write (`(900, 3)`, `(1000, 3)`, and in fact every bill split two or three ways) yet fails on the second random bill. Shrinking turns that failure into one you can check by hand: splitting 2 cents four ways, each share of 0.5 rounds to 0 (Python rounds halves to the nearest even integer), so `split_naive(2, 4)` returns `[0, 0, 0, 2]` and the last person pays everything. The shrinker here is greedy and simple — it tries zero, small powers of two, half the value and one less, and keeps any simpler input that still fails — yet even it finds a minimal case quickly.
+
+Finding good properties is the skill. Patterns that recur:
+
+- **Round trip:** `decode(encode(x)) == x` (serialisers, compressors, parsers and printers).
+- **Invariants of the output:** a sort's output is ordered *and* a permutation of its input; a split's shares sum to the total.
+- **Test oracle:** compare against a slow but obviously correct implementation (a brute-force search, the previous version of the code).
+- **Metamorphic relations:** when you cannot compute the right answer, relate answers: adding a row to a table never decreases `COUNT(*)`; shuffling the input to a mean does not change it.
+- **No crash:** for any input, the code returns or raises a *documented* error. This is the idea behind **fuzzing**, which at industrial scale (Google's OSS-Fuzz, for example) has found many thousands of bugs in widely used open-source software.
+
+In real projects, use [Hypothesis](https://hypothesis.readthedocs.io/) rather than a home-made tester: it has generators for every common type, much smarter shrinking, and a database that replays past failures. And always fix the seed or record failing cases, so that a failure in continuous integration can be reproduced on your machine.
+
+</Section>
+
+<Section id="test-doubles" kind="human" title="Test doubles, and the danger of mocks">
+
+Code talks to things that are slow, unreliable or uncontrollable in a test: networks, payment providers, the clock, random numbers. A **test double** stands in for them. The vocabulary, loosely standardised: a **stub** returns canned answers; a **fake** is a small working implementation (an in-memory database, a dictionary-backed key–value store); a **mock** records how it was called so the test can assert on those calls; a **spy** wraps a real object and records calls to it.
+
+Doubles are necessary, and **mocks in particular are dangerous**, because a mock is a claim about how another component behaves, made by the person who wrote the code under test — and nothing checks the claim. Watch a plain `Mock` hide a real bug:
+
+```python run
+from unittest import mock
+
+class RatesClient:
+    """The real client for a currency-rate service. In production it makes HTTP calls."""
+    def get_rate(self, base, quote):
+        raise RuntimeError("no network in this example")
+
+def price_in(currency, amount_eur, client):
+    return round(amount_eur * client.fetch_rate("EUR", currency), 2)   # bug: it is get_rate
+
+# 1. A plain Mock invents any attribute it is asked for, so this "test" passes.
+client = mock.Mock()
+client.fetch_rate.return_value = 1.08
+print("plain mock:", price_in("USD", 10, client), "<- passes, yet production would crash")
+
+# 2. An autospecced mock has the real class's interface, so the bug surfaces.
+client = mock.create_autospec(RatesClient, instance=True)
+try:
+    price_in("USD", 10, client)
+except AttributeError as err:
+    print("autospec:  ", err)
+
+# 3. A fake: a tiny real implementation of the same interface, with no network.
+class FakeRates(RatesClient):
+    def __init__(self, table):
+        self.table = table
+    def get_rate(self, base, quote):
+        return self.table[(base, quote)]
+
+def price_in_fixed(currency, amount_eur, client):
+    return round(amount_eur * client.get_rate("EUR", currency), 2)
+
+print("fake:      ", price_in_fixed("USD", 10, FakeRates({("EUR", "USD"): 1.08})))
+```
+
+Guidelines that keep doubles honest:
+
+- **Prefer real objects, then fakes, then mocks.** If the real thing is fast and deterministic (a pure function, an in-memory SQLite database), use it.
+- **Assert on outcomes, not interactions.** A test that checks `client.get_rate.assert_called_once_with("EUR", "USD")` breaks the day someone adds a cache, though nothing a user sees has changed. Check the returned price instead.
+- **Keep doubles faithful.** Use `autospec`; give each fake its own tests against the real implementation's contract (*contract tests*); and back unit tests with at least a few integration tests that use the real dependency.
+- **Inject dependencies.** A function that takes a `client` or a `clock` parameter can be tested with a fake; one that reaches for a global `requests.get` or `time.time()` can be tested only by patching, which couples tests to import paths. Designing for this is part of <LessonLink slug="program-design">Designing programs</LessonLink>.
+
+</Section>
+
+<Section id="coverage" kind="human" title="Coverage and its limits">
+
+**Coverage** tools such as [Coverage.py](https://coverage.readthedocs.io/) record which lines (**line coverage**) or which outcomes of each decision (**branch coverage**) the tests executed. Coverage is excellent at one thing: showing code that *no* test runs, which is certainly untested.
+
+It is poor at the converse. A line can be executed by a test that checks nothing about its result. A suite can reach 100% line coverage of `split_bill` with three calls — `split_bill(1000, 3)`, `split_bill(1, 0)` and `split_bill(-1, 1)` — and never test a zero total or more people than cents. And coverage measures the code that *exists*; the most dangerous bugs are often missing code — the unhandled case, the absent check — which no coverage report can show.
+
+So treat coverage as a flashlight, not a score. A reasonable practice is to look at uncovered lines in every review and ask whether each matters, rather than mandating a percentage, which teams then meet with tests that assert nothing. A stronger measure is **mutation testing**: a tool makes small changes to your code (`<` to `<=`, `+ 1` to `- 1`, deleting a line) and checks that some test fails for each "mutant". A surviving mutant points to behaviour that no test pins down. One of the exercises asks you to kill a set of mutants by hand.
+
+</Section>
+
+<Section id="invariants" kind="definitions" title="Invariants and assertions">
+
+Testing checks behaviour from the outside. **Invariants** state, from the inside, what must always be true.
+
+<Definition term="Preconditions, postconditions and invariants">
+
+A **precondition** is what a function requires of its inputs; a **postcondition** is what it guarantees about its result, provided the precondition held. A **loop invariant** is a statement that is true before a loop starts and after every iteration. A **class invariant** is a property of an object's state that every public method preserves.
+
+</Definition>
+
+For binary search over a sorted list `xs` looking for the first index whose value is at least `target` (from <LessonLink slug="searching-and-sorting">Searching and sorting</LessonLink>), the invariant is: every index below `lo` holds a value less than `target`, and every index at or above `hi` holds a value at least `target`. It holds initially (`lo = 0`, `hi = len(xs)`, both claims vacuous), each iteration preserves it, and when the loop stops with `lo == hi`, the invariant *is* the postcondition. Stating invariants this way is how you convince yourself a loop is correct — it is induction, as in <TopicLink id="math.found.proof-techniques">Proof techniques</TopicLink> — and writing them as `assert` statements turns your reasoning into checks that run.
+
+```python
+def lower_bound(xs, target):
+    lo, hi = 0, len(xs)
+    while lo < hi:
+        # invariant: all(x < target for x in xs[:lo]) and all(x >= target for x in xs[hi:])
+        mid = (lo + hi) // 2
+        if xs[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    assert lo == len(xs) or xs[lo] >= target          # postcondition
+    assert lo == 0 or xs[lo - 1] < target
+    return lo
+```
+
+Use `assert` for conditions that can only fail if *the program* is wrong. Do not use it to validate user input or external data: Python removes `assert` statements entirely when run with `-O`, and an assertion failure is the wrong error for a user to see. Input validation raises a proper exception such as `ValueError`, as `split_bill` does. The discipline of writing pre- and postconditions as part of an interface is called **design by contract**, after Bertrand Meyer's Eiffel language.
+
+</Section>
+
+<Section id="formal" kind="human" title="A short look at formal verification">
+
+Tests sample the input space; **formal verification** covers all of it, by proof. You write a precise **specification**, and a tool checks — mechanically, without trusting your reasoning — that the code meets it for every input.
+
+There is a spectrum of effort. **Type systems** (the next lessons) prove simple properties of every program automatically. **Model checkers** explore every reachable state of a finite model of a design: Amazon Web Services engineers have described using the TLA+ language to find subtle bugs in distributed protocols, of the kind <LessonLink slug="distributed-systems">Distributed systems</LessonLink> discusses, before writing production code. At the far end, **proof assistants** such as Lean, Rocq (formerly Coq) and Isabelle check proofs of arbitrary mathematical statements about programs. In Lean, a theorem about all lists, and its proof, look like this:
+
+```text
+-- Lean 4: for every list of natural numbers, reversing twice gives the list back.
+theorem reverse_twice (xs : List Nat) : xs.reverse.reverse = xs := by
+  simp
+```
+
+No test runs here: Lean checks that the proof establishes the statement for *every* list, of every length. Landmark verified systems include [CompCert](https://compcert.org/), a C compiler proved to preserve the meaning of the programs it compiles, and [seL4](https://sel4.systems/), an operating-system kernel with a machine-checked proof that its implementation meets its specification. The cost is high — such proofs take far more effort than the code — so industry applies verification where failure is catastrophic and the core is small: cryptographic libraries, kernels, consensus protocols. Lumenary Math's lessons <TopicLink id="math.comp.intro-lean">First steps in Lean</TopicLink> and <TopicLink id="math.comp.formal-proof-lean">Formalising mathematics in Lean</TopicLink> teach the tool itself.
+
+Even proofs have limits: a proof is only as good as its specification, and it says nothing about the hardware, the compiler (unless verified too) or the parts of the system outside the model. Testing and proof complement each other.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"100% coverage means the code is tested."** It means every line ran during some test. Whether any test *checked* the result, and whether the code handles the cases nobody wrote, coverage cannot say.
+
+</Misconception>
+
+<Misconception>
+
+**"Good unit tests mock every dependency."** Over-mocked tests verify that the code calls what it currently calls. They pass when the code is wrong (the mock's assumptions are wrong) and fail when the code is right (it was refactored). Mock at the boundaries you do not control; use real objects and fakes elsewhere.
+
+</Misconception>
+
+<Misconception>
+
+**"A flaky test is a minor annoyance."** A test that sometimes fails teaches everyone to ignore failures. It may also be telling the truth: many flaky tests expose real race conditions, of the kind discussed in <LessonLink slug="concurrency">Concurrency</LessonLink>.
+
+</Misconception>
+
+<Misconception>
+
+**"Random testing is unreproducible."** Only if you let it be. Seed the generator, log the seed with every failure, and store failing inputs as permanent regression tests. Hypothesis does this automatically.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

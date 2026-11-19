@@ -1,0 +1,212 @@
+{
+  "lesson": "inference-at-scale",
+  "exercises": [
+    {
+      "id": "kv-cache-bytes",
+      "type": "python",
+      "difficulty": "warm-up",
+      "mode": "C",
+      "prompt": "Write `kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per=2)` returning the size in bytes of the KV cache for `batch` sequences of `seq_len` tokens each.",
+      "starter": "def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per=2):\n    # your code here\n    return 0\n",
+      "tests": "assert kv_cache_bytes(32, 32, 128, 1, 1) == 524288, kv_cache_bytes(32, 32, 128, 1, 1)\nassert kv_cache_bytes(32, 8, 128, 1, 1) == 131072\nassert kv_cache_bytes(80, 8, 128, 131072, 1) == 40 * 2**30\nassert kv_cache_bytes(32, 8, 128, 1000, 3, bytes_per=1) == 2 * 32 * 8 * 128 * 1000 * 3\n",
+      "reference": "def kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per=2):\n    return 2 * layers * kv_heads * head_dim * seq_len * batch * bytes_per\n",
+      "hints": [
+        "Per token, per layer you store one key and one value vector for each KV head.",
+        "Multiply: 2 (K and V) × layers × kv_heads × head_dim × bytes_per × seq_len × batch."
+      ],
+      "solution": "```python\ndef kv_cache_bytes(layers, kv_heads, head_dim, seq_len, batch, bytes_per=2):\n    return 2 * layers * kv_heads * head_dim * seq_len * batch * bytes_per\n```\n\nThe tests reproduce the lesson's table: 512 KiB per token for a 7B model with full multi-head attention, 128 KiB with 8 KV heads, and 40 GiB for one 128k-token sequence on a 70B-class shape. Note that the number of *query* heads does not appear: only key–value heads are cached, which is why grouped-query attention saves so much."
+    },
+    {
+      "id": "kv-cache-gib",
+      "type": "integer",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "A model has 48 layers, 8 KV heads of dimension 128, and stores its cache in 16-bit precision. How many GiB ($2^{30}$ bytes) of KV cache do 4 concurrent sequences of 32,768 tokens each need?",
+      "answer": 24,
+      "feedback": [
+        {
+          "match": "12",
+          "message": "Close — remember the factor 2: both keys and values are cached."
+        },
+        {
+          "match": "6",
+          "message": "That is one sequence. There are four."
+        },
+        {
+          "match": "48",
+          "message": "Not yet — check bytes per number: 16-bit means 2 bytes, and you may have counted it twice."
+        }
+      ],
+      "hints": [
+        "Per token: $2 \\times 48 \\times 8 \\times 128 \\times 2$ bytes $= 196{,}608$ bytes $= 192$ KiB.",
+        "Total tokens: $4 \\times 32{,}768 = 131{,}072 = 2^{17}$."
+      ],
+      "solution": "Per token: $2 \\times 48 \\times 8 \\times 128 \\times 2 = 196{,}608$ bytes $= 192$ KiB. Tokens: $4 \\times 32{,}768 = 2^{17}$. Total: $192 \\text{ KiB} \\times 2^{17} = 192 \\times 2^{27}$ bytes $= 24 \\times 2^{30}$ bytes $= 24$ GiB. On an 80 GB GPU that leaves little room for the weights of anything but a small model, which is why long-context serving is so memory-hungry."
+    },
+    {
+      "id": "symmetric-quantization",
+      "type": "python",
+      "difficulty": "core",
+      "mode": "C",
+      "prompt": "Write `quantize(w, bits)` and `dequantize(q, scale)` for **per-tensor symmetric** quantisation.\n\n- `qmax = 2**(bits - 1) - 1`.\n- `scale = max(|w|) / qmax` (use `scale = 1.0` if every weight is 0).\n- `q = round(w / scale)` clipped to `[-qmax, qmax]`, as an integer numpy array.\n- `quantize` returns `(q, scale)`; `dequantize` returns `q * scale` as floats.",
+      "starter": "import numpy as np\n\ndef quantize(w, bits):\n    # your code here\n    return np.zeros_like(w, dtype=int), 1.0\n\ndef dequantize(q, scale):\n    return q * scale\n",
+      "tests": "import numpy as np\nrng = np.random.default_rng(7)\nw = rng.normal(size=1000)\nfor bits in [8, 4, 2]:\n    q, s = quantize(w, bits)\n    qmax = 2 ** (bits - 1) - 1\n    assert np.issubdtype(np.asarray(q).dtype, np.integer), 'q must hold integers'\n    assert np.abs(q).max() == qmax, 'the largest |w| should map to qmax'\n    assert np.isclose(s, np.abs(w).max() / qmax)\n    err = np.abs(dequantize(q, s) - w)\n    assert err.max() <= s / 2 + 1e-12, 'rounding error must be at most scale/2'\nq, s = quantize(np.zeros(5), 8)\nassert s == 1.0 and np.all(q == 0)\nq8, s8 = quantize(w, 8); q4, s4 = quantize(w, 4)\nassert np.abs(dequantize(q8, s8) - w).mean() < np.abs(dequantize(q4, s4) - w).mean()\n",
+      "reference": "import numpy as np\n\ndef quantize(w, bits):\n    qmax = 2 ** (bits - 1) - 1\n    m = float(np.abs(w).max())\n    scale = m / qmax if m > 0 else 1.0\n    q = np.clip(np.round(w / scale), -qmax, qmax).astype(np.int32)\n    return q, scale\n\ndef dequantize(q, scale):\n    return q.astype(np.float64) * scale\n",
+      "hints": [
+        "`qmax = 2 ** (bits - 1) - 1`; `scale = np.abs(w).max() / qmax`.",
+        "`q = np.clip(np.round(w / scale), -qmax, qmax).astype(np.int32)`."
+      ],
+      "solution": "```python\ndef quantize(w, bits):\n    qmax = 2 ** (bits - 1) - 1\n    m = float(np.abs(w).max())\n    scale = m / qmax if m > 0 else 1.0\n    q = np.clip(np.round(w / scale), -qmax, qmax).astype(np.int32)\n    return q, scale\n\ndef dequantize(q, scale):\n    return q.astype(np.float64) * scale\n```\n\nRounding to the nearest multiple of `scale` is off by at most half a step, so the error bound $s/2$ holds for every weight. Symmetric schemes waste one code (int8 uses -127..127, not -128) to keep zero exactly representable and the arithmetic simple. Going from 8 to 4 bits multiplies the step, and so the typical error, by about $127/7 \\approx 18$."
+    },
+    {
+      "id": "decode-speed-bound",
+      "type": "integer",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "An 8-billion-parameter model is stored in int8 (1 byte per weight) on an accelerator with 2 TB/s of memory bandwidth ($2 \\times 10^{12}$ bytes/s). Ignoring everything except reading the weights, what is the maximum number of tokens per second for **one** user (batch size 1)?",
+      "answer": 250,
+      "feedback": [
+        {
+          "match": "125",
+          "message": "That would be BF16 (2 bytes per weight). In int8 each weight is one byte."
+        },
+        {
+          "match": "4",
+          "message": "That is the time per token in milliseconds. Invert it for tokens per second."
+        }
+      ],
+      "hints": [
+        "Each decode step must read all 8 GB of weights.",
+        "$8 \\times 10^9 / 2 \\times 10^{12} = 4$ ms per token."
+      ],
+      "solution": "Each token requires reading $8 \\times 10^9$ bytes; at $2 \\times 10^{12}$ bytes/s that takes 4 ms, so at most $1 / 0.004 = 250$ tokens/s. Quantising from BF16 to int8 doubled this ceiling. Serving more users in the same batch reuses each weight read, so aggregate throughput can be many times higher even though each user's ceiling stays the same."
+    },
+    {
+      "id": "why-decode-memory-bound",
+      "type": "choice",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "Why is the decode phase of a language model memory-bandwidth-bound at small batch sizes?",
+      "options": [
+        {
+          "id": "a",
+          "label": "Each step multiplies one vector per sequence by every weight matrix, so each weight read from memory is used for very few operations.",
+          "correct": true,
+          "feedback": "Yes — arithmetic intensity is about the batch size, far below the hundreds of FLOPs per byte the chip needs to be compute-bound."
+        },
+        {
+          "id": "b",
+          "label": "The softmax over the vocabulary is too expensive.",
+          "correct": false,
+          "feedback": "Not yet — the vocabulary softmax is a small part of the work. The bottleneck is reading the weights for every step."
+        },
+        {
+          "id": "c",
+          "label": "Decode uses lower precision than prefill.",
+          "correct": false,
+          "feedback": "Not quite — both phases usually use the same precision. The difference is how many tokens share each weight read."
+        },
+        {
+          "id": "d",
+          "label": "The KV cache must be recomputed at every step.",
+          "correct": false,
+          "feedback": "Not yet — the point of the KV cache is that it is *not* recomputed. Reading it does add memory traffic, though."
+        }
+      ],
+      "hints": [
+        "Compare the arithmetic intensity of a matrix–vector product with that of a matrix–matrix product."
+      ],
+      "solution": "(a). With batch size $B$, each two-byte weight takes part in $B$ multiply–adds per step, an intensity of about $B$ FLOPs per byte; the GPU needs a few hundred to be compute-bound. Prefill processes thousands of tokens per weight read and is compute-bound. Reading the growing KV cache adds further memory traffic at long contexts."
+    },
+    {
+      "id": "speculative-expected-tokens",
+      "type": "choice",
+      "difficulty": "core",
+      "mode": "H",
+      "prompt": "A draft model proposes $k = 4$ tokens per round, and each is accepted with probability $\\alpha = 0.8$ (assume independence). About how many tokens does each target-model forward pass produce on average?",
+      "options": [
+        {
+          "id": "a",
+          "label": "3.36",
+          "correct": true,
+          "feedback": "Yes: $(1 - 0.8^5)/(1 - 0.8) = 0.672/0.2 = 3.36$."
+        },
+        {
+          "id": "b",
+          "label": "5",
+          "correct": false,
+          "feedback": "Not yet — 5 is the maximum, reached only if all four drafts are accepted (probability $0.8^4 \\approx 0.41$)."
+        },
+        {
+          "id": "c",
+          "label": "3.2",
+          "correct": false,
+          "feedback": "Close — $4 \\times 0.8 = 3.2$ ignores that a rejection discards all later drafts, and that the target always contributes one token of its own (a resample or the bonus token)."
+        },
+        {
+          "id": "d",
+          "label": "0.8",
+          "correct": false,
+          "feedback": "Not yet — that is the acceptance probability of one draft token, not the tokens produced per pass."
+        }
+      ],
+      "hints": [
+        "Use $(1 - \\alpha^{k+1})/(1 - \\alpha)$.",
+        "Equivalently $1 + \\alpha + \\alpha^2 + \\alpha^3 + \\alpha^4$."
+      ],
+      "solution": "The pass yields $j+1$ tokens when exactly the first $j$ drafts are accepted, and the expectation sums to $1 + \\alpha + \\alpha^2 + \\dots + \\alpha^k = (1 - \\alpha^{k+1})/(1 - \\alpha) = (1 - 0.32768)/0.2 \\approx 3.36$. The wall-clock speedup is less than 3.36× because drafting costs time too, which is why draft models must be much cheaper than the target."
+    },
+    {
+      "id": "paged-blocks",
+      "type": "python",
+      "difficulty": "core",
+      "mode": "C",
+      "prompt": "Write `paged_usage(lengths, block_size)` returning a tuple `(blocks, wasted_slots)`: the total number of KV blocks needed to hold sequences of the given token `lengths` when each sequence gets whole blocks of `block_size` tokens, and the number of allocated-but-unused token slots.",
+      "starter": "def paged_usage(lengths, block_size):\n    # your code here\n    return 0, 0\n",
+      "tests": "assert paged_usage([16, 17, 1], 16) == (4, 30), paged_usage([16, 17, 1], 16)\nassert paged_usage([], 16) == (0, 0)\nassert paged_usage([100] * 10, 1) == (1000, 0)\nb, w = paged_usage([50, 1199, 640], 16)\nassert b == 4 + 75 + 40 and w == b * 16 - (50 + 1199 + 640)\n",
+      "reference": "def paged_usage(lengths, block_size):\n    blocks = sum(-(-n // block_size) for n in lengths)\n    return blocks, blocks * block_size - sum(lengths)\n",
+      "hints": [
+        "A sequence of $n$ tokens needs $\\lceil n / \\text{block\\_size} \\rceil$ blocks. In integer arithmetic, `-(-n // b)` or `(n + b - 1) // b`.",
+        "Wasted slots = allocated slots − tokens stored."
+      ],
+      "solution": "```python\ndef paged_usage(lengths, block_size):\n    blocks = sum(-(-n // block_size) for n in lengths)\n    return blocks, blocks * block_size - sum(lengths)\n```\n\nEach sequence wastes fewer than `block_size` slots, only in its last block, so total waste is below `block_size × number of sequences` regardless of how long sequences get. Smaller blocks waste less but make the block tables longer and the attention kernel's memory accesses less efficient; vLLM's default of 16 tokens is a compromise."
+    },
+    {
+      "id": "paged-attention-analogy",
+      "type": "choice",
+      "difficulty": "warm-up",
+      "mode": "H",
+      "prompt": "PagedAttention borrows its central idea from which operating-system mechanism?",
+      "options": [
+        {
+          "id": "a",
+          "label": "Virtual memory with paging: fixed-size pages, a per-process page table, and physical pages anywhere in memory.",
+          "correct": true,
+          "feedback": "Yes — KV blocks play the role of pages, and each sequence's block table plays the role of a page table. Copy-on-write sharing comes along too."
+        },
+        {
+          "id": "b",
+          "label": "Process scheduling with time slices.",
+          "correct": false,
+          "feedback": "Not quite — continuous batching resembles scheduling, but PagedAttention is about memory layout."
+        },
+        {
+          "id": "c",
+          "label": "File-system journaling.",
+          "correct": false,
+          "feedback": "Not yet — journaling is about crash consistency on disk, not memory allocation."
+        },
+        {
+          "id": "d",
+          "label": "Interrupt handling.",
+          "correct": false,
+          "feedback": "Not yet — interrupts are about responding to devices, not managing memory."
+        }
+      ],
+      "hints": [
+        "The problem being solved is fragmentation of a growing, unpredictably sized memory region."
+      ],
+      "solution": "(a). Like an operating system giving each process the illusion of contiguous memory backed by scattered physical pages, vLLM gives each sequence a logically contiguous KV cache backed by scattered fixed-size blocks, allocated on demand. This nearly eliminates fragmentation and enables sharing of common prefixes with copy-on-write."
+    }
+  ]
+}

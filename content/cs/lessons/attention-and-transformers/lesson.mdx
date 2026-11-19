@@ -1,0 +1,536 @@
+---
+title: Attention and the transformer
+subtitle: Scaled dot-product attention from scratch, the block built around it, and how to count a transformer's parameters and FLOPs.
+minutes: 75
+objectives:
+  - Implement scaled dot-product attention in numpy and explain each step, including the square-root scaling
+  - Extend it to multi-head attention with a causal mask, and verify causality
+  - Explain why transformers need positional information, and how sinusoidal encodings and RoPE provide it
+  - Assemble a transformer block from attention, an MLP, residual connections and normalisation
+  - Distinguish encoder-only, decoder-only and encoder–decoder models
+  - Count a transformer's parameters and estimate its training FLOPs
+prerequisites: [neural-networks, training-in-practice, deep-architectures]
+related: [math.algebra.linear-algebra, math.analysis.harmonic-analysis, math.prob.probability-theory]
+references:
+  - title: "Attention Is All You Need"
+    author: Vaswani et al.
+    year: 2017
+    url: https://arxiv.org/abs/1706.03762
+    note: The transformer paper.
+  - title: "Neural Machine Translation by Jointly Learning to Align and Translate"
+    author: Bahdanau, Cho, Bengio
+    year: 2014
+    url: https://arxiv.org/abs/1409.0473
+  - title: "Layer Normalization"
+    author: Ba, Kiros, Hinton
+    year: 2016
+    url: https://arxiv.org/abs/1607.06450
+  - title: "On Layer Normalization in the Transformer Architecture"
+    author: Xiong et al.
+    year: 2020
+    url: https://arxiv.org/abs/2002.04745
+    note: Why pre-norm blocks train more stably than the original post-norm ones.
+  - title: "Root Mean Square Layer Normalization"
+    author: Zhang, Sennrich
+    year: 2019
+    url: https://arxiv.org/abs/1910.07467
+  - title: "GLU Variants Improve Transformer"
+    author: Noam Shazeer
+    year: 2020
+    url: https://arxiv.org/abs/2002.05202
+    note: The SwiGLU feed-forward layer used in most current open models.
+  - title: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+    author: Su et al.
+    year: 2021
+    url: https://arxiv.org/abs/2104.09864
+  - title: "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation"
+    author: Press, Smith, Lewis
+    year: 2021
+    url: https://arxiv.org/abs/2108.12409
+  - title: "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+    author: Devlin et al.
+    year: 2018
+    url: https://arxiv.org/abs/1810.04805
+  - title: "Language Models are Few-Shot Learners"
+    author: Brown et al.
+    year: 2020
+    url: https://arxiv.org/abs/2005.14165
+    note: GPT-3, whose sizes are used in this lesson's worked example.
+  - title: "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"
+    author: Raffel et al.
+    year: 2019
+    url: https://arxiv.org/abs/1910.10683
+    note: T5, an encoder–decoder model.
+  - title: "Fast Transformer Decoding: One Write-Head is All You Need"
+    author: Noam Shazeer
+    year: 2019
+    url: https://arxiv.org/abs/1911.02150
+    note: Multi-query attention.
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+    author: Ainslie et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.13245
+  - title: "Scaling Laws for Neural Language Models"
+    author: Kaplan et al.
+    year: 2020
+    url: https://arxiv.org/abs/2001.08361
+    note: Its Table 1 is the standard accounting of transformer FLOPs.
+  - title: "A Mathematical Framework for Transformer Circuits"
+    author: Elhage et al. (Anthropic)
+    year: 2021
+    url: https://transformer-circuits.pub/2021/framework/index.html
+    note: The residual-stream view of the transformer.
+  - title: nanoGPT
+    author: Andrej Karpathy
+    url: https://github.com/karpathy/nanoGPT
+    note: A small, readable GPT implementation in PyTorch.
+---
+
+<Section id="motivation" kind="motivation" title="Keep the attention, drop the recurrence">
+
+The <LessonLink slug="deep-architectures">previous lesson</LessonLink> ended with two problems and a hint. The problems: a recurrent encoder squeezes a sentence into one vector, and recurrent networks process tokens one after another, so they cannot use a GPU's parallelism across a sequence. The hint: Bahdanau's attention let a decoder look back at every encoder state directly, with learned weights.
+
+In 2017, eight researchers at Google published ["Attention Is All You Need"](https://arxiv.org/abs/1706.03762). Their **transformer** threw away recurrence and convolution and built a translation model from attention alone, plus small per-position MLPs. Every token looks at every other token in one step, so there is no long chain for gradients to vanish along, and every position of a training sequence is computed in parallel. It beat the best translation systems of the day at a fraction of their training cost.
+
+Nearly a decade later the core block is little changed, and it is the architecture inside essentially every frontier language model, most large vision and speech models, protein-structure predictors and much more. This lesson builds it from the ground up in numpy, then counts what it costs. Everything in the Frontier level of this course assumes you know this lesson well.
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Attention as a soft dictionary lookup">
+
+A Python dictionary maps keys to values. You present a query; if it equals a key exactly, you get that key's value. Attention softens every part of this:
+
+- the query is compared with *every* key, by a similarity score (a dot product), not tested for equality;
+- the scores are turned into weights that are positive and sum to 1 (a softmax);
+- the result is the weighted average of *all* the values.
+
+A query that matches one key much better than the others gets, in effect, that key's value. A vague query gets a blend. And because every step is differentiable, the network can *learn* what to put in queries, keys and values.
+
+<Analogy>
+
+Think of a librarian helping a reader. The reader's question is the query; each book's catalogue entry is a key; the book's contents are the value. A good librarian does not hand over one book: they pull the few that match best, and the reader takes most from the best match and a little from the others. In self-attention every word in the sentence is at once a reader with a question and a book on the shelf.
+
+</Analogy>
+
+</Section>
+
+<Section id="attention" kind="definitions" title="Scaled dot-product attention">
+
+<Definition term="Scaled dot-product attention">
+
+Given $n$ queries $Q \in \mathbb{R}^{n \times d_k}$, $m$ keys $K \in \mathbb{R}^{m \times d_k}$ and $m$ values $V \in \mathbb{R}^{m \times d_v}$,
+
+$$
+\operatorname{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{Q K^{\top}}{\sqrt{d_k}}\right) V ,
+$$
+
+where the softmax is applied to each row. Row $i$ of the $n \times m$ matrix of **attention weights** says how much query $i$ draws on each value; it is a probability distribution.
+
+In **self-attention** the queries, keys and values all come from the same sequence $X \in \mathbb{R}^{n \times d}$, through learned projections: $Q = X W_Q$, $K = X W_K$, $V = X W_V$.
+
+</Definition>
+
+Why divide by $\sqrt{d_k}$? If the entries of a query and a key are independent with mean 0 and variance 1, their dot product is a sum of $d_k$ such products and has variance $d_k$. With $d_k = 128$ the raw scores would have a standard deviation around 11, the softmax would put almost all weight on the single largest score, and its gradient with respect to the others would be nearly zero. Dividing by $\sqrt{d_k}$ brings the scores back to unit scale. It is a small detail that the paper called out, and it matters.
+
+```python run
+import numpy as np
+
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)      # subtracting the max changes nothing but avoids overflow
+    e = np.exp(z)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def attention(Q, K, V, mask=None):
+    """Scaled dot-product attention. Q: (n, d_k), K: (m, d_k), V: (m, d_v)."""
+    scores = Q @ K.T / np.sqrt(K.shape[-1])     # (n, m): how well each query matches each key
+    if mask is not None:
+        scores = np.where(mask, scores, -np.inf)
+    weights = softmax(scores)                    # each row is a probability distribution
+    return weights @ V, weights
+
+# A soft dictionary: three keys, each with a value.
+K = np.array([[2.0, 0.0], [0.0, 2.0], [-1.0, -1.0]])
+V = np.array([[10.0, 0.0], [0.0, 10.0], [5.0, 5.0]])
+Q = np.array([[3.0, 0.0],      # a query that strongly matches key 0
+              [0.2, 0.2]])     # a vague query
+out, w = attention(Q, K, V)
+np.set_printoptions(precision=3, suppress=True)
+print("weights:\n", w)
+print("row sums:", w.sum(axis=1))
+print("outputs:\n", out)
+
+# Self-attention has no idea of order: permute the inputs and the outputs permute the same way.
+rng = np.random.default_rng(0)
+n, d = 5, 8
+X = rng.normal(size=(n, d))
+Wq, Wk, Wv = (rng.normal(size=(d, d)) for _ in range(3))
+Y, _ = attention(X @ Wq, X @ Wk, X @ Wv)
+perm = np.array([3, 0, 4, 1, 2])
+Yp, _ = attention(X[perm] @ Wq, X[perm] @ Wk, X[perm] @ Wv)
+print("\npermutation equivariant:", np.allclose(Yp, Y[perm]))
+
+# Why divide by sqrt(d_k): dot products of random unit-variance vectors have variance d_k.
+for d_k in [4, 64, 1024]:
+    q = rng.normal(size=(10000, d_k)); k = rng.normal(size=(10000, d_k))
+    dots = (q * k).sum(axis=1)
+    print(f"d_k={d_k:5d}: std of q.k = {dots.std():6.1f}, after scaling = {(dots / np.sqrt(d_k)).std():.2f}")
+```
+
+Three things to take from the output. The sharp query takes 98% of its answer from key 0, the vague one blends all three. Every row of weights sums to 1. And self-attention is **permutation equivariant**: shuffle the tokens and the outputs are shuffled in the same way, otherwise identical. Attention by itself treats a sentence as a bag of words. "Dog bites man" and "man bites dog" look the same to it. We will fix that with positional information below.
+
+**Cost.** The score matrix $QK^{\top}$ has $n \times n$ entries for a sequence of $n$ tokens, so self-attention takes $O(n^2 d)$ time and, naively, $O(n^2)$ memory. That quadratic term is the transformer's most famous weakness; <LessonLink slug="accelerators-and-parallelism">Accelerators and distributed training</LessonLink> shows how FlashAttention removes the memory part of it, though not the time.
+
+</Section>
+
+<Section id="multihead" kind="computation" title="Multiple heads and the causal mask">
+
+One attention operation computes one weighted average per position, so it can follow one kind of relationship at a time. Language has many at once: which noun an adjective modifies, what a pronoun refers to, what the previous token was. **Multi-head attention** runs $h$ attentions in parallel on smaller projections and concatenates the results:
+
+$$
+\operatorname{head}_i = \operatorname{Attention}(X W_Q^{(i)}, X W_K^{(i)}, X W_V^{(i)}), \qquad \operatorname{MHA}(X) = [\operatorname{head}_1; \ldots; \operatorname{head}_h] \, W_O .
+$$
+
+Each head works in $d_{\text{head}} = d_{\text{model}} / h$ dimensions, so $h$ heads cost the same as one full-width head. In code you compute $XW_Q$ once at full width and reshape it into $h$ slices.
+
+### The causal mask
+
+A language model is trained to predict token $t+1$ from tokens $1, \ldots, t$ (<LessonLink slug="language-models">next lesson</LessonLink>). During training we feed it the whole sequence at once and ask for a prediction at every position, so we must stop position $t$ from peeking at later positions. The fix is a **causal mask**: set the scores for keys after the query to $-\infty$ before the softmax, so their weights become exactly 0. The weight matrix becomes lower-triangular.
+
+```python run
+import numpy as np
+
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def multi_head_attention(X, Wq, Wk, Wv, Wo, n_heads, causal=True):
+    """X: (n, d_model). Each W: (d_model, d_model). Returns (n, d_model) and the weights."""
+    n, d_model = X.shape
+    d_head = d_model // n_heads
+    # Project, then split the last dimension into heads: (n_heads, n, d_head).
+    def split(M):
+        return M.reshape(n, n_heads, d_head).transpose(1, 0, 2)
+    Q, K, V = split(X @ Wq), split(X @ Wk), split(X @ Wv)
+    scores = Q @ K.transpose(0, 2, 1) / np.sqrt(d_head)        # (n_heads, n, n)
+    if causal:
+        future = np.triu(np.ones((n, n), dtype=bool), k=1)     # True above the diagonal
+        scores = np.where(future, -np.inf, scores)
+    weights = softmax(scores)
+    heads = weights @ V                                         # (n_heads, n, d_head)
+    concat = heads.transpose(1, 0, 2).reshape(n, d_model)       # glue the heads back together
+    return concat @ Wo, weights
+
+rng = np.random.default_rng(1)
+n, d_model, n_heads = 6, 16, 4
+Wq, Wk, Wv, Wo = (rng.normal(scale=d_model**-0.5, size=(d_model, d_model)) for _ in range(4))
+X = rng.normal(size=(n, d_model))
+
+Y, W = multi_head_attention(X, Wq, Wk, Wv, Wo, n_heads)
+np.set_printoptions(precision=2, suppress=True)
+print("head 0 attention weights (row = query position):\n", W[0])
+
+# Causality: change the last two tokens; outputs at positions 0..3 must not move.
+X2 = X.copy()
+X2[4:] = rng.normal(size=(2, d_model))
+Y2, _ = multi_head_attention(X2, Wq, Wk, Wv, Wo, n_heads)
+print("positions 0-3 unchanged:", np.allclose(Y[:4], Y2[:4]))
+print("positions 4-5 changed:  ", not np.allclose(Y[4:], Y2[4:]))
+```
+
+The causality test is worth copying into any transformer you write: perturb the future, and check that the past does not move. A leak here produces a model that looks brilliant during training (it can read the answer) and is useless at generation time.
+
+Heads in trained models do specialise. Interpretability researchers have found heads that attend to the previous token, heads that find an earlier occurrence of the current token and copy what followed it (*induction heads*), and heads that track syntax. <LessonLink slug="interpretability">Interpretability</LessonLink> returns to them, and to why attention weights alone are not an explanation.
+
+### Fewer keys and values: MQA and GQA
+
+At generation time the keys and values of past tokens are cached, and that cache can be larger than the model itself (<LessonLink slug="inference-at-scale">Serving models</LessonLink>). **Multi-query attention** ([Shazeer, 2019](https://arxiv.org/abs/1911.02150)) lets all heads share one key and one value head; **grouped-query attention** ([Ainslie et al., 2023](https://arxiv.org/abs/2305.13245)) is the compromise most open models use today: say 32 query heads sharing 8 key–value heads. The quality cost is small and the memory saving large.
+
+</Section>
+
+<Section id="positions" kind="definitions" title="Where am I? Positional information">
+
+Since attention is permutation equivariant, order has to be supplied from outside. There are three main families.
+
+**Absolute encodings, added to the input.** The original transformer added a fixed vector to each token's embedding:
+
+$$
+\mathrm{PE}(p, 2i) = \sin\!\left(\frac{p}{10000^{2i/d}}\right), \qquad \mathrm{PE}(p, 2i+1) = \cos\!\left(\frac{p}{10000^{2i/d}}\right).
+$$
+
+Each pair of dimensions is a clock hand turning at its own speed, from once every $2\pi$ positions to once every $2\pi \cdot 10000$. Together they give each position a distinct fingerprint, and a fixed offset corresponds to a fixed rotation of every pair (<TopicLink id="math.analysis.harmonic-analysis">Fourier and harmonic analysis</TopicLink>). GPT-2 and BERT instead *learned* a vector per position, which works well but cannot go past the longest position seen in training.
+
+**Relative position in the scores.** What usually matters is how far apart two tokens are, not their absolute addresses. ALiBi ([Press et al.](https://arxiv.org/abs/2108.12409)) simply subtracts a penalty proportional to the distance from each attention score.
+
+**Rotary position embedding (RoPE)** ([Su et al.](https://arxiv.org/abs/2104.09864)) is what most current open models use. It does not add anything to the embeddings. Instead, just before the dot product, it rotates each pair of coordinates of a query at position $m$ by the angle $m \theta_i$, and each pair of a key at position $n$ by $n \theta_i$. Rotating two 2-D vectors by angles $\alpha$ and $\beta$ changes their dot product exactly as rotating one of them by $\alpha - \beta$ would. So the score between a query and a key depends on their content and on $m - n$ only.
+
+```python run
+import numpy as np
+
+def sinusoidal(n_pos, d):
+    """The original transformer's fixed positional encodings, shape (n_pos, d)."""
+    pos = np.arange(n_pos)[:, None]
+    freq = 10000.0 ** (-np.arange(0, d, 2) / d)       # one frequency per pair of dimensions
+    pe = np.zeros((n_pos, d))
+    pe[:, 0::2] = np.sin(pos * freq)
+    pe[:, 1::2] = np.cos(pos * freq)
+    return pe
+
+def rope(x, pos, base=10000.0):
+    """Rotary position embedding: rotate each pair (x[2i], x[2i+1]) by the angle pos * theta_i."""
+    d = x.shape[-1]
+    theta = base ** (-np.arange(0, d, 2) / d)
+    angle = pos * theta
+    cos, sin = np.cos(angle), np.sin(angle)
+    x_even, x_odd = x[0::2], x[1::2]
+    out = np.empty_like(x)
+    out[0::2] = x_even * cos - x_odd * sin
+    out[1::2] = x_even * sin + x_odd * cos
+    return out
+
+pe = sinusoidal(50, 8)
+print("sinusoidal encodings of positions 0-2 (first 4 dims):\n", np.round(pe[:3, :4], 3))
+
+rng = np.random.default_rng(0)
+q, k = rng.normal(size=64), rng.normal(size=64)
+
+# The score between a query at position m and a key at position n depends only on m - n.
+for m, n in [(5, 2), (105, 102), (1005, 1002)]:
+    print(f"q at {m:4d}, k at {n:4d} (offset 3): score = {rope(q, m) @ rope(k, n):.6f}")
+print(f"q at    5, k at    1 (offset 4): score = {rope(q, 5) @ rope(k, 1):.6f}")
+
+# Rotations preserve length, so RoPE never changes the size of a vector.
+print("norm before/after:", round(float(np.linalg.norm(q)), 6), round(float(np.linalg.norm(rope(q, 77))), 6))
+```
+
+The same query–key pair scores identically at positions (5, 2), (105, 102) and (1005, 1002), and differently at offset 4. That relative property, plus the fact that rotations do not distort vector lengths, is why RoPE became the default. It also made **context extension** possible: by rescaling the rotation frequencies (position interpolation, and refinements such as YaRN), labs stretch a model trained on, say, 8,000-token sequences to work on 128,000 tokens or more with a short additional training phase. How well models actually *use* very long contexts is a separate question, taken up in <LessonLink slug="evaluation">Evaluating models</LessonLink>.
+
+</Section>
+
+<Section id="block" kind="computation" title="The transformer block">
+
+Attention moves information *between* positions. The block also needs computation *within* each position, and the machinery that makes a deep stack trainable.
+
+<Definition term="Transformer block (pre-norm)">
+
+For a sequence of vectors $x \in \mathbb{R}^{n \times d}$, one block computes
+
+$$
+\begin{aligned}
+x &\leftarrow x + \operatorname{MHA}(\operatorname{Norm}(x)), \\
+x &\leftarrow x + \operatorname{MLP}(\operatorname{Norm}(x)),
+\end{aligned}
+$$
+
+where the **MLP** is applied to each position independently, classically $\operatorname{MLP}(h) = \operatorname{GELU}(h W_1 + b_1) W_2 + b_2$ with $W_1 \in \mathbb{R}^{d \times 4d}$ and $W_2 \in \mathbb{R}^{4d \times d}$, and **Norm** is layer normalisation: subtract each vector's mean, divide by its standard deviation, then apply a learned gain and bias. A model is an embedding layer, $L$ blocks, a final norm, and an output ("unembedding") layer that maps each position's vector to a score for every token in the vocabulary.
+
+</Definition>
+
+<Figure caption="A pre-norm transformer block. The thick vertical line is the residual stream. Each sublayer reads a normalised copy of it and adds its result back at a ⊕. A model stacks L such blocks.">
+
+<svg viewBox="0 0 400 340" role="img" aria-label="Diagram of a transformer block. A thick vertical line, the residual stream, runs from the input at the top to the output at the bottom. A first branch leaves the stream, passes through LayerNorm and causal multi-head attention, and is added back to the stream. A second branch passes through LayerNorm and an MLP and is added back.">
+  <text x="70" y="18" fontSize="13" textAnchor="middle" fill="currentColor">input x</text>
+  <line x1="70" y1="26" x2="70" y2="312" stroke="currentColor" strokeWidth="3" />
+  <line x1="70" y1="50" x2="210" y2="50" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="210" y1="50" x2="210" y2="62" stroke="currentColor" strokeWidth="1.5" />
+  <rect x="110" y="62" width="200" height="26" rx="5" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="210" y="80" fontSize="12" textAnchor="middle" fill="currentColor">LayerNorm</text>
+  <line x1="210" y1="88" x2="210" y2="100" stroke="currentColor" strokeWidth="1.5" />
+  <rect x="110" y="100" width="200" height="34" rx="5" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="210" y="121" fontSize="12" textAnchor="middle" fill="currentColor">causal multi-head attention</text>
+  <line x1="210" y1="134" x2="210" y2="150" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="210" y1="150" x2="86" y2="150" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="79,150 88,145 88,155" fill="currentColor" />
+  <circle cx="70" cy="150" r="9" fill="var(--card)" stroke="currentColor" strokeWidth="1.5" />
+  <text x="70" y="155" fontSize="14" textAnchor="middle" fill="currentColor">+</text>
+  <line x1="70" y1="180" x2="210" y2="180" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="210" y1="180" x2="210" y2="192" stroke="currentColor" strokeWidth="1.5" />
+  <rect x="110" y="192" width="200" height="26" rx="5" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="210" y="210" fontSize="12" textAnchor="middle" fill="currentColor">LayerNorm</text>
+  <line x1="210" y1="218" x2="210" y2="230" stroke="currentColor" strokeWidth="1.5" />
+  <rect x="110" y="230" width="200" height="34" rx="5" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="210" y="251" fontSize="12" textAnchor="middle" fill="currentColor">MLP: d → 4d → d, per position</text>
+  <line x1="210" y1="264" x2="210" y2="280" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="210" y1="280" x2="86" y2="280" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="79,280 88,275 88,285" fill="currentColor" />
+  <circle cx="70" cy="280" r="9" fill="var(--card)" stroke="currentColor" strokeWidth="1.5" />
+  <text x="70" y="285" fontSize="14" textAnchor="middle" fill="currentColor">+</text>
+  <text x="70" y="332" fontSize="13" textAnchor="middle" fill="currentColor">output, same shape as x</text>
+  <text x="330" y="121" fontSize="11" fill="currentColor">mixes</text>
+  <text x="330" y="135" fontSize="11" fill="currentColor">positions</text>
+  <text x="330" y="251" fontSize="11" fill="currentColor">mixes</text>
+  <text x="330" y="265" fontSize="11" fill="currentColor">features</text>
+</svg>
+
+</Figure>
+
+Each ingredient has a job:
+
+- **Residual connections** (from ResNets, previous lesson) give gradients an identity path through all $L$ blocks, which is what lets 100-layer transformers train at all. They also suggest a useful picture: a **residual stream** of vectors flowing through the model, which each sublayer reads from and writes into by addition ([Elhage et al.](https://transformer-circuits.pub/2021/framework/index.html)). We will lean on this picture in <LessonLink slug="interpretability">Interpretability</LessonLink>.
+- **Normalisation** keeps activations at a stable scale. The 2017 paper normalised *after* adding the residual ("post-norm"); almost everyone now normalises the *input* of each sublayer ("pre-norm"), which [trains more stably](https://arxiv.org/abs/2002.04745) in deep stacks. Many models replace LayerNorm with the cheaper **RMSNorm**, which skips subtracting the mean.
+- **The MLP** holds about two-thirds of the parameters and is where much of a model's stored knowledge appears to live. Current open models mostly use a gated variant, **SwiGLU** ([Shazeer, 2020](https://arxiv.org/abs/2002.05202)): $(\operatorname{Swish}(hW_1) \odot hW_3)\,W_2$, with the hidden width reduced to about $\tfrac{8}{3}d$ so the parameter count stays the same.
+
+Here is a whole, if tiny, decoder-only language model: embeddings, two pre-norm blocks, and an output layer that reuses the embedding matrix (**weight tying**, common in smaller models).
+
+```python run
+import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+def layer_norm(x, gain, bias, eps=1e-5):
+    mu = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    return gain * (x - mu) / np.sqrt(var + eps) + bias
+
+def gelu(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+def init_block(rng, d, ff_mult=4):
+    s = d ** -0.5
+    return {
+        "ln1_g": np.ones(d), "ln1_b": np.zeros(d),
+        "Wq": rng.normal(scale=s, size=(d, d)), "Wk": rng.normal(scale=s, size=(d, d)),
+        "Wv": rng.normal(scale=s, size=(d, d)), "Wo": rng.normal(scale=s, size=(d, d)),
+        "ln2_g": np.ones(d), "ln2_b": np.zeros(d),
+        "W1": rng.normal(scale=s, size=(d, ff_mult * d)), "b1": np.zeros(ff_mult * d),
+        "W2": rng.normal(scale=(ff_mult * d) ** -0.5, size=(ff_mult * d, d)), "b2": np.zeros(d),
+    }
+
+def block(x, p, n_heads):
+    """One pre-norm decoder block: x + Attn(LN(x)), then x + MLP(LN(x))."""
+    n, d = x.shape
+    dh = d // n_heads
+    h = layer_norm(x, p["ln1_g"], p["ln1_b"])
+    split = lambda M: M.reshape(n, n_heads, dh).transpose(1, 0, 2)
+    Q, K, V = split(h @ p["Wq"]), split(h @ p["Wk"]), split(h @ p["Wv"])
+    scores = Q @ K.transpose(0, 2, 1) / np.sqrt(dh)
+    scores = np.where(np.triu(np.ones((n, n), dtype=bool), 1), -np.inf, scores)
+    attn = (softmax(scores) @ V).transpose(1, 0, 2).reshape(n, d) @ p["Wo"]
+    x = x + attn                                        # residual connection 1
+    h = layer_norm(x, p["ln2_g"], p["ln2_b"])
+    x = x + gelu(h @ p["W1"] + p["b1"]) @ p["W2"] + p["b2"]   # residual connection 2
+    return x
+
+# A whole (tiny) decoder-only language model.
+rng = np.random.default_rng(0)
+V_size, d, L, n_heads = 100, 32, 2, 4
+emb = rng.normal(scale=0.02, size=(V_size, d))          # token embeddings, shared with the output layer
+pos = rng.normal(scale=0.02, size=(64, d))              # learned absolute positions
+blocks = [init_block(rng, d) for _ in range(L)]
+lnf_g, lnf_b = np.ones(d), np.zeros(d)
+
+tokens = np.array([5, 17, 42, 42, 7])
+x = emb[tokens] + pos[: len(tokens)]
+for p in blocks:
+    x = block(x, p, n_heads)
+logits = layer_norm(x, lnf_g, lnf_b) @ emb.T             # (n, V): a score for every next token
+print("logits shape:", logits.shape)
+print("next-token distribution after the last position sums to", round(float(softmax(logits[-1]).sum()), 6))
+
+# Count parameters and compare with the rule of thumb 12 * L * d^2.
+n_block = sum(a.size for a in blocks[0].values())
+total = n_block * L + emb.size + pos.size + 2 * d
+print(f"\nper block: {n_block}  (12 d^2 = {12 * d * d}; the rest are biases and norm gains)")
+print(f"total: {total}  of which embeddings: {emb.size + pos.size}")
+```
+
+The model is untrained, so its predictions are noise; training it is the subject of the <LessonLink slug="language-models">next lesson</LessonLink>. But every piece of a GPT-style model is here, and production code differs mainly in scale, in fused GPU kernels, and in the refinements listed above.
+
+As of 2026 a typical open-weight decoder (the Llama, Qwen, Mistral, DeepSeek, Gemma and OLMo families, among others) uses pre-norm RMSNorm, RoPE, SwiGLU, grouped-query attention, no bias terms, and increasingly a mixture-of-experts MLP. Individual families add their own twists — normalising queries and keys, alternating full attention with sliding-window layers, compressing the key–value cache — and closed frontier labs publish fewer details, but nothing suggests their cores are fundamentally different.
+
+</Section>
+
+<Section id="variants" kind="human" title="Encoders, decoders and both">
+
+The original transformer was an **encoder–decoder** for translation. Three variants descend from it:
+
+| Variant | Attention | Trained to | Examples | Good for |
+| --- | --- | --- | --- | --- |
+| Encoder-only | bidirectional: every token sees every token | fill in masked-out tokens | BERT and its descendants | classification, search embeddings, tagging |
+| Decoder-only | causal: each token sees only earlier ones | predict the next token | GPT series and almost every current LLM | generation of any kind |
+| Encoder–decoder | encoder bidirectional; decoder causal, plus **cross-attention** | map an input sequence to an output sequence | original transformer, T5, many speech models | translation, transcription, summarisation |
+
+In **cross-attention** the queries come from the decoder and the keys and values from the encoder's output — exactly Bahdanau's 2014 mechanism, now without the RNN.
+
+Why did decoder-only models win the language-model race? One objective — predict the next token — turns every text on the internet into training data, scales smoothly, and yields a model that can do any task phrased as text continuation, translation included. Encoder–decoder models remain competitive where input and output are clearly separate (speech recognition is a common case), and bidirectional encoders still power much of search and classification because they are small and fast.
+
+</Section>
+
+<Section id="counting" kind="examples" title="Counting parameters and FLOPs">
+
+You should be able to estimate a transformer's size and training cost on the back of an envelope. Ignore biases and norms (tiny), and use $d$ for the model width, $L$ for the number of blocks, $V$ for the vocabulary size.
+
+**Parameters per block.** Attention has four $d \times d$ matrices ($W_Q, W_K, W_V, W_O$): $4d^2$. The MLP has $d \times 4d$ and $4d \times d$: $8d^2$. Total $12d^2$ per block, so
+
+$$
+N \approx 12 L d^2 + V d ,
+$$
+
+the second term being the embedding table (doubled if the output layer is not tied to it).
+
+**FLOPs.** A matrix–vector product with an $a \times b$ matrix costs $ab$ multiply–adds, that is $2ab$ floating-point operations. Every weight is used once per token in the forward pass, so the forward pass costs about $2N$ FLOPs per token. The backward pass computes gradients with respect to both activations and weights and costs about twice the forward. Hence the rule used throughout the field:
+
+$$
+C_{\text{train}} \approx 6 N D \quad \text{FLOPs for } D \text{ training tokens.}
+$$
+
+The attention scores add a term the parameter count does not see: for each token and layer, the dot products with $n_{\text{ctx}}$ keys and the weighted sum of $n_{\text{ctx}}$ values cost about $4 n_{\text{ctx}} d$ FLOPs. With a causal mask a token attends to $n_{\text{ctx}}/2$ positions on average, so about $2 n_{\text{ctx}} d$. Relative to the $2 \times 12 d^2 = 24 d^2$ FLOPs per token and layer spent on the weights, that is a fraction of about $n_{\text{ctx}} / (12 d)$. For typical widths and contexts of a few thousand tokens it is small; for contexts of hundreds of thousands of tokens it dominates.
+
+<Example title="GPT-3 on the back of an envelope">
+
+GPT-3's largest model ([Brown et al., 2020](https://arxiv.org/abs/2005.14165)) has $L = 96$ layers, $d = 12{,}288$ and a vocabulary of about 50,000 tokens.
+
+- Blocks: $12 \times 96 \times 12{,}288^2 \approx 1.74 \times 10^{11}$.
+- Embeddings: $50{,}257 \times 12{,}288 \approx 6.2 \times 10^{8}$.
+- Total: about 175 billion — the published figure.
+
+It was trained on about 300 billion tokens, so $C \approx 6 \times 1.75 \times 10^{11} \times 3 \times 10^{11} \approx 3.1 \times 10^{23}$ FLOPs, which matches the paper's own estimate. With a context of 2,048 tokens, attention scores add only about $2048 / (12 \times 12288) \approx 1.4\%$.
+
+</Example>
+
+These rules are how labs budget training runs, and you will use them in every remaining lesson: to pick model sizes (<LessonLink slug="language-models">Language models</LessonLink>), to plan clusters (<LessonLink slug="accelerators-and-parallelism">Accelerators</LessonLink>) and to price inference (<LessonLink slug="inference-at-scale">Serving models</LessonLink>).
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The attention weights show what the model is thinking about."** They show how one head mixes value vectors in one layer. The values themselves can be large or near zero, many heads and layers combine, and quite different weight patterns can produce similar outputs. Attention maps are a useful hint, not an explanation (<LessonLink slug="interpretability">Interpretability</LessonLink>).
+
+</Misconception>
+
+<Misconception>
+
+**"Transformers understand word order because they read left to right."** Attention itself is order-blind; order enters only through positional information. Even a causal mask gives only a weak, implicit sense of position. Remove the positional scheme from a bidirectional model and it really does see a bag of words.
+
+</Misconception>
+
+<Misconception>
+
+**"The quadratic cost of attention dominates everything."** For contexts of a few thousand tokens the MLPs and projections, which grow with $d^2$, cost far more. The quadratic term takes over only at long contexts, which is exactly where FlashAttention, sparse and sliding-window attention, and recurrent hybrids come in.
+
+</Misconception>
+
+<Misconception>
+
+**"The 4× MLP width, 8 heads and 10,000 RoPE base are laws."** They are conventions that worked. Production models vary all of them; the RoPE base, for instance, is routinely raised to support longer contexts.
+
+</Misconception>
+
+<Misconception>
+
+**"Decoder-only models can't do understanding tasks; you need BERT for that."** A large decoder-only model, prompted or fine-tuned, does classification and extraction very well. Encoders persist because they are cheap, not because decoders can't.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

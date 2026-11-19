@@ -1,0 +1,483 @@
+---
+title: Serving models
+subtitle: Prefill and decode, the KV cache and its memory, batching, quantisation, speculative decoding, distillation — and what a token really costs.
+minutes: 75
+objectives:
+  - Distinguish prefill from decode and explain why decode is memory-bandwidth-bound
+  - Implement a KV cache, show that it gives identical outputs, and compute its memory for real model shapes
+  - Explain continuous batching and PagedAttention, and measure the memory they save
+  - Implement symmetric int8 and int4 quantisation and measure its error, with and without grouping
+  - Explain speculative decoding and prove that it leaves the output distribution unchanged
+  - Reason about latency, throughput and cost per token, and where distillation fits
+prerequisites: [attention-and-transformers, language-models, accelerators-and-parallelism, operating-systems]
+related: [math.comp.numerical-analysis, math.prob.probability-theory]
+references:
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+    author: Kwon et al.
+    year: 2023
+    url: https://arxiv.org/abs/2309.06180
+    note: The vLLM paper.
+  - title: vLLM
+    url: https://github.com/vllm-project/vllm
+    note: Open-source serving engine built on PagedAttention.
+  - title: SGLang
+    url: https://github.com/sgl-project/sglang
+    note: Open-source serving engine with prefix caching (RadixAttention).
+  - title: TensorRT-LLM
+    author: NVIDIA
+    url: https://github.com/NVIDIA/TensorRT-LLM
+  - title: llama.cpp
+    url: https://github.com/ggml-org/llama.cpp
+    note: Inference on laptops, phones and CPUs with aggressive quantisation.
+  - title: "Fast Inference from Transformers via Speculative Decoding"
+    author: Leviathan, Kalman, Matias
+    year: 2022
+    url: https://arxiv.org/abs/2211.17192
+  - title: "Accelerating Large Language Model Decoding with Speculative Sampling"
+    author: Chen et al.
+    year: 2023
+    url: https://arxiv.org/abs/2302.01318
+  - title: "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale"
+    author: Dettmers, Lewis, Belkada, Zettlemoyer
+    year: 2022
+    url: https://arxiv.org/abs/2208.07339
+  - title: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"
+    author: Frantar, Ashkboos, Hoefler, Alistarh
+    year: 2022
+    url: https://arxiv.org/abs/2210.17323
+  - title: "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration"
+    author: Lin et al.
+    year: 2023
+    url: https://arxiv.org/abs/2306.00978
+  - title: "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models"
+    author: Xiao et al.
+    year: 2022
+    url: https://arxiv.org/abs/2211.10438
+  - title: "Distilling the Knowledge in a Neural Network"
+    author: Hinton, Vinyals, Dean
+    year: 2015
+    url: https://arxiv.org/abs/1503.02531
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+    author: Ainslie et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.13245
+  - title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model"
+    author: DeepSeek-AI
+    year: 2024
+    url: https://arxiv.org/abs/2405.04434
+    note: Introduces multi-head latent attention, which compresses the KV cache.
+---
+
+<Section id="motivation" kind="motivation" title="Training happens once; inference happens billions of times">
+
+A model is trained once, over a few months. If it is popular, it then answers questions for years, for millions of people. For widely used models, the total compute spent on **inference** can rival or exceed the training run, and inference is what users feel: how long before the first word appears, how fast the rest streams, and what it costs.
+
+Serving a language model turns out to be a very different engineering problem from training one. Training pushes huge batches of tokens through the model and is compute-bound (<LessonLink slug="accelerators-and-parallelism">previous lesson</LessonLink>). Generation produces one token at a time per user, and that makes it — surprisingly at first — limited by memory bandwidth, and then by memory capacity. Almost every technique in this lesson attacks one of those two limits.
+
+The numbers that serving teams watch:
+
+- **Time to first token (TTFT)**: how long a user waits before output begins.
+- **Time per output token (TPOT)**, or inter-token latency: how fast the text streams after that.
+- **Throughput**: total tokens per second across all users, which sets the cost.
+- **Cost per million tokens**, the unit in which model APIs are priced.
+
+</Section>
+
+<Section id="phases" kind="definitions" title="Prefill and decode">
+
+A request goes through two phases.
+
+<Definition term="Prefill and decode">
+
+**Prefill** runs the whole prompt through the model in one forward pass, computing every layer for all prompt tokens in parallel, and produces the first output token. **Decode** then generates the remaining tokens one at a time: each step runs the model on the single newest token, attending to everything before it, and samples the next.
+
+</Definition>
+
+Prefill looks like training without the backward pass: a prompt of 2,000 tokens multiplies a $2000 \times d$ matrix by each weight matrix. That is compute-bound, and it determines TTFT.
+
+Decode is different. Each step multiplies a *single* vector by every weight matrix in the model. Every weight must be read from memory, used for one multiply–add, and discarded. The arithmetic intensity is about one FLOP per byte (two FLOPs per two-byte weight), far below the ridge point of a few hundred (<LessonLink slug="accelerators-and-parallelism">Accelerators</LessonLink>). The GPU spends almost all its time waiting for memory.
+
+<Example title="A lower bound on decode speed">
+
+An 8-billion-parameter model in BF16 occupies 16 GB. On a GPU with 3.35 TB/s of memory bandwidth, merely reading the weights once takes $16 \times 10^9 / 3.35 \times 10^{12} \approx 4.8$ ms. So a single user can never get more than about 210 tokens per second from that model on that GPU, however many FLOPs it has to spare.
+
+Now decode for 64 users at once. Each weight, read once, is used for 64 multiply–adds instead of one. The step takes barely longer, but produces 64 tokens. **Batching is how decode becomes efficient**, and much of serving engineering is about making large batches possible.
+
+</Example>
+
+</Section>
+
+<Section id="kv-cache" kind="computation" title="The KV cache">
+
+In causal attention, the key and value vectors of a token depend only on that token and the ones before it. Once computed, they never change. So instead of recomputing the keys and values of the entire sequence at every decode step, we store them — in every layer — and compute only the new token's. That store is the **KV cache**.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+d, vocab = 16, 50
+E = rng.normal(size=(vocab, d))                       # token embeddings
+Wq, Wk, Wv = (rng.normal(scale=d**-0.5, size=(d, d)) for _ in range(3))
+W_out = rng.normal(size=(d, vocab))
+
+def softmax(z):
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+def next_token_no_cache(tokens, counter):
+    """Recompute keys and values for the whole sequence at every step."""
+    X = E[tokens]
+    K, V = X @ Wk, X @ Wv
+    counter["kv_rows"] += len(tokens)
+    q = X[-1] @ Wq
+    h = softmax(K @ q / np.sqrt(d)) @ V
+    return int(np.argmax(h @ W_out))
+
+def next_token_with_cache(token, cache, counter):
+    """Compute key and value for the newest token only; reuse the cached ones."""
+    x = E[token]
+    cache["K"].append(x @ Wk)
+    cache["V"].append(x @ Wv)
+    counter["kv_rows"] += 1
+    K, V = np.array(cache["K"]), np.array(cache["V"])
+    h = softmax(K @ (x @ Wq) / np.sqrt(d)) @ V
+    return int(np.argmax(h @ W_out))
+
+prompt = [3, 14, 15, 9, 26]
+steps = 40
+
+c1 = {"kv_rows": 0}
+seq = list(prompt)
+for _ in range(steps):
+    seq.append(next_token_no_cache(seq, c1))
+
+c2 = {"kv_rows": 0}
+cache = {"K": [], "V": []}
+for t in prompt[:-1]:                                  # prefill: cache the prompt
+    cache["K"].append(E[t] @ Wk); cache["V"].append(E[t] @ Wv)
+    c2["kv_rows"] += 1
+seq2 = list(prompt)
+tok = prompt[-1]
+for _ in range(steps):
+    tok = next_token_with_cache(tok, cache, c2)
+    seq2.append(tok)
+
+print("same tokens generated:", seq == seq2)
+print("key/value rows computed without cache:", c1["kv_rows"])
+print("key/value rows computed with cache:   ", c2["kv_rows"])
+```
+
+Identical output, and the work on keys and values drops from quadratic in the sequence length to linear. In a real multi-layer model the same holds layer by layer: thanks to the causal mask, the hidden states of earlier positions — and hence their keys and values in every layer — never change when later tokens arrive.
+
+The price is memory, and it is large.
+
+<Definition term="KV cache size">
+
+For a model with $L$ layers, $n_{kv}$ key–value heads of dimension $d_{\text{head}}$, storing $b$ bytes per number, the cache for one token takes
+
+$$
+2 \times L \times n_{kv} \times d_{\text{head}} \times b \ \text{ bytes}
+$$
+
+(the 2 is for keys and values), and a batch of $B$ sequences of length $T$ takes $B \times T$ times that.
+
+</Definition>
+
+<Example title="KV cache sizes of real model shapes (16-bit)">
+
+| Shape | $L$ | $n_{kv}$ | $d_{\text{head}}$ | per token | one 128k-token sequence |
+| --- | --- | --- | --- | --- | --- |
+| 7B, full multi-head (Llama 2 7B) | 32 | 32 | 128 | 512 KiB | 64 GiB |
+| 8B, grouped-query (Llama 3 8B) | 32 | 8 | 128 | 128 KiB | 16 GiB |
+| 70B, grouped-query (Llama 3 70B) | 80 | 8 | 128 | 320 KiB | 40 GiB |
+
+A single long conversation with a 70B model needs 40 GiB of cache — more than a quarter of the model's own weights. Multiply by a batch of users and the cache, not the weights, is what fills the GPU.
+
+</Example>
+
+This is why so much architecture work since 2023 has gone into shrinking the cache: **grouped-query** and **multi-query attention** share keys and values across heads (a 4× saving in the table above); **sliding-window** layers keep only the last few thousand tokens; DeepSeek's **multi-head latent attention** ([DeepSeek-V2](https://arxiv.org/abs/2405.04434)) stores a compressed latent vector per token instead of full keys and values, cutting the cache by over 90% relative to their earlier dense model; and the cache itself can be quantised to 8 bits or fewer. Recurrent and state-space layers (<LessonLink slug="deep-architectures">Convolutions, sequences and embeddings</LessonLink>) avoid a growing cache altogether, which is a large part of their appeal.
+
+</Section>
+
+<Section id="batching" kind="human" title="Batching and memory management">
+
+Batching makes decode efficient, but requests are messy: they arrive at random times, with prompts of different lengths, and finish after different numbers of tokens.
+
+**Static batching** gathers a batch, runs it until the *longest* request finishes, and only then starts the next batch. Short requests sit idle in finished slots, and new requests queue.
+
+**Continuous batching** (also called iteration-level scheduling or in-flight batching, introduced by the Orca system in 2022) re-forms the batch at *every decode step*: finished sequences leave immediately and waiting requests join. GPU utilisation and throughput rise dramatically, and all modern serving engines do it.
+
+That creates a memory-management problem. Each sequence's KV cache grows by one token per step, to a length nobody knows in advance. Early systems reserved a contiguous slab of memory for the maximum possible length of every sequence. The [vLLM paper](https://arxiv.org/abs/2309.06180) (Kwon et al., 2023) measured that such systems wasted most of their KV memory to over-reservation and fragmentation.
+
+**PagedAttention**, vLLM's answer, borrows the idea of virtual memory from <LessonLink slug="operating-systems">operating systems</LessonLink>. KV memory is divided into fixed-size **blocks** of, say, 16 tokens. Each sequence has a **block table** mapping its logical blocks to physical blocks anywhere in memory, and a new block is allocated only when the last one fills. The attention kernel follows the block table. Waste is limited to the unfilled part of each sequence's last block.
+
+```python run
+import numpy as np
+
+class PagedKVCache:
+    """Toy block manager in the spirit of PagedAttention: KV memory is a pool of fixed-size blocks,
+    and each sequence has a block table mapping its logical blocks to physical ones."""
+    def __init__(self, num_blocks, block_size):
+        self.block_size = block_size
+        self.free = list(range(num_blocks))
+        self.tables = {}          # sequence id -> list of physical block ids
+        self.lengths = {}         # sequence id -> tokens stored
+
+    def append_token(self, seq):
+        n = self.lengths.get(seq, 0)
+        if n % self.block_size == 0:              # current block full (or none yet): grab a new one
+            if not self.free:
+                raise MemoryError("out of KV blocks: a sequence must wait or be preempted")
+            self.tables.setdefault(seq, []).append(self.free.pop())
+        self.lengths[seq] = n + 1
+
+    def finish(self, seq):
+        self.free.extend(self.tables.pop(seq))
+        del self.lengths[seq]
+
+    def slots_in_use(self):
+        return sum(len(t) for t in self.tables.values()) * self.block_size
+
+rng = np.random.default_rng(0)
+MAX_LEN, BLOCK = 2048, 16
+lengths = rng.integers(50, 1200, size=24)            # how long each request will actually get
+
+cache = PagedKVCache(num_blocks=4000, block_size=BLOCK)
+for step in range(int(lengths.max())):               # all sequences decode together, one token per step
+    for seq, n in enumerate(lengths):
+        if step < n:
+            cache.append_token(seq)
+
+used = int(lengths.sum())
+print(f"tokens actually stored:            {used:6d}")
+print(f"paged: slots allocated             {cache.slots_in_use():6d}  ({cache.slots_in_use() / used - 1:.1%} waste)")
+print(f"contiguous, reserved at max length {len(lengths) * MAX_LEN:6d}  ({len(lengths) * MAX_LEN / used - 1:.0%} waste)")
+print("block table of sequence 0:", cache.tables[0][:6], "... (physical blocks need not be adjacent)")
+cache.finish(0)
+print("free blocks after sequence 0 finishes:", len(cache.free))
+```
+
+Paging wastes about 1% here against over 200% for reservation at maximum length; in practice that means several times more concurrent sequences on the same GPU, and correspondingly higher throughput. Paging also enables **sharing**: when several requests begin with the same text — the same long system prompt, or several samples from one prompt — their block tables can point to the same physical blocks, copied only when they diverge (copy-on-write, again straight from operating systems). Engines such as [SGLang](https://github.com/sgl-project/sglang) organise cached prefixes in a tree so any new request can reuse the longest matching prefix. Commercial APIs expose this as **prompt caching**, typically billing cached input tokens at a steep discount.
+
+Two further ideas complete the modern picture. **Chunked prefill** splits a long prompt into pieces processed alongside other requests' decode steps, so one huge prompt does not stall everyone's streaming. **Prefill–decode disaggregation** runs the two phases on separate pools of machines, each tuned for its bottleneck (compute for prefill, memory bandwidth for decode), and ships the KV cache from one to the other. Several large providers have described running this way.
+
+</Section>
+
+<Section id="quantisation" kind="computation" title="Quantisation">
+
+Since decode is limited by the bytes read per token, storing weights in fewer bits makes it faster almost in proportion — and lets a model fit on fewer or smaller devices.
+
+<Definition term="Symmetric quantisation">
+
+To quantise real numbers $w$ to signed $k$-bit integers, let $q_{\max} = 2^{k-1} - 1$ (127 for int8, 7 for int4) and choose a **scale** $s = \max |w| / q_{\max}$. Store $q = \operatorname{round}(w / s)$, clipped to $[-q_{\max}, q_{\max}]$, and recover $\hat w = s\,q$. The rounding error per weight is at most $s/2$. A **per-tensor** scheme uses one scale for the whole matrix; a **per-channel** or **per-group** scheme uses one scale for each row or each block of, say, 128 consecutive weights.
+
+</Definition>
+
+The catch is outliers. Trained LLMs have a few weights, and especially a few activation dimensions, far larger than the rest ([LLM.int8()](https://arxiv.org/abs/2208.07339) documented systematic outlier features in large models). A single outlier sets the scale for everything sharing it, and the ordinary weights get crushed to zero:
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+W = rng.normal(scale=0.02, size=(512, 1024)).astype(np.float32)   # a weight matrix
+W.flat[rng.choice(W.size, 20, replace=False)] = 0.4               # a few large outliers, as real LLM weights have
+x = rng.normal(size=(8, 512)).astype(np.float32)                   # a batch of activations
+
+def quantize(w, bits, group_size=None):
+    """Symmetric quantisation: one scale per group (or per tensor), integers in [-qmax, qmax]."""
+    qmax = 2 ** (bits - 1) - 1                    # 127 for int8, 7 for int4
+    groups = w.reshape(1, -1) if group_size is None else w.reshape(-1, group_size)
+    scale = np.abs(groups).max(axis=1, keepdims=True) / qmax
+    q = np.clip(np.round(groups / scale), -qmax, qmax).astype(np.int8)
+    return q, scale
+
+def dequantize(q, scale, shape):
+    return (q * scale).reshape(shape).astype(np.float32)
+
+def rel_err(a, b):
+    return np.linalg.norm(a - b) / np.linalg.norm(a)
+
+print(f"{'format':24s} {'bytes':>9s} {'weight error':>13s} {'output error':>13s}")
+print(f"{'bf16 (reference)':24s} {W.size * 2:9d} {'-':>13s} {'-':>13s}")
+for bits in [8, 4]:
+    for gs in [None, 128]:
+        q, s = quantize(W, bits, gs)
+        W_hat = dequantize(q, s, W.shape)
+        nbytes = W.size * bits // 8 + s.size * 2            # integers plus 16-bit scales
+        name = f"int{bits}, " + ("per-tensor" if gs is None else f"groups of {gs}")
+        print(f"{name:24s} {nbytes:9d} {rel_err(W, W_hat):13.4f} {rel_err(x @ W, x @ W_hat):13.4f}")
+
+q, s = quantize(W, 4)
+print(f"\nper-tensor int4: the outliers set the scale to {s.item():.4f}, so",
+      f"{np.mean(q == 0):.0%} of all weights round to zero")
+```
+
+Per-tensor int4 is useless here (77% error, most weights zeroed), while int4 with groups of 128 costs only 3% more memory than per-tensor and cuts the error sixfold. Real methods go much further:
+
+- **GPTQ** ([Frantar et al.](https://arxiv.org/abs/2210.17323)) quantises weights one column at a time and adjusts the not-yet-quantised weights to compensate for each rounding error, using second-order information from a small calibration set.
+- **AWQ** ([Lin et al.](https://arxiv.org/abs/2306.00978)) observes that a small fraction of weights matter most — those multiplying large activations — and rescales channels to protect them.
+- **Activation quantisation** is harder because activations have the worst outliers; **SmoothQuant** ([Xiao et al.](https://arxiv.org/abs/2211.10438)) migrates the difficulty from activations into weights with a per-channel rescaling.
+
+As of 2026, serving in FP8 is routine on hardware that supports it, 4-bit weight formats are common for open models run locally (the GGUF formats of [llama.cpp](https://github.com/ggml-org/llama.cpp), for example), and newer accelerators support 4-bit floating-point formats natively; OpenAI's open-weight gpt-oss models were released with their expert weights already in a 4-bit format. Quality loss at 8 bits is usually negligible; at 4 bits it depends on the method and the model, and is easy to underestimate with a few spot checks. Measure on your own evaluations.
+
+</Section>
+
+<Section id="speculative" kind="computation" title="Speculative decoding">
+
+Decode wastes FLOPs: each step reads all the weights to process one token. Scoring *several* tokens at once would cost almost the same time, but we don't know the future tokens yet. Speculative decoding guesses them.
+
+A small, fast **draft** model proposes $k$ tokens. The large **target** model then scores all $k$ positions in one forward pass — like a short prefill — and accepts a prefix of the guesses. Proposed independently by [Leviathan, Kalman and Matias](https://arxiv.org/abs/2211.17192) at Google and [Chen et al.](https://arxiv.org/abs/2302.01318) at DeepMind, the method has a remarkable property: with the right acceptance rule, the output has *exactly* the target model's distribution.
+
+For each drafted token $x$, with target probability $p(x)$ and draft probability $q(x)$ in that context: accept with probability $\min(1, p(x)/q(x))$. On the first rejection, discard the remaining drafts and instead sample from the **residual** distribution $r(x) \propto \max(0,\, p(x) - q(x))$. If all $k$ are accepted, sample one bonus token from the target.
+
+<Theorem name="Speculative sampling is exact">
+
+The token emitted at each position is distributed exactly according to the target distribution $p$.
+
+</Theorem>
+
+<Proof>
+
+Let $\beta = \sum_y \min(p(y), q(y))$, the total acceptance probability. Token $x$ is emitted either by drawing $x$ from $q$ and accepting it, with probability $q(x) \min(1, p(x)/q(x)) = \min(p(x), q(x))$, or by rejecting the draft (probability $1 - \beta$) and then drawing $x$ from the residual, whose normalising constant is $\sum_y \max(0, p(y) - q(y)) = 1 - \beta$. The total is
+
+$$
+\min(p(x), q(x)) + (1 - \beta)\,\frac{\max(0, p(x) - q(x))}{1 - \beta} = \min(p(x), q(x)) + \max(0, p(x) - q(x)) = p(x).
+$$
+
+By induction the same holds at every subsequent position, conditioned on the tokens before it.
+
+</Proof>
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(0)
+V = 5
+# Toy "models": next-token distributions that depend only on the previous token (a Markov chain).
+P = rng.dirichlet(np.ones(V) * 0.5, size=V)          # the big target model
+Q = 0.7 * P + 0.3 * rng.dirichlet(np.ones(V), size=V) # a cheaper draft model: similar, not equal
+
+def speculative_step(prev, k):
+    """Draft k tokens with Q, verify them with P in one 'parallel' pass. Returns the accepted tokens."""
+    drafts, ctx = [], prev
+    for _ in range(k):                                # the draft runs k cheap sequential steps
+        t = rng.choice(V, p=Q[ctx]); drafts.append(t); ctx = t
+    out, ctx = [], prev
+    for t in drafts:                                  # the target scores all k positions at once
+        p, q = P[ctx], Q[ctx]
+        if rng.random() < min(1.0, p[t] / q[t]):      # accept with probability min(1, p/q)
+            out.append(t); ctx = t
+        else:                                         # reject: resample from the leftover mass
+            residual = np.maximum(p - q, 0)
+            out.append(rng.choice(V, p=residual / residual.sum()))
+            return out
+    out.append(rng.choice(V, p=P[ctx]))               # all accepted: one bonus token from the target
+    return out
+
+start, k, rounds = 0, 4, 20000
+first_two = np.zeros((V, V))
+tokens_per_pass = []
+for _ in range(rounds):
+    toks = speculative_step(start, k)
+    tokens_per_pass.append(len(toks))
+    if len(toks) >= 2:
+        first_two[toks[0], toks[1]] += 1
+    else:                                             # need a second token: run one more step
+        nxt = speculative_step(toks[0], k)
+        first_two[toks[0], nxt[0]] += 1
+
+empirical = first_two / rounds
+exact = P[start][:, None] * P                         # P(a | start) * P(b | a)
+print("largest gap between empirical and exact P(first two tokens):", round(float(np.abs(empirical - exact).max()), 4))
+print("mean tokens per target pass:", round(float(np.mean(tokens_per_pass)), 2), f"(at most {k + 1})")
+alpha = np.mean([np.minimum(P[c], Q[c]).sum() for c in range(V)])
+print(f"average acceptance probability per draft token ~ {alpha:.2f}")
+```
+
+The empirical distribution matches the exact one to within sampling noise, and each expensive target pass yields about four tokens instead of one. If each draft token is accepted with probability $\alpha$ (independently, as an approximation), the expected number of tokens per target pass is
+
+$$
+\frac{1 - \alpha^{k+1}}{1 - \alpha},
+$$
+
+which with $\alpha = 0.89$ and $k = 4$ is about 4.0, matching the simulation. Real speedups are smaller, since drafting costs time and acceptance rates on real text vary, but two- to three-fold speedups on suitable workloads are widely reported. Variants abound: extra prediction heads on the target model itself instead of a separate draft model (Medusa, EAGLE), drafts copied from the prompt (useful for code editing, where much output repeats input), and models trained from the start to predict several future tokens, as DeepSeek-V3 was.
+
+Note the subtlety in the guarantee. It holds for *sampling*; with greedy decoding the output is the same as the target's greedy output. In practice, floating-point differences between batched and unbatched computation mean outputs may still differ in rare near-ties.
+
+</Section>
+
+<Section id="distillation" kind="definitions" title="Distillation: a smaller model that learned from a larger one">
+
+The other way to make inference cheap is to serve a smaller model — ideally one nearly as good as a larger one.
+
+<Definition term="Knowledge distillation">
+
+Training a **student** model to imitate a **teacher** model. In the classic form ([Hinton, Vinyals and Dean, 2015](https://arxiv.org/abs/1503.02531)) the student is trained on the teacher's full output distribution — "soft targets", often softened with a temperature — rather than only on the correct labels. In **sequence-level** distillation, common for language models, the student is simply fine-tuned on text the teacher generated.
+
+</Definition>
+
+Soft targets carry more information than labels: a teacher that puts 30% on "sofa" when the answer is "couch" teaches the student something about both words. Distillation is now a standard part of building model families. Labs train small models partly on the outputs or logits of their largest ones, and DeepSeek released small open models distilled from the reasoning traces of its R1 model, which reasoned far better than models of the same size trained without them ([DeepSeek-R1](https://arxiv.org/abs/2501.12948)). Distilling from *another company's* model raises contractual questions, since many providers' terms of service forbid using outputs to train competing models.
+
+</Section>
+
+<Section id="tradeoffs" kind="examples" title="Latency, throughput and cost">
+
+Every serving decision moves along a trade-off curve.
+
+- **Batch size.** Larger batches raise throughput (and cut cost per token) until decode becomes compute-bound, but each step takes longer and the KV cache fills memory, so per-user latency worsens.
+- **Parallelism.** Splitting a model across more GPUs with tensor parallelism adds memory bandwidth to each decode step and lowers latency, but communication makes it less efficient per GPU.
+- **Precision.** Quantisation helps both latency and cost, at some risk to quality.
+- **Model size.** The biggest lever of all; hence distillation and small, overtrained models (<LessonLink slug="language-models">Language models</LessonLink>).
+
+<Example title="What does a million tokens cost?">
+
+Suppose, for illustration, a GPU rents for USD 2.50 per hour and a well-batched deployment of some model produces 2,000 output tokens per second on it. That is $2000 \times 3600 = 7.2$ million tokens per hour, or about USD 0.35 per million output tokens in hardware cost. Halve the batch to cut latency and throughput might fall to 1,200 tokens per second: USD 0.58 per million. Quantise to 8 bits and it might rise again.
+
+Real prices also cover idle capacity for traffic peaks, redundancy, networking, staff and margin, but the arithmetic explains two features of every price list: **output tokens cost several times more than input tokens**, because prompt tokens are processed in parallel during compute-efficient prefill while output tokens are generated one memory-bound step at a time; and **cached input tokens cost less still**, because their prefill was already done.
+
+</Example>
+
+For a product, the right point depends on the use. A chat interface needs a fast first token and steady streaming; a batch job summarising a million documents overnight cares only about throughput; an agent that calls a model hundreds of times per task (<LessonLink slug="reasoning-and-agents">Reasoning models, tools and agents</LessonLink>) multiplies every latency by the number of calls.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A faster GPU (more FLOPs) makes my chatbot respond faster."** At small batch sizes decode is limited by memory bandwidth, not FLOPs. Bandwidth, memory capacity and interconnect usually matter more for serving than peak compute.
+
+</Misconception>
+
+<Misconception>
+
+**"The KV cache is a small optimisation detail."** At long contexts and large batches it is often the largest thing in GPU memory, and it is why grouped-query attention, latent attention, paging and KV quantisation exist.
+
+</Misconception>
+
+<Misconception>
+
+**"Speculative decoding trades quality for speed."** With the acceptance rule above, the output distribution is exactly the target model's. The draft model affects only how *fast* you get there.
+
+</Misconception>
+
+<Misconception>
+
+**"4-bit quantisation is free."** Good 4-bit methods often lose little on standard benchmarks, but losses can concentrate in specific skills (long-context retrieval, multilingual text, careful reasoning). Evaluate on what you care about.
+
+</Misconception>
+
+<Misconception>
+
+**"Temperature 0 gives exactly reproducible outputs from an API."** Results of floating-point arithmetic depend on the order of operations, and that order can change with batch composition. Unless a system is specifically engineered for batch-invariant computation, identical requests can produce slightly different outputs.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
