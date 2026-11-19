@@ -1,4 +1,4 @@
-import { AlertTriangle, Atom, Binary, BookOpen, Boxes, Compass, Cpu, Dices, Donut, Eye, Feather, Globe2, Grid3x3, Hash, Infinity as InfinityIcon, Library, Lightbulb, MousePointerClick, Network, PencilLine, PencilRuler, ShieldCheck, Sparkles, Terminal, Triangle, Variable } from "lucide-react";
+import { AlertTriangle, AudioLines, Atom, Binary, BookOpen, Boxes, Compass, Cpu, Dices, Donut, Eye, Feather, Globe2, Grid3x3, Hash, Infinity as InfinityIcon, Languages, Library, Lightbulb, MessagesSquare, Landmark, SpellCheck, MousePointerClick, Network, PencilLine, PencilRuler, ShieldCheck, Sparkles, Terminal, Triangle, Variable } from "lucide-react";
 import type { Mode } from "@/components/ui/ModeBadge";
 
 export const SECTION_KINDS = {
@@ -19,6 +19,12 @@ export const SECTION_KINDS = {
   viewpoints: { mode: "H", Icon: Eye },
   history: { mode: null, Icon: Globe2 },
   reading: { mode: null, Icon: Library },
+  // Lumenary Lingua
+  vocabulary: { mode: null, Icon: Languages },
+  grammar: { mode: null, Icon: SpellCheck },
+  dialogue: { mode: null, Icon: MessagesSquare },
+  pronunciation: { mode: null, Icon: AudioLines },
+  culture: { mode: null, Icon: Landmark },
 } as const satisfies Record<string, { mode: Mode | null; Icon: unknown }>;
 
 export type SectionKind = keyof typeof SECTION_KINDS;

@@ -16,7 +16,9 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const computeDir = path.join(repoRoot, "compute");
-const verifyScript = path.join(computeDir, "verify.py");
+// `node scripts/verify-compute.mjs --courses …` runs compute/verify_courses.py instead (npm run verify:courses).
+const courses = process.argv[2] === "--courses";
+const verifyScript = path.join(computeDir, courses ? "verify_courses.py" : "verify.py");
 
 function findPython() {
   if (process.env.LUMENARY_PYTHON) return { python: process.env.LUMENARY_PYTHON, fromVenv: false };
@@ -39,7 +41,7 @@ if (!fromVenv && !process.env.LUMENARY_PYTHON) {
   );
 }
 
-const result = spawnSync(python, [verifyScript, ...process.argv.slice(2)], {
+const result = spawnSync(python, [verifyScript, ...process.argv.slice(courses ? 3 : 2)], {
   cwd: repoRoot,
   stdio: "inherit",
 });
