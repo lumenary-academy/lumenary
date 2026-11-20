@@ -61,6 +61,7 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/en/robotics/`, `/en/robotics/[slug]/` | Lumenary Robotics: the course page and its lessons (English only) |
 | `/en/chemistry/`, `/en/chemistry/[slug]/` | Lumenary Chemistry: the course page and its lessons (English only) |
 | `/en/me/`, `/en/me/[slug]/` | Lumenary ME: the course page and its lessons (English only) |
+| `/en/materials/`, `/en/materials/[slug]/` | Lumenary Materials: the course page and its lessons (English only) |
 | `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site (see "Lumenary Lingua and Lumenary Prep" below), and `vercel.json` redirects these old addresses there |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
 
