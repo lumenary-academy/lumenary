@@ -176,7 +176,7 @@ it("course pages are linked to their teaching locale", async () => {
   expect(href("es", "cs/complexity")).toBe("/en/cs/complexity/");
   expect(href("ar", "cs/languages/rust/")).toBe("/en/cs/languages/rust/");
   expect(href("hi", "ee#levels")).toBe("/en/ee/#levels");
-  expect(href("es", "divisions")).toBe("/es/divisions/");
+  expect(href("es", "about")).toBe("/es/about/");
 });
 
 it("links into a Scientia subject that is not published yet are plain text until it is", async () => {

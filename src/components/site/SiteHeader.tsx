@@ -6,17 +6,17 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useI18n } from "@/i18n/client";
 import { href } from "@/lib/href";
-import { ACADEMY_MORE, ACADEMY_NAV, MATH_MORE, MATH_NAV, navHref, SCIENTIA_MORE, SCIENTIA_NAV, siteSection, type NavItem } from "@/lib/site-nav";
+import { MATH_MORE, MATH_NAV, navHref, SCIENTIA_MORE, SCIENTIA_NAV, siteSection, type NavItem } from "@/lib/site-nav";
 import { LogoMark, Wordmark } from "@/components/brand/Logo";
 import { LanguageSelector } from "./LanguageSelector";
 import { CatToggle } from "./CatToggle";
 import { ThemeToggle } from "./ThemeToggle";
 
 /**
- * The site header. Its navigation depends on the part of the academy the page belongs to (see
- * src/lib/site-nav.ts): Lumenary Math's on Math's pages, Scientia's subjects on the other subjects'
- * pages, and the divisions and project pages everywhere else. `available` lists the course paths that
- * have pages (from the layout, which reads the content), so a subject appears only once its course is published.
+ * The site header. Its navigation depends on the part of the site the page belongs to (see
+ * src/lib/site-nav.ts): Lumenary Math's on Math's pages, and Lumenary Scientia's subjects everywhere
+ * else. `available` lists the course paths that have pages (from the layout, which reads the
+ * content), so a subject appears only once its course is published.
  */
 export function SiteHeader({ available = [] }: { available?: string[] }) {
   const { locale, t } = useI18n();
@@ -34,12 +34,11 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
 
   const section = siteSection(pathname);
   const published = (item: NavItem) => !item.course || available.includes(item.path);
-  const [nav, more] =
-    section === "math" ? [MATH_NAV, MATH_MORE] : section === "scientia" ? [SCIENTIA_NAV.filter(published), SCIENTIA_MORE.filter(published)] : [ACADEMY_NAV, ACADEMY_MORE];
+  const [nav, more] = section === "math" ? [MATH_NAV, MATH_MORE] : [SCIENTIA_NAV.filter(published), SCIENTIA_MORE.filter(published)];
 
   const isActive = (item: NavItem) => {
     const { path } = item;
-    if (item.site || path.startsWith("#")) return false;
+    if (item.site) return false;
     const target = `/${locale}/${path}`;
     if (path === "math") return pathname === `${target}/` || pathname === target;
     // Lumenary CS's own pages, but not its programming languages or electives, which have their own links.
@@ -48,7 +47,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
     return pathname.startsWith(target);
   };
 
-  /** A navigation link. The divisions with their own sites are plain links, marked as leaving this site. */
+  /** A navigation link. Links to other sites are plain links, marked as leaving this site. */
   const navLink = (item: NavItem, label: string, className: string) =>
     item.site ? (
       <a key={item.key} href={navHref(item, locale)} title={t(`nav.${item.key}`)} className={className}>

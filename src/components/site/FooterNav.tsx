@@ -6,7 +6,7 @@ import { siteSection, type SiteSection } from "@/lib/site-nav";
 
 export interface FooterLink {
   label: string;
-  /** A locale-prefixed path on this site, or a full URL (a division with its own site). */
+  /** A locale-prefixed path on this site, or a full URL (another site, or the source code). */
   href: string;
 }
 export interface FooterColumn {
@@ -15,10 +15,10 @@ export interface FooterColumn {
 }
 
 /**
- * The footer's columns, chosen by the part of the academy the page belongs to (src/lib/site-nav.ts).
+ * The footer's columns, chosen by the part of the site the page belongs to (src/lib/site-nav.ts).
  * The footer is rendered by the layout, which cannot know the page, so it passes every set of columns
  * and this picks one from the pathname; each exported page's HTML has only its own. `children` is
- * the footer's description of the academy, and Lumenary Math's motto follows it on Math's pages.
+ * the footer's description of Lumenary Scientia, and Lumenary Math's motto follows it on Math's pages.
  */
 export function FooterNav({ columns, motto, children }: { columns: Record<SiteSection, FooterColumn[]>; motto: string; children: React.ReactNode }) {
   const section = siteSection(usePathname() ?? "");

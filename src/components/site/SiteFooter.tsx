@@ -8,21 +8,21 @@ import { scientiaSubjects } from "@/lib/subjects";
 import { FooterNav, type FooterColumn, type FooterLink } from "./FooterNav";
 
 /**
- * The site footer. Its columns depend on the part of the academy the page belongs to (src/lib/site-nav.ts):
- * Lumenary Math's pages list the subjects, Math's tools and the project pages; the other subjects'
- * pages list the subjects with the electives, the three divisions and the project pages; every other
- * page lists only the three divisions and the project pages.
+ * The site footer. Its columns depend on the part of the site the page belongs to (src/lib/site-nav.ts):
+ * Lumenary Math's pages list the subjects, Math's tools and the project pages; every other page lists
+ * the subjects with the electives, Lumenary Academy and its two other divisions (on their own sites),
+ * and the project pages with the source code.
  */
 export function SiteFooter({ locale, t }: { locale: Locale; t: TFunction }) {
   const link = (item: NavItem): FooterLink => ({ label: t(`nav.${item.key}`), href: navHref(item, locale) });
   const subjects: FooterLink[] = scientiaSubjects().open.map((s) => ({ label: t(`divisions.${s.key}`), href: href(locale, s.path) }));
   const lingua = link(DIVISIONS_NAV.find((i) => i.key === "lingua")!);
-  // On the other subjects' pages, Lumenary CS's electives follow its programming languages.
+  // Outside Lumenary Math, Lumenary CS's electives follow its programming languages.
   const electives = SCIENTIA_MORE.find((i) => i.key === "electives")!;
   const after = subjects.findIndex((s) => s.href === href(locale, "cs/languages"));
   const withElectives = getCollection("cs/electives").length > 0 && after >= 0 ? [...subjects.slice(0, after + 1), link(electives), ...subjects.slice(after + 1)] : subjects;
 
-  const divisions: FooterColumn = { title: t("meta.siteName"), links: DIVISIONS_NAV.map(link) };
+  const divisions: FooterColumn = { title: t("nav.divisions"), links: DIVISIONS_NAV.map(link) };
   const project: FooterColumn = { title: t("footer.project"), links: PROJECT_PAGES.map(link) };
   const columns: Record<SiteSection, FooterColumn[]> = {
     math: [
@@ -31,7 +31,6 @@ export function SiteFooter({ locale, t }: { locale: Locale; t: TFunction }) {
       { title: t("footer.project"), links: MATH_PROJECT_PAGES.map(link) },
     ],
     scientia: [{ title: t("footer.subjects"), links: withElectives }, divisions, project],
-    academy: [divisions, project],
   };
 
   return (

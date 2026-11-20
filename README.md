@@ -1,18 +1,34 @@
-# Lumenary Academy
+# Lumenary Scientia
 
 **All the sciences. Many languages. Every nation.**
 
-Lumenary Academy is a Christian-inspired education project in three divisions. This repository holds its website, [lumenary.academy](https://lumenary.academy), the open subjects of Lumenary Scientia — **Lumenary Math**, **Lumenary Statistics**, **Lumenary CS** (with its programming-language courses and electives), **Lumenary EE**, **Lumenary Robotics**, **Lumenary Chemistry**, **Lumenary ME** and **Lumenary Materials**. **Lumenary Lingua** and **Lumenary Prep** have their own sites and repositories.
+Lumenary Scientia is the sciences division of Lumenary Academy, a Christian-inspired education project in three divisions. This repository, [lumenary-academy/lumenary-scientia](https://github.com/lumenary-academy/lumenary-scientia), builds its website, [scientia.lumenary.academy](https://scientia.lumenary.academy): **Lumenary Math**, **Lumenary Statistics**, **Lumenary CS** (with its programming-language courses and electives), **Lumenary EE**, **Lumenary Robotics**, **Lumenary Chemistry**, **Lumenary ME** and **Lumenary Materials**, free and open source for ever: no accounts, no advertising, no paid tiers.
 
-## The three divisions
-
-| Division | What it is | Status |
+| Subject | Where | Status |
 | --- | --- | --- |
-| **Lumenary Scientia** | The sciences, free and open source for ever: no accounts, no advertising, no paid tiers | Available: mathematics (**[Lumenary Math](content/math/README.md)**), statistics (**Lumenary Statistics**, `content/statistics/`), computer science (**Lumenary CS**, `content/cs/`, with programming languages from Assembly to Zig in `content/cs/languages/` and electives in `content/cs/electives/`), electrical engineering (**Lumenary EE**, `content/ee/`), robotics (**Lumenary Robotics**, `content/robotics/`), chemistry (**Lumenary Chemistry**, `content/chemistry/`) mechanical engineering (**Lumenary ME**, `content/me/`) and materials science (**Lumenary Materials**, `content/materials/`). Physics, biology and other sciences pending |
-| **Lumenary Lingua** | Languages, each taught through a language the learner already knows | At [lingua.lumenary.academy](https://lingua.lumenary.academy), built in its own repository, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua). Available, A1 to C2: Spanish taught in English and English taught in Spanish. Other pairs pending. Its old addresses here (`/<locale>/lingua/…`) redirect there (`vercel.json`) |
-| **Lumenary Prep** | Exam preparation as a paid service: one price per course, paid once, for lifetime access | At [prep.lumenary.academy](https://prep.lumenary.academy), built in a separate repository |
+| Mathematics (**[Lumenary Math](content/math/README.md)**) | `content/math/`, `formal/`, `compute/` | Available |
+| Chemistry (**Lumenary Chemistry**) | `content/chemistry/` | Available |
+| Statistics (**Lumenary Statistics**) | `content/statistics/` | Available |
+| Computer science (**Lumenary CS**), with programming languages from Assembly to Zig and electives | `content/cs/`, `content/cs/languages/`, `content/cs/electives/` | Available |
+| Electrical engineering (**Lumenary EE**) | `content/ee/` | Available |
+| Robotics (**Lumenary Robotics**) | `content/robotics/` | Available |
+| Mechanical engineering (**Lumenary ME**) | `content/me/` | Available |
+| Materials science (**Lumenary Materials**) | `content/materials/` | Available |
+| Physics, biology and other sciences | | Pending |
 
-Paying for Prep is never needed to use Scientia, and Scientia stays free and open source. The site's [divisions page](https://lumenary.academy/en/divisions/) (`content/pages/divisions/en.mdx`) has the details.
+## Lumenary Academy and its other divisions
+
+The rest of Lumenary Academy is built in other repositories:
+
+| Site | What it is | Repository |
+| --- | --- | --- |
+| [lumenary.academy](https://lumenary.academy) | Lumenary Academy's front page, with the three divisions and the academy-level About, Divisions and Contribute pages | [lumenary-academy/lumenary-academy](https://github.com/lumenary-academy/lumenary-academy) |
+| [lingua.lumenary.academy](https://lingua.lumenary.academy) | **Lumenary Lingua**: languages, each taught through a language the learner already knows | [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua) |
+| [prep.lumenary.academy](https://prep.lumenary.academy) | **Lumenary Prep**: exam preparation as a paid service (one price per course, paid once, for lifetime access) | A separate repository |
+
+Paying for Prep is never needed to use Scientia, and Scientia stays free and open source. The shared library [lumenary-academy/lumenary-core](https://github.com/lumenary-academy/lumenary-core) (`@lumenary/core`), which Lumenary Lingua is built on, will be adopted here later.
+
+This repository used to build lumenary.academy as well. Old addresses that now belong elsewhere redirect permanently (`vercel.json`): the divisions page (`/<locale>/divisions/`) to Lumenary Academy's site, and Lingua's courses (`/<locale>/lingua/…`) to Lumenary Lingua's. Lumenary Academy's site, in turn, redirects old Scientia addresses on lumenary.academy here.
 
 ## Lumenary Math
 
@@ -53,13 +69,13 @@ content/
   me/                Lumenary ME: course.json and lessons/<slug>/
   materials/         Lumenary Materials: course.json and lessons/<slug>/
   statistics/        Lumenary Statistics: course.json and lessons/<slug>/
-  pages/             About, Divisions, Contribute, Educators, evaluation package (MDX)
+  pages/             About, Contribute, Educators, evaluation package (MDX)
   registry/          languages.json, countries.json, glossaries/
   verification/      generated reports — never edit by hand
 formal/              Lean 4 project for Lumenary Math
 compute/             Python experiments for Lumenary Math, tests, verify.py, pinned requirements
 src/
-  app/[locale]/      routes (static export): the front page (the three divisions), math/, cs/, ee/, robotics/, chemistry/, me/, materials/, statistics/, and the project pages
+  app/[locale]/      routes (static export): the front page (Lumenary Scientia and its subjects), math/, cs/, ee/, robotics/, chemistry/, me/, materials/, statistics/, and the project pages
   components/        UI, lesson blocks, widgets, graph, exercises
   i18n/              locale config and message catalogues
   lib/               schemas (zod), content loaders, MDX, layout, sandbox
@@ -79,4 +95,4 @@ docs/                architecture, curriculum, i18n, design, testing, licensing,
 
 Software, Lean proofs and Python experiments: [Apache-2.0](LICENSE). Educational content (text, exercises, diagrams): [CC BY-SA 4.0](LICENSE-CONTENT). See [docs/licensing.md](docs/licensing.md).
 
-Lumenary Academy is an independent project. No institutional endorsement is implied.
+Lumenary Scientia is part of Lumenary Academy, an independent project. No institutional endorsement is implied.

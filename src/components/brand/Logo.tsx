@@ -1,4 +1,4 @@
-/** The Lumenary Academy mark: a four-pointed star of light inside a ring — a lamp, a compass, a point of wonder. */
+/** The Lumenary mark, shared by Lumenary Academy and its divisions: a four-pointed star of light inside a ring — a lamp, a compass, a point of wonder. */
 export function LogoMark({ size = 32, className = "" }: { size?: number; className?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" className={className} aria-hidden="true">
@@ -10,12 +10,13 @@ export function LogoMark({ size = 32, className = "" }: { size?: number; classNa
   );
 }
 
+/** This site's name, Lumenary Scientia. */
 export function Wordmark({ className = "" }: { className?: string }) {
   return (
     // Stacked so the longer name takes no more width in the header than "Lumenary" alone.
     <span className={`inline-flex flex-col font-display leading-none ${className}`}>
       <span className="text-[1.2rem] font-semibold tracking-tight text-ink">Lumenary</span>
-      <span className="mt-1 text-[0.6rem] font-medium uppercase tracking-[0.3em] text-ink-2">Academy</span>
+      <span className="mt-1 text-[0.6rem] font-medium uppercase tracking-[0.3em] text-ink-2">Scientia</span>
     </span>
   );
 }

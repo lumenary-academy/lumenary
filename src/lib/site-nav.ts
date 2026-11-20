@@ -1,27 +1,30 @@
 import { href } from "./href";
-import { linguaHome, PREP_URL } from "./sites";
+import { academyPage, linguaHome, PREP_URL, SOURCE_URL } from "./sites";
 
 /**
  * The site header's and footer's navigation. They were first designed for Lumenary Math alone; now
- * each page shows the navigation of the part of the academy it belongs to:
+ * each page shows the navigation of the part of Lumenary Scientia it belongs to:
  *
  * - "math": Lumenary Math's own pages (/math/…, the labs, practice, progress and the educator
  *   resources, which are built from Math's lessons) keep Math's navigation;
- * - "scientia": the pages of Lumenary Scientia's other subjects show the subjects, the programming
- *   languages and electives, the divisions and the project pages;
- * - "academy": everything else (the front page, the divisions, about, contribute, languages and
- *   verification pages) shows the three divisions and the project pages, and nothing of one subject.
+ * - "scientia": every other page (the front page, the other subjects' pages, and the about,
+ *   contribute, languages and verification pages) shows Scientia's subjects, the programming
+ *   languages and electives, and the project pages, and nothing of Math's tools.
  *
  * Labels are `nav.<key>` (and `nav.short.<key>` in the header). Paths are site paths without the
- * locale; `site` marks a division with its own site, linked by URL.
+ * locale; `site` marks a link to another site.
  */
-export type SiteSection = "math" | "scientia" | "academy";
+export type SiteSection = "math" | "scientia";
 
 export interface NavItem {
   key: string;
   path: string;
-  /** A division built elsewhere: linked to its own site instead of `path`. */
-  site?: "lingua" | "prep";
+  /**
+   * A link off this site, instead of to `path` here: a page of Lumenary Academy's site (`path` is
+   * its path there, "" for its front page), Lumenary Lingua's or Lumenary Prep's front page, or
+   * this site's source code.
+   */
+  site?: "academy" | "lingua" | "prep" | "source";
   /** A course's page: listed only once the course is published. */
   course?: true;
 }
@@ -40,7 +43,7 @@ export const MATH_NAV: NavItem[] = [
 ];
 /** The rest of the list in the menu on narrow screens, on Lumenary Math's pages. */
 export const MATH_MORE: NavItem[] = [
-  { key: "divisions", path: "divisions" },
+  { key: "divisions", path: "divisions", site: "academy" },
   { key: "progress", path: "progress" },
   { key: "languages", path: "languages" },
   { key: "contribute", path: "contribute" },
@@ -50,8 +53,8 @@ export const MATH_MORE: NavItem[] = [
 export const MATH_TOOLS: NavItem[] = MATH_NAV.filter((i) => !["math", "educators", "about"].includes(i.key));
 
 /**
- * Lumenary Scientia's subjects, linked to one another on the other subjects' pages. They are in the
- * order of SUBJECTS in src/lib/subjects.ts, which a test checks.
+ * Lumenary Scientia's subjects, linked to one another everywhere outside Lumenary Math. They are in
+ * the order of SUBJECTS in src/lib/subjects.ts, which a test checks.
  */
 export const SCIENTIA_NAV: NavItem[] = [
   { key: "math", path: "math" },
@@ -64,57 +67,59 @@ export const SCIENTIA_NAV: NavItem[] = [
   { key: "me", path: "me", course: true },
   { key: "materials", path: "materials", course: true },
 ];
-/** The rest of the list in the menu on narrow screens, on the other subjects' pages. */
+/** The rest of the list in the menu on narrow screens, outside Lumenary Math. */
 export const SCIENTIA_MORE: NavItem[] = [
   { key: "electives", path: "cs/electives", course: true },
-  { key: "divisions", path: "divisions" },
   { key: "about", path: "about" },
   { key: "contribute", path: "contribute" },
 ];
 
-/** Lumenary Academy's three divisions. Scientia's subjects are listed on the front page. */
+/** Lumenary Academy and its two other divisions, which have their own sites. */
 export const DIVISIONS_NAV: NavItem[] = [
-  { key: "scientia", path: "#subjects" },
+  { key: "academy", path: "", site: "academy" },
   { key: "lingua", path: "", site: "lingua" },
   { key: "prep", path: "", site: "prep" },
 ];
-/** The academy's own pages, which belong to no one subject. */
+/** This site's own pages, which belong to no one subject, and its source code. */
 export const PROJECT_PAGES: NavItem[] = [
   { key: "about", path: "about" },
-  { key: "divisions", path: "divisions" },
   { key: "contribute", path: "contribute" },
   { key: "languages", path: "languages" },
   { key: "verification", path: "verification" },
+  { key: "source", path: "", site: "source" },
 ];
 /** The footer's project column on Lumenary Math's pages, with Math's educator resources and progress page. */
 export const MATH_PROJECT_PAGES: NavItem[] = [
   { key: "about", path: "about" },
-  { key: "divisions", path: "divisions" },
+  { key: "divisions", path: "divisions", site: "academy" },
   { key: "educators", path: "educators" },
   { key: "contribute", path: "contribute" },
   { key: "languages", path: "languages" },
   { key: "verification", path: "verification" },
   { key: "progress", path: "progress" },
+  { key: "source", path: "", site: "source" },
 ];
-/** The header on the academy's pages: the divisions and the main project pages (the rest are in the menu on narrow screens). */
-export const ACADEMY_NAV: NavItem[] = [...DIVISIONS_NAV, ...PROJECT_PAGES.filter((i) => ["divisions", "about", "contribute"].includes(i.key))];
-export const ACADEMY_MORE: NavItem[] = PROJECT_PAGES.filter((i) => !ACADEMY_NAV.includes(i));
 
 /** Lumenary Math's pages: its front page and everything under /math/, the labs, practice, progress and the educator resources. */
 const MATH_PAGES = /^\/[^/]+\/(math|lab|formal|practice|progress|educators)(\/|$)/;
-/** The other subjects' pages, by first path segment (cs covers its programming languages and electives). */
-const SCIENTIA_PAGES = new RegExp(`^/[^/]+/(${[...new Set(SCIENTIA_NAV.filter((i) => i.key !== "math").map((i) => i.path.split("/")[0]))].join("|")})(/|$)`);
 
-/** The part of the academy a page belongs to, from its pathname ("/en/cs/functions/"). */
+/** The part of the site a page belongs to, from its pathname ("/en/cs/functions/"). */
 export function siteSection(pathname: string): SiteSection {
-  if (MATH_PAGES.test(pathname)) return "math";
-  if (SCIENTIA_PAGES.test(pathname)) return "scientia";
-  return "academy";
+  return MATH_PAGES.test(pathname) ? "math" : "scientia";
 }
 
-/** Where a navigation item links: a locale-prefixed page on this site, or a division's own site. */
+/** Where a navigation item links: a locale-prefixed page on this site, or another site. */
 export function navHref(item: NavItem, locale: string): string {
-  if (item.site === "lingua") return linguaHome(locale);
-  if (item.site === "prep") return PREP_URL;
-  return href(locale, item.path);
+  switch (item.site) {
+    case "academy":
+      return academyPage(locale, item.path);
+    case "lingua":
+      return linguaHome(locale);
+    case "prep":
+      return PREP_URL;
+    case "source":
+      return SOURCE_URL;
+    default:
+      return href(locale, item.path);
+  }
 }

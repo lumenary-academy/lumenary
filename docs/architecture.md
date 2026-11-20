@@ -1,5 +1,7 @@
 # Architecture
 
+This repository, [lumenary-academy/lumenary-scientia](https://github.com/lumenary-academy/lumenary-scientia), builds Lumenary Scientia's website, [scientia.lumenary.academy](https://scientia.lumenary.academy). The origin is `SITE_URL` in `src/lib/sites.ts` (the layout's `metadataBase` and the sitemap); `public/robots.txt` names the sitemap's address. The package name (`lumenary`), the Lean namespace (`Lumenary.*`) and the browser storage keys (`lumenary:*`) predate the move to this address and keep their names.
+
 ## Goals that shaped it
 
 - **Cheap, durable hosting, no lock-in.** The site is a fully static export (`next build` → `out/`). Any static host or CDN works, and nothing needs a server at runtime.
@@ -40,7 +42,7 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | Route | Page |
 | --- | --- |
 | `/` | Language negotiation (remembered choice → browser preferences → English), with a no-JS fallback list |
-| `/[locale]/` | Home: Lumenary Academy's three divisions (Lumenary Scientia, Lingua and Prep) |
+| `/[locale]/` | Home: Lumenary Scientia (what it is, its subjects with lessons to try, and a link to Lumenary Academy and its other divisions) |
 | `/[locale]/math/` | Lumenary Math's front page (part of Lumenary Scientia) |
 | `/[locale]/math/curriculum/` | Curriculum browser (filter by level, subject, pathway, status, objective text) |
 | `/[locale]/math/graph/` | Interactive knowledge graph (map and accessible list views) |
@@ -63,12 +65,13 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/en/me/`, `/en/me/[slug]/` | Lumenary ME: the course page and its lessons (English only) |
 | `/en/materials/`, `/en/materials/[slug]/` | Lumenary Materials: the course page and its lessons (English only) |
 | `/en/statistics/`, `/en/statistics/[slug]/` | Lumenary Statistics: the course page and its lessons (English only) |
-| `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site (see "Lumenary Lingua and Lumenary Prep" below), and `vercel.json` redirects these old addresses there |
-| `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
+| `/[locale]/about/`, `/[locale]/contribute/` | Project pages |
+| `/[locale]/divisions/` | No page: the divisions page is on Lumenary Academy's site (see "Lumenary Academy, Lingua and Prep" below), and `vercel.json` redirects this old address there |
+| `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site, and `vercel.json` redirects these old addresses there |
 
 ### Header and footer
 
-The header and footer show the navigation of the part of the academy a page belongs to (`src/lib/site-nav.ts`, `siteSection`). Lumenary Math's pages (`/math/…`, the labs, practice, progress and the educator resources) keep Math's navigation, its tools and its motto. The other subjects' pages link the subjects to one another, with the programming languages, the electives, the divisions and the project pages. Every other page (the front page, divisions, about, contribute, languages, verification) shows only the three divisions and the project pages. The footer is rendered by the layout, which cannot know the page, so it hands every set of columns to a small client component (`FooterNav`) that picks one from the pathname; each exported page's HTML contains only its own.
+The header shows the wordmark "Lumenary Scientia" (`src/components/brand/Logo.tsx`), and the header and footer show the navigation of the part of the site a page belongs to (`src/lib/site-nav.ts`, `siteSection`). Lumenary Math's pages (`/math/…`, the labs, practice, progress and the educator resources) keep Math's navigation, its tools and its motto. Every other page (the front page, the other subjects' pages, about, contribute, languages, verification) has Scientia's navigation: the header links the subjects and the programming languages, with the electives, about and contribute in the menu on narrow screens, and the footer lists the subjects with the electives, Lumenary Academy, Lingua and Prep (links to their own sites), and the project pages with the source code. Links to other sites are `NavItem`s with a `site` (`academy`, `lingua`, `prep`, `source`), which `navHref` resolves from the constants in `src/lib/sites.ts`. The footer is rendered by the layout, which cannot know the page, so it hands every set of columns to a small client component (`FooterNav`) that picks one from the pathname; each exported page's HTML contains only its own.
 
 ## Lesson architecture
 
@@ -86,13 +89,13 @@ Exercises live in `exercises.json` (types: `choice`, `integer`, `set`, `python`)
 
 Topic ids are namespaced (`math.*`) and subjects/levels are data. Subjects other than mathematics are **courses** (`src/lib/courses.ts`): a syllabus and lesson directories under `content/cs/`, `content/ee/` or `content/robotics/`, rendered by `src/components/course/CoursePages.tsx` with the same lesson components, plus highlighted and runnable code blocks (`CodeBlock`). Their code is run by `compute/verify_courses.py`, which writes `content/verification/course-code-report.json`. See [courses.md](courses.md).
 
-## Lumenary Lingua and Lumenary Prep
+## Lumenary Academy, Lingua and Prep
 
-Two of the academy's three divisions are not built here. **Lumenary Lingua**, the language courses, lives at [lingua.lumenary.academy](https://lingua.lumenary.academy), built from its own repository, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua), on the shared [@lumenary/core](https://github.com/lumenary-academy/lumenary-core) library. Its courses exist only in their teaching locale there: Spanish at `/en/spanish/`, English at `/es/ingles/`. **Lumenary Prep** lives at [prep.lumenary.academy](https://prep.lumenary.academy). This site links to both from the front page and the divisions page, with their base URLs in one place, `src/lib/sites.ts` (`LINGUA_URL`, `PREP_URL`).
+Lumenary Scientia is one of Lumenary Academy's three divisions, and the rest of the academy is built elsewhere. **Lumenary Academy's front page**, with the three divisions and the academy-level About, Divisions and Contribute pages, is [lumenary.academy](https://lumenary.academy), built from [lumenary-academy/lumenary-academy](https://github.com/lumenary-academy/lumenary-academy); it redirects old Scientia addresses on lumenary.academy here. **Lumenary Lingua**, the language courses, lives at [lingua.lumenary.academy](https://lingua.lumenary.academy), built from [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua) on the shared [@lumenary/core](https://github.com/lumenary-academy/lumenary-core) library, which this repository will adopt later. **Lumenary Prep** lives at [prep.lumenary.academy](https://prep.lumenary.academy). Their base URLs are in one place, `src/lib/sites.ts` (`ACADEMY_URL`, `LINGUA_URL`, `PREP_URL`, beside this site's own `SITE_URL` and `SOURCE_URL`); the front page's last line and the footer link all three, and the About and Contribute pages link the academy's own.
 
-The front page offers a few lessons to try from each division. Scientia's are listed with each subject in `SUBJECTS` (`src/lib/subjects.ts`): each subject's first lesson, titled from the lesson itself. Lingua's (the first lesson of each course) and Prep's (free samples, lessons marked `free: true` that anyone can open) are in `src/lib/sites.ts` (`LINGUA_SAMPLES`, `PREP_SAMPLES`). `tests/front-page-samples.test.ts` checks Scientia's against the syllabi and Lingua's against a pinned copy of its syllabi. Prep's content is private, so its links were checked with curl when chosen; check again before changing them.
+The front page offers a few lessons to try in each subject, listed with the subject in `SUBJECTS` (`src/lib/subjects.ts`): each subject's first lesson, titled from the lesson itself. `tests/front-page-samples.test.ts` checks them against the syllabi. (Lingua's and Prep's sample lessons are on Lumenary Academy's front page.)
 
-Lingua's courses used to be part of this site, at `/[locale]/lingua/…`. Those addresses redirect permanently (308) to the Lingua site in `vercel.json`: `…/lingua/spanish/…` to `/en/spanish/…` and `…/lingua/ingles/…` to `/es/ingles/…` from any locale, and anything else under `/[locale]/lingua/` to Lingua's front page in the same locale. The course rules come before the general one. Because the site is exported with `trailingSlash: true`, the sources end in an optional `/:path(.*)?` rather than `/:path*`, which Vercel compiles strictly and which would not match a trailing slash.
+Old addresses redirect permanently (308) in `vercel.json`. The divisions page used to be here, at `/[locale]/divisions/`; any address under it goes to the divisions page in the same locale on Lumenary Academy's site. Lingua's courses used to be here too, at `/[locale]/lingua/…`: `…/lingua/spanish/…` goes to `/en/spanish/…` and `…/lingua/ingles/…` to `/es/ingles/…` on Lingua's site from any locale, and anything else under `/[locale]/lingua/` to Lingua's front page in the same locale. The course rules come before the general one. Because the site is exported with `trailingSlash: true`, the sources end in an optional `/:path(.*)?` rather than `/:path*`, which Vercel compiles strictly and which would not match a trailing slash. `tests/site-nav.test.ts` checks that neither the navigation nor the content links the divisions page on this site.
 
 ## Page weight
 

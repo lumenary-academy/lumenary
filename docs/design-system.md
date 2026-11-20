@@ -4,7 +4,7 @@ Lumenary Academy should feel like a well-lit study: warm paper and deep ink by d
 
 ## Brand
 
-- **Name:** Lumenary Academy (public brand). Mathematics curriculum: **Lumenary Math**.
+- **Name:** **Lumenary Scientia**, the name of this site and its wordmark, is the sciences division of **Lumenary Academy**, the name of the whole. Its subjects are named after it: **Lumenary Math**, **Lumenary CS** and so on.
 - **Mark:** a four-pointed star of light inside a ring (`src/components/brand/Logo.tsx`). It reads as a lamp, a compass rose or a point of wonder, and it works at 16 px.
 - **Mottos:** "One mathematics. Many languages. Every nation." · "Understand. Prove. Compute. Verify." · "Master the present. Glimpse the future. Never require the future to understand the present."
 

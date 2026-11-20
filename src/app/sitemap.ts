@@ -3,10 +3,9 @@ import { LOCALES } from "@/i18n/config";
 import { getComputeReport, getGraph, getLeanReport, lessonSlugs, trailSlugs } from "@/lib/content";
 import { COLLECTIONS, getCourses } from "@/lib/courses";
 import { href } from "@/lib/href";
+import { SITE_URL } from "@/lib/sites";
 
 export const dynamic = "force-static";
-
-const SITE_URL = "https://lumenary.academy";
 
 /** Every public page in every demo locale (static export writes this to /sitemap.xml). */
 export default function sitemap(): MetadataRoute.Sitemap {
@@ -21,7 +20,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
     "practice/",
     "educators/",
     "about/",
-    "divisions/",
     "contribute/",
     "languages/",
     "verification/",
