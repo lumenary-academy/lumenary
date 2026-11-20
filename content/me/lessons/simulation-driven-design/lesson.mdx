@@ -1,0 +1,561 @@
+---
+title: Simulation-driven and generative design
+subtitle: Letting the analysis propose the shape — design optimisation and topology optimisation built from scratch, digital twins, machine-learned surrogates and generative design tools, and how far to trust any of it.
+minutes: 85
+objectives:
+  - Describe the simulation-driven design loop and distinguish a digital model, a digital shadow and a digital twin
+  - State a design optimisation problem and tell sizing, shape and topology optimisation apart
+  - Derive the compliance sensitivity used by SIMP topology optimisation, and implement a small 2-D SIMP optimiser in NumPy
+  - Fit a Gaussian-process surrogate to a handful of expensive runs and explain where its predictions and error bars can be trusted
+  - Separate verification, validation and uncertainty quantification, and run a mesh-convergence study with Richardson extrapolation
+  - Describe the commercial and open-source generative design and surrogate tools of 2026 fairly, including what they cannot yet do
+narrators: [chloe, margaret, gideon]
+prerequisites: [deflection-and-buckling, finite-element-method, computational-fluid-dynamics, engineering-design-and-cad, additive-manufacturing]
+related: [math.applied.optimisation, math.comp.numerical-analysis, math.analysis.pde-intro, math.prob.probability-theory]
+references:
+  - title: "Generating optimal topologies in structural design using a homogenization method"
+    author: Martin Bendsøe and Noboru Kikuchi
+    year: 1988
+    note: Computer Methods in Applied Mechanics and Engineering 71, 197–224. The paper that started modern topology optimisation.
+  - title: "A 99 line topology optimization code written in Matlab"
+    author: Ole Sigmund
+    year: 2001
+    note: Structural and Multidisciplinary Optimization 21, 120–127. The educational code from which a generation of engineers learned SIMP.
+  - title: "Efficient topology optimization in MATLAB using 88 lines of code"
+    author: Erik Andreassen, Anders Clausen, Mattias Schevenels, Boyan Lazarov and Ole Sigmund
+    year: 2011
+    note: Structural and Multidisciplinary Optimization 43, 1–16. A faster successor, with density filtering and sparse assembly.
+  - title: "Topology Optimization: Theory, Methods and Applications"
+    author: Martin Bendsøe and Ole Sigmund
+    year: 2003
+    note: The standard monograph (Springer).
+  - title: TopOpt research group, Technical University of Denmark
+    url: https://www.topopt.mek.dtu.dk/
+    note: Educational codes and apps for topology optimisation in several languages.
+  - title: "Gaussian Processes for Machine Learning"
+    author: Carl Edward Rasmussen and Christopher Williams
+    year: 2006
+    url: https://gaussianprocess.org/gpml/
+    note: The standard text on Gaussian-process regression; free to read online.
+  - title: "Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations"
+    author: Maziar Raissi, Paris Perdikaris and George Karniadakis
+    year: 2019
+    note: Journal of Computational Physics 378, 686–707.
+  - title: "Fourier Neural Operator for Parametric Partial Differential Equations"
+    author: Zongyi Li et al.
+    year: 2020
+    url: https://arxiv.org/abs/2010.08895
+  - title: "Learning Mesh-Based Simulation with Graph Networks"
+    author: Tobias Pfaff, Meire Fortunato, Alvaro Sanchez-Gonzalez and Peter Battaglia
+    year: 2020
+    url: https://arxiv.org/abs/2010.03409
+  - title: "Digital Twin in manufacturing: A categorical literature review and classification"
+    author: Werner Kritzinger, Matthias Karner, Georg Traar, Jan Henjes and Wilfried Sihn
+    year: 2018
+    note: IFAC-PapersOnLine 51(11), 1016–1022. The digital model, shadow and twin distinction used in this lesson.
+  - title: "Foundational Research Gaps and Future Directions for Digital Twins"
+    author: National Academies of Sciences, Engineering, and Medicine
+    year: 2024
+    note: A careful survey of what digital twins need — verification, validation, uncertainty quantification — and where research is lacking.
+  - title: "Perspective: A method for uniform reporting of grid refinement studies"
+    author: Patrick Roache
+    year: 1994
+    note: Journal of Fluids Engineering 116, 405–413. Introduces the grid convergence index.
+  - title: ASME verification and validation standards
+    url: https://www.asme.org/
+    note: ASME publishes V&V 10 (computational solid mechanics), V&V 20 (fluid dynamics and heat transfer) and V&V 40 (medical devices).
+  - title: NAFEMS
+    url: https://www.nafems.org/
+    note: The international association for engineering modelling, analysis and simulation; benchmarks, training and guidance on simulation quality.
+  - title: FEniCS Project
+    url: https://fenicsproject.org/
+    note: Open-source finite element software, widely used for research in PDE-constrained optimisation.
+  - title: code_aster
+    url: https://code-aster.org/
+    note: EDF's open-source structural and thermomechanical finite element solver.
+---
+
+<Section id="motivation" kind="motivation" title="Let the analysis propose the shape">
+
+For most of the twentieth century, analysis came after design. An engineer drew a part from experience, a stress analyst checked it, a prototype was built and broken, and the loop went round again, slowly and expensively. The <LessonLink slug="finite-element-method">finite element method</LessonLink> and <LessonLink slug="computational-fluid-dynamics">computational fluid dynamics</LessonLink> sped up the checking. The change of the last thirty years is more radical: simulation now runs *inside* the design loop, and can propose shapes nobody drew.
+
+In the early 2000s Airbus used topology optimisation to lay out the ribs in the leading edge of the A380's wing, and the result looked more like a truss than the plate ribs it replaced. Brackets in jet engines and satellites, the uprights of racing cars, the frames of electric bicycles and the nodes of steel roofs are now routinely shaped by an optimiser and finished by an engineer. <LessonLink slug="additive-manufacturing">Additive manufacturing</LessonLink> made many such shapes buildable for the first time.
+
+At the same time, the model no longer stops when the product ships. A **digital twin** is kept in step with one particular machine, fed by its sensors, and asked what will happen next. And a new tool, the **machine-learned surrogate**, promises answers from a trained network in milliseconds instead of hours of solver time.
+
+This lesson builds the core of each from scratch: a topology optimiser, a surrogate with error bars, and a mesh-convergence study. It ends with the question that matters most: when should you believe a simulation?
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="The loop, and three kinds of model">
+
+Simulation-driven design is a loop. Requirements and loads come in; the design is described by **design variables** (a thickness, a fillet radius, or the density of every element in a mesh); a solver predicts its behaviour; objectives and constraints are evaluated; and either an engineer or an optimiser changes the variables. When each solve takes hours, a **surrogate** fitted to earlier runs can stand in for the solver during the search, with the real solver checking the candidates it proposes.
+
+<Figure caption="The simulation-driven design loop. Design variables describe the part; a solver predicts its behaviour; an optimiser or an engineer changes the variables. A surrogate fitted to earlier runs can short-cut the expensive solver, and physical testing closes the loop with reality.">
+<svg viewBox="0 0 640 270" role="img" aria-label="A loop of five boxes. Requirements and loads feed into design variables and CAD, which leads to mesh and solve, which leads to evaluate objectives and constraints, which leads to an optimiser or engineer, which loops back to design variables. A dashed arrow labelled surrogate goes directly from design variables to evaluate, bypassing the solver. Below, a box labelled prototype and test sends validation data back to the solver.">
+  <defs>
+    <marker id="sd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="40" width="120" height="50" rx="6" />
+    <rect x="170" y="40" width="130" height="50" rx="6" />
+    <rect x="340" y="40" width="130" height="50" rx="6" />
+    <rect x="500" y="40" width="130" height="50" rx="6" />
+    <rect x="340" y="160" width="130" height="50" rx="6" />
+    <rect x="500" y="160" width="130" height="50" rx="6" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#sd-arrow)">
+    <path d="M 130 65 L 166 65" />
+    <path d="M 300 65 L 336 65" />
+    <path d="M 470 65 L 496 65" />
+    <path d="M 565 90 L 565 156" />
+    <path d="M 500 185 L 474 185" />
+    <path d="M 405 210 L 405 245 L 235 245 L 235 94" />
+    <path d="M 235 40 L 235 18 L 565 18 L 565 36" strokeDasharray="6 4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="70" y="62">requirements</text>
+    <text x="70" y="78">and loads</text>
+    <text x="235" y="62">design variables</text>
+    <text x="235" y="78">(parametric CAD)</text>
+    <text x="405" y="62">mesh and solve</text>
+    <text x="405" y="78">(FEA, CFD)</text>
+    <text x="565" y="62">evaluate objectives</text>
+    <text x="565" y="78">and constraints</text>
+    <text x="405" y="182">optimiser</text>
+    <text x="405" y="198">or engineer</text>
+    <text x="565" y="182">prototype</text>
+    <text x="565" y="198">and test</text>
+    <text x="400" y="13" fontSize="11">surrogate: fitted to earlier runs, milliseconds per answer</text>
+    <text x="320" y="262" fontSize="11">update the design</text>
+    <text x="488" y="140" fontSize="11">validate</text>
+  </g>
+</svg>
+</Figure>
+
+Models also live on after the design is finished. A useful classification, from a 2018 review by Kritzinger and colleagues in Vienna, sorts them by how data flows between the model and one physical object:
+
+- a **digital model** is a simulation of the object with no automatic data flow either way (most design models);
+- a **digital shadow** is updated automatically from the object's sensors, but people decide what to do;
+- a **digital twin** closes the loop: data flows automatically both ways, and the model's predictions change how the object is operated.
+
+<Narrator who="chloe">
+
+What is a twin *for*? Not to look impressive on a screen, but to answer a decision that the sensors alone cannot: how much life is left in this turbine blade, given the temperatures it actually saw; which pump in this plant to service first; how hard this wind turbine can run in tonight's gusts. A twin that informs no decision is a dashboard.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Optimisation problems and their three families">
+
+<Definition term="Design optimisation problem">
+
+Choose design variables $\mathbf x$ to
+
+$$\min_{\mathbf x}\ f(\mathbf x) \quad\text{subject to}\quad g_j(\mathbf x) \le 0,\ \ j = 1, \dots, m, \qquad \mathbf x_\text{min} \le \mathbf x \le \mathbf x_\text{max},$$
+
+where the objective $f$ and the constraints $g_j$ (a mass limit, a stress limit, a minimum natural frequency) are computed by a simulation of the design. The simulation's state (displacements, temperatures, velocities) satisfies its governing equations, for example $K(\mathbf x)\,\mathbf u = \mathbf f$ in linear elasticity.
+
+</Definition>
+
+Structural optimisation comes in three families, in increasing freedom:
+
+- **Sizing**: the layout is fixed and only dimensions change: the cross-sectional areas of the members of a truss, the thickness of each panel of a fuselage.
+- **Shape**: the boundary moves, but no holes appear or disappear: the profile of a fillet, the curve of a turbine blade.
+- **Topology**: the optimiser decides where material should exist at all, including how many holes there are and how members connect.
+
+The last is the most powerful and the hardest. In 1988 Martin Bendsøe of the Technical University of Denmark and Noboru Kikuchi of the University of Michigan made it tractable by turning a yes-or-no question (material here or not?) into a continuous one. The simplest and most widely used form of their idea is **SIMP**, the *solid isotropic material with penalisation* model.
+
+<Definition term="SIMP (solid isotropic material with penalisation)">
+
+Divide the design domain into $N$ finite elements and give each a density $\rho_e \in [0, 1]$. Element $e$ gets Young's modulus
+
+$$E_e = E_\text{min} + \rho_e^{\,p}\,(E_0 - E_\text{min}),$$
+
+where $E_0$ is the solid material's modulus, $E_\text{min}$ a tiny value that keeps the stiffness matrix invertible, and the **penalty** $p$ (typically 3) makes intermediate densities poor value: at $\rho = 0.5$ an element costs half the material but gives only an eighth of the stiffness. The classic problem minimises the **compliance** $c = \mathbf f^{\mathsf T}\mathbf u$ (twice the work done by the loads, so a measure of flexibility) subject to a limit on the total volume:
+
+$$\min_{\boldsymbol\rho}\ c(\boldsymbol\rho) = \mathbf f^{\mathsf T}\mathbf u \quad\text{subject to}\quad K(\boldsymbol\rho)\,\mathbf u = \mathbf f, \qquad \frac{1}{N}\sum_e \rho_e \le V_f, \qquad 0 \le \rho_e \le 1.$$
+
+</Definition>
+
+With thousands or millions of variables, an optimiser needs the gradient of $c$ with respect to every $\rho_e$. Finite differences would need one extra solve per element. The structure of the problem gives all of them for free.
+
+<Theorem name="Compliance sensitivity">
+
+If $K$ is symmetric and the loads do not depend on the design, then
+
+$$\frac{\partial c}{\partial \rho_e} = -\,\mathbf u^{\mathsf T}\,\frac{\partial K}{\partial \rho_e}\,\mathbf u = -\,p\,\rho_e^{\,p-1}\,(E_0 - E_\text{min})\;\mathbf u_e^{\mathsf T} \mathbf k_0\, \mathbf u_e \;\le\; 0,$$
+
+where $\mathbf u_e$ holds the displacements of element $e$'s nodes and $\mathbf k_0$ is the stiffness matrix of a solid element with unit modulus.
+
+</Theorem>
+
+<Proof>
+
+Differentiate $K\mathbf u = \mathbf f$ with respect to $\rho_e$: $\frac{\partial K}{\partial \rho_e}\mathbf u + K \frac{\partial \mathbf u}{\partial \rho_e} = \mathbf 0$, so $\frac{\partial \mathbf u}{\partial \rho_e} = -K^{-1}\frac{\partial K}{\partial \rho_e}\mathbf u$. Then $\frac{\partial c}{\partial \rho_e} = \mathbf f^{\mathsf T}\frac{\partial \mathbf u}{\partial \rho_e} = -\mathbf f^{\mathsf T}K^{-1}\frac{\partial K}{\partial \rho_e}\mathbf u = -\mathbf u^{\mathsf T}\frac{\partial K}{\partial \rho_e}\mathbf u$, using $\mathbf f^{\mathsf T} K^{-1} = (K^{-1}\mathbf f)^{\mathsf T} = \mathbf u^{\mathsf T}$ for symmetric $K$. Only element $e$'s stiffness depends on $\rho_e$, so $\frac{\partial K}{\partial \rho_e}$ is $p\rho_e^{p-1}(E_0 - E_\text{min})\mathbf k_0$ placed at that element's degrees of freedom, which gives the second form. It is not positive because $\mathbf k_0$ is positive semi-definite.
+
+</Proof>
+
+Two things follow. Adding material anywhere never makes the structure more flexible, so the volume constraint is always active. And one solve gives every sensitivity: compliance is **self-adjoint**. For other objectives (a stress, a displacement at one point, a temperature) the same trick needs one extra **adjoint** solve with the same matrix, still independent of the number of variables. Adjoint sensitivities are the reason that topology optimisation with millions of elements, and aerodynamic shape optimisation with CFD, are possible at all.
+
+The update rule used below is the **optimality criteria** method. At an optimum the *marginal stiffness per unit of volume*, $-\partial c/\partial\rho_e$ divided by $\partial V/\partial \rho_e$, must be the same for every element that is neither empty nor full (a Lagrange multiplier $\lambda$ sets its value). So each step multiplies $\rho_e$ by $\sqrt{-\partial c/\partial \rho_e\,/\,\lambda}$ (growing elements that pay their way and shrinking the rest), clips the change to a move limit, and finds $\lambda$ by bisection so that the volume is exactly $V_f$.
+
+</Section>
+
+<Section id="computation-simp" kind="computation" title="Computing it: a topology optimiser in sixty lines">
+
+The test problem is the **MBB beam**, named after the German aerospace firm Messerschmitt–Bölkow–Blohm: a simply supported beam with a load at mid-span. By symmetry only the right half is modelled, with the left edge free to move vertically but not horizontally.
+
+<Figure caption="The MBB beam. A beam on a pin and a roller carries a central load. Symmetry about the dashed centre line means only the shaded right half is modelled: its left edge may slide vertically but not move sideways, and its bottom right corner rests on the roller.">
+<svg viewBox="0 0 640 200" role="img" aria-label="A long rectangle representing a beam, six times as long as it is deep. A downward arrow labelled F acts at the middle of the top edge. A pin support is drawn under the bottom left corner and a roller support under the bottom right corner. A dashed vertical line runs through the middle, and the right half of the rectangle is shaded and labelled modelled half, 36 by 12 elements, with small rollers drawn on its left edge to show the symmetry condition.">
+  <defs>
+    <marker id="sd-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="320" y="60" width="270" height="90" fill="var(--sky-soft)" />
+  <rect x="50" y="60" width="540" height="90" fill="none" stroke="currentColor" strokeWidth="2" />
+  <line x1="320" y1="30" x2="320" y2="180" stroke="currentColor" strokeWidth="1.2" strokeDasharray="6 4" />
+  <path d="M 320 12 L 320 56" stroke="currentColor" strokeWidth="2" markerEnd="url(#sd-arrow2)" />
+  <polygon points="50,150 38,170 62,170" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="30" y1="172" x2="70" y2="172" stroke="currentColor" strokeWidth="1.5" />
+  <polygon points="590,150 578,166 602,166" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <circle cx="582" cy="170" r="4" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <circle cx="598" cy="170" r="4" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <line x1="570" y1="176" x2="610" y2="176" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <circle cx="326" cy="80" r="4" />
+    <circle cx="326" cy="105" r="4" />
+    <circle cx="326" cy="130" r="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="330" y="26">F</text>
+    <text x="400" y="100">modelled half</text>
+    <text x="400" y="116" fontSize="11">36 × 12 elements</text>
+    <text x="70" y="100" fontSize="11">mirror image</text>
+    <text x="250" y="194" fontSize="11">line of symmetry</text>
+  </g>
+</svg>
+</Figure>
+
+The program below builds the stiffness matrix of a four-node quadrilateral element by Gauss quadrature, as in <LessonLink slug="finite-element-method">the finite element method</LessonLink>, assembles the mesh, and runs SIMP with $p = 3$, half the domain's volume, and the classic **sensitivity filter**: each element's sensitivity is replaced by a distance-weighted average over its neighbours within 1.5 element widths. Without a filter the optimiser exploits a weakness of the element and fills the domain with chequerboards of solid and void, and the design changes with every mesh refinement. One detail is about speed rather than optimisation: numbering the nodes column by column makes the stiffness matrix **block tridiagonal**, and solving it block by block is far faster than treating it as a full matrix. Production codes use general sparse solvers for the same reason.
+
+```python run
+import numpy as np
+
+# 1. Stiffness matrix of one unit-square bilinear (Q4) element, E = 1, plane stress, 2 x 2 Gauss points
+def q4_stiffness(nu=0.3):
+    D = np.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1 - nu) / 2]]) / (1 - nu**2)
+    corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], float)    # anticlockwise
+    k, g = np.zeros((8, 8)), 1 / np.sqrt(3)
+    for xi in (-g, g):
+        for eta in (-g, g):
+            dN = 0.25 * np.array([[-(1 - eta), 1 - eta, 1 + eta, -(1 + eta)],
+                                  [-(1 - xi), -(1 + xi), 1 + xi, 1 - xi]])
+            J = dN @ corners
+            dNdx = np.linalg.solve(J, dN)
+            B = np.zeros((3, 8))
+            B[0, 0::2], B[1, 1::2] = dNdx[0], dNdx[1]
+            B[2, 0::2], B[2, 1::2] = dNdx[1], dNdx[0]
+            k += B.T @ D @ B * np.linalg.det(J)
+    return k
+
+# 2. Half of a simply supported beam, loaded at mid-span (symmetry on the left edge)
+nelx, nely = 36, 12
+volfrac, p, rmin, Emin = 0.5, 3.0, 1.5, 1e-9
+node = lambda ix, iy: ix * (nely + 1) + iy                          # iy = 0 is the bottom edge
+ndof, m = 2 * (nelx + 1) * (nely + 1), 2 * (nely + 1)               # m unknowns per column of nodes
+edof = np.array([[2 * n + d for n in (node(ix, iy), node(ix + 1, iy), node(ix + 1, iy + 1), node(ix, iy + 1))
+                  for d in (0, 1)] for ix in range(nelx) for iy in range(nely)])
+rows, cols = np.repeat(edof, 8, axis=1).ravel(), np.tile(edof, 8).ravel()
+k0 = q4_stiffness()
+f = np.zeros(ndof)
+f[2 * node(0, nely) + 1] = -1.0                                     # unit load, top of the centre line
+fixed = [2 * node(0, iy) for iy in range(nely + 1)] + [2 * node(nelx, 0) + 1]
+
+def solve(rho):
+    """Assemble K and solve K u = f. Numbering nodes column by column makes K block tridiagonal."""
+    K = np.zeros((ndof, ndof))
+    np.add.at(K, (rows, cols), np.outer(Emin + rho**p * (1 - Emin), k0.ravel()).ravel())
+    K[fixed, :], K[:, fixed] = 0.0, 0.0
+    K[fixed, fixed] = 1.0                                           # supports: u = 0 there
+    blk = lambda i, j: K[i * m:(i + 1) * m, j * m:(j + 1) * m]
+    D, y = [blk(0, 0)], [f[:m]]
+    for i in range(1, nelx + 1):                                    # block forward elimination
+        W = np.linalg.solve(D[-1], blk(i - 1, i)).T
+        D.append(blk(i, i) - W @ blk(i - 1, i))
+        y.append(f[i * m:(i + 1) * m] - W @ y[-1])
+    u = np.zeros(ndof)
+    u[nelx * m:] = np.linalg.solve(D[-1], y[-1])
+    for i in range(nelx - 1, -1, -1):                               # back substitution
+        u[i * m:(i + 1) * m] = np.linalg.solve(D[i], y[i] - blk(i, i + 1) @ u[(i + 1) * m:(i + 2) * m])
+    return u
+
+def compliance(rho):
+    u = solve(rho)
+    energy = np.einsum("ei,ij,ej->e", u[edof], k0, u[edof])           # u_e^T k0 u_e per element
+    return np.sum((Emin + rho**p * (1 - Emin)) * energy), energy
+
+# Sensitivity filter weights: fall linearly to zero at rmin element widths
+c_xy = np.array([(ix + 0.5, iy + 0.5) for ix in range(nelx) for iy in range(nely)])
+H = np.maximum(0.0, rmin - np.linalg.norm(c_xy[:, None] - c_xy[None], axis=2))
+
+def oc_update(rho, dc, move=0.2):
+    lo, hi = 1e-9, 1e9
+    while (hi - lo) / (hi + lo) > 1e-6:                              # bisection on the multiplier
+        lam = 0.5 * (lo + hi)
+        new = np.clip(rho * np.sqrt(-dc / lam), np.maximum(0, rho - move), np.minimum(1, rho + move))
+        lo, hi = (lam, hi) if new.mean() > volfrac else (lo, lam)
+    return new
+
+rho = np.full(nelx * nely, volfrac)
+for it in range(1, 81):
+    c, energy = compliance(rho)
+    dc = -p * rho ** (p - 1) * (1 - Emin) * energy
+    dc = (H @ (rho * dc)) / (np.maximum(1e-3, rho) * H.sum(axis=1))
+    new = oc_update(rho, dc)
+    change, rho = np.abs(new - rho).max(), new
+    if it in (1, 2, 5, 10, 20, 40, 80) or change < 0.01:
+        print(f"iteration {it:2d}: compliance {c:7.1f}, volume fraction {rho.mean():.3f}, largest change {change:.3f}")
+    if change < 0.01:
+        break
+
+field = rho.reshape(nelx, nely).T[::-1]                              # rows from the top down
+for row in field:
+    half = "".join("#" if r > 0.75 else "+" if r > 0.4 else "." if r > 0.1 else " " for r in row)
+    print(half[::-1] + half)                                         # mirror: the whole beam
+grey = np.mean((rho > 0.1) & (rho < 0.9))
+solid = (rho >= np.sort(rho)[::-1][int(volfrac * rho.size) - 1]).astype(float)   # keep the densest half
+print(f"grey elements (0.1 to 0.9): {grey:.0%}")
+print(f"compliance: optimised (grey) {compliance(rho)[0]:.1f}; rounded to solid and void {compliance(solid)[0]:.1f}")
+print(f"same mass as a plain plate of half the thickness: {2 * compliance(np.ones_like(rho))[0]:.1f}")
+```
+
+From a uniform grey start (compliance 991, heavily penalised) the design settles in 73 iterations to a compliance of 215.6. The picture, mirrored to show the whole beam, is a structure every engineer recognises: a deep top chord in compression, a bottom chord in tension, and diagonal members between them, a truss that nobody told the program about. Rounding the densest half of the elements to solid and the rest to void gives a compliance of 194.9. A plain plate with the same outline and the same mass (the full plate at half the thickness) has 247.7, so the optimised layout's compliance is 21% lower: it is about 27% stiffer for the same material.
+
+<Narrator who="gideon">
+
+Notice what the program *assumed*. Linear elasticity with small displacements; one load case; no stress limit; no buckling check, so the thin compression chord would have to be checked against <LessonLink slug="deflection-and-buckling">buckling</LessonLink> separately; and no manufacturing constraint. Nearly a third of the elements are still grey, which no machine can make, and the solid-and-void version is a different design that must be analysed again, as we did. An optimiser optimises exactly the problem you wrote down, including its omissions.
+
+</Narrator>
+
+Real tools add what this one leaves out: several load cases, stress and displacement constraints, minimum and maximum member sizes, symmetry, draw directions for casting and milling, overhang limits for additive manufacturing, and a **projection** step that pushes densities to 0 or 1. They then smooth the result into a surface that CAD can edit, which is still where a large share of the engineer's time goes.
+
+</Section>
+
+<Section id="surrogates" kind="computation" title="Surrogates: learning the simulation">
+
+A full CFD run of a car or a crash simulation can take hours on hundreds of cores, and an optimiser or a twin may want thousands of answers. A **surrogate model** (also called a metamodel or reduced-order model) is a cheap approximation fitted to the results of earlier runs.
+
+The families, from oldest to newest:
+
+- **Response surfaces**: low-order polynomials fitted by least squares over a designed set of runs. Cheap and transparent, but too stiff for strongly nonlinear responses.
+- **Gaussian-process regression** (kriging, named after the South African mining engineer Danie Krige, who used it to estimate ore grades): a statistical model that interpolates the runs and gives an error estimate at every point. It is the engine of **Bayesian optimisation**, which chooses the next run where the surrogate is promising or uncertain.
+- **Reduced-order models**: project the full equations onto a few dominant modes found from earlier solutions (proper orthogonal decomposition), keeping some physics in the approximation.
+- **Neural surrogates**: networks trained on thousands of simulations. Graph neural networks operate on the mesh itself ([Pfaff et al., 2020](https://arxiv.org/abs/2010.03409)); **neural operators** learn maps between whole fields, such as from a boundary shape to a pressure field ([Li et al., 2020](https://arxiv.org/abs/2010.08895)); **physics-informed neural networks** put the governing equations into the training loss. The most striking demonstration is not in mechanical engineering but in weather: machine-learned models trained on decades of reanalysis now forecast as well as traditional numerical models for many variables, and the European Centre for Medium-Range Weather Forecasts began running one operationally in 2025.
+
+The program below fits a Gaussian process to six "expensive" results. The stand-in for the simulation is a classic engineering approximation: the peak stress at a round hole in a strip under tension, divided by the nominal stress, as the hole grows to a fraction $r = d/W$ of the strip's width. The six runs cover $0 \le r \le 0.6$; the kernel's length scale is chosen by maximising the marginal likelihood; then the surrogate is asked about holes inside and outside that range.
+
+```python run
+import numpy as np
+
+def simulation(r):
+    """Stand-in for an expensive analysis: peak stress / nominal stress at a central hole of
+    diameter d in a strip of width W, r = d/W (Heywood's approximation, nominal on the gross section)."""
+    return (2 + (1 - r) ** 3) / (1 - r)
+
+def kernel(a, b, length, scale):
+    return scale**2 * np.exp(-0.5 * (a[:, None] - b[None, :]) ** 2 / length**2)
+
+def fit_gp(x, y, length, noise=1e-6):
+    mean, scale = y.mean(), y.std()
+    K = kernel(x, x, length, scale) + noise * np.eye(len(x))
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y - mean))
+    log_like = -0.5 * (y - mean) @ alpha - np.log(np.diag(L)).sum() - 0.5 * len(x) * np.log(2 * np.pi)
+    def predict(xs):
+        Ks = kernel(xs, x, length, scale)
+        v = np.linalg.solve(L, Ks.T)
+        var = scale**2 - np.sum(v**2, axis=0)
+        return mean + Ks @ alpha, np.sqrt(np.maximum(var, 0.0))
+    return predict, log_like
+
+x_train = np.linspace(0.0, 0.6, 6)                    # six "runs", hole sizes 0 to 60 % of the width
+y_train = simulation(x_train)
+
+# choose the kernel's length scale by maximising the marginal likelihood on a grid
+lengths = np.linspace(0.05, 1.0, 96)
+best = max(lengths, key=lambda l: fit_gp(x_train, y_train, l)[1])
+predict, _ = fit_gp(x_train, y_train, best)
+print(f"length scale chosen by maximum likelihood: {best:.2f}\n")
+
+print("  d/W   simulation  surrogate  +/- 2 sigma   error")
+for r in [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.70, 0.75, 0.80, 0.85]:
+    mu, sd = predict(np.array([r]))
+    tag = "  (outside the training range)" if r > 0.6 else ""
+    print(f"  {r:4.2f}  {simulation(r):9.3f}  {mu[0]:9.3f}   {2 * sd[0]:9.3f}  {mu[0] - simulation(r):+8.3f}{tag}")
+```
+
+Inside the training range the surrogate is excellent: errors of a few thousandths up to 0.065, with honest-looking error bars. Outside it, the true stress ratio climbs steeply towards infinity as the ligament beside the hole vanishes, while the surrogate drifts back towards the mean of its data. At $r = 0.85$ it predicts 4.8 against a true 13.4, and its own two-sigma band is only $\pm 1.3$: confidently wrong by a factor of almost three.
+
+<Narrator who="margaret">
+
+Count the cost of filling a design space evenly. Five levels of each of six design variables is $5^6 = 15\,625$ runs; at two hours each that is three and a half years on one machine. This **curse of dimensionality** is why surrogates are trained on cleverly spread samples (Latin hypercubes, Sobol sequences) and refined adaptively, and why neural surrogates need large shared datasets. A surrogate is cheap to evaluate and expensive to train.
+
+</Narrator>
+
+</Section>
+
+<Section id="verification" kind="computation" title="Verification, validation and the limits of trust">
+
+Every simulation result carries three kinds of error, and a standard vocabulary (used by ASME's V&V standards and NASA's standard for models and simulations, NASA-STD-7009) keeps them apart:
+
+<Definition term="Verification, validation and uncertainty quantification">
+
+**Verification** asks whether the equations are being solved correctly: code bugs, and numerical errors from the mesh, time step and solver tolerances. **Validation** asks whether they are the right equations: how well the model predicts physical experiments, for the intended use. **Uncertainty quantification** (UQ) carries the uncertainty in inputs (loads, material properties, geometry, boundary conditions) through to the outputs, so a prediction is a range, not a number.
+
+</Definition>
+
+The commonest verification task is a **mesh-convergence study**. Solve on a sequence of meshes, each refined by a factor $r$ (here 2). If the error behaves like $C h^{\,q}$, three results $\phi_1, \phi_2, \phi_3$ from coarse to fine give the **observed order** and a **Richardson extrapolation** to zero mesh size:
+
+$$q = \frac{\ln\big[(\phi_2 - \phi_1)/(\phi_3 - \phi_2)\big]}{\ln r}, \qquad \phi_\text{exact} \approx \phi_3 + \frac{\phi_3 - \phi_2}{r^{\,q} - 1}.$$
+
+The test case is a cantilever ten times as long as it is deep, clamped at one end with a load at the other, modelled with the same four-node elements as the optimiser. Beam theory, including shear deformation (Timoshenko), gives a dimensionless tip deflection of 4031.
+
+```python run
+import numpy as np
+
+def q4_stiffness(a, b, nu=0.3):
+    """Q4 element of width a and height b: E = 1, plane stress, unit thickness, 2 x 2 Gauss points."""
+    D = np.array([[1, nu, 0], [nu, 1, 0], [0, 0, (1 - nu) / 2]]) / (1 - nu**2)
+    corners = np.array([[0, 0], [a, 0], [a, b], [0, b]], float)
+    k, g = np.zeros((8, 8)), 1 / np.sqrt(3)
+    for xi in (-g, g):
+        for eta in (-g, g):
+            dN = 0.25 * np.array([[-(1 - eta), 1 - eta, 1 + eta, -(1 + eta)],
+                                  [-(1 - xi), -(1 + xi), 1 + xi, 1 - xi]])
+            J = dN @ corners
+            dNdx = np.linalg.solve(J, dN)
+            B = np.zeros((3, 8))
+            B[0, 0::2], B[1, 1::2] = dNdx[0], dNdx[1]
+            B[2, 0::2], B[2, 1::2] = dNdx[1], dNdx[0]
+            k += B.T @ D @ B * np.linalg.det(J)
+    return k
+
+def solve_block_tridiagonal(K, f, m):
+    """Solve K u = f, where K is block tridiagonal with m x m blocks (nodes numbered column by column)."""
+    n = len(f) // m
+    blk = lambda i, j: K[i * m:(i + 1) * m, j * m:(j + 1) * m]
+    D, y = [blk(0, 0)], [f[:m]]
+    for i in range(1, n):
+        W = np.linalg.solve(D[-1], blk(i - 1, i)).T
+        D.append(blk(i, i) - W @ blk(i - 1, i))
+        y.append(f[i * m:(i + 1) * m] - W @ y[-1])
+    u = np.zeros_like(f)
+    u[-m:] = np.linalg.solve(D[-1], y[-1])
+    for i in range(n - 2, -1, -1):
+        u[i * m:(i + 1) * m] = np.linalg.solve(D[i], y[i] - blk(i, i + 1) @ u[(i + 1) * m:(i + 2) * m])
+    return u
+
+def cantilever_tip(nx, ny, L=10.0, h=1.0, P=1.0):
+    """Tip deflection of a cantilever clamped at x = 0, end load P shared by the end nodes."""
+    m = 2 * (ny + 1)
+    node = lambda ix, iy: ix * (ny + 1) + iy
+    k = q4_stiffness(L / nx, h / ny)
+    K = np.zeros(((nx + 1) * m, (nx + 1) * m))
+    for ix in range(nx):
+        for iy in range(ny):
+            dofs = [2 * n + d for n in (node(ix, iy), node(ix + 1, iy), node(ix + 1, iy + 1), node(ix, iy + 1))
+                    for d in (0, 1)]
+            K[np.ix_(dofs, dofs)] += k
+    f = np.zeros((nx + 1) * m)
+    for iy in range(ny + 1):
+        f[2 * node(nx, iy) + 1] = -P / ny * (0.5 if iy in (0, ny) else 1.0)
+    K[:m, :], K[:, :m] = 0.0, 0.0
+    K[range(m), range(m)] = 1.0                                   # clamp the first column of nodes
+    u = solve_block_tridiagonal(K, f, m)
+    return -np.mean(u[[2 * node(nx, iy) + 1 for iy in range(ny + 1)]])
+
+E, nu, L, h, P = 1.0, 0.3, 10.0, 1.0, 1.0
+I, G = h**3 / 12, E / (2 * (1 + nu))
+bending = P * L**3 / (3 * E * I)
+timoshenko = bending + P * L / (5 / 6 * G * h)
+print(f"beam theory: bending only {bending:.0f}; with shear deformation (Timoshenko) {timoshenko:.0f}\n")
+results = []
+for ny in (1, 2, 4, 8, 16):
+    nx = 5 * ny
+    d = cantilever_tip(nx, ny)
+    results.append(d)
+    print(f"mesh {nx:2d} x {ny:2d}: {2 * (nx + 1) * (ny + 1):5d} unknowns, tip deflection {d:7.1f}"
+          f"  ({d / timoshenko:6.1%} of beam theory)")
+
+print("\nRichardson extrapolation from three successive meshes:")
+for d1, d2, d3 in zip(results, results[1:], results[2:]):
+    order = np.log((d2 - d1) / (d3 - d2)) / np.log(2)
+    extrap = d3 + (d3 - d2) / (2**order - 1)
+    print(f"  observed order {order:.2f}, extrapolated deflection {extrap:7.1f},"
+          f" estimated error of the finest of the three {abs(extrap - d3) / extrap:.1%}")
+```
+
+With one element through the depth the cantilever is only 38% as flexible as it should be. The four-node element cannot bend without also shearing, so in bending it is far too stiff, a defect called **shear locking**. Refinement cures it slowly: 71%, 90%, 97%, 99%. The convergence study tells you so, if you read it carefully. From the three coarsest meshes the observed order is 0.72, far below the element's theoretical 2, and the extrapolation (4862) is nonsense: those meshes are not yet in the **asymptotic range** where the error formula holds. From the three finest the order is 1.84 and the extrapolation 4027, within 0.1% of beam theory, with the finest mesh about 0.7% short.
+
+<Narrator who="gideon">
+
+Verification tells you the equations were solved well; it says nothing about whether they were the right ones. Our "exact" answer is itself a model: a perfectly rigid clamp, a linear material, a load spread evenly over the end. A real bolted root is softer than any clamp in a model, and a test of this beam would probably deflect more than 4031. That gap is the business of validation, and only an experiment can close it.
+
+</Narrator>
+
+The best-known failure of unverified analysis is the **Sleipner A** platform in the North Sea. On 23 August 1991, during a controlled ballasting test in Gandsfjord, Norway, the concrete base structure sprang a leak and sank, with no injuries but a large financial loss. The investigation found that a coarse, badly shaped finite element mesh had underestimated the shear forces in a set of walls by nearly half, and that the reinforcement detailing there was inadequate. A hand calculation of the kind every senior engineer can do would have flagged the discrepancy.
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view in 2026">
+
+**Generative design tools.** Topology optimisation is built into most commercial CAD and simulation suites: Altair's OptiStruct and Inspire (Altair became part of Siemens in 2025), Siemens NX, Dassault Systèmes' SIMULIA tools (Tosca, Abaqus) and CATIA, Ansys Mechanical (Ansys became part of Synopsys in 2025), PTC Creo, and Autodesk Fusion, whose "generative design" runs many optimisations in the cloud for different materials and manufacturing methods and lets the engineer choose among the outcomes. nTop specialises in implicit geometry, which handles lattices and gyroid infills that boundary-representation CAD struggles with. On the open-source side, FreeCAD's FEM workbench drives open solvers, research codes are built on [FEniCS](https://fenicsproject.org/) and similar frameworks, and the [TopOpt group at DTU](https://www.topopt.mek.dtu.dk/) publishes educational codes in many languages.
+
+**Machine-learned surrogates.** Several established simulation vendors and newer companies (in Europe, for example, PhysicsX in London and Neural Concept in Lausanne) sell neural surrogates trained on a customer's own simulations, mostly for aerodynamics, thermal design and crash; NVIDIA's open-source PhysicsNeMo framework is widely used to build them. Car makers and aerospace firms report using them to screen design variants in seconds before running full simulations on the best. As of 2026 the honest summary is: very useful for rapid exploration *inside* a well-sampled design family, unreliable outside it, and not a replacement for a verified solver in certification. Learned models that generalise across very different geometries and physics ("foundation models" for simulation) are an active research goal, not yet a dependable tool.
+
+**Generative AI and CAD.** Language models are being wired into design tools to write CAD scripts (CadQuery, FreeCAD macros), fill in feature trees, summarise requirements and search parts libraries, and several companies sell text-to-CAD tools. As of 2026 they are good at simple parts and first drafts and do not reliably produce correct, toleranced, manufacturable designs of complex assemblies; their output needs the same checking as a junior engineer's first attempt.
+
+**Digital twins.** Aero-engine makers such as Rolls-Royce and GE Aerospace have streamed engine-health data from airliners for decades and use it with models to plan maintenance; wind-farm operators, process plants and rail networks use twins for condition monitoring and scheduling. The hard parts are rarely the visualisation: they are keeping the model calibrated as the asset ages, quantifying its uncertainty, and securing the data link. The US National Academies' 2024 report on digital twins is a sober guide to what is still missing.
+
+**Credibility.** Industries where simulation supports safety decisions have formal frameworks: ASME V&V 10 for solid mechanics and V&V 20 for fluids and heat transfer, ASME V&V 40 for medical devices (used in submissions to the US Food and Drug Administration), NASA-STD-7009, and the benchmarks and guidance of [NAFEMS](https://www.nafems.org/). The common thread is to state the intended use, verify the code and the solution, validate against experiments that resemble that use, quantify uncertainty, and have the work reviewed by someone independent.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Topology optimisation finds the best possible part."** It finds a local optimum of the problem as posed: one material model, the chosen load cases, the chosen filter radius, the chosen starting point. Change any of them and the layout changes. It is a powerful way to generate a good concept, which an engineer then interprets, checks for stress, buckling, fatigue and manufacturability, and redesigns.
+
+</Misconception>
+
+<Misconception>
+
+**"A converged simulation is a correct simulation."** Convergence of the iterations or of the mesh is verification. A model can converge beautifully to the wrong answer if the boundary conditions, material data or physics are wrong; only validation against experiment catches that.
+
+</Misconception>
+
+<Misconception>
+
+**"A surrogate's error bars tell you when it is wrong."** They are the surrogate's own estimate, made under its own assumptions. As the program showed, a Gaussian process can be confidently wrong outside its data, and neural networks often give no error estimate at all. Check any surrogate's prediction with the real solver before acting on it, especially near the edge of the training data.
+
+</Misconception>
+
+<Misconception>
+
+**"A digital twin is a detailed 3-D model."** Geometry is the least of it. What makes a twin is the continuous, two-way link with one particular physical object, a model that stays calibrated as that object changes, and a decision it informs.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
