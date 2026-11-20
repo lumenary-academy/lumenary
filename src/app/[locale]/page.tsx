@@ -4,10 +4,8 @@ import { ArrowRight, ArrowUpRight, Atom, Bot, Braces, Cog, Cpu, FlaskConical, Ge
 import type { LucideIcon } from "lucide-react";
 import { getT, resolveLocale } from "@/i18n/server";
 import { href } from "@/lib/href";
+import { linguaHome, PREP_URL } from "@/lib/sites";
 import { scientiaSubjects } from "@/lib/subjects";
-
-/** Lumenary Prep is its own site. */
-const PREP_URL = "https://prep.lumenary.academy";
 
 /** Each Scientia subject's icon and accent. */
 const SUBJECT_LOOK: Record<string, { Icon: LucideIcon; accent: string }> = {
@@ -101,9 +99,9 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               badge={t("divisions.available")}
               text={t("divisions.linguaText")}
               action={
-                <Link href={href(locale, "lingua")} className="btn btn-primary">
-                  {t("divisions.linguaCta")} {arrow}
-                </Link>
+                <a href={linguaHome(locale)} className="btn btn-primary">
+                  {t("divisions.linguaCta")} <ArrowUpRight size={16} className="rtl:-scale-x-100" aria-hidden="true" />
+                </a>
               }
             />
           </li>
