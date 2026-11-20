@@ -23,18 +23,24 @@ const NAV = [
   { key: "about", path: "about" },
 ] as const;
 
-/** On the pages of Lumenary Scientia's other subjects, the header links the subjects to one another. */
+/** On the pages of Lumenary Scientia's other subjects, the header links the subjects to one another (the rest of the list is in the menu). */
 const SCIENTIA_NAV = [
   { key: "math", path: "math" },
   { key: "cs", path: "cs" },
   { key: "programming", path: "cs/languages" },
-  { key: "electives", path: "cs/electives" },
   { key: "ee", path: "ee" },
   { key: "robotics", path: "robotics" },
+  { key: "chemistry", path: "chemistry" },
+  { key: "me", path: "me" },
+  { key: "materials", path: "materials" },
+] as const;
+const SCIENTIA_MORE = [
+  { key: "electives", path: "cs/electives" },
   { key: "divisions", path: "divisions" },
   { key: "about", path: "about" },
+  { key: "contribute", path: "contribute" },
 ] as const;
-const SCIENTIA_SUBJECTS = /^\/[^/]+\/(cs|ee|robotics)(\/|$)/;
+const SCIENTIA_SUBJECTS = /^\/[^/]+\/(cs|ee|robotics|chemistry|me|materials)(\/|$)/;
 
 /**
  * The site header. `available` lists the course paths that have pages (from the layout, which reads
@@ -56,7 +62,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
 
   // The front page lists the three divisions; Lumenary Math's navigation starts on its own front page.
   const home = pathname === `/${locale}/` || pathname === `/${locale}`;
-  const scientiaNav = SCIENTIA_NAV.filter((item) => item.path === "math" || item.path === "divisions" || item.path === "about" || available.includes(item.path));
+  const scientiaNav = SCIENTIA_NAV.filter((item) => item.path === "math" || available.includes(item.path));
   const nav = SCIENTIA_SUBJECTS.test(pathname) ? scientiaNav : NAV;
 
   const isActive = (path: string) => {
@@ -118,7 +124,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
           <ul className="container-page grid grid-cols-2 gap-1 py-3 sm:grid-cols-4">
             {(nav === NAV
               ? [...NAV, { key: "divisions", path: "divisions" }, { key: "progress", path: "progress" }, { key: "languages", path: "languages" }, { key: "contribute", path: "contribute" }, { key: "verification", path: "verification" }]
-              : [...scientiaNav, { key: "contribute", path: "contribute" }]
+              : [...scientiaNav, ...SCIENTIA_MORE]
             ).map((item) => (
               <li key={item.key}>
                 <Link

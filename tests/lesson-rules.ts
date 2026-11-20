@@ -63,6 +63,14 @@ export const SAFETY_PATTERNS: { re: RegExp; why: string }[] = [
     re: /\b(?:touch|touching|grab|grabbing|poke|poking|probe|probing|open|opening|lick|licking)\b[^.!?\n]{0,40}?\b(?:mains|wall sockets?|power outlets?|live wires?|power lines?|plugs? sockets?)\b/gi,
     why: "touching or opening mains electricity",
   },
+  {
+    re: /\b(?:mix|mixing|mixed|combine|combining|add|adding|pour|pouring)\b[^.!?\n]{0,60}?\b(?:bleach|chlorine)\b[^.!?\n]{0,50}?\b(?:ammonia|vinegar|acids?|toilet cleaners?|rubbing alcohol)\b/gi,
+    why: "mixing bleach with other household chemicals",
+  },
+  {
+    re: /\b(?:taste|tasting|sniff|sniffing|smell|smelling|inhale|inhaling)\b[^.!?\n]{0,40}?\b(?:the\s+)?(?:chemicals?|reagents?|solutions?|acids?|gas(?:es)?|fumes)\b/gi,
+    why: "tasting or smelling chemicals directly",
+  },
 ];
 
 /** Safety problems in a piece of learner-facing text (empty = fine). Warnings against a danger are allowed. */
