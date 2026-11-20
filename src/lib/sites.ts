@@ -48,8 +48,9 @@ export interface PrepLesson {
 export const prepLesson = (l: Pick<PrepLesson, "course" | "slug">) => `${PREP_URL}/courses/${l.course}/lessons/${l.slug}`;
 
 /**
- * The front page's free sample lessons from Lumenary Prep: in each course, the first lesson of its
- * syllabus marked `free: true`, which anyone can open without buying the course. One exam from
+ * The front page's free sample lessons from Lumenary Prep: in each course, a free lesson (`free: true`)
+ * that teaches a real skill rather than describing the exam, which anyone can open without buying
+ * the course. One exam from
  * each of the kinds Prep covers: admissions, graduate school, law school, English-language and a
  * professional licence.
  *
@@ -58,9 +59,9 @@ export const prepLesson = (l: Pick<PrepLesson, "course" | "slug">) => `${PREP_UR
  * lesson). Check again with curl before changing or adding one.
  */
 export const PREP_SAMPLES: PrepLesson[] = [
-  { course: "sat", exam: "SAT", slug: "how-the-digital-sat-works", title: "How the digital SAT works" },
-  { course: "gre-general", exam: "GRE General Test", slug: "gre-test-overview", title: "The shorter GRE General Test, section by section" },
-  { course: "lsat", exam: "LSAT", slug: "how-the-lsat-works", title: "How the LSAT works" },
-  { course: "ielts", exam: "IELTS", slug: "how-ielts-works", title: "How IELTS works" },
-  { course: "ea", exam: "Enrolled Agent (SEE)", slug: "p1-see-and-preliminary-work", title: "The SEE, Part 1, and the preliminary work on a return" },
+  { course: "sat", exam: "SAT", slug: "words-in-context", title: "Words in context" },
+  { course: "gre-general", exam: "GRE General Test", slug: "quantitative-comparison", title: "Quantitative Comparison" },
+  { course: "lsat", exam: "LSAT", slug: "anatomy-of-an-argument", title: "The anatomy of an argument" },
+  { course: "ielts", exam: "IELTS", slug: "reading-true-false-not-given", title: "True, False or Not Given (and Yes, No or Not Given)" },
+  { course: "ea", exam: "Enrolled Agent (SEE)", slug: "p3-practice-before-irs", title: "Practice before the IRS and who may do it" },
 ];

@@ -23,10 +23,12 @@ type Entry = { key: string; path?: string; course?: string; collection?: Collect
  * `samples` are the lessons the front page offers to try: each subject's first lesson, where its
  * course starts. The programming languages offer the first lesson of two courses: Python, the
  * language of Lumenary CS's own lessons, and JavaScript, the language of the web.
+ * Mathematics also offers a lesson for older learners (proof techniques, grades 9–12) beside its
+ * first, kindergarten lesson.
  * tests/front-page-samples.test.ts checks that each exists and is in its course's first two levels.
  */
 const SUBJECTS: Entry[] = [
-  { key: "mathematics", path: "math", math: true, samples: ["math/lessons/collections"] },
+  { key: "mathematics", path: "math", math: true, samples: ["math/lessons/collections", "math/lessons/proof-techniques"] },
   { key: "chemistry", path: "chemistry", course: "chemistry", samples: ["chemistry/what-is-matter"] },
   { key: "statistics", path: "statistics", course: "statistics", samples: ["statistics/what-is-statistics"] },
   { key: "computerScience", path: "cs", course: "cs", samples: ["cs/what-is-computing"] },
