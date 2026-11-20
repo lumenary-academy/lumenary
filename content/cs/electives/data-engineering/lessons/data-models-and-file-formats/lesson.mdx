@@ -449,7 +449,6 @@ The column chunks profile the data. 100,000 consecutive loan ids take 2.0 kB wit
 To answer "loans between 10 and 16 March", a reader can compare that range with each row group's minimum and maximum `loan_date` in the footer and read only the row groups that *could* contain matches. This is **predicate pushdown** — the filter is applied to metadata before any data is touched — and with **projection pushdown** (reading only the needed columns) it lets a narrow question read a tiny part of the bytes, provided the data is laid out to allow it. The block writes the same 100,000 loans twice, in 10 row groups: sorted by date, and shuffled.
 
 ```python run
-import io
 from datetime import date
 import numpy as np
 import pyarrow as pa
@@ -466,8 +465,9 @@ loans = pa.table({
 })
 files = {}
 for name, table in [("sorted by date", loans), ("shuffled", loans.take(rng.permutation(n)))]:
-    files[name] = io.BytesIO()
-    pq.write_table(table, files[name], row_group_size=10_000, compression="none")
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink, row_group_size=10_000, compression="none")
+    files[name] = sink.getvalue()  # the file's bytes, in an Arrow buffer
 
 def scan(buf, lo, hi, columns):
     """Read only the row groups whose loan_date [min, max] overlaps [lo, hi], and only `columns`."""
@@ -530,7 +530,6 @@ Parquet is a format for **storage**: encoded, compressed, decoded when read. Eng
 **Apache Arrow**, started in 2016 by developers from many of those projects, specifies one **columnar memory format** for every language. An Arrow **array** is a column: a type, a length and a few **buffers**, contiguous memory aligned for vector instructions. A **validity bitmap** holds one bit per value (0 = null), so nulls need no sentinel values. Fixed-width types have one buffer of values; strings have an **offsets** buffer — value $i$ is bytes `offsets[i]` to `offsets[i+1]` — and one **data** buffer of all the bytes end to end. Equal-length arrays with a schema form a **record batch**; batches sharing a schema form a **table**.
 
 ```python run
-import io
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -565,10 +564,11 @@ print(f"IPC file: {ipc.size} bytes; equal after reading: {back.equals(pa.Table.f
       "column read in place:", ipc.address <= inner.address < ipc.address + ipc.size)
 
 # Parquet round trip: encoded and compressed for storage, decoded back into Arrow memory on read.
-pbuf = io.BytesIO()
-pq.write_table(pa.Table.from_batches([batch]), pbuf)
-again = pq.read_table(pbuf)
-print(f"Parquet file: {pbuf.getbuffer().nbytes} bytes; equal after reading: {again.equals(back)}")
+sink = pa.BufferOutputStream()
+pq.write_table(pa.Table.from_batches([batch]), sink)
+parquet = sink.getvalue()
+again = pq.read_table(parquet)
+print(f"Parquet file: {parquet.size} bytes; equal after reading: {again.equals(back)}")
 
 # At scale the trade-off shows: 100,000 rows of the same two columns.
 rng = np.random.default_rng(0)
@@ -577,10 +577,10 @@ big = pa.table({"city": rng.choice(["Nairobi", "Lima", "Kraków", "Osaka"], 100_
 sink = pa.BufferOutputStream()
 with pa.ipc.new_file(sink, big.schema) as writer:
     writer.write_table(big)
-pbuf = io.BytesIO()
-pq.write_table(big, pbuf)
+psink = pa.BufferOutputStream()
+pq.write_table(big, psink)
 print(f"\n100,000 rows: in memory {big.nbytes / 1e3:.0f} kB, Arrow IPC {sink.getvalue().size / 1e3:.0f} kB,"
-      f" Parquet {pbuf.getbuffer().nbytes / 1e3:.0f} kB")
+      f" Parquet {psink.getvalue().size / 1e3:.0f} kB")
 ```
 
 The bitmap marks the second value null, which takes zero bytes of data; the offsets count bytes, not characters (Kraków is 7 bytes). The integer array, having no nulls, has no bitmap at all, and NumPy views its values buffer **without copying** a byte.

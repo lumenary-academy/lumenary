@@ -41,10 +41,15 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CONTENT = ROOT / "content"
 REPORT = CONTENT / "verification" / "course-code-report.json"
 SEPARATOR = "\n#@@ lumenary: tests follow @@\n"
+FINISHED = "#@@ lumenary: finished @@"
 
-# Runs each part in one namespace, as the browser's worker does (runPythonAsync).
+# Runs each part in one namespace, as the browser's worker does (runPythonAsync). A program that is
+# still running shortly before the timeout prints every thread's Python stack and exits, so a hang
+# is reported with where it happened; one that finishes says so on stderr, so a process that hangs
+# only while exiting (in a library's threads, after the code is done) can be told apart.
 RUNNER = r'''
-import ast, asyncio, sys
+import ast, asyncio, faulthandler, os, sys
+faulthandler.dump_traceback_later(float(os.environ["LUMENARY_STACKS_AFTER"]), exit=True)
 source = sys.stdin.read()
 ns = {"__name__": "__main__"}
 for part in source.split(SEPARATOR):
@@ -52,7 +57,10 @@ for part in source.split(SEPARATOR):
     result = eval(code, ns)
     if asyncio.iscoroutine(result):
         asyncio.run(result)
-'''.replace("SEPARATOR", repr(SEPARATOR))
+faulthandler.cancel_dump_traceback_later()
+sys.stdout.flush()
+print(FINISHED, file=sys.stderr, flush=True)
+'''.replace("SEPARATOR", repr(SEPARATOR)).replace("FINISHED", repr(FINISHED))
 
 RUN_BLOCK = re.compile(r"^```python[ \t]+run[ \t]*\n(.*?)^```\s*$", re.M | re.S)
 CHECK_BLOCK = re.compile(r"^```([\w#+-]+)[ \t]+check[ \t]*\n(.*?)^```\s*$", re.M | re.S)
@@ -222,12 +230,20 @@ def run(source, timeout):
             proc = subprocess.run(
                 [sys.executable, "-I", "-X", "utf8", "-c", RUNNER],
                 input=source, text=True, capture_output=True, timeout=timeout, cwd=tmp,
-                env={**os.environ, "PYTHONHASHSEED": "0", "MPLBACKEND": "Agg", **SINGLE_THREADED},
+                env={**os.environ, "PYTHONHASHSEED": "0", "MPLBACKEND": "Agg", **SINGLE_THREADED,
+                     "LUMENARY_STACKS_AFTER": str(max(timeout - 5, timeout * 0.9))},
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+            if FINISHED in err:
+                return False, f"timed out after {timeout}s: the code finished, but the process hung while exiting"
             return False, f"timed out after {timeout}s"
     if proc.returncode != 0:
-        return False, (proc.stderr.strip().splitlines() or ["exit status %d" % proc.returncode])[-1]
+        err = proc.stderr.strip()
+        if err.startswith("Timeout (") or "\nTimeout (" in err:
+            stacks = err[err.index("Timeout ("):].splitlines()
+            return False, f"timed out after {timeout}s; Python stacks when it was stopped:\n" + "\n".join("      " + l for l in stacks[:60])
+        return False, (err.splitlines() or ["exit status %d" % proc.returncode])[-1]
     return True, ""
 
 
