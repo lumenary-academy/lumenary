@@ -71,7 +71,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
           <LogoMark size={30} />
           <Wordmark />
         </Link>
-        <nav className="ms-2 hidden items-center gap-0.5 lg:flex" aria-label="Primary">
+        <nav className="ms-2 hidden items-center gap-0.5 xl:flex" aria-label="Primary">
           {nav.map((item) =>
             navLink(
               item,
@@ -88,7 +88,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
           <ThemeToggle />
           <button
             type="button"
-            className="inline-flex h-9 w-9 items-center justify-center rounded-full text-ink-2 hover:bg-paper-2 lg:hidden"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-full text-ink-2 hover:bg-paper-2 xl:hidden"
             aria-expanded={open}
             aria-controls="mobile-nav"
             aria-label={open ? t("nav.close") : t("nav.menu")}
@@ -99,7 +99,7 @@ export function SiteHeader({ available = [] }: { available?: string[] }) {
         </div>
       </div>
       {open && (
-        <nav id="mobile-nav" className="border-t border-line bg-paper lg:hidden" aria-label="Primary">
+        <nav id="mobile-nav" className="border-t border-line bg-paper xl:hidden" aria-label="Primary">
           <ul className="container-page grid grid-cols-2 gap-1 py-3 sm:grid-cols-4">
             {[...nav, ...more].map((item) => (
               <li key={item.key}>
