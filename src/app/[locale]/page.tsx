@@ -4,8 +4,8 @@ import { ArrowRight, ArrowUpRight, Atom, BarChart3, Bot, Braces, Cog, Cpu, Flask
 import type { LucideIcon } from "lucide-react";
 import { getT, resolveLocale } from "@/i18n/server";
 import { href } from "@/lib/href";
-import { linguaHome, PREP_URL } from "@/lib/sites";
-import { scientiaSubjects } from "@/lib/subjects";
+import { LINGUA_SAMPLES, linguaHome, linguaLesson, PREP_SAMPLES, PREP_URL, prepLesson } from "@/lib/sites";
+import { sampleLesson, scientiaSubjects } from "@/lib/subjects";
 
 /** Each Scientia subject's icon and accent. */
 const SUBJECT_LOOK: Record<string, { Icon: LucideIcon; accent: string }> = {
@@ -42,6 +42,40 @@ function Division({ Icon, accent, name, what, badge, text, children, action }: {
       {children}
       <div className="mt-auto pt-6">{action}</div>
     </article>
+  );
+}
+
+/** A lesson to try: its title (in the lesson's own language), and what it belongs to when the title alone does not say. */
+interface Sample {
+  href: string;
+  title: string;
+  lang: string;
+  context?: string;
+}
+
+/** A short list of lessons to try. Lessons on another division's site are plain links. */
+function TryLessons({ title, samples, note, className = "" }: { title: string; samples: Sample[]; note?: string; className?: string }) {
+  return (
+    <div className={className}>
+      <p className="text-xs font-semibold text-muted">{title}</p>
+      <ul className="mt-1.5 space-y-1 text-sm leading-snug">
+        {samples.map((s) => (
+          <li key={s.href} lang={s.lang}>
+            {s.href.startsWith("https://") ? (
+              <a href={s.href} className="link">
+                {s.title}
+              </a>
+            ) : (
+              <Link prefetch={false} href={s.href} className="link">
+                {s.title}
+              </Link>
+            )}
+            {s.context && <span className="text-muted"> · {s.context}</span>}
+          </li>
+        ))}
+      </ul>
+      {note && <p className="mt-2 text-xs leading-relaxed text-muted">{note}</p>}
+    </div>
   );
 }
 
@@ -104,7 +138,13 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                   {t("divisions.linguaCta")} <ArrowUpRight size={16} className="rtl:-scale-x-100" aria-hidden="true" />
                 </a>
               }
-            />
+            >
+              <TryLessons
+                className="mt-5 border-t border-line pt-4"
+                title={t("divisions.tryLesson")}
+                samples={LINGUA_SAMPLES.map((l) => ({ href: linguaLesson(l), title: l.title, lang: l.locale, context: l.courseTitle }))}
+              />
+            </Division>
           </li>
           <li>
             <Division
@@ -119,7 +159,14 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                   {t("divisions.prepCta")} <ArrowUpRight size={16} className="rtl:-scale-x-100" aria-hidden="true" />
                 </a>
               }
-            />
+            >
+              <TryLessons
+                className="mt-5 border-t border-line pt-4"
+                title={t("divisions.prepTry")}
+                note={t("divisions.prepTryNote")}
+                samples={PREP_SAMPLES.map((l) => ({ href: prepLesson(l), title: l.title, lang: "en", context: l.exam }))}
+              />
+            </Division>
           </li>
         </ul>
       </section>
@@ -134,23 +181,28 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
           <ul className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             {open.map((s) => {
               const look = SUBJECT_LOOK[s.key] ?? { Icon: Atom, accent: "bg-gold" };
+              const samples = s.samples.map((p) => sampleLesson(p, locale)).map((l) => ({ href: href(locale, l.path), title: l.title, lang: l.lang, context: l.course }));
+              // The subject's name links its page, and its link covers the card; the lessons to try sit above it.
               return (
-                <li key={s.key}>
-                  <Link href={href(locale, s.path)} className="card group relative flex h-full flex-col overflow-hidden p-5 hover:shadow-[var(--shadow-lg)]">
-                    <span className={`absolute inset-x-0 top-0 h-1 ${look.accent}`} aria-hidden="true" />
-                    <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-paper-2 text-ink">
-                      <look.Icon size={20} aria-hidden="true" />
+                <li key={s.key} className="card group relative flex h-full flex-col overflow-hidden p-5 hover:shadow-[var(--shadow-lg)]">
+                  <span className={`absolute inset-x-0 top-0 h-1 ${look.accent}`} aria-hidden="true" />
+                  <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-paper-2 text-ink">
+                    <look.Icon size={20} aria-hidden="true" />
+                  </span>
+                  <h3 className="mt-4 font-display text-xl font-semibold text-ink">
+                    <Link href={href(locale, s.path)} className="after:absolute after:inset-0">
+                      {t(`divisions.${s.key}`)}
+                    </Link>
+                  </h3>
+                  <p className="mt-1.5 text-sm leading-snug text-ink-2">{t(`divisions.${s.key}Text`)}</p>
+                  {samples.length > 0 && <TryLessons className="relative z-10 mt-4" title={t("divisions.tryLesson")} samples={samples} />}
+                  <span className="mt-auto flex items-center justify-between gap-2 pt-4 text-xs text-muted">
+                    <span>
+                      {s.courses ? `${t("divisions.coursesN", { n: s.courses })} · ` : ""}
+                      {t("divisions.lessonsN", { n: s.lessons })}
                     </span>
-                    <span className="mt-4 font-display text-xl font-semibold text-ink">{t(`divisions.${s.key}`)}</span>
-                    <span className="mt-1.5 text-sm leading-snug text-ink-2">{t(`divisions.${s.key}Text`)}</span>
-                    <span className="mt-auto flex items-center justify-between gap-2 pt-4 text-xs text-muted">
-                      <span>
-                        {s.courses ? `${t("divisions.coursesN", { n: s.courses })} · ` : ""}
-                        {t("divisions.lessonsN", { n: s.lessons })}
-                      </span>
-                      <ArrowRight size={14} className="text-muted transition-transform group-hover:translate-x-0.5 rtl:rotate-180" aria-hidden="true" />
-                    </span>
-                  </Link>
+                    <ArrowRight size={14} className="text-muted transition-transform group-hover:translate-x-0.5 rtl:rotate-180" aria-hidden="true" />
+                  </span>
                 </li>
               );
             })}

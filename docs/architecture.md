@@ -66,6 +66,10 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site (see "Lumenary Lingua and Lumenary Prep" below), and `vercel.json` redirects these old addresses there |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
 
+### Header and footer
+
+The header and footer show the navigation of the part of the academy a page belongs to (`src/lib/site-nav.ts`, `siteSection`). Lumenary Math's pages (`/math/…`, the labs, practice, progress and the educator resources) keep Math's navigation, its tools and its motto. The other subjects' pages link the subjects to one another, with the programming languages, the electives, the divisions and the project pages. Every other page (the front page, divisions, about, contribute, languages, verification) shows only the three divisions and the project pages. The footer is rendered by the layout, which cannot know the page, so it hands every set of columns to a small client component (`FooterNav`) that picks one from the pathname; each exported page's HTML contains only its own.
+
 ## Lesson architecture
 
 A lesson is `content/math/lessons/<slug>/en.mdx`, with frontmatter validated by `LessonFrontmatter`. Its body is a sequence of `<Section id kind title>` blocks whose `kind` maps to the standard lesson architecture (motivation, intuition, definitions, examples, proof, formal, computation, visualization, exercises, misconceptions, viewpoints, trails, sets, categories, history, reading) and to a reasoning mode (H/F/C). From early undergraduate onwards a `viewpoints` section is required, showing the topic through other mathematicians' eyes as well as set theory and category theory (see `docs/curriculum/viewpoints.md`). The full contract for authors is `docs/authoring-guide.md`. Available components:
@@ -85,6 +89,8 @@ Topic ids are namespaced (`math.*`) and subjects/levels are data. Subjects other
 ## Lumenary Lingua and Lumenary Prep
 
 Two of the academy's three divisions are not built here. **Lumenary Lingua**, the language courses, lives at [lingua.lumenary.academy](https://lingua.lumenary.academy), built from its own repository, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua), on the shared [@lumenary/core](https://github.com/lumenary-academy/lumenary-core) library. Its courses exist only in their teaching locale there: Spanish at `/en/spanish/`, English at `/es/ingles/`. **Lumenary Prep** lives at [prep.lumenary.academy](https://prep.lumenary.academy). This site links to both from the front page and the divisions page, with their base URLs in one place, `src/lib/sites.ts` (`LINGUA_URL`, `PREP_URL`).
+
+The front page offers a few lessons to try from each division. Scientia's are listed with each subject in `SUBJECTS` (`src/lib/subjects.ts`): each subject's first lesson, titled from the lesson itself. Lingua's (the first lesson of each course) and Prep's (free samples, lessons marked `free: true` that anyone can open) are in `src/lib/sites.ts` (`LINGUA_SAMPLES`, `PREP_SAMPLES`). `tests/front-page-samples.test.ts` checks Scientia's against the syllabi and Lingua's against a pinned copy of its syllabi. Prep's content is private, so its links were checked with curl when chosen; check again before changing them.
 
 Lingua's courses used to be part of this site, at `/[locale]/lingua/…`. Those addresses redirect permanently (308) to the Lingua site in `vercel.json`: `…/lingua/spanish/…` to `/en/spanish/…` and `…/lingua/ingles/…` to `/es/ingles/…` from any locale, and anything else under `/[locale]/lingua/` to Lingua's front page in the same locale. The course rules come before the general one. Because the site is exported with `trailingSlash: true`, the sources end in an optional `/:path(.*)?` rather than `/:path*`, which Vercel compiles strictly and which would not match a trailing slash.
 
