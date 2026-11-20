@@ -1,0 +1,368 @@
+---
+title: Storage and managed databases
+subtitle: Block, file and object storage; what "eleven nines" really promises; replication and erasure codes; managed databases and their consistency; and backups you can actually restore.
+minutes: 65
+objectives:
+  - Choose between block, file and object storage, and between storage tiers, for a given workload
+  - Distinguish durability from availability, and compute durability from a failure-and-repair model
+  - Explain replication and erasure coding, and rebuild lost fragments of an erasure-coded object
+  - Describe what a managed relational or NoSQL database does and does not do for you
+  - Recognise the consistency a cloud database actually offers, and when a read can be stale
+  - Define RPO and RTO, and compare backup and disaster-recovery designs by both
+narrators: [chloe, margaret, gideon]
+prerequisites: [what-is-the-cloud, virtualisation-and-containers, cloud-networking]
+related: [math.prob.markov-chains, math.algebra.linear-algebra, math.number.modular-arithmetic]
+references:
+  - title: "Amazon S3 user guide"
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html
+  - title: "Azure Storage redundancy"
+    url: https://learn.microsoft.com/en-us/azure/storage/common/storage-redundancy
+  - title: "Google Cloud Storage documentation"
+    url: https://docs.cloud.google.com/storage/docs
+  - title: "Alibaba Cloud Object Storage Service (OSS)"
+    url: https://www.alibabacloud.com/help/en/oss/
+  - title: Ceph
+    url: https://ceph.io/
+    note: Open-source software providing block, file and object storage on your own hardware.
+  - title: "Erasure Coding in Windows Azure Storage"
+    author: Cheng Huang and colleagues
+    year: 2012
+    url: https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang
+  - title: "Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases"
+    author: Alexandre Verbitski and colleagues
+    year: 2017
+    url: https://doi.org/10.1145/3035918.3056101
+  - title: "Spanner: Google's Globally-Distributed Database"
+    author: James C. Corbett and colleagues
+    year: 2012
+    url: https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett
+  - title: "Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service"
+    author: Mostafa Elhemali and colleagues
+    year: 2022
+    url: https://www.usenix.org/conference/atc22/presentation/elhemali
+  - title: "Consistency levels in Azure Cosmos DB"
+    url: https://learn.microsoft.com/en-us/azure/cosmos-db/consistency-levels
+  - title: "PostgreSQL: continuous archiving and point-in-time recovery"
+    url: https://www.postgresql.org/docs/current/continuous-archiving.html
+---
+
+<Section id="motivation" kind="motivation" title="Forty terabytes and a catalogue">
+
+A city museum in Kraków is digitising its collection: two million high-resolution scans, about 40 TB, which researchers worldwide will view online. It also has a catalogue — a relational database of objects, artists, loans and conservation records — and a small team of developers. The museum's director asks three questions that every cloud storage decision comes down to. Where should each kind of data live? How likely are we to lose any of it? And if something goes badly wrong — a region outage, a bug, a ransomware attack, a tired administrator typing a command into the wrong window — how much would we lose, and how long would we be closed?
+
+The providers' marketing answers the second question with a number like "99.999999999% durability", eleven nines. This lesson explains what such a number means, computes it from a model, and shows which assumption in that model matters most. It then turns to the databases built on top of storage, the consistency they really offer, and backups. Lumenary CS's [storage at scale](/en/cs/storage-at-scale/) (storage engines, partitioning, object stores), [replication and consensus](/en/cs/replication-and-consensus/) and [databases](/en/cs/databases/) lessons are the background; here we see how a cloud packages those ideas as services.
+
+</Section>
+
+<Section id="kinds" kind="definitions" title="Block, file and object storage">
+
+Clouds offer three fundamentally different kinds of storage, distinguished by the interface they present.
+
+<Definition term="Block, file and object storage">
+
+**Block storage** presents a virtual disk: an array of fixed-size blocks that one machine's operating system formats with a file system and reads and writes at any offset. **File storage** presents a shared file system — directories, files, permissions, locks — that many machines mount at once over a network protocol such as NFS or SMB. **Object storage** presents a flat namespace of *buckets* and *keys*, each holding an object written whole and read whole or by byte range, over an HTTP API.
+
+</Definition>
+
+| | Block | File | Object |
+| --- | --- | --- | --- |
+| Interface | a disk (`/dev/nvme1n1`) | a mounted directory (`/mnt/shared`) | HTTP: `PUT`, `GET`, `DELETE` a key |
+| Shared by | one machine at a time (usually) | many machines | any number of clients, anywhere |
+| Latency | well under a millisecond to a few ms | a few ms | tens of ms per request |
+| Typical use | databases, a VM's system disk | shared home directories, render farms, legacy applications | media, backups, data lakes, static websites |
+| Examples | Amazon EBS, Azure Managed Disks, Google Persistent Disk and Hyperdisk, Alibaba Cloud ESSD; Ceph RBD | Amazon EFS and FSx, Azure Files, Google Filestore, Alibaba Cloud NAS; CephFS, NFS servers | Amazon S3, Azure Blob Storage, Google Cloud Storage, Alibaba Cloud OSS; Ceph RGW |
+
+The S3 API has become a de facto standard, accepted by many object stores — Alibaba Cloud OSS, Google Cloud Storage's interoperability mode, many regional providers and open-source servers such as [Ceph](https://ceph.io/)'s gateway — though Azure Blob Storage has its own API. Block storage is usually *zonal*: a disk lives in one zone and attaches only to machines there (some providers also offer regional disks, replicated to a second zone). Managed file systems and object stores are usually replicated across the zones of a region, and object stores across regions if you ask.
+
+There is a fourth kind that is easy to overlook: **instance storage**, NVMe drives physically inside the host. It is the fastest storage there is, and it is **ephemeral**: when the VM is stopped or moved, or the host fails, the data is gone. It suits caches, scratch space and databases that replicate themselves across machines, never the only copy of anything.
+
+Object stores also offer **storage classes** that trade price per gigabyte against the cost and delay of reading. As of 2026, archive tiers on the large clouds cost roughly a tenth or less of the standard tier per gigabyte-month, but charge for retrieval and for deleting an object before a minimum period (from 30 days to a year, depending on class and provider), and some take hours to bring an object back. **Lifecycle rules** move objects between classes by age automatically: the museum's scans might stay in the standard class while new, move to an infrequent-access class after a year, and keep a second copy in an archive class in another region.
+
+</Section>
+
+<Section id="durability" kind="computation" title="What eleven nines means">
+
+<Definition term="Durability and availability">
+
+**Durability** is the probability that a stored object is *not lost* over a period, usually a year. **Availability** is the fraction of time the service *answers requests* successfully. A store can be unavailable for an hour without losing anything; it can be available while having quietly lost an object.
+
+</Definition>
+
+The two numbers differ enormously in practice. The large object stores state *designed* annual durabilities of eleven nines or more, while their availability targets and service-level agreements are typically three or four nines. Eleven nines means a probability of about $10^{-11}$ of losing a given object in a year. For the museum's two million scans that is an expected $2 \times 10^{6} \times 10^{-11} = 2 \times 10^{-5}$ objects a year: on average, one lost scan every 50,000 years — *if* the model behind the number is right.
+
+Where does such a number come from? From a model of failure and repair. An object is stored as $n$ fragments — whole copies, or erasure-coded pieces — on $n$ different disks, and survives as long as no more than a certain number are lost at once. Disks fail at random; when one does, the system rebuilds its fragments elsewhere from the survivors. Data is lost only if enough further disks fail *before the repairs finish*. The block below computes this with a small Markov chain, for an illustrative annual disk failure rate of 2%.
+
+```python run
+import math
+
+AFR = 0.02                          # each disk fails with probability about 2% a year (an example)
+lam = -math.log(1 - AFR)            # the same, as a failure rate per disk per year
+
+def mttdl_years(n, tolerate, repair_hours):
+    """Mean time to data loss for an object stored as n fragments (copies or erasure-coded
+    pieces) on n different disks, which survives losing up to `tolerate` of them. Lost
+    fragments are rebuilt in parallel, each taking about repair_hours on average.
+
+    A Markov chain on f = fragments currently lost: f -> f+1 at rate (n - f) * lam,
+    f -> f-1 at rate f * mu. If tau_f is the expected time to first reach f+1 from f,
+    then tau_f = (1 + f * mu * tau_(f-1)) / ((n - f) * lam), and MTTDL is their sum."""
+    mu = 365 * 24 / repair_hours
+    tau, total = 0.0, 0.0
+    for f in range(tolerate + 1):
+        tau = (1 + f * mu * tau) / ((n - f) * lam)
+        total += tau
+    return total
+
+print("scheme                stores  repair   P(lose a given object in a year)  nines")
+for name, n, k in [("2 copies", 2, 1), ("3 copies", 3, 1), ("erasure code (6, 3)", 9, 6),
+                   ("erasure code (10, 4)", 14, 10)]:
+    for hours in [24, 1]:
+        p = -math.expm1(-1 / mttdl_years(n, n - k, hours))   # 1 - exp(-1/MTTDL), computed accurately
+        print(f"{name:20} {n / k:5.1f}x {hours:5d} h {p:22.1e} {-math.log10(p):20.1f}")
+
+# The model assumes independent failures. If every fragment is in one zone, an event that
+# destroys the zone (fire, flood, a faulty bulk deletion) caps durability, whatever the code.
+for p_zone in [1e-4, 1e-6]:
+    print(f"all fragments in one zone, lost with probability {p_zone:.0e} a year: at most {-math.log10(p_zone):.0f} nines")
+```
+
+Three copies with a day to repair give about 9.7 nines; repairing within an hour gives 12.5. A $(10, 4)$ erasure code — ten data fragments plus four parity fragments, surviving any four losses — stores only 1.4 bytes per byte yet reaches 14.7 nines with day-long repairs. Two lessons follow. **Fast repair is worth as much as extra copies**: with $r$ copies, the loss probability falls roughly like $(\lambda/\mu)^{r-1}$, so cutting repair time 24-fold gains $r - 1$ factors of 24. And **erasure codes buy durability cheaply**, which is why every large object store uses them for most data.
+
+<Narrator who="gideon">
+
+Read the last two lines before believing the others. Every figure above assumes that disks fail *independently*. Real losses come mostly from correlated causes — a power event that takes out a rack, a firmware bug in one batch of drives, a software release that deletes the wrong data everywhere at once, an operator's mistake — and those are why providers spread fragments over zones and roll out storage software slowly. "Eleven nines" is a design target from a model, not something anyone has measured; nobody has run a store for $10^{11}$ object-years.
+
+</Narrator>
+
+</Section>
+
+<Section id="erasure-coding" kind="computation" title="Replication and erasure coding">
+
+**Replication** is the simple answer: keep $r$ full copies on different disks, racks or zones. Reads can go to any copy, a lost copy is rebuilt by copying a survivor, and the logic is easy to verify. It costs $r$ bytes of disk per byte stored.
+
+An **erasure code** with parameters $(k, m)$ splits data into $k$ fragments and computes $m$ extra *parity* fragments such that **any** $k$ of the $k + m$ reconstruct the original. Lumenary CS's storage-at-scale lesson met the $(10, 4)$ Reed–Solomon code; the block below builds a small code of the same kind from scratch, using nothing but polynomials.
+
+<Narrator who="chloe">
+
+The idea that makes it work is a fact from school algebra: a polynomial of degree less than $k$ is determined by its values at any $k$ points. Treat $k$ data symbols as the values of such a polynomial at $x = 1, \ldots, k$, and store its values at $k + m$ points. Lose any $m$ of them, and the $k$ that remain still pin the polynomial down, so you can recompute every missing value. Reed–Solomon codes are exactly this, done in a finite field so that the arithmetic is exact.
+
+</Narrator>
+
+```python run
+P = 257                                       # a prime: arithmetic modulo P is a field
+
+def interpolate(points, x):
+    """The value at x of the unique polynomial of degree < len(points) through `points`
+    (Lagrange interpolation, all arithmetic modulo P)."""
+    total = 0
+    for i, (xi, yi) in enumerate(points):
+        num, den = 1, 1
+        for j, (xj, _) in enumerate(points):
+            if j != i:
+                num = num * (x - xj) % P
+                den = den * (xi - xj) % P
+        total = (total + yi * num * pow(den, P - 2, P)) % P   # division = multiply by inverse
+    return total
+
+def encode(data, k, m):
+    """Split data into k fragments and add m parity fragments: fragment i holds, for each
+    stripe of k symbols, the value at x = i + 1 of the polynomial through that stripe."""
+    data = data + bytes(-len(data) % k)       # pad to whole stripes
+    stripes = [data[s:s + k] for s in range(0, len(data), k)]
+    return [[interpolate(list(zip(range(1, k + 1), st)), x) for st in stripes]
+            for x in range(1, k + m + 1)]     # fragments 1..k are the data itself
+
+def decode(fragments, k):
+    """Rebuild the data from ANY k surviving fragments (None marks a lost one)."""
+    alive = [(x + 1, f) for x, f in enumerate(fragments) if f is not None][:k]
+    if len(alive) < k:
+        raise ValueError("too many fragments lost")
+    out = []
+    for s in range(len(alive[0][1])):
+        pts = [(x, f[s]) for x, f in alive]
+        out += [interpolate(pts, x) for x in range(1, k + 1)]
+    return bytes(out)
+
+record = "Synthetic test record: archive scan 0042, digitised 2026-11-19".encode()
+k, m = 6, 3
+frags = encode(record, k, m)
+print(f"{len(record)} bytes -> {k + m} fragments of {len(frags[0])} symbols "
+      f"(overhead {(k + m) / k:.2f}x, any {m} may be lost)")
+print("data fragment 1 starts:", frags[0][:6], "  parity fragment 7 starts:", frags[6][:6])
+for lost in [(0, 3, 8), (1, 2, 4), (5, 6, 7)]:
+    damaged = [None if i in lost else f for i, f in enumerate(frags)]
+    print(f"lose fragments {[i + 1 for i in lost]}: rebuilt correctly?",
+          decode(damaged, k)[:len(record)] == record)
+try:
+    decode([None, None, None, None] + frags[4:], k)
+except ValueError as e:
+    print("lose 4 fragments:", e)
+```
+
+The code is **systematic**: fragments 1 to 6 hold the data itself (interleaved, one symbol of each stripe), so a healthy read needs no decoding. Any three fragments can be lost — data, parity or a mixture — and the record comes back; a fourth loss is fatal. Production codes work in the field with $2^8$ elements rather than modulo 257, so that every symbol is exactly one byte (here a parity symbol may be 256), and use fast matrix methods rather than Lagrange's formula, but the principle is the same.
+
+Erasure coding has costs that replication does not. Rebuilding one lost fragment means reading $k$ others, so a $(10, 4)$ code moves ten times as much data across the network for a repair as replication would. Small objects are inefficient to split, so stores often replicate them and erasure-code large ones. And reads during a failure must decode. Engineers have attacked the repair cost directly: Azure's storage team described **locally repairable codes**, which add parity over small groups so that most repairs read only a few fragments, in a [2012 paper](https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang).
+
+Placement completes the design. Storing fragments in three zones so that the loss of a whole zone leaves at least $k$ of them is what turns a code's durability into protection against the correlated failures Gideon described. Azure's [redundancy options](https://learn.microsoft.com/en-us/azure/storage/common/storage-redundancy) make this choice explicit — locally, zone- and geo-redundant storage — and the other providers offer similar choices through storage classes and multi-region buckets.
+
+</Section>
+
+<Section id="managed-databases" kind="human" title="Managed databases">
+
+Most applications keep their important state not in raw storage but in a database, and in the cloud most teams rent it managed. A **managed relational database** — Amazon RDS and Aurora, Azure SQL Database and Azure Database for PostgreSQL and MySQL, Google Cloud SQL and AlloyDB, Alibaba Cloud ApsaraDB RDS and PolarDB, among others — runs PostgreSQL, MySQL, SQL Server or a compatible engine for you. What "managed" includes is worth listing precisely:
+
+- **Provided:** installation and minor-version patching, automated backups with point-in-time recovery, a standby replica in another zone with automatic failover, read replicas, monitoring, encryption at rest, and storage that grows.
+- **Still yours:** the schema and indexes, query performance, connection management, access control (who can connect, with what privileges), choosing backup retention and *testing restores*, major-version upgrades (scheduled by you, tested by you), and the bill.
+
+Several of these services separate compute from storage. Amazon Aurora, for example, sends only its redo log to a shared storage layer that keeps six copies across three zones and accepts a write once four have it, as its [SIGMOD 2017 paper](https://doi.org/10.1145/3035918.3056101) explains; Azure SQL Hyperscale, PolarDB, AlloyDB and the open-source Neon follow related designs. Failover and new replicas become faster because the storage is already shared.
+
+Beyond one primary per database, two other families exist. **Distributed SQL** databases partition and replicate tables across many machines and zones, with consensus for each partition and transactions across them: Google's [Spanner](https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett) and open-source or source-available systems such as CockroachDB, YugabyteDB, TiDB and OceanBase. **NoSQL** services trade the relational model for predictable scaling on simpler access patterns: key-value and document stores such as Amazon [DynamoDB](https://www.usenix.org/conference/atc22/presentation/elhemali), Azure Cosmos DB, Google Firestore and Bigtable, and Alibaba Cloud Tablestore, with Apache Cassandra, ScyllaDB and MongoDB among the self-run options.
+
+A managed database is a trade: less operational work, more dependence on one provider's product, its limits and its price. Engines that are open source (PostgreSQL, MySQL) keep the option of moving; proprietary APIs make moving a rewrite. Neither choice is wrong, but it should be a choice.
+
+</Section>
+
+<Section id="consistency" kind="computation" title="Consistency in practice">
+
+Lumenary CS's replication-and-consensus lesson defined linearizability and eventual consistency. In the cloud the question becomes concrete: *if I write and then read, will I see my write?*
+
+Within one primary database, yes. The trouble starts with **read replicas**, which most managed relational databases update asynchronously: a write commits on the primary and reaches each replica some milliseconds — occasionally seconds — later. A read sent to a replica in that window returns the old value. The block uses an illustrative lag distribution: usually about 20 ms, but 5% of the time the replica is busy and lags about a second.
+
+```python run
+import math
+
+# Replication lag of an asynchronous read replica, as a mixture (illustrative numbers):
+# usually it applies a write within ~20 ms, but 5% of the time it is busy and lags ~1 s.
+def p_stale(delay_s):
+    """Probability that a read sent delay_s after a write still sees the old value."""
+    return 0.95 * math.exp(-delay_s / 0.020) + 0.05 * math.exp(-delay_s / 1.0)
+
+print("read issued after the write   P(stale read from replica)")
+for d in [0.005, 0.05, 0.2, 1, 5]:
+    print(f"{d * 1000:10.0f} ms {p_stale(d):27.2%}")
+```
+
+<Narrator who="margaret">
+
+The tail is what bites. A page that reloads 50 ms after the user saves their profile shows the old profile 12.6% of the time; waiting 200 ms still leaves 4.1%, almost all from the busy-replica case, and even a full second leaves 1.8%. Averages hide this: the *mean* lag here is only 69 ms. Measure the lag distribution of your own replicas, especially under load, before deciding which reads can tolerate it.
+
+</Narrator>
+
+The usual remedy is a **session guarantee** rather than strong consistency everywhere: *read-your-writes* (a client always sees its own writes) and *monotonic reads* (it never sees time go backwards). Applications get them by sending a user's reads to the primary for a short while after that user writes, or by carrying a log position from the write and reading only from a replica that has applied it. Services expose such choices explicitly. Azure Cosmos DB offers [five consistency levels](https://learn.microsoft.com/en-us/azure/cosmos-db/consistency-levels), from strong through bounded staleness, session and consistent prefix to eventual; DynamoDB's reads are eventually consistent by default with a strongly consistent option within a region; Spanner provides externally consistent transactions across regions using tightly synchronised clocks; and the major object stores, after years of eventual consistency for some operations, now give strong read-after-write consistency for objects (Amazon S3 since December 2020).
+
+Across regions the speed of light returns. A synchronous write to another continent costs at least one intercontinental round trip, the <LessonLink slug="cloud-networking">networking lesson</LessonLink>'s 100 ms or more, so most multi-region designs replicate asynchronously and accept that the newest writes can be lost if a region fails — which is exactly the RPO of the next section.
+
+</Section>
+
+<Section id="backups" kind="computation" title="Backups and disaster recovery">
+
+<Definition term="RPO and RTO">
+
+The **recovery point objective** (RPO) is the most data, measured in time, that you are prepared to lose in a disaster: an RPO of 5 minutes means the restored system may lack at most the last 5 minutes of changes. The **recovery time objective** (RTO) is the longest you are prepared to be out of service before the system works again.
+
+</Definition>
+
+<Figure caption="RPO and RTO on a timeline. Changes made after the last recoverable point are lost; the time from the disaster until service is restored is downtime. Each design trades cost against both.">
+
+<svg viewBox="0 0 680 170" role="img" aria-label="A horizontal time axis with three marked moments: the last recoverable point, the disaster, and service restored. The interval from the last recoverable point to the disaster is labelled RPO, the data that is lost. The interval from the disaster to service restored is labelled RTO, the time out of service.">
+  <defs>
+    <marker id="dr-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <line x1="20" y1="100" x2="660" y2="100" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#dr-arrow)" />
+  <text x="640" y="125" fill="currentColor" fontSize="12" textAnchor="end">time</text>
+  <rect x="180" y="86" width="170" height="28" fill="var(--gold-soft)" stroke="var(--gold)" strokeWidth="1.2" />
+  <rect x="350" y="86" width="220" height="28" fill="var(--sky-soft)" stroke="var(--sky)" strokeWidth="1.2" />
+  <g stroke="currentColor" strokeWidth="2">
+    <line x1="180" y1="70" x2="180" y2="130" />
+    <line x1="350" y1="70" x2="350" y2="130" />
+    <line x1="570" y1="70" x2="570" y2="130" />
+  </g>
+  <g fill="currentColor" fontSize="12" textAnchor="middle">
+    <text x="180" y="60">last recoverable point</text>
+    <text x="350" y="60">disaster</text>
+    <text x="570" y="60">service restored</text>
+    <text x="265" y="104">RPO</text>
+    <text x="460" y="104">RTO</text>
+    <text x="265" y="150">changes lost</text>
+    <text x="460" y="150">time out of service</text>
+  </g>
+</svg>
+
+</Figure>
+
+Both are business decisions, and both cost money: a smaller RPO needs more frequent copies or continuous replication; a smaller RTO needs more of the system already running somewhere else. The block compares four designs for the museum's 2 TB catalogue database, with illustrative throughput figures.
+
+```python run
+# Recovery for a 2 TB catalogue database, four designs (illustrative figures).
+DB_GB = 2000
+RESTORE_GB_PER_H = 1800          # copying a snapshot back from object storage, about 0.5 GB/s
+WAL_GB_PER_H = 5                 # change log the database writes per hour
+REPLAY_GB_PER_H = 50             # how fast a restored copy can replay that log
+PROVISION_H = 0.25               # starting a new database server
+
+def restore_hours(snapshot_every_h):
+    worst_log = snapshot_every_h * WAL_GB_PER_H              # log written since the last snapshot
+    return PROVISION_H + DB_GB / RESTORE_GB_PER_H + worst_log / REPLAY_GB_PER_H
+
+designs = [
+    # name, worst-case RPO in hours, worst-case RTO in hours
+    ("nightly snapshot only", 24, PROVISION_H + DB_GB / RESTORE_GB_PER_H),
+    ("nightly snapshot + log archived every 5 min", 5 / 60, restore_hours(24)),
+    ("4-hourly snapshot + log archived every 5 min", 5 / 60, restore_hours(4)),
+    ("warm standby in another region (async, ~2 s lag)", 2 / 3600, 10 / 60),
+]
+print("design                                              worst RPO     worst RTO")
+for name, rpo, rto in designs:
+    rpo_text = f"{rpo:.0f} h" if rpo >= 1 else (f"{rpo * 60:.0f} min" if rpo * 60 >= 1 else f"{rpo * 3600:.0f} s")
+    print(f"{name:50} {rpo_text:>10} {rto * 60:9.0f} min")
+```
+
+Archiving the database's change log every five minutes, as [PostgreSQL's point-in-time recovery](https://www.postgresql.org/docs/current/continuous-archiving.html) and every managed service do, cuts the worst-case RPO from a day to five minutes — but *lengthens* the worst-case RTO from 82 to 226 minutes, because a restore just before the next nightly snapshot must replay almost a day of log. Snapshotting every four hours brings it back to 106 minutes. Only a standby already running in another region gets both down to seconds and minutes, at the price of a second database running all the time. Industry guides name a ladder of such designs — backup and restore, a "pilot light" of minimal standby infrastructure, warm standby, and active–active across regions — each costing more and recovering faster.
+
+Five habits separate backups that work from backups that exist:
+
+1. **Replication is not a backup.** A mistaken `DELETE`, a buggy migration or ransomware is copied to every replica within seconds. Backups are copies from the *past*.
+2. **Keep copies apart**: the old *3-2-1* rule — three copies, on two kinds of media, one off-site — translates to copies in another region and, ideally, another account with separate credentials.
+3. **Make some copies immutable.** Object-lock or write-once retention settings stop anyone, including an attacker with stolen administrator credentials, from deleting or altering a backup before its retention ends.
+4. **Protect the keys.** Encrypted backups are only as recoverable as the keys that decrypt them; a key deleted with the account takes every backup with it.
+5. **Test restores, regularly and timed.** A backup that has never been restored is a hope, not a plan, and the measured restore time is your real RTO.
+
+Backups of personal data also carry obligations: data-protection laws such as the GDPR expect retention periods to be justified, and deletion requests to reach backups eventually, typically by letting backups expire on a defined schedule rather than editing them.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Eleven nines of durability means my data is safe."** It means the provider's storage is very unlikely to lose an object through hardware failure. It says nothing about you or your software deleting or overwriting it, about an attacker with your credentials, or about losing access to your account. Those are covered by versioning, immutable backups and access control — your side of the shared-responsibility model.
+
+</Misconception>
+
+<Misconception>
+
+**"Durability and availability are the same thing."** A store can be unreachable without losing data, and durability figures (eleven nines) are far higher than availability figures (three or four nines). Design for the store being unavailable sometimes.
+
+</Misconception>
+
+<Misconception>
+
+**"A multi-zone database is a backup."** A standby in another zone protects against losing a zone, not against a bad write, which it faithfully replicates. You need both: replicas for availability, backups for recovery.
+
+</Misconception>
+
+<Misconception>
+
+**"Data on the VM's disk is stored durably."** Network block volumes are replicated within their zone; local instance storage disappears with the VM or the host. Know which kind each path on your machine is.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

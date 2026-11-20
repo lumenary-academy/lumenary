@@ -1,0 +1,526 @@
+---
+title: Infrastructure as code
+subtitle: Describe infrastructure in versioned, reviewed files and let a tool work out the changes — state, plans and drift, modules and environments, GitOps, policy as code, and changing production safely.
+minutes: 90
+objectives:
+  - Explain declarative infrastructure, and how a tool turns a description into create, update, replace and delete operations
+  - Compare OpenTofu and Terraform, Pulumi, each cloud's own tools and Kubernetes-native ones fairly
+  - Implement a toy plan engine with dependency ordering, forced replacement and drift detection
+  - Organise code into modules and environments with separate, locked, remote state
+  - Describe GitOps and policy as code, and write a policy check over a plan
+  - Review an infrastructure change for its blast radius, and apply exactly what was reviewed
+prerequisites: [what-is-the-cloud, cloud-networking, kubernetes]
+related: [math.discrete.graph-theory, math.found.order-theory, math.comp.formal-methods]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: OpenTofu documentation
+    url: https://opentofu.org/docs/
+  - title: Terraform documentation
+    url: https://developer.hashicorp.com/terraform/docs
+  - title: Pulumi documentation
+    url: https://www.pulumi.com/docs/
+  - title: AWS CloudFormation documentation
+    url: https://docs.aws.amazon.com/cloudformation/
+  - title: Bicep documentation (Microsoft Azure)
+    url: https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/
+  - title: Google Cloud Infrastructure Manager documentation
+    url: https://cloud.google.com/infrastructure-manager/docs
+  - title: Alibaba Cloud Resource Orchestration Service (ROS) documentation
+    url: https://www.alibabacloud.com/help/en/ros/
+  - title: Crossplane
+    url: https://www.crossplane.io/
+    note: Cloud resources managed as Kubernetes objects by continuously running controllers.
+  - title: OpenGitOps
+    url: https://opengitops.dev/
+    note: The four GitOps principles, from a CNCF working group.
+  - title: Argo CD documentation
+    url: https://argo-cd.readthedocs.io/
+  - title: Flux documentation
+    url: https://fluxcd.io/
+  - title: Open Policy Agent documentation
+    url: https://www.openpolicyagent.org/docs
+  - title: Conftest
+    url: https://www.conftest.dev/
+    note: Runs Open Policy Agent policies against configuration files and plans.
+  - title: "OpenTofu: refactoring with moved blocks"
+    url: https://opentofu.org/docs/language/modules/develop/refactoring/
+  - title: "OpenTofu: state encryption"
+    url: https://opentofu.org/docs/language/state/encryption/
+---
+
+<Section id="motivation" kind="motivation" title="The environment nobody can rebuild">
+
+A hospital group in Durban runs its appointment and records platform on a public cloud. The production environment was built by hand in 2021, through the provider's web console, by an engineer who has since left. Staging was built a year later by someone else and differs from production in forty small ways that nobody has listed. During an incident last winter, a firewall rule was opened at two in the morning and never closed. Now the auditors ask what is deployed and why, and the team wants a second region for disaster recovery. Nobody can say exactly what to build.
+
+This is the problem **infrastructure as code** (IaC) solves. Networks, firewalls, databases, buckets, clusters and permissions are described in text files, kept in version control and reviewed like any other code, and a tool makes the cloud match them. The same files build staging, production and the new region identically; every change has an author, a reviewer and a reason in the history; and rebuilding after a disaster means running the tool again.
+
+The idea grew from configuration-management tools that kept *servers* in a declared state — CFEngine from 1993, then Puppet, Chef and Ansible — and moved to whole cloud estates with AWS CloudFormation in 2011 and Terraform in 2014. This lesson builds the core of such a tool in Python, then turns to what professionals argue about: where state lives, how to structure code across environments, how Git and policies fit in, and how to change production without breaking it.
+
+</Section>
+
+<Section id="declarative" kind="definitions" title="Declarative infrastructure">
+
+You could automate infrastructure with a script of provider commands: create a network, then a subnet, then a database. The script works once. Run it again and it fails (the network exists) or creates duplicates; change one line and it cannot tell what to remove. Infrastructure as code tools are **declarative** instead, like the Kubernetes controllers of <LessonLink slug="kubernetes">Kubernetes</LessonLink>: you describe the resources that should exist, and the tool computes and performs the operations that make reality match.
+
+<Definition term="resource and provider">
+
+A **resource** is one manageable object in some system — a virtual network, a bucket, a DNS record, a role. A **provider** is the plug-in that knows how to create, read, update and delete one family of resources through that system's API (one per cloud, and others for DNS services, monitoring tools, Kubernetes and more).
+
+</Definition>
+
+<Definition term="state">
+
+**State** is the tool's record of which real objects it manages: for each resource address in the code (`database.records`), the real object's identifier and its attributes as last applied or read. It is how the tool knows that the database named in the code *is* the database with a particular cloud id.
+
+</Definition>
+
+<Definition term="plan, apply and drift">
+
+A **plan** is the list of operations needed to move from the current state to the configuration: create, update in place, replace (destroy and recreate), or delete. **Applying** performs them. **Drift** is any difference between the real infrastructure and the state that arose outside the tool — a change made by hand, by another tool, or by the provider.
+
+</Definition>
+
+Two properties make declarative tools trustworthy. Applying the same configuration twice is **idempotent**: the second run finds nothing to do. And the plan can be **inspected before it happens**, which turns an infrastructure change into something a colleague can review.
+
+</Section>
+
+<Section id="tools" kind="human" title="The tools, side by side">
+
+| Tool | You write | Where state lives | Scope |
+| --- | --- | --- | --- |
+| [OpenTofu](https://opentofu.org/docs/) and [Terraform](https://developer.hashicorp.com/terraform/docs) | HCL, a declarative configuration language | A state file in a backend you choose (object storage, a database, a hosted service) | Any cloud or API with a provider |
+| [Pulumi](https://www.pulumi.com/docs/) | TypeScript, Python, Go, C#, Java or YAML | A state backend you choose, or Pulumi's hosted service | Any cloud with a provider |
+| [AWS CloudFormation](https://docs.aws.amazon.com/cloudformation/) (and the [AWS CDK](https://docs.aws.amazon.com/cdk/), which generates it from code) | JSON or YAML templates | Held by AWS as "stacks" | AWS |
+| [Bicep](https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/) and ARM templates | Bicep, which compiles to ARM JSON | No separate state: Azure Resource Manager itself is the record, with deployment stacks to manage lifecycles | Azure |
+| [Infrastructure Manager](https://cloud.google.com/infrastructure-manager/docs) | Terraform configuration, run as a managed service | Kept by the service | Google Cloud |
+| [Resource Orchestration Service](https://www.alibabacloud.com/help/en/ros/) | ROS templates (JSON or YAML), or Terraform | Held by Alibaba Cloud as stacks | Alibaba Cloud |
+| [Crossplane](https://www.crossplane.io/) | Kubernetes custom resources | The Kubernetes API (etcd) | Any cloud with a provider; reconciled continuously |
+
+Terraform, created by HashiCorp, made a provider-based, multi-cloud language the most common choice. In 2023 HashiCorp moved it from an open-source licence (MPL 2.0) to the Business Source License, which restricts some commercial uses, and IBM acquired HashiCorp in 2025. A community fork, **OpenTofu**, was started in response under the Linux Foundation, keeps the MPL licence and the same language, and has since added features of its own, such as encryption of state files. The two remain largely compatible. Pulumi uses the same desired-state model but lets you write it in a general-purpose language, which helps with loops and abstractions and makes it easier to write code too clever to review. The provider-specific tools need no separate state and support new services on day one, but describe one cloud only. Google retired its older Deployment Manager in 2026 in favour of Infrastructure Manager, which runs Terraform. Configuration-management tools such as Ansible remain common for what runs *inside* machines, alongside one of these for the machines themselves.
+
+Here, for comparison only, is the same intent — an object-storage bucket that keeps old versions of every object — on four clouds, in OpenTofu/Terraform's HCL. Real projects rarely mix four clouds in one configuration.
+
+```hcl
+# Not run here: OpenTofu / Terraform configuration. Credentials come from the environment, never from files.
+terraform {
+  required_providers {
+    aws      = { source = "hashicorp/aws", version = "~> 6.0" }
+    azurerm  = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    google   = { source = "hashicorp/google", version = "~> 7.0" }
+    alicloud = { source = "aliyun/alicloud", version = "~> 1.280" }
+  }
+}
+
+provider "aws" {
+  region = "af-south-1"                 # Cape Town
+}
+provider "azurerm" {
+  features {}                           # subscription from ARM_SUBSCRIPTION_ID
+}
+provider "google" {
+  project = "dbn-records-example"
+  region  = "africa-south1"             # Johannesburg
+}
+provider "alicloud" {
+  region = "ap-southeast-1"             # Singapore
+}
+
+resource "aws_s3_bucket" "scans" {
+  bucket = "dbn-scans-aws-7f3a"
+}
+resource "aws_s3_bucket_versioning" "scans" {        # on AWS, versioning is its own resource
+  bucket = aws_s3_bucket.scans.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "azurerm_resource_group" "records" {
+  name     = "rg-dbn-records"
+  location = "southafricanorth"
+}
+resource "azurerm_storage_account" "scans" {        # on Azure, containers live inside an account
+  name                     = "dbnscans7f3a"
+  resource_group_name      = azurerm_resource_group.records.name
+  location                 = azurerm_resource_group.records.location
+  account_tier             = "Standard"
+  account_replication_type = "ZRS"
+  blob_properties {
+    versioning_enabled = true
+  }
+}
+
+resource "google_storage_bucket" "scans" {
+  name                        = "dbn-scans-gcp-7f3a"
+  location                    = "AFRICA-SOUTH1"
+  uniform_bucket_level_access = true
+  versioning {
+    enabled = true
+  }
+}
+
+resource "alicloud_oss_bucket" "scans" {
+  bucket = "dbn-scans-oss-7f3a"
+  versioning {
+    status = "Enabled"
+  }
+}
+```
+
+The workflow is the same on every cloud — write, plan, review, apply — but the resources are not: AWS splits versioning into a separate resource, Azure puts storage containers inside an account inside a resource group, and each provider names its options differently. A common IaC tool gives you one way of working, not portability. Moving to another cloud still means rewriting the resources.
+
+</Section>
+
+<Section id="plans" kind="computation" title="State, plans and drift">
+
+A plan comes from comparing three things: the **configuration** (what the files say), the **state** (what the tool last applied), and the **real infrastructure** (what the cloud reports now). Before planning, the tool *refreshes*: it reads each managed object back through the provider's API and notices drift. It then orders the resources by their references — a database that names a network must come after the network — which is a topological sort of a dependency graph (see <TopicLink id="math.discrete.graph-theory">graph theory</TopicLink>). Creations follow that order and deletions go in reverse, so nothing is removed while something still uses it.
+
+For each resource the plan decides one of four things. Present in the configuration but not in state: **create** (`+`). In both, with some attributes changed: **update in place** (`~`), unless one of the changed attributes is one the provider cannot change on an existing object — a bucket's name, a database's engine, a network's address range — in which case **replace** (`-/+`). In state but no longer in the configuration: **delete** (`-`).
+
+<Figure caption="Where a plan comes from. The tool reads the configuration and its state, refreshes the state from the real infrastructure, and computes a plan; applying the plan changes the real infrastructure and records the result in state. A change made outside the tool shows up as drift at the next refresh.">
+<svg viewBox="0 0 560 260" role="img" aria-label="Diagram with four boxes. Configuration, files in Git, at top left, and state, what the tool last applied, at top right, both have arrows into a central box labelled plan, the diff to review. An arrow labelled apply goes from plan down to a box labelled real infrastructure, read through cloud APIs. An arrow labelled refresh goes from real infrastructure up to state. On the left, a dashed box labelled manual change has a dashed arrow labelled drift into real infrastructure.">
+  <defs>
+    <marker id="iac-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="20" width="160" height="50" rx="4" />
+    <rect x="380" y="20" width="160" height="50" rx="4" />
+    <rect x="195" y="195" width="170" height="50" rx="4" />
+    <rect x="20" y="200" width="120" height="40" rx="4" strokeDasharray="5 4" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5">
+    <rect x="215" y="105" width="130" height="46" rx="4" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="100" y="42">configuration</text>
+    <text x="100" y="58" fontSize="10">files in Git</text>
+    <text x="460" y="42">state</text>
+    <text x="460" y="58" fontSize="10">what the tool last applied</text>
+    <text x="280" y="125">plan</text>
+    <text x="280" y="141" fontSize="10">the diff to review</text>
+    <text x="280" y="217">real infrastructure</text>
+    <text x="280" y="233" fontSize="10">read through cloud APIs</text>
+    <text x="80" y="224" fontSize="11">manual change</text>
+    <text x="300" y="178" fontSize="11" textAnchor="start">apply</text>
+    <text x="440" y="150" fontSize="11" textAnchor="start">refresh</text>
+    <text x="167" y="212" fontSize="11">drift</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#iac-arrow)">
+    <path d="M 120 70 L 228 103" />
+    <path d="M 440 70 L 332 103" />
+    <path d="M 280 151 L 280 193" />
+    <path d="M 365 210 L 470 72" />
+    <path d="M 140 220 L 193 220" strokeDasharray="5 4" />
+  </g>
+</svg>
+</Figure>
+
+The toy engine below implements all of this for an imaginary cloud: a topological order, the four kinds of operation, an `apply` that records new ids in state, and a `refresh` that detects drift. It applies a first configuration, suffers a manual change during an incident, and then plans a second configuration.
+
+```python run
+import copy, itertools
+
+# Attributes the (imaginary) cloud cannot change on an existing resource: changing one forces the
+# resource to be destroyed and created again, as real providers mark them.
+FORCE_NEW = {"network": {"cidr"}, "firewall": {"network"}, "database": {"engine", "network"},
+             "bucket": {"name", "region"}}
+
+def refs(attrs):
+    return {v[4:] for v in attrs.values() if isinstance(v, str) and v.startswith("ref:")}
+
+def order(config):
+    """Topological order of addresses: every resource after the ones it references (Kahn)."""
+    needs = {a: refs(r) & config.keys() for a, r in config.items()}
+    done, out = set(), []
+    while len(out) < len(config):
+        ready = sorted(a for a in config if a not in done and needs[a] <= done)
+        if not ready:
+            raise ValueError("dependency cycle")
+        out.append(ready[0])
+        done.add(ready[0])
+    return out
+
+def plan(desired, state):
+    steps = []
+    for addr in order(desired):
+        want = desired[addr]
+        if addr not in state:
+            steps.append(("+", addr, sorted(want)))
+            continue
+        have = state[addr]["attrs"]
+        changed = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        if not changed:
+            continue
+        forced = set(changed) & FORCE_NEW[want["type"]]
+        steps.append(("-/+" if forced else "~", addr, changed))
+    for addr in reversed(order({a: s["attrs"] for a, s in state.items()})):
+        if addr not in desired:
+            steps.append(("-", addr, []))
+    return steps
+
+ids = (f"id-{n:03d}" for n in itertools.count(1))
+real = {}                     # the cloud: id -> attributes (what actually exists)
+state = {}                    # the tool's record: address -> {"id", "attrs"}
+
+def apply(steps, desired):
+    for op, addr, _ in steps:
+        if op in ("-", "-/+"):
+            del real[state.pop(addr)["id"]]
+        if op in ("+", "-/+"):
+            new_id = next(ids)
+            real[new_id] = copy.deepcopy(desired[addr])
+            state[addr] = {"id": new_id, "attrs": copy.deepcopy(desired[addr])}
+        if op == "~":
+            real[state[addr]["id"]] = copy.deepcopy(desired[addr])
+            state[addr]["attrs"] = copy.deepcopy(desired[addr])
+
+def refresh():
+    """Read every resource back from the cloud; report and record any drift."""
+    for addr, s in state.items():
+        actual = real[s["id"]]
+        for k in sorted(set(actual) | set(s["attrs"])):
+            if actual.get(k) != s["attrs"].get(k):
+                print(f"  drift: {addr}.{k} is {actual.get(k)!r}, last applied {s['attrs'].get(k)!r}")
+        s["attrs"] = copy.deepcopy(actual)
+
+def show(steps):
+    for op, addr, keys in steps:
+        print(f"  {op:>3} {addr:18} {', '.join(keys)}")
+    adds = sum(op in ("+", "-/+") for op, _, _ in steps)
+    changes = sum(op == "~" for op, _, _ in steps)
+    destroys = sum(op in ("-", "-/+") for op, _, _ in steps)
+    print(f"  Plan: {adds} to add, {changes} to change, {destroys} to destroy.")
+
+v1 = {
+    "network.main":     {"type": "network", "cidr": "10.20.0.0/16"},
+    "firewall.web":     {"type": "firewall", "network": "ref:network.main", "allow": "443"},
+    "database.records": {"type": "database", "engine": "postgres-17", "size": "small",
+                         "network": "ref:network.main"},
+    "bucket.scans":     {"type": "bucket", "name": "clinic-scans", "region": "af-south-1"},
+}
+print("1. first plan, empty state:")
+steps = plan(v1, state)
+show(steps)
+apply(steps, v1)
+
+print("2. during an incident someone opens port 22 by hand, outside the tool")
+real[state["firewall.web"]["id"]]["allow"] = "443,22"
+
+v2 = copy.deepcopy(v1)
+v2["database.records"]["size"] = "medium"                 # can be changed in place
+v2["bucket.scans"]["name"] = "dbn-clinic-scans"          # a new naming convention: forces a new bucket
+v2["bucket.backups"] = {"type": "bucket", "name": "clinic-backups", "region": "af-south-1"}
+print("3. refresh, then plan the new configuration:")
+refresh()
+steps = plan(v2, state)
+show(steps)
+apply(steps, v2)
+print("4. plan again after apply:")
+show(plan(v2, state))
+```
+
+The first plan creates four resources, the network before the firewall and database that reference it. After the manual change, the refresh reports the drift, and the second plan proposes to *remove* port 22 again — the tool restores the configuration, not the most recent human decision. The final plan is empty: apply is idempotent.
+
+<Narrator who="margaret">
+
+Read the summary line the way a reviewer should: "2 to add, 2 to change, 1 to destroy" sounds routine, but the one destroy is the scans bucket, replaced because its *name* changed. A new bucket starts empty, so the plan would discard every stored scan (many providers refuse to delete a non-empty bucket unless forced, which turns data loss into an apply that fails halfway). One symbol, `-/+`, carried the whole risk of the change.
+
+</Narrator>
+
+Real tools add what the toy omits. A reference resolves to the other resource's *id*, so replacing a network forces replacing everything placed in it — a cascade worth looking for in any plan. Lifecycle settings change the defaults: `create_before_destroy` builds the replacement first (needed for anything that must not have a gap), `prevent_destroy` makes the tool refuse any plan that would delete the resource, and `ignore_changes` tells it to leave an attribute that something else manages. And **state** deserves the care of a production database: it maps code to real objects, so losing it orphans them; it often contains secrets such as generated passwords, so it is encrypted and access-controlled; and two people applying at once would corrupt it, so backends **lock** it during every operation.
+
+</Section>
+
+<Section id="modules" kind="human" title="Modules and environments">
+
+A **module** is a reusable group of resources with inputs and outputs, like a function. A team might write one module for "a versioned, encrypted, private bucket with a retention rule" and use it everywhere, so that a security fix is made once. Modules are versioned and pinned like any dependency, published in public registries or kept in the organisation's own repositories. The usual warning applies: a module with thirty options is an API to maintain, and an abstraction that hides which resources it creates makes plans harder to read.
+
+**Environments** — development, staging, production, a second region — should differ in their *inputs*, not in their structure: the same modules, called with different sizes, counts and names. Each environment, and usually each major component within it, gets its own **state**, so that a mistake in the staging network's plan cannot touch the production database, and so that plans stay small enough to read. A typical layout has one directory per environment and component, each calling shared modules and naming its own backend:
+
+```hcl
+# Not run here: environments/prod/records/main.tf — one component of one environment.
+terraform {
+  backend "s3" {                                # state in object storage, locked during every run
+    bucket       = "dbn-iac-state"
+    key          = "prod/records/terraform.tfstate"
+    region       = "af-south-1"
+    encrypt      = true
+    use_lockfile = true                         # native S3 locking: OpenTofu 1.10+, Terraform 1.10+
+  }
+}
+
+module "scans_bucket" {
+  source         = "../../../modules/versioned-bucket"
+  name           = "dbn-scans-prod"
+  retention_days = 3650
+}
+
+module "records_db" {
+  source        = "../../../modules/postgres"
+  instance_size = "large"
+  multi_zone    = true                          # staging calls the same module with false
+}
+```
+
+Each cloud has an equivalent backend — `azurerm` (state in Blob Storage, locked with a blob lease), `gcs` (Cloud Storage, locked with a lock object), `oss` (Alibaba Cloud OSS, locked through a Tablestore table) — and backends that use a PostgreSQL database or a hosted service work anywhere. Changes are then **promoted**: the same module version is applied to development, then staging, then production, so production only ever receives a change that has already worked twice.
+
+</Section>
+
+<Section id="gitops" kind="human" title="GitOps">
+
+Infrastructure as code still leaves one question open: who runs `apply`, and when? In the simplest setup an engineer runs it from a laptop, which means credentials on laptops and no guarantee that what was applied matches what was merged. **GitOps** makes the Git repository the single source of truth and lets automation do the rest. The CNCF's [OpenGitOps](https://opengitops.dev/) group states four principles: the desired state is **declarative**; it is **versioned and immutable** (every version kept, none edited in place); it is **pulled automatically** by software agents; and it is **continuously reconciled** — the agents keep comparing and correcting, not just on each merge.
+
+For Kubernetes, agents such as [Argo CD](https://argo-cd.readthedocs.io/) and [Flux](https://fluxcd.io/), both CNCF graduated projects, run inside the cluster, watch a repository of manifests and apply changes; drift caused by a manual `kubectl edit` is reverted or reported. For cloud resources, Crossplane brings the same model by making buckets and databases Kubernetes objects, and controllers exist that run OpenTofu or Terraform on a schedule. Many teams use a **push** variant instead: the CI system plans on every pull request, posts the plan for review, and applies it on merge. Pull-based agents keep cloud credentials inside the environment they manage; push-based pipelines are simpler and can manage things outside any cluster.
+
+<Narrator who="chloe">
+
+GitOps is the reconciler from the Kubernetes lesson with one change: the desired state lives in Git rather than in the API server. That single move gives every change a reviewer, a timestamp and an undo button — reverting a commit *is* the rollback — and it means the running system can always be compared against something written down.
+
+</Narrator>
+
+</Section>
+
+<Section id="policy" kind="computation" title="Policy as code">
+
+Review catches a lot, but people miss things at the end of a long day. **Policy as code** writes an organisation's rules — no public buckets, encryption everywhere, an owner on every resource, no database deleted without sign-off — as programs that check every plan automatically before it can be applied. Because OpenTofu and Terraform can both export a plan as JSON (`tofu show -json` or `terraform show -json`), a policy is just a function over that document. Here is a small policy engine over a plan of that shape:
+
+```python run
+# The shape of a machine-readable plan, as `tofu show -json` / `terraform show -json` produce it
+# (only the fields these rules need; the resource types are invented for the example).
+plan = {"resource_changes": [
+    {"address": "bucket.scans", "type": "bucket", "change": {"actions": ["create"],
+     "after": {"name": "clinic-scans", "public_read": False, "encrypted": True, "tags": {"owner": "records"}}}},
+    {"address": "bucket.exports", "type": "bucket", "change": {"actions": ["create"],
+     "after": {"name": "clinic-exports", "public_read": True, "encrypted": False, "tags": {}}}},
+    {"address": "firewall.admin", "type": "firewall", "change": {"actions": ["update"],
+     "after": {"port": 22, "source": "0.0.0.0/0", "tags": {"owner": "platform"}}}},
+    {"address": "database.records", "type": "database", "change": {"actions": ["delete", "create"],
+     "after": {"engine": "postgres-17", "tags": {"owner": "records"}}}},
+    {"address": "network.main", "type": "network", "change": {"actions": ["no-op"],
+     "after": {"cidr": "10.20.0.0/16", "tags": {"owner": "platform"}}}},
+]}
+
+def no_public_buckets(rc):
+    if rc["type"] == "bucket" and rc["change"]["after"].get("public_read"):
+        yield "buckets must not be publicly readable"
+
+def encrypted_buckets(rc):
+    if rc["type"] == "bucket" and not rc["change"]["after"].get("encrypted"):
+        yield "buckets must be encrypted at rest"
+
+def has_owner(rc):
+    if "owner" not in rc["change"]["after"].get("tags", {}):
+        yield "every resource needs an owner tag"
+
+def no_ssh_from_internet(rc):
+    after = rc["change"]["after"]
+    if rc["type"] == "firewall" and after.get("port") == 22 and after.get("source") == "0.0.0.0/0":
+        yield "port 22 must not be open to the whole internet"
+
+def databases_never_destroyed(rc):
+    if rc["type"] == "database" and "delete" in rc["change"]["actions"]:
+        yield "this plan destroys a database: needs explicit approval"
+
+RULES = [no_public_buckets, encrypted_buckets, has_owner, no_ssh_from_internet, databases_never_destroyed]
+
+violations = []
+for rc in plan["resource_changes"]:
+    if rc["change"]["actions"] == ["no-op"]:
+        continue                                   # judge only what is about to change
+    for rule in RULES:
+        for message in rule(rc):
+            violations.append((rc["address"], rule.__name__, message))
+
+for address, rule, message in violations:
+    print(f"DENY  {address:17} {rule:26} {message}")
+changing = sum(rc["change"]["actions"] != ["no-op"] for rc in plan["resource_changes"])
+print(f"{len(violations)} violations in {changing} changing resources: "
+      f"{'apply blocked' if violations else 'apply may proceed'}")
+```
+
+Notice the database rule: a replacement appears in the JSON plan as the actions `["delete", "create"]`, so a rule that looks for `"delete"` catches replacements as well as deletions — exactly the changes a reviewer most needs to see.
+
+In practice the most widely used open-source engine is the [Open Policy Agent](https://www.openpolicyagent.org/docs) (a CNCF graduated project), whose rules are written in a language called Rego and run against plans by tools such as [Conftest](https://www.conftest.dev/). A rule in the same spirit, for the Google Cloud bucket of the earlier example, might read (not run here):
+
+```text
+# Not run here: a Rego policy (Open Policy Agent 1.x syntax) over a JSON plan
+package main
+
+deny contains msg if {
+  some rc in input.resource_changes
+  rc.type == "google_storage_bucket"
+  not rc.change.after.uniform_bucket_level_access
+  msg := sprintf("%s must use uniform bucket-level access", [rc.address])
+}
+```
+
+Kubernetes clusters enforce policies at admission time with OPA Gatekeeper or [Kyverno](https://kyverno.io/); static scanners such as [Checkov](https://www.checkov.io/) and [Trivy](https://trivy.dev/) check configuration files against hundreds of common rules; [AWS CloudFormation Guard](https://github.com/aws-cloudformation/cloudformation-guard) does the same for CloudFormation templates. Each cloud also enforces or audits organisation-wide guardrails on its own side, whatever tool made the request: AWS service control policies, [Azure Policy](https://learn.microsoft.com/en-us/azure/governance/policy/), Google Cloud's [Organization Policy Service](https://cloud.google.com/resource-manager/docs/organization-policy/overview) and Alibaba Cloud's [Cloud Config](https://www.alibabacloud.com/help/en/cloud-config/) rules. Checks in the pipeline give fast feedback; guardrails in the cloud catch whatever bypasses the pipeline. <LessonLink slug="cloud-security-and-identity">Cloud security and identity</LessonLink> covers the permissions side.
+
+</Section>
+
+<Section id="review" kind="human" title="Reviewing infrastructure changes safely">
+
+Infrastructure changes fail differently from application changes: there is often no quick rollback for a deleted database or a replaced network. Teams that change production often and safely tend to follow the same habits.
+
+- **Review the plan, not only the code.** A one-line change to a name can produce a replacement. Look first for `-/+` and `-`, and for anything that holds data, carries traffic or has an address others depend on.
+- **Apply exactly what was reviewed.** Save the plan to a file, review it, and apply that file; the tools refuse to apply a saved plan if the state has changed since it was made.
+- **Limit the blast radius.** Small changes, separate states per environment and component, and promotion through staging before production.
+- **Protect what cannot be recreated.** Mark critical resources with `prevent_destroy`, and turn on the provider's own protection — a deletion-protection setting or a resource lock — for databases and the like, so that two independent switches must be flipped.
+- **Refactor without destroying.** Renaming a resource in code looks to the tool like deleting one and creating another. `moved` blocks record the rename so the tool updates its state instead; `import` blocks adopt existing resources into code without recreating them.
+- **Give the pipeline, not people, the power to apply.** CI jobs authenticate to the cloud with short-lived, federated credentials (OIDC) rather than stored keys; plan jobs get read-only access and only apply jobs can change things. Humans keep a documented break-glass procedure for incidents — and afterwards put any manual change into code, or the next apply will undo it.
+
+A review-then-apply pipeline, in commands (OpenTofu shown; the `terraform` command takes the same ones):
+
+```bash
+# Not run here: plan on the pull request, apply on merge
+tofu init -input=false
+tofu plan -input=false -out=plan.bin       # save the exact plan
+tofu show -json plan.bin > plan.json       # machine-readable copy for policy checks
+conftest test plan.json                    # policy as code: fails the job on any violation
+# ... a person reads the plan output and approves the pull request ...
+tofu apply -input=false plan.bin           # apply exactly what was reviewed
+```
+
+<Narrator who="gideon">
+
+A plan is a prediction, not a guarantee. The provider can still reject an operation halfway through — a quota, a name already taken, a permission missing — and an apply is not a transaction: what succeeded stays applied and what failed does not, so the next plan starts from that partial state. Design changes so that every intermediate state is safe, for instance by creating the new resource, moving traffic, and deleting the old one in separate changes.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Using a multi-cloud IaC tool makes us portable."** It gives one workflow and one language, but every resource is provider-specific, as the four buckets show. Moving clouds means rewriting the resources and migrating the data.
+
+</Misconception>
+
+<Misconception>
+
+**"The state file is a cache; we can delete it and start again."** Without state the tool no longer knows which real objects it manages. The next plan would try to create everything again, colliding with or duplicating what exists. State is backed up, versioned, encrypted and locked.
+
+</Misconception>
+
+<Misconception>
+
+**"A quick fix in the console during an incident is harmless."** It is drift. The next apply silently reverts it, possibly reopening the incident, or the fix lives on undocumented. Put it into code as soon as the incident is over.
+
+</Misconception>
+
+<Misconception>
+
+**"If the code change was reviewed, the infrastructure change was reviewed."** The plan is the change. The same small diff can mean an in-place update or the replacement of a database, depending on which attribute it touches and what depends on the resource.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

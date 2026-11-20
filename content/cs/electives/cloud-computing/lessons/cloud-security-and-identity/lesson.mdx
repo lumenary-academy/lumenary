@@ -1,0 +1,588 @@
+---
+title: Cloud security and identity
+subtitle: In the cloud, identity is the perimeter — who may do what to which resource, under which conditions, with which keys, and how to notice when the answer is wrong.
+minutes: 90
+objectives:
+  - Explain principals, credentials and policies, and how the major providers and Kubernetes name them
+  - Implement a policy evaluator with allow, explicit deny, default deny and conditions, and prove that its decision does not depend on statement order
+  - Apply least privilege with short-lived credentials, workload identity and right-sizing from audit logs
+  - Keep secrets out of code, and explain encryption in transit and at rest, envelope encryption and key management
+  - Describe network security and the principles of zero trust
+  - Detect and fix the commonest misconfigurations — public storage, over-broad roles, old keys, open administration ports — and outline what compliance requires
+prerequisites: [what-is-the-cloud, cloud-networking, cloud-storage-and-databases, kubernetes, infrastructure-as-code]
+related: [math.found.propositional-logic, math.applied.cryptography]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "AWS IAM: policy evaluation logic"
+    url: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
+  - title: "What is Azure role-based access control (Azure RBAC)?"
+    url: https://learn.microsoft.com/en-us/azure/role-based-access-control/overview
+  - title: "Azure attribute-based access control (conditions)"
+    url: https://learn.microsoft.com/en-us/azure/role-based-access-control/conditions-overview
+  - title: "Google Cloud IAM overview"
+    url: https://docs.cloud.google.com/iam/docs/overview
+  - title: "Google Cloud IAM deny policies"
+    url: https://docs.cloud.google.com/iam/docs/deny-overview
+  - title: "Alibaba Cloud Resource Access Management (RAM)"
+    url: https://www.alibabacloud.com/help/en/ram/
+  - title: "Kubernetes: using RBAC authorisation"
+    url: https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+  - title: "Semantic-based Automated Reasoning for AWS Access Policies using SMT"
+    author: John Backes et al.
+    year: 2018
+    url: https://www.amazon.science/publications/semantic-based-automated-reasoning-for-aws-access-policies-using-smt
+    note: How a provider answers questions about all possible requests with a logic solver.
+  - title: "NIST SP 800-207: Zero Trust Architecture"
+    year: 2020
+    url: https://csrc.nist.gov/pubs/sp/800/207/final
+  - title: "BeyondCorp: A New Approach to Enterprise Security"
+    author: Rory Ward and Betsy Beyer
+    year: 2014
+    url: https://research.google/pubs/beyondcorp-a-new-approach-to-enterprise-security/
+  - title: "NIST SP 800-57 Part 1 Rev. 5: Recommendation for Key Management"
+    url: https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final
+  - title: "FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard"
+    year: 2024
+    url: https://csrc.nist.gov/pubs/fips/203/final
+    note: ML-KEM, the post-quantum key exchange now appearing in TLS.
+  - title: SPIFFE — Secure Production Identity Framework for Everyone
+    url: https://spiffe.io/
+  - title: Open Policy Agent documentation
+    url: https://www.openpolicyagent.org/docs/
+  - title: OpenBao
+    url: https://openbao.org/
+    note: An open-source secrets manager under the Linux Foundation.
+  - title: CIS Benchmarks
+    url: https://www.cisecurity.org/cis-benchmarks
+    note: Consensus configuration baselines, including for each major cloud and for Kubernetes.
+  - title: Cloud Controls Matrix
+    url: https://cloudsecurityalliance.org/research/cloud-controls-matrix
+    note: The Cloud Security Alliance's control framework, mapped to many standards.
+  - title: Prowler
+    url: https://github.com/prowler-cloud/prowler
+    note: An open-source tool that checks AWS, Azure, Google Cloud and Kubernetes configurations against such baselines.
+  - title: Verizon Data Breach Investigations Report
+    url: https://www.verizon.com/business/resources/reports/dbir/
+    note: An annual analysis of thousands of real breaches.
+---
+
+<Section id="motivation" kind="motivation" title="Identity is the perimeter">
+
+In a traditional data centre, security began at the door: a guarded building, a firewall at the edge of the network, and inside it a trusted zone. A cloud has no such door. Every resource — every virtual machine, bucket, database, key and backup — is created, changed and deleted through an API that answers on the internet, and anyone who presents valid credentials with the right permissions can do whatever the API allows. In practice this means that **identity is the perimeter**: who you are, what you are allowed to do, and under which conditions.
+
+That changes where breaches come from. Year after year, published analyses of real incidents, such as Verizon's annual [Data Breach Investigations Report](https://www.verizon.com/business/resources/reports/dbir/), find stolen or misused credentials among the commonest ways in, and misconfiguration — a bucket readable by anyone, a role that can do everything, a forgotten key — among the commonest causes of exposure. Exotic exploits of the provider's own systems are rare. As the <LessonLink slug="what-is-the-cloud">first lesson</LessonLink> put it in the shared-responsibility model, your data, who may reach it and your configuration choices stay yours in every service model.
+
+This lesson applies Lumenary CS's [security](/en/cs/security/) lesson (threat models, authentication and authorisation, least privilege, defence in depth) and its [applied cryptography](/en/cs/applied-cryptography/) to cloud platforms: how access is decided and kept small, how secrets and keys are handled, how networks are trusted (or not), and how to find mistakes before someone else does. It is written for defenders, about systems you own or are authorised to manage; probing systems you do not own is illegal in most countries, and the security lesson explains how to report a problem responsibly.
+
+</Section>
+
+<Section id="iam" kind="definitions" title="Principals, credentials and policies">
+
+<Definition term="Principal">
+
+Any identity that can make a request: a human user, a group, a **workload identity** (a role or service account used by a program), or a **federated identity** vouched for by an outside identity provider.
+
+</Definition>
+
+**Authentication** proves which principal is calling. For people, the professional pattern is single sign-on through one identity provider, so that leaving the organisation disables everything at once, with phishing-resistant multi-factor authentication (passkeys or hardware keys). For programs, it is **short-lived credentials**: a workload proves what it is (its machine, its pod's service account, the signed token a CI system issues for one run) and receives a token that expires within an hour or so. Long-lived access keys, which work from anywhere until revoked, are the credential most often leaked.
+
+**Authorisation** is decided by **policies**. Whatever the provider's syntax, a policy statement says:
+
+<Definition term="Policy statement">
+
+An **effect** (allow or deny) for a set of **principals**, **actions** (such as `storage:GetObject`) and **resources** (such as `bucket/reports/*`), optionally restricted by **conditions** on the request's context: the source network, whether multi-factor authentication was used, the time, or tags on the principal and the resource.
+
+</Definition>
+
+Two styles coexist. **Role-based access control** (RBAC) bundles permissions into roles and assigns roles to principals: "analysts can read reports". **Attribute-based access control** (ABAC) writes rules over attributes: "anyone may write objects whose `team` tag matches their own" — one rule instead of one role per team. Policies attach at several levels: to identities, to resources (a bucket's own policy), and as **guardrails** over a whole organisation, which cap what any policy below them can grant. The names differ by platform; the table is a map as of 2026.
+
+| | Amazon Web Services | Microsoft Azure | Google Cloud | Alibaba Cloud |
+| --- | --- | --- | --- | --- |
+| People and sign-in | IAM Identity Center | Microsoft Entra ID | Cloud Identity, workforce identity federation | RAM users and SSO |
+| Permissions | [IAM](https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html) policies (JSON) | [Azure RBAC](https://learn.microsoft.com/en-us/azure/role-based-access-control/overview) role assignments, with conditions | [IAM](https://docs.cloud.google.com/iam/docs/overview) allow policies (role bindings), IAM Conditions | [RAM](https://www.alibabacloud.com/help/en/ram/) policies (JSON) |
+| Workload identity | IAM roles for instances, functions and pods | managed identities | service accounts | RAM roles |
+| Organisation guardrails | [service control policies](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html) | [Azure Policy](https://learn.microsoft.com/en-us/azure/governance/policy/overview) and management groups | [Organization Policy](https://docs.cloud.google.com/resource-manager/docs/organization-policy/overview), [IAM deny policies](https://docs.cloud.google.com/iam/docs/deny-overview) | Resource Directory [control policies](https://www.alibabacloud.com/help/en/resource-management/resource-directory/user-guide/control-policy-overview) |
+| Audit log of API calls | CloudTrail | Activity Log, Entra audit logs | Cloud Audit Logs | ActionTrail |
+
+Open-source systems use the same ideas: Kubernetes has its own [RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/) (allow-only: there are no deny rules), [Keycloak](https://www.keycloak.org/) is a widely used open-source identity provider, and policy engines such as [Open Policy Agent](https://www.openpolicyagent.org/docs/) and [Cedar](https://www.cedarpolicy.com/) let applications evaluate policies of their own.
+
+</Section>
+
+<Section id="evaluator" kind="computation" title="A policy evaluator you can read">
+
+Every provider's documentation spells out how its evaluator combines statements, and the details differ — which policy types apply, how sessions and boundaries narrow them. The core, though, is shared by AWS IAM, Google Cloud's deny policies, Alibaba Cloud's RAM and Azure's deny assignments: **an explicit deny always wins; otherwise an explicit allow is needed; otherwise the answer is no.**
+
+<Figure caption="The core of cloud policy evaluation. Every statement that applies — guardrails, resource policies, identity policies — is gathered first; then a matching deny wins, an allow is needed, and the default is to deny.">
+
+<svg viewBox="0 0 680 200" role="img" aria-label="A flowchart. A request is matched against all applicable statements. First question: does any matching statement deny it? If yes, the result is DENY. If no, the second question: does any matching statement allow it? If yes, ALLOW. If no, DENY by default.">
+  <defs>
+    <marker id="cs-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="2">
+    <rect x="10" y="20" width="140" height="56" rx="6" stroke="var(--sky)" />
+    <rect x="190" y="20" width="170" height="56" rx="6" stroke="var(--gold)" />
+    <rect x="410" y="20" width="170" height="56" rx="6" stroke="var(--gold)" />
+    <rect x="610" y="20" width="62" height="56" rx="6" stroke="var(--good)" />
+    <rect x="215" y="140" width="120" height="44" rx="6" stroke="var(--bad)" />
+    <rect x="435" y="140" width="120" height="44" rx="6" stroke="var(--bad)" />
+  </g>
+  <g fill="currentColor" fontSize="12" textAnchor="middle">
+    <text x="80" y="44" fontWeight="600">Request</text>
+    <text x="80" y="62">who, action, resource</text>
+    <text x="275" y="44" fontWeight="600">Any matching deny?</text>
+    <text x="275" y="62">guardrails, resource, identity</text>
+    <text x="495" y="44" fontWeight="600">Any matching allow?</text>
+    <text x="495" y="62">only if no deny matched</text>
+    <text x="641" y="53" fontWeight="600">ALLOW</text>
+    <text x="275" y="167" fontWeight="600">DENY (explicit)</text>
+    <text x="495" y="167" fontWeight="600">DENY (default)</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" markerEnd="url(#cs-flow-arrow)">
+    <line x1="150" y1="48" x2="187" y2="48" />
+    <line x1="360" y1="48" x2="407" y2="48" />
+    <line x1="580" y1="48" x2="607" y2="48" />
+    <line x1="275" y1="76" x2="275" y2="137" />
+    <line x1="495" y1="76" x2="495" y2="137" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="383" y="40">no</text>
+    <text x="594" y="40">yes</text>
+    <text x="290" y="112">yes</text>
+    <text x="508" y="112">no</text>
+  </g>
+</svg>
+
+</Figure>
+
+The evaluator below implements that core for a small policy language of our own, with wildcard matching, three kinds of condition (multi-factor authentication, source network, and an attribute-based "same tag" rule) and a reason for every decision. The documentation range 203.0.113.0/24 stands in for an outside address.
+
+```python run
+import ipaddress
+from fnmatch import fnmatchcase
+
+# A small policy language in the spirit of the providers' (not any one provider's syntax).
+POLICIES = [
+    {"id": "analysts-read-reports", "effect": "allow", "principals": ["group:analysts"],
+     "actions": ["storage:Get*", "storage:List*"], "resources": ["bucket/reports/*"]},
+    {"id": "payroll-team", "effect": "allow", "principals": ["group:payroll"],
+     "actions": ["storage:GetObject", "storage:PutObject"], "resources": ["bucket/payroll/*"],
+     "conditions": {"mfa": True}},
+    {"id": "payroll-only-from-office", "effect": "deny", "principals": ["*"],
+     "actions": ["storage:*"], "resources": ["bucket/payroll/*"],
+     "conditions": {"source_ip_not_in": "10.20.0.0/16"}},
+    {"id": "teams-own-prefix", "effect": "allow", "principals": ["*"],      # attribute-based:
+     "actions": ["storage:*"], "resources": ["bucket/teams/*"],             # your team tag must
+     "conditions": {"same_tag": "team"}},                                   # match the object's
+    {"id": "ops-admin", "effect": "allow", "principals": ["role:ops-admin"],
+     "actions": ["*"], "resources": ["*"]},
+    {"id": "nobody-deletes-audit-logs", "effect": "deny", "principals": ["*"],
+     "actions": ["storage:Delete*"], "resources": ["bucket/audit/*"]},
+]
+
+def condition_holds(name, value, req):
+    ctx = req.get("context", {})
+    if name == "mfa":
+        return ctx.get("mfa") is value                       # a missing key is not "True"
+    if name == "source_ip_not_in":
+        if "source_ip" not in ctx:
+            return True                                      # unknown origin: treat as outside
+        return ipaddress.ip_address(ctx["source_ip"]) not in ipaddress.ip_network(value)
+    if name == "same_tag":
+        mine, theirs = req["principal_tags"].get(value), req["resource_tags"].get(value)
+        return mine is not None and mine == theirs
+    raise ValueError(f"unknown condition {name!r}")          # never ignore what we don't understand
+
+def matches(st, req):
+    identities = [req["principal"], *req.get("groups", [])]
+    return (any(fnmatchcase(i, p) for p in st["principals"] for i in identities)
+            and any(fnmatchcase(req["action"], a) for a in st["actions"])
+            and any(fnmatchcase(req["resource"], r) for r in st["resources"])
+            and all(condition_holds(k, v, req) for k, v in st.get("conditions", {}).items()))
+
+def evaluate(policies, req):
+    hits = [st for st in policies if matches(st, req)]
+    for st in hits:
+        if st["effect"] == "deny":
+            return "DENY", f"explicit deny: {st['id']}"
+    for st in hits:
+        if st["effect"] == "allow":
+            return "ALLOW", f"allowed by {st['id']}"
+    return "DENY", "implicit deny: nothing allows it"
+
+def request(who, groups, action, resource, ptags=None, rtags=None, **context):
+    return {"principal": who, "groups": groups, "action": action, "resource": resource,
+            "principal_tags": ptags or {}, "resource_tags": rtags or {}, "context": context}
+
+office, cafe = "10.20.4.7", "203.0.113.50"      # 203.0.113.0/24 is reserved for documentation
+requests = [
+    request("user:amara", ["group:analysts"], "storage:GetObject", "bucket/reports/2026-q3.csv", source_ip=office),
+    request("user:amara", ["group:analysts"], "storage:DeleteObject", "bucket/reports/2026-q3.csv", source_ip=office),
+    request("user:kenji", ["group:payroll"], "storage:GetObject", "bucket/payroll/nov.pdf", source_ip=office, mfa=True),
+    request("user:kenji", ["group:payroll"], "storage:GetObject", "bucket/payroll/nov.pdf", source_ip=cafe, mfa=True),
+    request("user:kenji", ["group:payroll"], "storage:GetObject", "bucket/payroll/nov.pdf", source_ip=office),
+    request("user:kenji", ["group:payroll"], "storage:GetObject", "bucket/payroll/nov.pdf", mfa=True),
+    request("user:leila", [], "storage:PutObject", "bucket/teams/maps/tiles.bin", {"team": "maps"}, {"team": "maps"}),
+    request("user:leila", [], "storage:GetObject", "bucket/teams/search/index", {"team": "maps"}, {"team": "search"}),
+    request("role:ops-admin", [], "storage:PutObject", "bucket/audit/2026-11.log"),
+    request("role:ops-admin", [], "storage:DeleteObject", "bucket/audit/2026-11.log"),
+]
+PLACES = {office: "office", cafe: "café"}
+for r in requests:
+    decision, why = evaluate(POLICIES, r)
+    ctx = r["context"]
+    where = PLACES.get(ctx.get("source_ip"), "no IP") + (" +MFA" if ctx.get("mfa") else "")
+    print(f"{r['principal'].split(':')[1]:9s} {r['action'].split(':')[1]:12s} "
+          f"{r['resource'].removeprefix('bucket/'):21s} {where:12s} {decision:5s} {why}")
+```
+
+Amara can read reports but not delete them: nothing allows deletion, and the **default is deny**. Kenji can read payroll from the office with MFA; from a café the explicit deny beats his team's allow; without MFA his allow's condition fails. One attribute-based statement lets Leila write to her own team's prefix but not read another team's. And even `ops-admin` cannot delete audit logs: a deny written once protects them from every allow, present or future.
+
+<Theorem name="Deny-overrides evaluation">
+
+Let $M(P, q)$ be the set of statements in a policy set $P$ that match request $q$, and let the decision be DENY if $M(P,q)$ contains a deny statement, ALLOW if it contains only allow statements and is non-empty, and DENY if it is empty. Then (1) the decision depends only on the set $M(P,q)$, not on the order in which statements are written or evaluated; and (2) if some deny statement in $P$ matches $q$, then for every policy set $P' \supseteq P$ the decision for $q$ is DENY.
+
+</Theorem>
+
+<Proof>
+
+(1) The decision is defined by two questions about the set $M(P,q)$ — does it contain a deny? does it contain an allow? — and neither answer changes when the statements are reordered, because membership in a set does not depend on order. (2) Whether a statement matches $q$ depends only on that statement and $q$, so every statement that matches $q$ in $P$ still matches it in $P'$: $M(P,q) \subseteq M(P',q)$. A deny in $M(P,q)$ is therefore also in $M(P',q)$, and the decision for $P'$ is DENY.
+
+</Proof>
+
+Part (2) is why guardrails work: an organisation-wide deny on deleting audit logs cannot be undone by any team adding allows later. Precise semantics also make policies analysable over *every possible* request — "can anyone outside the organisation read this bucket?" — by translating them into logic for a solver, as AWS has described doing with SMT solvers (see the references); access analysers such as Google Cloud's [Policy Analyzer](https://docs.cloud.google.com/policy-intelligence/docs/policy-analyzer-overview) and Azure's [check access](https://learn.microsoft.com/en-us/azure/role-based-access-control/check-access) answer "who can do what" across all policies.
+
+<Narrator who="gideon">
+
+Look at how `source_ip_not_in` handles a request that carries no source address: it treats the origin as *outside*. Write it the obvious way — "the address is not in the office range" — and a missing address makes the condition false, so the **deny silently stops applying** and the allow beneath it wins. A condition on a missing key fails closed in an allow and fails *open* in a deny. Requests forwarded by another service often lack such keys, which is why the providers' policy languages offer explicit "if the key exists" and "key is absent" operators; use them in every deny.
+
+</Narrator>
+
+Two more traps hide in the matching. Wildcards match more than they seem to: `bucket/reports*` also matches `bucket/reports-salaries/`, so end prefixes with a slash. And `*` in an action list grants actions that do not exist yet — every new action the provider adds next year.
+
+</Section>
+
+<Section id="least-privilege" kind="computation" title="Least privilege in practice">
+
+Least privilege, from Lumenary CS's [security](/en/cs/security/) lesson, becomes a set of concrete habits in the cloud:
+
+- **One identity per workload**, with only what it needs. A role shared by twelve services can never be small.
+- **No long-lived keys where federation exists.** A CI pipeline can exchange the signed OpenID Connect token its platform issues for each run for a short-lived cloud credential, scoped to one repository and branch, so there is no stored key to steal. All four providers document this: [AWS](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc.html), [Azure](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation), [Google Cloud](https://docs.cloud.google.com/iam/docs/workload-identity-federation) and [Alibaba Cloud](https://www.alibabacloud.com/help/en/ram/user-guide/overview-of-oidc-based-sso). Across clouds and data centres, the open-source [SPIFFE](https://spiffe.io/) standard and its SPIRE implementation issue workloads short-lived, verifiable identities.
+- **Small standing access for people.** Engineers hold read-only roles day to day and request elevated ones for a limited time, with a reason and an audit trail (Microsoft Entra's [Privileged Identity Management](https://learn.microsoft.com/en-us/entra/id-governance/privileged-identity-management/pim-configure) is one such service; other platforms and identity providers offer similar just-in-time access). One or two **break-glass** accounts, with hardware keys in a safe and loud alerts on use, cover the day the identity provider is down.
+- **Right-size from evidence.** Every platform records API calls in an audit log, so granted permissions can be compared with used ones. AWS [IAM Access Analyzer](https://docs.aws.amazon.com/IAM/latest/UserGuide/what-is-access-analyzer.html) and Google Cloud's [role recommendations](https://docs.cloud.google.com/policy-intelligence/docs/role-recommendations-overview) do this as a service; the same analysis can be run on Azure's activity logs and Alibaba Cloud's ActionTrail.
+
+The program below does that analysis on 90 days of synthetic audit events for four roles, of the kind every organisation accumulates.
+
+```python run
+import random
+from collections import Counter
+from fnmatch import fnmatchcase
+
+CATALOGUE = {          # every action each (made-up) service offers
+    "storage": ["GetObject", "PutObject", "DeleteObject", "ListBucket", "GetBucketPolicy", "PutBucketPolicy"],
+    "queue":   ["Send", "Receive", "Delete", "Purge", "CreateQueue", "DeleteQueue"],
+    "kms":     ["Encrypt", "Decrypt", "GenerateDataKey", "DisableKey", "ScheduleKeyDeletion"],
+    "db":      ["Connect", "Query", "CreateSnapshot", "RestoreSnapshot", "DeleteInstance"],
+    "iam":     ["CreateRole", "AttachPolicy", "PassRole", "CreateAccessKey"],
+}
+ALL = [f"{svc}:{a}" for svc, acts in CATALOGUE.items() for a in acts]
+DANGEROUS = {"storage:PutBucketPolicy", "queue:Purge", "kms:DisableKey", "kms:ScheduleKeyDeletion",
+             "db:DeleteInstance", "iam:CreateRole", "iam:AttachPolicy", "iam:PassRole", "iam:CreateAccessKey"}
+
+GRANTS = {             # what each workload's role is allowed, as written by busy people
+    "invoice-worker": ["storage:*", "queue:*", "kms:*"],
+    "reporting":      ["db:*", "storage:Get*", "storage:List*"],
+    "ci-deployer":    ["*"],
+    "old-migration":  ["db:*", "storage:*"],
+}
+NEEDS = {              # what each workload actually calls (unknown to the analysis)
+    "invoice-worker": ["queue:Receive", "queue:Delete", "storage:GetObject", "storage:PutObject",
+                       "kms:Decrypt", "kms:GenerateDataKey"],
+    "reporting":      ["db:Connect", "db:Query", "storage:GetObject", "storage:ListBucket"],
+    "ci-deployer":    ["storage:PutObject", "storage:GetObject", "iam:PassRole", "db:Connect"],
+    "old-migration":  [],
+}
+
+# 90 days of synthetic audit-log events: (day, role, action).
+rng = random.Random(11)
+log = [(day, role, rng.choice(acts)) for day in range(90) for role, acts in NEEDS.items()
+       if acts for _ in range(rng.randint(20, 60))]
+
+def expand(patterns):
+    return {a for a in ALL if any(fnmatchcase(a, p) for p in patterns)}
+
+used = {role: Counter(a for _, r, a in log if r == role) for role in GRANTS}
+print(f"{len(log):,} audit events over 90 days\n")
+print(f"{'role':15s} {'granted':>7s} {'used':>5s} {'unused':>6s}  dangerous ones among the unused")
+for role, patterns in GRANTS.items():
+    granted = expand(patterns)
+    unused = granted - set(used[role])
+    risky = sorted(unused & DANGEROUS)
+    print(f"{role:15s} {len(granted):7d} {len(used[role]):5d} {len(unused):6d}  "
+          + f"{len(risky)}: " + ", ".join(a.split(":")[1] for a in risky[:3]) + (", ..." if len(risky) > 3 else ""))
+
+granted_total = sum(len(expand(p)) for p in GRANTS.values())
+needed_total = sum(len(u) for u in used.values())
+print(f"\nall roles: {granted_total} grants, {needed_total} used; "
+      f"right-sizing removes {1 - needed_total / granted_total:.0%} of them")
+print("suggested policy for invoice-worker:", sorted(used["invoice-worker"]))
+print("old-migration: no calls in 90 days -> candidate for deletion, after asking its owner")
+```
+
+More than three quarters of the granted permissions were never used, and among them are the dangerous ones — disabling encryption keys, purging queues, rewriting bucket policies, creating new access keys. None of that was needed by the work, and all of it would have been available to whoever stole the role's credentials.
+
+<Narrator who="gideon">
+
+"Unused in 90 days" is evidence, not proof. A disaster-recovery job that restores a snapshot once a year, or a year-end report, will not appear in a 90-day log, and removing its permission turns next year's drill into an outage. Right-size with the owners, keep the rare paths documented, and prefer a longer window for roles that run seasonal work.
+
+</Narrator>
+
+On Kubernetes the same habit is a namespaced `Role` that grants a workload exactly the verbs and objects it uses, bound to that workload's service account (not run here):
+
+```yaml
+# Not run here: Kubernetes RBAC. The invoice worker may read one ConfigMap, nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: invoice-worker
+  namespace: billing
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["invoice-settings"]
+    verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: invoice-worker
+  namespace: billing
+subjects:
+  - kind: ServiceAccount
+    name: invoice-worker
+    namespace: billing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: invoice-worker
+```
+
+</Section>
+
+<Section id="secrets" kind="human" title="Secrets management">
+
+A **secret** is anything that grants access by being known: a database password, an API token, a private key, a webhook signing key. The rules are short. Never put secrets in source code, container images, infrastructure code, or logs; they are copied, cached and shared far more widely than anyone intends, and a secret pushed to a public repository can be found by automated scanners within minutes. Keep them in a **secrets manager** — [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html), [Azure Key Vault](https://learn.microsoft.com/en-us/azure/key-vault/), Google Cloud [Secret Manager](https://docs.cloud.google.com/secret-manager/docs), the secrets feature of Alibaba Cloud's [Key Management Service](https://www.alibabacloud.com/help/en/kms/), or open-source [OpenBao](https://openbao.org/) and HashiCorp's [Vault](https://developer.hashicorp.com/vault/docs) (now under a source-available licence) — and let workloads fetch them at run time with their own identity, so access to each secret is a policy and every read is logged. For configuration kept in Git, tools such as [SOPS](https://getsops.io/) encrypt the secret values with a key held in a key management service. How Kubernetes Secrets fit in — and why base64 is not encryption — is in the <LessonLink slug="kubernetes">Kubernetes</LessonLink> lesson.
+
+Better still is needing fewer secrets. Workload identity removes cloud keys altogether; **dynamic secrets** go further, with the secrets manager creating a short-lived database account for each workload on request. What remains should be **rotated** automatically, since a rotation that takes a person a weekend never happens, and repositories scanned for leaks with tools such as [gitleaks](https://github.com/gitleaks/gitleaks).
+
+When a secret does leak, the order matters: **revoke or rotate it first**, then investigate. Deleting the commit does not help, since copies already exist. After rotation, read the audit logs for every use of the old credential since it was exposed, and treat what it could reach as possibly compromised.
+
+</Section>
+
+<Section id="encryption" kind="intuition" title="Encryption in transit and at rest">
+
+**In transit**, use TLS for every connection — including between your own services inside a private network, since an attacker who reaches one machine inside it may be able to read whatever crosses it unencrypted. TLS 1.3 ([RFC 8446](https://www.rfc-editor.org/rfc/rfc8446)) is the current version. Within a cluster, **mutual TLS** (mTLS), in which both sides present certificates, gives every connection authenticated identities as well as encryption; service meshes such as [Istio](https://istio.io/latest/docs/) and [Linkerd](https://linkerd.io/) provide it without changing application code. Certificates expire, so their issue and renewal must be automated, through the providers' certificate services or with [cert-manager](https://cert-manager.io/) and the ACME protocol used by [Let's Encrypt](https://letsencrypt.org/). As of 2026, a large share of TLS connections on the public internet — from current browsers, and to many cloud endpoints — already negotiate a hybrid post-quantum key exchange based on ML-KEM ([FIPS 203](https://csrc.nist.gov/pubs/fips/203/final)), so that traffic recorded today cannot be decrypted by a future quantum computer.
+
+**At rest**, the large providers encrypt data in most storage and database services by default, or with one account-wide setting, using keys they manage. That protects against a lost disk, not against a stolen credential: the service decrypts transparently for anyone it authorises. The control that matters is therefore who may *use the key*. With **customer-managed keys** in a key management service — [AWS KMS](https://docs.aws.amazon.com/kms/latest/developerguide/overview.html), [Azure Key Vault](https://learn.microsoft.com/en-us/azure/key-vault/) and its [Managed HSM](https://learn.microsoft.com/en-us/azure/key-vault/managed-hsm/), [Google Cloud KMS](https://docs.cloud.google.com/kms/docs), [Alibaba Cloud KMS](https://www.alibabacloud.com/help/en/kms/) — key use is a separate permission, logged on every call, held by different people from those who administer the data, and revocable: disabling the key makes the data unreadable everywhere at once.
+
+Key management services use **envelope encryption**, because sending terabytes to a key service would be slow and the key must never leave it.
+
+<Figure caption="Envelope encryption. Each object is encrypted locally with its own data key; the data key is encrypted (wrapped) by a key-encryption key that never leaves the key management service, and the wrapped copy is stored beside the data.">
+
+<svg viewBox="0 0 680 220" role="img" aria-label="On the left, an object is encrypted with a fresh data key, producing ciphertext. The data key is sent to the key management service, where a key-encryption key held in a hardware security module wraps it; the wrapped data key comes back. Ciphertext and wrapped data key are stored together in the bucket. To read, the wrapped key is sent back to the service, which checks permission, logs the call and returns the data key, which decrypts the object locally.">
+  <defs>
+    <marker id="cs-env-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="2">
+    <rect x="10" y="20" width="130" height="44" rx="6" stroke="var(--sky)" />
+    <rect x="10" y="110" width="130" height="44" rx="6" stroke="var(--gold)" />
+    <rect x="240" y="20" width="150" height="44" rx="6" stroke="var(--sky)" />
+    <rect x="470" y="20" width="200" height="134" rx="8" stroke="var(--compute)" />
+    <rect x="240" y="150" width="150" height="56" rx="6" stroke="currentColor" strokeDasharray="5 4" />
+  </g>
+  <g fill="currentColor" fontSize="12" textAnchor="middle">
+    <text x="75" y="46" fontWeight="600">object</text>
+    <text x="75" y="130" fontWeight="600">data key</text>
+    <text x="75" y="146">fresh, per object</text>
+    <text x="315" y="46" fontWeight="600">ciphertext</text>
+    <text x="570" y="44" fontWeight="600">key management service</text>
+    <text x="570" y="70">key-encryption key</text>
+    <text x="570" y="86">(in a hardware module;</text>
+    <text x="570" y="102">never leaves)</text>
+    <text x="570" y="126">checks permission,</text>
+    <text x="570" y="142">logs every use</text>
+    <text x="315" y="172" fontWeight="600">stored together</text>
+    <text x="315" y="190">ciphertext + wrapped key</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#cs-env-arrow)">
+    <line x1="140" y1="42" x2="237" y2="42" />
+    <path d="M75,110 L75,80 L190,80 L190,48 L234,48" />
+    <line x1="140" y1="122" x2="467" y2="122" />
+    <path d="M470,140 L430,140 L430,178 L393,178" />
+    <line x1="315" y1="64" x2="315" y2="147" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="190" y="36">encrypt</text>
+    <text x="392" y="116">data key, to be wrapped</text>
+    <text x="430" y="200">wrapped key</text>
+  </g>
+</svg>
+
+</Figure>
+
+To read an object, the wrapped data key goes back to the key service, which checks permission, logs the call and returns the data key for local decryption. The hierarchy pays off at rotation: key services keep old versions of a key-encryption key to unwrap old data keys, and re-wrapping, when required, touches only the small data keys, never the data. Keys live in **hardware security modules** validated to [FIPS 140-3](https://csrc.nist.gov/pubs/fips/140-3/final) or similar schemes; NIST's [SP 800-57](https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final) is the standard reference for key lifetimes and roles. Where the threat includes the provider itself, or a government with power over it, options run from importing your own key material, to external key managers in which the key never enters the provider at all, to confidential computing; these are taken up in <LessonLink slug="edge-multicloud-and-sovereignty">Edge, multi-cloud and sovereignty</LessonLink> and <LessonLink slug="sustainable-and-confidential-cloud">Sustainable and confidential cloud</LessonLink>.
+
+<Narrator who="margaret">
+
+Take a bucket of 3 million objects holding 120 TB. Re-wrapping every data key after a key-encryption key is replaced means re-encrypting 3 million 32-byte keys: 96 MB of key material, in 3 million small requests to the key service. Re-encrypting the objects themselves would mean reading and writing 120 TB. That ratio of bytes, more than a million to one, is the point of the envelope.
+
+</Narrator>
+
+</Section>
+
+<Section id="zero-trust" kind="human" title="Network security and zero trust">
+
+Network controls remain essential; <LessonLink slug="cloud-networking">Cloud networking</LessonLink> describes private subnets, security groups that admit only what each tier needs, and **private endpoints** that reach managed services without an internet route. Add two habits: control **egress** too, so a compromised server cannot freely send data out, and never expose administration ports, reaching machines instead through identity-aware services that authenticate and record each session, such as [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html), [Azure Bastion](https://learn.microsoft.com/en-us/azure/bastion/), Google Cloud's [Identity-Aware Proxy](https://docs.cloud.google.com/iap/docs) and Alibaba Cloud's [Bastionhost](https://www.alibabacloud.com/help/en/bastion-host/).
+
+**Zero trust** is the name for not relying on the network at all. NIST's [SP 800-207](https://csrc.nist.gov/pubs/sp/800/207/final) sets out its principles; Google's BeyondCorp papers describe one of the first large deployments. In our words: no request is trusted because of where it comes from; every request is authenticated and authorised, as a person or as a workload, on its own; access is granted per resource and per session, with the least privilege that does the job; decisions use all available signals — identity, device health, location, behaviour — and are re-evaluated continuously; and everything is logged, on the assumption that some part of the network is already compromised.
+
+<Narrator who="chloe">
+
+The idea underneath zero trust is to move every check from *where you are* to *who you are and what you are allowed to do*. A network location is a weak, shared credential: everyone inside holds it, and an attacker who gets one machine inside inherits it. An identity can be proved, scoped, logged and revoked, one request at a time.
+
+</Narrator>
+
+In a cloud, zero trust is less a product than the sum of this lesson: identity for every person and workload, policy on every call, mTLS between services, and private networks as one layer of defence in depth rather than the boundary of trust.
+
+</Section>
+
+<Section id="misconfigurations" kind="computation" title="The commonest misconfigurations, and how to find them">
+
+Most cloud exposures come from a short list of configuration mistakes. Each has a reliable way to detect it and a known fix.
+
+1. **Storage readable by anyone**, often set up once for a quick share. *Detect* by listing every bucket's effective access; *prevent* with each provider's account- or organisation-wide setting — [S3 Block Public Access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html), Azure Storage's [setting to disallow anonymous access](https://learn.microsoft.com/en-us/azure/storage/blobs/anonymous-read-access-prevent), Google Cloud Storage's [public access prevention](https://docs.cloud.google.com/storage/docs/public-access-prevention), Alibaba Cloud OSS's [Block Public Access](https://www.alibabacloud.com/help/en/oss/user-guide/block-public-access) — and share files with expiring signed URLs instead.
+2. **Over-broad roles**: every action on every resource, built-in owner and editor roles granted for convenience, or unconditional trust in another organisation's accounts. *Detect* by analysing policies for wildcards and external trust; *fix* by right-sizing.
+3. **Old or unprotected credentials**: years-old access keys, password-only sign-ins, accounts of people who left. *Detect* from credential reports and sign-in logs; *fix* with federation, phishing-resistant MFA and automatic deprovisioning.
+4. **Administration and database ports open to the internet**: SSH (22), RDP (3389) or a database port allowed from `0.0.0.0/0` or `::/0`. *Detect* by scanning firewall rules for the whole-internet source; *fix* with identity-aware access and private endpoints.
+5. **Snapshots and images shared publicly**, carrying whole disks. *Detect* by listing sharing permissions; *fix* by unsharing, encrypting snapshots by default, and checking who read them.
+6. **An unprotected instance metadata service.** A server-side request forgery bug can make a web server fetch its own credentials from it. *Fix* by requiring the session-token mode where offered (AWS's [IMDSv2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html), Alibaba Cloud's [security hardening mode](https://www.alibabacloud.com/help/en/ecs/user-guide/view-instance-metadata)); Azure and Google Cloud require a special request header on every metadata call.
+7. **Incomplete logging**: audit logs missing in some regions, or deletable by the people they watch. *Fix* by logging every region to a separate, locked-down account.
+
+The scanner below applies these checks to a synthetic inventory, the kind of list a posture tool builds through the providers' read-only APIs, and prints each finding with its fix.
+
+```python run
+import ipaddress
+
+# A synthetic inventory, as a posture tool would collect it through the providers' read-only APIs.
+INVENTORY = [
+    {"kind": "bucket", "name": "press-kit", "public_read": True, "approved_public": True},
+    {"kind": "bucket", "name": "customer-exports", "public_read": True},
+    {"kind": "bucket", "name": "invoices", "public_read": False, "encrypted": True, "versioning": True},
+    {"kind": "bucket", "name": "ml-training-data", "public_read": False, "encrypted": True, "versioning": False},
+    {"kind": "role", "name": "ci-deployer", "actions": ["*"], "resources": ["*"]},
+    {"kind": "role", "name": "vendor-support", "actions": ["storage:*"], "resources": ["*"],
+     "trusts_external_account": True, "requires_external_id": False},
+    {"kind": "role", "name": "reporting", "actions": ["db:Query", "storage:GetObject"], "resources": ["bucket/reports/*"]},
+    {"kind": "user", "name": "svc-backup", "key_age_days": 812, "key_last_used_days": 2, "mfa": False},
+    {"kind": "user", "name": "admin-break-glass", "console": True, "mfa": False},
+    {"kind": "user", "name": "ana.souza", "console": True, "mfa": True},
+    {"kind": "firewall", "name": "allow-ssh", "source": "0.0.0.0/0", "ports": (22, 22)},
+    {"kind": "firewall", "name": "web", "source": "0.0.0.0/0", "ports": (443, 443)},
+    {"kind": "firewall", "name": "db-debug", "source": "::/0", "ports": (5432, 5432)},
+    {"kind": "firewall", "name": "office-rdp", "source": "10.20.0.0/16", "ports": (3389, 3389)},
+    {"kind": "snapshot", "name": "orders-db-2026-10-01", "encrypted": False, "shared_publicly": True},
+    {"kind": "vm", "name": "web-7", "metadata_tokens_required": False},
+    {"kind": "audit_log", "name": "org-trail", "enabled": True, "all_regions": False},
+]
+
+def everyone(source):
+    return ipaddress.ip_network(source).prefixlen == 0       # 0.0.0.0/0 or ::/0
+
+def check(r):
+    """Yield (severity, finding, fix) for one resource."""
+    k = r["kind"]
+    if k == "bucket" and r["public_read"]:
+        if r.get("approved_public"):
+            yield "INFO", "public by design", "serve it through a CDN; keep it free of anything private"
+        else:
+            yield "CRITICAL", "anyone on the internet can read it", "block public access account-wide; share with expiring signed URLs"
+    if k == "bucket" and not r.get("versioning", True):
+        yield "MEDIUM", "no versioning: deletions and overwrites are final", "turn on versioning and object lock for important data"
+    if k == "role" and "*" in r["actions"] and "*" in r["resources"]:
+        yield "HIGH", "allowed every action on every resource", "grant only what its audit log shows it uses"
+    if k == "role" and r.get("trusts_external_account") and not r.get("requires_external_id"):
+        yield "HIGH", "another organisation can assume it with no extra check", "trust one named identity, with a condition such as an agreed external ID"
+    if k == "user" and r.get("key_age_days", 0) > 90:
+        yield "HIGH", f"access key is {r['key_age_days']} days old", "replace with a role or workload identity; rotate meanwhile"
+    if k == "user" and r.get("console") and not r["mfa"]:
+        yield "CRITICAL", "can sign in with a password alone", "require phishing-resistant MFA (hardware key or passkey)"
+    if k == "firewall" and everyone(r["source"]):
+        lo, hi = r["ports"]
+        if lo <= 22 <= hi or lo <= 3389 <= hi:
+            yield "HIGH", f"remote administration open to the internet ({r['source']})", "close it; use an identity-aware access service"
+        elif (lo, hi) not in [(80, 80), (443, 443)]:
+            yield "HIGH", f"port {lo} open to the internet ({r['source']})", "keep databases on private addresses only"
+    if k == "snapshot" and r["shared_publicly"]:
+        yield "CRITICAL", "disk snapshot shared with every account", "unshare it now; check access logs; encrypt snapshots by default"
+    if k == "vm" and not r["metadata_tokens_required"]:
+        yield "MEDIUM", "metadata service answers without a session token", "require the token-based (hardened) metadata mode"
+    if k == "audit_log" and not r["all_regions"]:
+        yield "MEDIUM", "audit log misses some regions", "log every region, to a separate, locked-down account"
+
+ORDER = ["CRITICAL", "HIGH", "MEDIUM", "INFO"]
+findings = sorted(((sev, r["kind"], r["name"], what, fix) for r in INVENTORY for sev, what, fix in check(r)),
+                  key=lambda f: ORDER.index(f[0]))
+for sev, kind, name, what, fix in findings:
+    print(f"{sev:8s} {kind:9s} {name:21s} {what}\n{'':40s}-> {fix}")
+counts = {s: sum(f[0] == s for f in findings) for s in ORDER}
+print("\n" + ", ".join(f"{n} {s.lower()}" for s, n in counts.items()), f"across {len(INVENTORY)} resources")
+```
+
+Real tools do this continuously and at scale. Every large provider runs a posture service — [AWS Security Hub](https://docs.aws.amazon.com/securityhub/latest/userguide/what-is-securityhub.html), [Microsoft Defender for Cloud](https://learn.microsoft.com/en-us/azure/defender-for-cloud/), Google Cloud's [Security Command Center](https://docs.cloud.google.com/security-command-center/docs) and Alibaba Cloud's [Security Center](https://www.alibabacloud.com/help/en/security-center/) — and open-source tools such as [Prowler](https://github.com/prowler-cloud/prowler), [Cloud Custodian](https://cloudcustodian.io/) and [Trivy](https://trivy.dev/) check one or several clouds against baselines such as the [CIS Benchmarks](https://www.cisecurity.org/cis-benchmarks). Two practices make findings rarer: organisation-wide guardrails that make the worst settings impossible, and **policy as code**, in which tools such as [Checkov](https://www.checkov.io/) or Open Policy Agent reject a dangerous change in its pull request — the natural partner of <LessonLink slug="infrastructure-as-code">infrastructure as code</LessonLink>. Note the `INFO` line: some buckets are public on purpose, and a good process records the exception and its owner.
+
+</Section>
+
+<Section id="compliance" kind="human" title="Compliance in outline">
+
+Compliance means showing customers, auditors and regulators that the controls you claim are real, and in the cloud it is shared like everything else. Providers are independently audited against standards such as [ISO/IEC 27001](https://www.iso.org/standard/27001) and SOC 2, the payment industry's [PCI DSS](https://www.pcisecuritystandards.org/), and national schemes such as FedRAMP in the United States, C5 in Germany, ISMAP in Japan and the Multi-Level Protection Scheme in China, and they publish the reports for customers to inspect. Those attestations cover the provider's layers; your application inherits them only for those layers, and must still show its own controls for the rest.
+
+Privacy and data-protection laws — the EU's [GDPR](https://eur-lex.europa.eu/eli/reg/2016/679/oj), Brazil's LGPD, India's Digital Personal Data Protection Act, China's Personal Information Protection Law, Kenya's Data Protection Act and many others — add duties about what personal data is collected, where it may be stored and moved, how long it is kept and how breaches are reported. Frameworks such as the Cloud Security Alliance's [Cloud Controls Matrix](https://cloudsecurityalliance.org/research/cloud-controls-matrix) map one set of controls to many of these standards. For engineers, the useful fact is that the evidence auditors ask for — who had access, what changed and when, whether data was encrypted and backed up — is what good identity management, audit logging, infrastructure as code and posture checks produce anyway. Compliance built on them is a by-product; compliance bolted on before an audit is a fire drill. Where data may live, and under whose law, is the subject of <LessonLink slug="edge-multicloud-and-sovereignty">Edge, multi-cloud and sovereignty</LessonLink>.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The provider is responsible for security."** The provider secures its layers. Who may access your data, how your services are configured and what you expose are yours in every service model.
+
+</Misconception>
+
+<Misconception>
+
+**"Our data is encrypted at rest, so a leaked access key is harmless."** Storage services decrypt transparently for any authorised caller, and a leaked key *is* an authorised caller. Encryption at rest protects lost disks; identity and key-use policies protect against stolen credentials.
+
+</Misconception>
+
+<Misconception>
+
+**"An explicit deny always protects us."** It wins whenever it *matches*. A deny with a condition on a key that a request does not carry may not match at all, and a deny on `bucket/reports*` may cover more than intended. Test denies against the requests they are meant to stop.
+
+</Misconception>
+
+<Misconception>
+
+**"MFA for every person means we are safe."** Workloads, CI pipelines and integrations make most API calls, and their credentials cannot do MFA. They need short-lived credentials, narrow permissions and monitoring of their own.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

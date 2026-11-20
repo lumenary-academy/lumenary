@@ -1,0 +1,531 @@
+---
+title: Markov chain Monte Carlo
+subtitle: Computing with a posterior you can only write down up to a constant — the Metropolis–Hastings algorithm built from scratch, the diagnostics that tell you whether to trust it, and Hamiltonian Monte Carlo as Stan and PyMC use it.
+minutes: 75
+objectives:
+  - Explain why Bayesian computation comes down to integrals, and why grids fail when there are many parameters
+  - Implement random-walk Metropolis, and state the detailed-balance condition that makes Metropolis–Hastings correct
+  - Estimate posterior summaries from Monte Carlo draws, including summaries of derived quantities
+  - Diagnose warm-up, mixing and autocorrelation, and compute the effective sample size and split R-hat across chains
+  - Explain how Hamiltonian Monte Carlo uses gradients, and read the diagnostics that Stan or PyMC report
+prerequisites: [generalised-linear-models, likelihood-and-model-selection, bayesian-inference]
+related: [math.prob.markov-chains, math.prob.stochastic-processes, math.comp.numerical-methods]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Equation of State Calculations by Fast Computing Machines"
+    author: Nicholas Metropolis, Arianna Rosenbluth, Marshall Rosenbluth, Augusta Teller and Edward Teller
+    year: 1953
+    url: https://doi.org/10.1063/1.1699114
+    note: The original Metropolis algorithm, for simulating a fluid of hard spheres.
+  - title: "Monte Carlo Sampling Methods Using Markov Chains and Their Applications"
+    author: W. K. Hastings
+    year: 1970
+    url: https://doi.org/10.1093/biomet/57.1.97
+    note: The generalisation to asymmetric proposals.
+  - title: "Inference from Iterative Simulation Using Multiple Sequences"
+    author: Andrew Gelman and Donald Rubin
+    year: 1992
+    url: https://doi.org/10.1214/ss/1177011136
+    note: The paper that introduced R-hat.
+  - title: "Rank-normalization, folding, and localization: An improved R-hat for assessing convergence of MCMC"
+    author: Aki Vehtari, Andrew Gelman, Daniel Simpson, Bob Carpenter and Paul-Christian Bürkner
+    year: 2021
+    url: https://arxiv.org/abs/1903.08008
+    note: The diagnostics Stan, PyMC and ArviZ report today, with recommended thresholds.
+  - title: "MCMC using Hamiltonian dynamics"
+    author: Radford Neal
+    year: 2011
+    url: https://arxiv.org/abs/1206.1901
+    note: A clear and thorough account of HMC.
+  - title: "The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian Monte Carlo"
+    author: Matthew Hoffman and Andrew Gelman
+    year: 2014
+    url: https://arxiv.org/abs/1111.4246
+    note: NUTS, the default sampler in Stan and PyMC.
+  - title: "A Conceptual Introduction to Hamiltonian Monte Carlo"
+    author: Michael Betancourt
+    year: 2017
+    url: https://arxiv.org/abs/1701.02434
+    note: Why HMC works in high dimensions, explained geometrically.
+  - title: Stan documentation
+    url: https://mc-stan.org/docs/
+    note: The reference manual explains Stan's effective sample size and R-hat computations in detail.
+  - title: PyMC
+    url: https://www.pymc.io/
+    note: A probabilistic programming library for Python.
+---
+
+<Section id="motivation" kind="motivation" title="Why integrals are hard">
+
+Everything a Bayesian wants from a posterior is an integral. The posterior mean of a parameter is $\int \theta\, p(\theta \mid y)\, d\theta$; the probability that it exceeds a threshold is the integral of the posterior over that region; a prediction averages the model over the posterior. Even the posterior itself contains an integral, the evidence $p(y) = \int p(y \mid \theta)\, p(\theta)\, d\theta$ in the denominator of Bayes' theorem.
+
+In <LessonLink slug="bayesian-inference">Bayesian inference</LessonLink> we were lucky twice. The beta prior was conjugate to the binomial likelihood, so the integrals had formulas; and there was only one parameter, so a grid of 2,001 points could check them. Real models are rarely so kind. A <LessonLink slug="generalised-linear-models">logistic regression</LessonLink> with normal priors has no conjugate posterior. A model of exam results in 300 schools, with a parameter for each school, has hundreds of parameters. A grid with 50 points per parameter needs $50^d$ evaluations of the posterior:
+
+| Parameters $d$ | 1 | 2 | 5 | 10 | 100 |
+| --- | --- | --- | --- | --- | --- |
+| Grid points $50^d$ | 50 | 2,500 | $3.1 \times 10^{8}$ | $9.8 \times 10^{16}$ | $7.9 \times 10^{169}$ |
+
+Beyond about five parameters, grids are hopeless. There is a way out, and it comes from simulation. If we could draw independent values $\theta^{(1)}, \ldots, \theta^{(N)}$ from the posterior, we could estimate any posterior expectation by an average, $\int g(\theta)\, p(\theta \mid y)\, d\theta \approx \frac{1}{N} \sum_i g(\theta^{(i)})$, with an error that shrinks like $1/\sqrt{N}$ **whatever the number of parameters**. This is **Monte Carlo integration**. The remaining obstacle is that we cannot draw independent values from a distribution we know only up to its normalising constant.
+
+**Markov chain Monte Carlo (MCMC)** removes the obstacle. Instead of independent draws, it produces a sequence in which each value depends on the previous one — a Markov chain — designed so that, in the long run, the values are distributed according to the posterior. This lesson builds the simplest such chain from scratch, applies it to a model with no formula, learns how to tell whether it has worked, and then meets the gradient-based method that powers modern software.
+
+<Narrator who="chloe">
+
+The trick that makes everything possible is that MCMC only ever needs *ratios* of posterior densities, $p(\theta' \mid y) / p(\theta \mid y)$. In a ratio the unknown constant $p(y)$ cancels, so the one integral we cannot compute is the one we never need.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Markov chains with a chosen destination">
+
+A **Markov chain** is a sequence of random values in which the next value depends only on the current one, through a fixed **transition rule**. Lumenary Math's <TopicLink id="math.prob.markov-chains">Markov chains</TopicLink> develops the theory; we need three facts. A distribution $\pi$ is **stationary** for the chain if, when the current value is drawn from $\pi$, the next one is too. Under mild conditions — the chain can reach every region of positive probability (it is **irreducible**) and does not cycle with a fixed period (it is **aperiodic**) — the chain converges to its stationary distribution from any starting point. And then the **ergodic theorem** holds: averages along a single long run converge to expectations under $\pi$, just as averages of independent draws would. MCMC turns this around: we choose $\pi$ to be the posterior, and design a transition rule that has it as its stationary distribution.
+
+<Definition term="Metropolis–Hastings algorithm">
+
+To sample from a density $\pi(\theta)$ known up to a constant, choose a **proposal distribution** $q(\theta' \mid \theta)$ and a starting value $\theta^{(0)}$. At each step $t$:
+
+1. Propose $\theta' \sim q(\cdot \mid \theta^{(t)})$.
+2. Compute the **acceptance probability**
+$$\alpha = \min\!\left(1,\; \frac{\pi(\theta')\, q(\theta^{(t)} \mid \theta')}{\pi(\theta^{(t)})\, q(\theta' \mid \theta^{(t)})}\right).$$
+3. With probability $\alpha$ set $\theta^{(t+1)} = \theta'$ (accept); otherwise set $\theta^{(t+1)} = \theta^{(t)}$ (reject, and **repeat** the current value).
+
+If the proposal is symmetric, $q(\theta' \mid \theta) = q(\theta \mid \theta')$ — for example $\theta' = \theta + \varepsilon$ with $\varepsilon \sim N(0, s^2)$ — the $q$ terms cancel and $\alpha = \min(1, \pi(\theta')/\pi(\theta))$. This **random-walk Metropolis** algorithm always accepts a move uphill and accepts a move downhill with probability equal to the ratio of heights.
+
+</Definition>
+
+<Theorem name="Metropolis–Hastings leaves the target distribution invariant">
+
+The Metropolis–Hastings transition satisfies **detailed balance** with respect to $\pi$: for all $\theta \ne \theta'$, $\pi(\theta)\, P(\theta \to \theta') = \pi(\theta')\, P(\theta' \to \theta)$. Consequently $\pi$ is a stationary distribution of the chain.
+
+</Theorem>
+
+<Proof>
+
+For $\theta \ne \theta'$, the chain moves from $\theta$ to $\theta'$ only by proposing $\theta'$ and accepting, so $P(\theta \to \theta') = q(\theta' \mid \theta)\, \alpha(\theta, \theta')$. Write $a = \pi(\theta)\, q(\theta' \mid \theta)$ and $b = \pi(\theta')\, q(\theta \mid \theta')$. Then $\alpha(\theta, \theta') = \min(1, b/a)$ and $\alpha(\theta', \theta) = \min(1, a/b)$, so
+$$\pi(\theta)\, P(\theta \to \theta') = a \min(1, b/a) = \min(a, b) = b \min(1, a/b) = \pi(\theta')\, P(\theta' \to \theta).$$
+Detailed balance says the probability flow from any $\theta$ to any $\theta'$ equals the flow back. Summing (or integrating) the flow into $\theta'$ over all $\theta$, including the probability of staying put, gives $\int \pi(\theta)\, P(\theta \to \theta')\, d\theta = \pi(\theta') \int P(\theta' \to \theta)\, d\theta = \pi(\theta')$, which is the definition of stationarity.
+
+</Proof>
+
+Stationarity is not the whole story: it says that a chain which *starts* in the posterior stays there, not how quickly a chain started elsewhere gets there, nor how quickly its averages settle down. Those practical questions are what the diagnostics later in this lesson are for.
+
+</Section>
+
+<Section id="from-scratch" kind="computation" title="Metropolis from scratch">
+
+Our first target is the posterior from the previous lesson, $\text{Beta}(8, 14)$, written only as the unnormalised product of likelihood and uniform prior, $\theta^7 (1-\theta)^{13}$. We know the exact answers, so we can check the chain. The program works with logarithms, as all serious samplers do, because products of many small probabilities underflow to zero in floating-point arithmetic, while sums of their logarithms do not.
+
+```python run
+import numpy as np
+from scipy import stats
+
+def log_target(theta):
+    """Unnormalised log posterior from the previous lesson: Beta(8, 14), known only up to a constant."""
+    if not 0 < theta < 1:
+        return -np.inf
+    return 7 * np.log(theta) + 13 * np.log(1 - theta)
+
+def metropolis(log_p, start, step, n_iter, rng):
+    x, lp = start, log_p(start)
+    chain, accepted = np.empty(n_iter), 0
+    for i in range(n_iter):
+        proposal = x + step * rng.normal()            # symmetric random-walk proposal
+        lp_new = log_p(proposal)
+        if np.log(rng.uniform()) < lp_new - lp:       # accept with probability min(1, ratio)
+            x, lp = proposal, lp_new
+            accepted += 1
+        chain[i] = x                                  # a rejected move repeats the old value
+    return chain, accepted / n_iter
+
+rng = np.random.default_rng(1953)
+chain, rate = metropolis(log_target, start=0.9, step=0.15, n_iter=50_000, rng=rng)
+draws = chain[1_000:]                                 # discard the warm-up
+exact = stats.beta(8, 14)
+print(f"acceptance rate {rate:.2f}")
+print(f"{'':10} {'MCMC':>7} {'exact':>7}")
+print(f"{'mean':10} {draws.mean():7.4f} {exact.mean():7.4f}")
+print(f"{'sd':10} {draws.std():7.4f} {exact.std():7.4f}")
+for q in [0.025, 0.5, 0.975]:
+    print(f"{'q ' + str(q):10} {np.quantile(draws, q):7.4f} {exact.ppf(q):7.4f}")
+print(f"{'P(>0.2)':10} {np.mean(draws > 0.2):7.4f} {exact.sf(0.2):7.4f}")
+print("first ten values of the chain:", np.round(chain[:10], 3))
+```
+
+Every summary agrees with the exact beta distribution to about two decimal places, without the program ever knowing the normalising constant. Look at the first ten values: the chain started far out at 0.9, repeated values whenever a proposal was rejected, and took several steps to reach the bulk of the posterior. Those early values are not representative, which is why the program discarded the first 1,000 iterations as **warm-up** (also called **burn-in**).
+
+<Narrator who="margaret">
+
+How accurate are those summaries? Not as accurate as 49,000 independent draws would be, because neighbouring values of the chain are correlated. Measured with the effective sample size we compute below, this chain is worth roughly 9,000 independent draws, so the Monte Carlo standard error of the mean is about $0.100/\sqrt{9\,000} \approx 0.001$ — consistent with the MCMC mean, 0.3640, sitting 0.0004 from the exact 0.3636.
+
+</Narrator>
+
+</Section>
+
+<Section id="frost" kind="examples" title="A model without a formula">
+
+Now a model that needs MCMC. A plant-breeding station in Saskatchewan tests the frost tolerance of a new winter-wheat line (the data are synthetic). Batches of 20 seedlings are held in a climate chamber at −2, −4, −6, −8 and −10 °C, and the survivors are counted: 19, 16, 12, 5 and 1. A logistic regression models the survival probability at temperature $t$ as
+$$\operatorname{logit} P(\text{survive}) = \alpha + \beta\,(t + 6),$$
+centred at −6 °C so that $\alpha$ is the log-odds of survival there and $\beta$ is the change in log-odds per degree. We give both parameters weakly informative $N(0, 2.5^2)$ priors. The breeders care most about the **LT50**, the temperature at which half the seedlings survive, which is $t = -6 - \alpha/\beta$. There is no conjugate prior here and no formula for the posterior, but the log posterior is easy to evaluate at any point, and that is all Metropolis needs.
+
+```python run
+import numpy as np
+
+# Synthetic frost-tolerance trial: 20 seedlings at each temperature; survivors counted.
+temp = np.array([-2.0, -4.0, -6.0, -8.0, -10.0])        # degrees Celsius
+x = temp + 6.0                                          # centred at -6 C
+n = np.array([20, 20, 20, 20, 20])
+y = np.array([19, 16, 12, 5, 1])
+
+def log_post(alpha, beta):
+    """Logistic regression, logit P(survive) = alpha + beta * x, with Normal(0, 2.5^2) priors."""
+    eta = alpha + beta * x
+    loglik = np.sum(y * eta - n * np.logaddexp(0.0, eta))
+    return loglik - (alpha**2 + beta**2) / (2 * 2.5**2)
+
+def metropolis_2d(start, step, n_iter, rng):
+    theta = np.array(start, dtype=float)
+    lp = log_post(*theta)
+    out, acc = np.empty((n_iter, 2)), 0
+    for i in range(n_iter):
+        prop = theta + step * rng.normal(size=2)
+        lp_new = log_post(*prop)
+        if np.log(rng.uniform()) < lp_new - lp:
+            theta, lp, acc = prop, lp_new, acc + 1
+        out[i] = theta
+    return out, acc / n_iter
+
+rng = np.random.default_rng(7)
+starts = [(-3, -2), (3, 2), (-3, 2), (3, -2)]          # deliberately scattered
+chains = []
+for s in starts:
+    c, rate = metropolis_2d(s, step=0.3, n_iter=6_000, rng=rng)
+    chains.append(c[1_000:])                           # drop 1,000 warm-up iterations
+    print(f"chain from {s}: acceptance {rate:.2f}, mean alpha {c[1000:, 0].mean():.3f}, mean beta {c[1000:, 1].mean():.3f}")
+draws = np.concatenate(chains)
+
+# Derived quantity: LT50, the temperature at which half the seedlings survive.
+lt50 = -6.0 - draws[:, 0] / draws[:, 1]
+print(f"\nMCMC  alpha {draws[:, 0].mean():.3f} (sd {draws[:, 0].std():.3f})   beta {draws[:, 1].mean():.3f} (sd {draws[:, 1].std():.3f})")
+print(f"      LT50 mean {lt50.mean():.2f} C, 95% interval [{np.quantile(lt50, 0.025):.2f}, {np.quantile(lt50, 0.975):.2f}] C")
+
+# Check against brute force on a 2-D grid (possible here only because there are two parameters).
+a_grid, b_grid = np.meshgrid(np.linspace(-1.5, 2.0, 351), np.linspace(0.2, 1.4, 361), indexing="ij")
+eta = a_grid[..., None] + b_grid[..., None] * x
+logp = (y * eta - n * np.logaddexp(0.0, eta)).sum(axis=-1) - (a_grid**2 + b_grid**2) / (2 * 2.5**2)
+w = np.exp(logp - logp.max()); w /= w.sum()
+print(f"grid  alpha {(w * a_grid).sum():.3f} (sd {np.sqrt((w * a_grid**2).sum() - (w * a_grid).sum()**2):.3f})"
+      f"   beta {(w * b_grid).sum():.3f} (sd {np.sqrt((w * b_grid**2).sum() - (w * b_grid).sum()**2):.3f})")
+print("correlation of alpha and beta in the posterior:", round(np.corrcoef(draws.T)[0, 1], 2))
+```
+
+Four chains started at deliberately scattered points all settle on the same region and agree with each other to about 0.02, and the pooled results agree with a brute-force grid, which is still affordable with two parameters. The derived quantity is where MCMC shines. The posterior of the LT50, a nonlinear function of two correlated parameters, would be awkward to obtain analytically; with draws, we simply compute $-6 - \alpha/\beta$ for every draw and summarise the results. The breeders can report that the LT50 is about −6.3 °C, with a 95% credible interval from −7.1 to −5.6 °C.
+
+This is the general pattern: **once you have draws from the posterior, every question becomes a question about a list of numbers.** Probabilities are fractions of draws, intervals are quantiles of draws, and predictions come from simulating new data for each draw.
+
+</Section>
+
+<Section id="diagnostics" kind="computation" title="Is the chain telling the truth?">
+
+An MCMC run always produces numbers. The hard part is knowing whether they describe the posterior. Three things can go wrong: the chain has not yet forgotten its starting point; it moves so sluggishly that its draws carry little information; or it has explored only part of the posterior. Practitioners check for all three, using several chains and a few standard quantities.
+
+<Definition term="autocorrelation and effective sample size">
+
+The **autocorrelation at lag $k$**, $\rho_k$, is the correlation between draws $k$ steps apart in a chain. The **effective sample size** of $N$ correlated draws is
+$$N_{\text{eff}} = \frac{N}{1 + 2\sum_{k=1}^{\infty} \rho_k},$$
+the number of independent draws that would estimate a posterior mean with the same precision. The **Monte Carlo standard error** of a posterior mean is then about $\text{sd}/\sqrt{N_{\text{eff}}}$. In practice the infinite sum is estimated from the chains and truncated where the estimated autocorrelations become noise; the program below uses Charles Geyer's rule of adding lags in pairs while the pairs stay positive.
+
+</Definition>
+
+<Definition term="split R-hat">
+
+Run $m \ge 4$ chains from dispersed starting points, discard warm-up, and split each remaining chain in half, giving $2m$ sequences of length $n$. Let $W$ be the average within-sequence variance and $B/n$ the variance of the sequence means. The **potential scale reduction factor** is
+$$\hat R = \sqrt{\frac{\frac{n-1}{n} W + \frac{B}{n}}{W}}.$$
+If all sequences explore the same distribution, $\hat R \approx 1$; values above 1 mean the sequences disagree, so the chains have not mixed. Splitting catches a single chain that drifts during the run.
+
+</Definition>
+
+The program runs four chains of random-walk Metropolis on the frost model with three proposal step sizes, and computes the acceptance rate, the autocorrelation of $\beta$ at lags 1 and 20, the effective sample sizes and split $\hat R$ for both parameters. Every row uses the same 10,000 kept draws.
+
+```python run
+import numpy as np
+
+x = np.array([4.0, 2.0, 0.0, -2.0, -4.0])               # the frost trial again, temperature + 6 C
+n = np.array([20, 20, 20, 20, 20])
+y = np.array([19, 16, 12, 5, 1])
+
+def log_post(theta):
+    eta = theta[0] + theta[1] * x
+    return np.sum(y * eta - n * np.logaddexp(0.0, eta)) - (theta @ theta) / (2 * 2.5**2)
+
+def run_chains(step, starts, n_iter, warmup, seed):
+    rng = np.random.default_rng(seed)
+    chains, rates = [], []
+    for s in starts:
+        theta = np.array(s, dtype=float); lp = log_post(theta); acc = 0
+        out = np.empty((n_iter, 2))
+        for i in range(n_iter):
+            prop = theta + step * rng.normal(size=2)
+            lp_new = log_post(prop)
+            if np.log(rng.uniform()) < lp_new - lp:
+                theta, lp, acc = prop, lp_new, acc + 1
+            out[i] = theta
+        chains.append(out[warmup:]); rates.append(acc / n_iter)
+    return np.array(chains), np.mean(rates)              # shape (chains, draws, 2)
+
+def autocov(c):
+    """Autocovariance of one chain at every lag, via the FFT."""
+    m = len(c); z = c - c.mean()
+    f = np.fft.rfft(z, 2 * m)
+    return np.fft.irfft(f * np.conj(f))[:m] / m
+
+def split_rhat(ch):
+    """Split R-hat for one parameter; ch has shape (chains, draws)."""
+    half = ch.shape[1] // 2
+    s = np.concatenate([ch[:, :half], ch[:, half:2 * half]])
+    W = s.var(axis=1, ddof=1).mean()
+    B = half * s.mean(axis=1).var(ddof=1)
+    return np.sqrt(((half - 1) / half * W + B / half) / W)
+
+def ess(ch):
+    """Effective sample size for one parameter across chains (autocorrelations summed with Geyer's rule)."""
+    m, nd = ch.shape
+    acov = np.array([autocov(c) for c in ch])
+    W = (acov[:, 0] * nd / (nd - 1)).mean()
+    var_plus = W * (nd - 1) / nd + (ch.mean(axis=1).var(ddof=1) if m > 1 else 0.0)
+    rho = 1 - (W - acov.mean(axis=0)) / var_plus
+    rho[0] = 1.0
+    tau, t = 0.0, 0
+    while t + 1 < nd:
+        pair = rho[t] + rho[t + 1]                       # sum lags in pairs while the pairs stay positive
+        if pair <= 0:
+            break
+        tau += pair; t += 2
+    return m * nd / (2 * tau - 1)
+
+starts = [(-3, -2), (3, 2), (-3, 2), (3, -2)]
+print(f"{'step':>5} {'accept':>7} {'lag-1 ac':>9} {'lag-20 ac':>10} {'ESS alpha':>10} {'ESS beta':>9} {'Rhat alpha':>11} {'Rhat beta':>10}")
+for step in [0.02, 0.3, 3.0]:
+    ch, rate = run_chains(step, starts, n_iter=3_000, warmup=500, seed=11)
+    b = ch[:, :, 1]
+    ac = np.mean([autocov(c) / autocov(c)[0] for c in b], axis=0)
+    print(f"{step:5.2f} {rate:7.2f} {ac[1]:9.2f} {ac[20]:10.2f} {ess(ch[:, :, 0]):10.0f} {ess(b):9.0f}"
+          f" {split_rhat(ch[:, :, 0]):11.3f} {split_rhat(b):10.3f}")
+print("(4 chains x 2,500 kept draws = 10,000 draws per row)")
+```
+
+<Figure caption="The first 1,000 iterations of the slope β in one Metropolis chain for the frost model, started at β = −2, for three step sizes. The dashed line is the posterior mean, 0.715. A tiny step accepts often but crawls; a huge step proposes wild values that are almost always rejected, so the chain sits still; a moderate step explores the posterior quickly.">
+<svg viewBox="0 0 640 330" role="img" aria-label="Three trace plots of the slope beta over the first 1,000 iterations of a Metropolis chain started at beta = -2. Top, step 0.02: the line creeps upwards, needs about 300 iterations to reach the posterior region, and then wanders slowly. Middle, step 0.3: it jumps to the posterior region within a few dozen iterations and then wanders rapidly around 0.7. Bottom, step 3: one lucky jump reaches the region, after which the line stays flat for hundreds of iterations at a time because almost every proposal is rejected.">
+  <rect x="70" y="20" width="550" height="70" fill="none" stroke="currentColor" strokeWidth="0.8" />
+  <line x1="70" y1="36.3" x2="620" y2="36.3" stroke="var(--gold)" strokeWidth="1.2" strokeDasharray="5 4" />
+  <path d="M 70.0 86.3 L 72.2 85.2 L 74.4 85.0 L 76.6 85.3 L 78.8 84.9 L 81.0 83.4 L 83.2 82.9 L 85.4 82.5 L 87.6 81.9 L 89.8 81.6 L 92.0 81.6 L 94.2 81.0 L 96.4 80.6 L 98.6 80.0 L 100.8 79.2 L 103.0 78.2 L 105.2 78.0 L 107.4 76.9 L 109.6 75.9 L 111.8 74.7 L 114.0 74.1 L 116.2 73.5 L 118.4 72.9 L 120.7 72.1 L 122.9 71.6 L 125.1 71.4 L 127.3 70.6 L 129.5 70.0 L 131.7 69.1 L 133.9 68.6 L 136.1 68.8 L 138.3 69.1 L 140.5 68.6 L 142.7 67.6 L 144.9 67.7 L 147.1 67.2 L 149.3 66.1 L 151.5 65.6 L 153.7 65.1 L 155.9 64.0 L 158.1 62.7 L 160.3 62.3 L 162.5 61.0 L 164.7 61.0 L 166.9 60.3 L 169.1 59.7 L 171.3 59.6 L 173.5 58.6 L 175.7 58.8 L 177.9 58.1 L 180.1 57.9 L 182.3 57.9 L 184.5 57.7 L 186.7 56.8 L 188.9 55.5 L 191.1 54.2 L 193.3 53.8 L 195.5 54.2 L 197.7 54.0 L 199.9 53.9 L 202.1 53.8 L 204.3 52.5 L 206.5 52.4 L 208.7 51.3 L 210.9 50.7 L 213.1 49.9 L 215.3 49.9 L 217.5 49.3 L 219.7 48.9 L 222.0 47.7 L 224.2 47.7 L 226.4 47.7 L 228.6 47.6 L 230.8 46.9 L 233.0 46.8 L 235.2 46.4 L 237.4 45.6 L 239.6 45.2 L 241.8 44.5 L 244.0 44.1 L 246.2 43.7 L 248.4 43.5 L 250.6 42.1 L 252.8 42.2 L 255.0 41.6 L 257.2 41.1 L 259.4 40.4 L 261.6 40.0 L 263.8 39.5 L 266.0 39.1 L 268.2 38.5 L 270.4 37.9 L 272.6 37.0 L 274.8 36.5 L 277.0 35.7 L 279.2 35.6 L 281.4 35.1 L 283.6 34.5 L 285.8 34.3 L 288.0 34.7 L 290.2 33.9 L 292.4 32.7 L 294.6 31.9 L 296.8 31.9 L 299.0 31.9 L 301.2 31.4 L 303.4 31.6 L 305.6 31.2 L 307.8 32.2 L 310.0 32.1 L 312.2 31.6 L 314.4 31.5 L 316.6 31.1 L 318.8 31.5 L 321.1 31.3 L 323.3 31.0 L 325.5 30.8 L 327.7 31.2 L 329.9 31.4 L 332.1 31.7 L 334.3 31.3 L 336.5 31.4 L 338.7 30.7 L 340.9 30.8 L 343.1 30.9 L 345.3 29.9 L 347.5 30.8 L 349.7 30.5 L 351.9 30.9 L 354.1 30.0 L 356.3 30.3 L 358.5 30.3 L 360.7 31.2 L 362.9 31.7 L 365.1 32.3 L 367.3 32.8 L 369.5 33.4 L 371.7 33.3 L 373.9 32.8 L 376.1 31.4 L 378.3 31.0 L 380.5 30.8 L 382.7 30.3 L 384.9 30.4 L 387.1 29.9 L 389.3 29.7 L 391.5 30.3 L 393.7 29.1 L 395.9 29.1 L 398.1 29.2 L 400.3 28.3 L 402.5 28.0 L 404.7 29.1 L 406.9 29.7 L 409.1 29.6 L 411.3 29.3 L 413.5 28.7 L 415.7 27.8 L 417.9 27.8 L 420.2 28.7 L 422.4 28.0 L 424.6 27.6 L 426.8 26.3 L 429.0 26.8 L 431.2 26.4 L 433.4 26.6 L 435.6 25.8 L 437.8 26.8 L 440.0 27.5 L 442.2 27.4 L 444.4 26.7 L 446.6 27.1 L 448.8 27.3 L 451.0 26.9 L 453.2 27.7 L 455.4 27.3 L 457.6 27.8 L 459.8 28.0 L 462.0 28.3 L 464.2 28.3 L 466.4 29.2 L 468.6 28.1 L 470.8 28.3 L 473.0 26.6 L 475.2 27.5 L 477.4 25.9 L 479.6 26.0 L 481.8 27.3 L 484.0 27.4 L 486.2 28.2 L 488.4 29.4 L 490.6 29.1 L 492.8 28.1 L 495.0 28.0 L 497.2 27.9 L 499.4 27.7 L 501.6 27.1 L 503.8 27.1 L 506.0 28.4 L 508.2 29.5 L 510.4 30.3 L 512.6 29.6 L 514.8 29.0 L 517.0 28.1 L 519.2 27.7 L 521.5 27.1 L 523.7 26.7 L 525.9 27.1 L 528.1 27.6 L 530.3 28.0 L 532.5 27.9 L 534.7 27.3 L 536.9 26.4 L 539.1 26.9 L 541.3 26.1 L 543.5 27.0 L 545.7 27.4 L 547.9 27.5 L 550.1 27.6 L 552.3 28.8 L 554.5 28.8 L 556.7 29.1 L 558.9 28.7 L 561.1 28.2 L 563.3 28.4 L 565.5 28.5 L 567.7 28.0 L 569.9 28.3 L 572.1 28.4 L 574.3 27.9 L 576.5 27.5 L 578.7 27.6 L 580.9 27.7 L 583.1 27.8 L 585.3 28.3 L 587.5 28.9 L 589.7 28.2 L 591.9 27.6 L 594.1 27.0 L 596.3 26.7 L 598.5 27.3 L 600.7 27.5 L 602.9 27.7 L 605.1 28.5 L 607.3 28.3 L 609.5 27.8 L 611.7 28.8 L 613.9 28.5 L 616.1 29.0 L 618.3 30.2 L 620.0 29.1" fill="none" stroke="currentColor" strokeWidth="1" />
+  <text x="64" y="90.3" textAnchor="end" fontSize="10" fill="currentColor">-2</text>
+  <text x="64" y="53.5" textAnchor="end" fontSize="10" fill="currentColor">0</text>
+  <text x="64" y="35.1" textAnchor="end" fontSize="10" fill="currentColor">1</text>
+  <text x="78" y="82" fontSize="11" fill="currentColor">step 0.02: too small (acceptance 0.80)</text>
+  <rect x="70" y="112" width="550" height="70" fill="none" stroke="currentColor" strokeWidth="0.8" />
+  <line x1="70" y1="128.3" x2="620" y2="128.3" stroke="var(--gold)" strokeWidth="1.2" strokeDasharray="5 4" />
+  <path d="M 70.0 178.3 L 72.2 161.7 L 74.4 157.6 L 76.6 157.5 L 78.8 149.2 L 81.0 127.1 L 83.2 125.2 L 85.4 126.2 L 87.6 124.7 L 89.8 128.2 L 92.0 128.2 L 94.2 123.2 L 96.4 123.2 L 98.6 124.7 L 100.8 128.7 L 103.0 127.3 L 105.2 127.3 L 107.4 127.3 L 109.6 127.9 L 111.8 128.3 L 114.0 126.1 L 116.2 126.9 L 118.4 127.6 L 120.7 127.6 L 122.9 127.3 L 125.1 127.3 L 127.3 125.1 L 129.5 128.5 L 131.7 129.6 L 133.9 129.6 L 136.1 128.4 L 138.3 134.4 L 140.5 129.9 L 142.7 126.0 L 144.9 128.1 L 147.1 128.1 L 149.3 126.9 L 151.5 127.1 L 153.7 127.4 L 155.9 123.0 L 158.1 121.6 L 160.3 127.7 L 162.5 127.7 L 164.7 128.7 L 166.9 128.7 L 169.1 120.5 L 171.3 125.8 L 173.5 126.4 L 175.7 127.2 L 177.9 128.5 L 180.1 128.4 L 182.3 128.9 L 184.5 127.6 L 186.7 127.0 L 188.9 127.0 L 191.1 127.0 L 193.3 126.7 L 195.5 131.9 L 197.7 129.3 L 199.9 130.2 L 202.1 130.2 L 204.3 126.8 L 206.5 129.8 L 208.7 128.2 L 210.9 130.0 L 213.1 130.6 L 215.3 130.3 L 217.5 130.3 L 219.7 125.7 L 222.0 125.1 L 224.2 125.3 L 226.4 126.6 L 228.6 129.6 L 230.8 129.6 L 233.0 130.1 L 235.2 128.0 L 237.4 128.0 L 239.6 129.0 L 241.8 125.2 L 244.0 128.1 L 246.2 127.3 L 248.4 128.8 L 250.6 128.8 L 252.8 128.2 L 255.0 128.2 L 257.2 129.0 L 259.4 125.8 L 261.6 125.8 L 263.8 127.1 L 266.0 125.4 L 268.2 129.6 L 270.4 129.7 L 272.6 127.6 L 274.8 127.6 L 277.0 127.5 L 279.2 126.5 L 281.4 126.5 L 283.6 127.9 L 285.8 128.6 L 288.0 129.5 L 290.2 127.8 L 292.4 127.8 L 294.6 127.8 L 296.8 127.8 L 299.0 127.2 L 301.2 129.8 L 303.4 127.1 L 305.6 126.4 L 307.8 125.8 L 310.0 125.8 L 312.2 124.2 L 314.4 130.0 L 316.6 132.1 L 318.8 128.8 L 321.1 127.0 L 323.3 129.2 L 325.5 129.2 L 327.7 128.0 L 329.9 128.0 L 332.1 130.0 L 334.3 128.8 L 336.5 128.8 L 338.7 126.2 L 340.9 127.9 L 343.1 127.9 L 345.3 127.9 L 347.5 127.0 L 349.7 125.2 L 351.9 128.4 L 354.1 127.7 L 356.3 127.7 L 358.5 131.0 L 360.7 131.0 L 362.9 129.5 L 365.1 129.6 L 367.3 131.1 L 369.5 131.1 L 371.7 128.9 L 373.9 127.4 L 376.1 132.5 L 378.3 133.4 L 380.5 129.0 L 382.7 128.3 L 384.9 133.0 L 387.1 130.2 L 389.3 128.2 L 391.5 131.0 L 393.7 130.3 L 395.9 130.1 L 398.1 125.4 L 400.3 127.6 L 402.5 123.3 L 404.7 125.4 L 406.9 126.7 L 409.1 127.2 L 411.3 129.6 L 413.5 127.4 L 415.7 125.1 L 417.9 124.8 L 420.2 131.0 L 422.4 125.5 L 424.6 125.5 L 426.8 126.2 L 429.0 131.9 L 431.2 125.8 L 433.4 125.8 L 435.6 126.4 L 437.8 126.1 L 440.0 126.1 L 442.2 127.2 L 444.4 127.4 L 446.6 127.4 L 448.8 126.0 L 451.0 128.0 L 453.2 128.0 L 455.4 131.2 L 457.6 125.6 L 459.8 127.6 L 462.0 125.8 L 464.2 131.9 L 466.4 124.9 L 468.6 124.2 L 470.8 129.7 L 473.0 129.7 L 475.2 128.8 L 477.4 128.2 L 479.6 128.2 L 481.8 127.3 L 484.0 127.3 L 486.2 127.3 L 488.4 131.7 L 490.6 126.2 L 492.8 126.2 L 495.0 127.3 L 497.2 128.1 L 499.4 126.3 L 501.6 126.3 L 503.8 126.3 L 506.0 128.9 L 508.2 128.9 L 510.4 130.1 L 512.6 123.4 L 514.8 127.5 L 517.0 124.0 L 519.2 125.0 L 521.5 127.9 L 523.7 127.2 L 525.9 126.6 L 528.1 128.5 L 530.3 127.4 L 532.5 128.9 L 534.7 128.9 L 536.9 131.5 L 539.1 131.5 L 541.3 127.1 L 543.5 127.1 L 545.7 127.5 L 547.9 127.5 L 550.1 129.2 L 552.3 131.9 L 554.5 128.9 L 556.7 131.7 L 558.9 130.0 L 561.1 125.9 L 563.3 126.4 L 565.5 128.0 L 567.7 129.2 L 569.9 129.7 L 572.1 124.3 L 574.3 126.7 L 576.5 126.7 L 578.7 126.7 L 580.9 131.4 L 583.1 131.4 L 585.3 129.6 L 587.5 132.7 L 589.7 123.1 L 591.9 122.8 L 594.1 124.9 L 596.3 131.6 L 598.5 129.0 L 600.7 126.3 L 602.9 125.4 L 605.1 128.7 L 607.3 126.0 L 609.5 126.0 L 611.7 130.1 L 613.9 125.7 L 616.1 132.2 L 618.3 130.9 L 620.0 127.1" fill="none" stroke="currentColor" strokeWidth="1" />
+  <text x="64" y="182.3" textAnchor="end" fontSize="10" fill="currentColor">-2</text>
+  <text x="64" y="145.5" textAnchor="end" fontSize="10" fill="currentColor">0</text>
+  <text x="64" y="127.1" textAnchor="end" fontSize="10" fill="currentColor">1</text>
+  <text x="78" y="174" fontSize="11" fill="currentColor">step 0.3: about right (acceptance 0.35)</text>
+  <rect x="70" y="204" width="550" height="70" fill="none" stroke="currentColor" strokeWidth="0.8" />
+  <line x1="70" y1="220.3" x2="620" y2="220.3" stroke="var(--gold)" strokeWidth="1.2" strokeDasharray="5 4" />
+  <path d="M 70.0 270.3 L 72.2 207.5 L 74.4 215.6 L 76.6 215.6 L 78.8 215.6 L 81.0 215.6 L 83.2 215.6 L 85.4 215.6 L 87.6 216.0 L 89.8 216.0 L 92.0 216.0 L 94.2 216.0 L 96.4 216.0 L 98.6 216.0 L 100.8 216.0 L 103.0 216.0 L 105.2 216.0 L 107.4 216.0 L 109.6 216.0 L 111.8 220.6 L 114.0 220.6 L 116.2 220.6 L 118.4 220.6 L 120.7 220.6 L 122.9 215.4 L 125.1 215.4 L 127.3 215.4 L 129.5 215.4 L 131.7 215.4 L 133.9 215.4 L 136.1 215.4 L 138.3 215.4 L 140.5 214.5 L 142.7 214.5 L 144.9 214.5 L 147.1 214.5 L 149.3 214.5 L 151.5 214.5 L 153.7 214.5 L 155.9 214.5 L 158.1 214.5 L 160.3 214.5 L 162.5 214.5 L 164.7 214.5 L 166.9 214.5 L 169.1 214.5 L 171.3 214.5 L 173.5 214.5 L 175.7 214.5 L 177.9 214.5 L 180.1 213.0 L 182.3 213.0 L 184.5 213.0 L 186.7 213.0 L 188.9 213.0 L 191.1 213.0 L 193.3 213.0 L 195.5 213.0 L 197.7 213.0 L 199.9 213.0 L 202.1 213.0 L 204.3 213.0 L 206.5 213.0 L 208.7 213.0 L 210.9 213.0 L 213.1 213.0 L 215.3 213.0 L 217.5 213.0 L 219.7 213.0 L 222.0 213.0 L 224.2 213.0 L 226.4 213.0 L 228.6 213.0 L 230.8 213.0 L 233.0 213.4 L 235.2 213.4 L 237.4 213.4 L 239.6 213.4 L 241.8 213.4 L 244.0 213.4 L 246.2 213.4 L 248.4 213.4 L 250.6 213.4 L 252.8 213.4 L 255.0 213.4 L 257.2 221.7 L 259.4 221.7 L 261.6 221.7 L 263.8 221.7 L 266.0 221.7 L 268.2 221.7 L 270.4 221.7 L 272.6 221.7 L 274.8 221.7 L 277.0 221.7 L 279.2 221.7 L 281.4 221.7 L 283.6 221.7 L 285.8 221.7 L 288.0 221.7 L 290.2 221.7 L 292.4 221.7 L 294.6 221.7 L 296.8 221.7 L 299.0 221.7 L 301.2 221.7 L 303.4 221.7 L 305.6 221.7 L 307.8 221.7 L 310.0 221.7 L 312.2 221.7 L 314.4 221.7 L 316.6 221.7 L 318.8 221.7 L 321.1 221.7 L 323.3 221.7 L 325.5 221.7 L 327.7 221.7 L 329.9 221.7 L 332.1 221.7 L 334.3 221.7 L 336.5 221.7 L 338.7 221.7 L 340.9 221.7 L 343.1 221.7 L 345.3 221.7 L 347.5 221.7 L 349.7 221.7 L 351.9 221.7 L 354.1 221.7 L 356.3 221.7 L 358.5 221.7 L 360.7 221.7 L 362.9 221.7 L 365.1 221.7 L 367.3 221.7 L 369.5 221.7 L 371.7 221.7 L 373.9 221.7 L 376.1 221.7 L 378.3 221.7 L 380.5 221.7 L 382.7 221.7 L 384.9 221.7 L 387.1 221.7 L 389.3 221.7 L 391.5 221.7 L 393.7 221.7 L 395.9 221.7 L 398.1 221.7 L 400.3 221.7 L 402.5 221.7 L 404.7 221.7 L 406.9 221.7 L 409.1 221.7 L 411.3 221.7 L 413.5 221.7 L 415.7 221.7 L 417.9 221.7 L 420.2 221.7 L 422.4 221.7 L 424.6 221.7 L 426.8 221.7 L 429.0 221.7 L 431.2 221.7 L 433.4 221.7 L 435.6 221.7 L 437.8 221.7 L 440.0 221.7 L 442.2 221.7 L 444.4 221.7 L 446.6 221.7 L 448.8 221.7 L 451.0 221.7 L 453.2 221.7 L 455.4 221.7 L 457.6 221.7 L 459.8 221.7 L 462.0 221.7 L 464.2 221.7 L 466.4 221.7 L 468.6 214.2 L 470.8 214.2 L 473.0 214.2 L 475.2 214.2 L 477.4 214.2 L 479.6 214.2 L 481.8 214.2 L 484.0 214.2 L 486.2 214.2 L 488.4 214.2 L 490.6 214.2 L 492.8 214.2 L 495.0 214.2 L 497.2 214.2 L 499.4 214.2 L 501.6 214.2 L 503.8 214.2 L 506.0 214.2 L 508.2 214.2 L 510.4 214.2 L 512.6 214.2 L 514.8 214.2 L 517.0 214.2 L 519.2 214.2 L 521.5 214.2 L 523.7 214.2 L 525.9 214.2 L 528.1 214.2 L 530.3 214.2 L 532.5 214.2 L 534.7 214.2 L 536.9 214.2 L 539.1 214.2 L 541.3 214.2 L 543.5 214.2 L 545.7 214.2 L 547.9 214.2 L 550.1 214.2 L 552.3 214.2 L 554.5 214.2 L 556.7 214.2 L 558.9 214.2 L 561.1 219.6 L 563.3 219.6 L 565.5 219.6 L 567.7 219.6 L 569.9 223.9 L 572.1 223.9 L 574.3 223.9 L 576.5 223.9 L 578.7 223.9 L 580.9 223.9 L 583.1 223.9 L 585.3 223.9 L 587.5 223.9 L 589.7 223.9 L 591.9 223.9 L 594.1 223.9 L 596.3 223.9 L 598.5 223.9 L 600.7 223.9 L 602.9 223.9 L 605.1 223.9 L 607.3 223.9 L 609.5 223.9 L 611.7 223.9 L 613.9 223.9 L 616.1 223.9 L 618.3 223.9 L 620.0 223.9" fill="none" stroke="currentColor" strokeWidth="1" />
+  <text x="64" y="274.3" textAnchor="end" fontSize="10" fill="currentColor">-2</text>
+  <text x="64" y="237.5" textAnchor="end" fontSize="10" fill="currentColor">0</text>
+  <text x="64" y="219.1" textAnchor="end" fontSize="10" fill="currentColor">1</text>
+  <text x="78" y="266" fontSize="11" fill="currentColor">step 3: too large (acceptance 0.01)</text>
+  <text x="70.0" y="290" textAnchor="middle" fontSize="11" fill="currentColor">0</text>
+  <text x="207.6" y="290" textAnchor="middle" fontSize="11" fill="currentColor">250</text>
+  <text x="345.3" y="290" textAnchor="middle" fontSize="11" fill="currentColor">500</text>
+  <text x="482.9" y="290" textAnchor="middle" fontSize="11" fill="currentColor">750</text>
+  <text x="620.0" y="290" textAnchor="middle" fontSize="11" fill="currentColor">1000</text>
+  <text x="345" y="308" textAnchor="middle" fontSize="12" fill="currentColor">iteration</text>
+  <text x="18" y="158" textAnchor="middle" fontSize="12" fill="currentColor" transform="rotate(-90 18 158)">slope β</text>
+</svg>
+</Figure>
+
+The output and the figure tell one story. With **tiny steps** (0.02) nearly every proposal is accepted, but each move is so small that draws 20 iterations apart are still correlated at 0.84; 10,000 draws are worth only 12 independent ones for $\alpha$, and $\hat R = 1.49$ says the four chains still disagree. With **huge steps** (3.0) almost every proposal lands in a region of negligible posterior density and is rejected, so the chain often repeats one value for a hundred iterations or more: again an effective sample size of about 50. The **moderate step** (0.3) accepts about a third of proposals, its autocorrelation dies out within 20 lags, $\hat R$ is 1.00, and the same 10,000 draws are worth over 600 independent ones for $\alpha$ and about 1,700 for $\beta$. (The difference between the two parameters arises because $\alpha$ has the wider posterior, and a single step size cannot suit both; real samplers adapt a separate scale for each direction.) For random-walk Metropolis in many dimensions, theory suggests aiming for an acceptance rate of about 0.23, and somewhat higher in one or two dimensions.
+
+<Narrator who="gideon">
+
+No diagnostic can prove that a chain has converged; it can only fail to detect a problem. If the posterior has two well-separated modes and all four chains happen to start near the same one, every chain agrees, $\hat R$ is 1.00, the effective sample size looks healthy, and half the posterior is missing. Dispersed starting points, more chains and knowledge of the model are the defences.
+
+</Narrator>
+
+The current recommendations, from the 2021 paper by Aki Vehtari and colleagues that refined $\hat R$ with rank normalisation, are to run at least four chains, to trust the results only when $\hat R < 1.01$ for every quantity of interest, and to have an effective sample size of at least about 400 for the bulk of the distribution and for its tails (tail quantiles are estimated less precisely than means). Software reports these as `r_hat`, `ess_bulk` and `ess_tail`.
+
+</Section>
+
+<Section id="hmc" kind="human" title="Hamiltonian Monte Carlo">
+
+Random-walk Metropolis has a fatal flaw in high dimensions. To keep a reasonable acceptance rate in $d$ dimensions, its step size must shrink roughly like $1/\sqrt{d}$, and a random walk with tiny steps needs about $d$ times as many iterations to cross the posterior. Guessing directions blindly is the problem: in 100 dimensions, almost every direction from a point in the posterior leads downhill.
+
+**Hamiltonian Monte Carlo (HMC)** uses the gradient of the log posterior to choose directions. Picture the negative log posterior as a landscape of valleys and hills, and the current parameter value as a frictionless puck on it. Each iteration gives the puck a random push (a **momentum** drawn from a normal distribution) and lets it slide for a while under simulated physics: it speeds up going downhill and slows going uphill, so it follows the shape of the posterior and travels far from where it started. The physics is simulated with the **leapfrog** method, alternating small updates of momentum (using the gradient) and position. Exact physics would conserve the total "energy" — potential (the negative log posterior) plus kinetic — and every trajectory would be accepted; the leapfrog's small errors are corrected by a Metropolis accept-or-reject step on the energy change. The result is a valid MCMC method whose proposals are distant yet usually accepted.
+
+The program compares the two methods on a target with $d$ independent normal coordinates whose standard deviations range from 1 to 3, giving each method the same budget of 40,000 density or gradient evaluations (an HMC iteration with 8 leapfrog steps costs 8). It reports the effective sample size of the widest, slowest-mixing coordinate.
+
+```python run
+import numpy as np
+
+def autocov(c):
+    m = len(c); z = c - c.mean()
+    f = np.fft.rfft(z, 2 * m)
+    return np.fft.irfft(f * np.conj(f))[:m] / m
+
+def ess1(c):
+    """Single-chain effective sample size (Geyer's initial positive sequence)."""
+    rho = autocov(c) / autocov(c)[0]
+    tau, t = 0.0, 0
+    while t + 1 < len(c) and rho[t] + rho[t + 1] > 0:
+        tau += rho[t] + rho[t + 1]; t += 2
+    return len(c) / (2 * tau - 1)
+
+# Target: d independent normals with standard deviations from 1 to 3.
+# log p(q) = -sum(q^2 / (2 sd^2)), and its gradient is -q / sd^2.
+def rwm(d, budget, rng):
+    inv = 1 / np.linspace(1, 3, d) ** 2
+    step = 2.38 / np.sqrt(d)                       # the classic scaling with dimension
+    q = rng.normal(size=d); out = np.empty(budget); acc = 0
+    for i in range(budget):                        # one density evaluation per iteration
+        prop = q + step * rng.normal(size=d)
+        if np.log(rng.uniform()) < 0.5 * (q @ (q * inv) - prop @ (prop * inv)):
+            q, acc = prop, acc + 1
+        out[i] = q[-1]                             # the widest coordinate mixes slowest
+    return out, acc / budget
+
+def hmc(d, budget, rng, L=8):
+    inv = 1 / np.linspace(1, 3, d) ** 2
+    eps0 = 1.0 / d**0.25                           # step size shrinks slowly with dimension
+    q = rng.normal(size=d); out = []; acc = 0
+    for _ in range(budget // L):                   # L gradient evaluations per iteration
+        eps = eps0 * rng.uniform(0.3, 1.0)         # jitter, so paths do not loop back on themselves
+        p = rng.normal(size=d)                     # fresh random momentum
+        qn, pn = q.copy(), p - 0.5 * eps * q * inv # leapfrog: half step for momentum,
+        for j in range(L):
+            qn += eps * pn                         # full steps for position and momentum,
+            if j < L - 1:
+                pn -= eps * qn * inv
+        pn -= 0.5 * eps * qn * inv                 # and a final half step
+        h_old = 0.5 * (q @ (q * inv) + p @ p)      # "energy" = potential + kinetic
+        h_new = 0.5 * (qn @ (qn * inv) + pn @ pn)
+        if np.log(rng.uniform()) < h_old - h_new:  # accept to correct the leapfrog's small error
+            q, acc = qn, acc + 1
+        out.append(q[-1])
+    return np.array(out), acc / (budget // L)
+
+rng = np.random.default_rng(1987)
+budget = 40_000
+print(f"effective draws of the slowest coordinate per {budget:,} density or gradient evaluations")
+print(f"{'dimension':>9} {'RWM accept':>11} {'RWM ESS':>8} {'HMC accept':>11} {'HMC ESS':>8}")
+for d in [2, 10, 100]:
+    c1, a1 = rwm(d, budget, rng)
+    c2, a2 = hmc(d, budget, rng)
+    print(f"{d:9} {a1:11.2f} {ess1(c1[1000:]):8.0f} {a2:11.2f} {ess1(c2[50:]):8.0f}")
+```
+
+HMC is ahead by a factor of about 2.6 in two dimensions and 4.5 in ten, and at $d = 100$ random-walk Metropolis delivers about 30 effective draws for the budget while HMC — not even tuned, as its 99% acceptance rate shows — delivers over 500. Theory for simple targets says HMC's step size needs to shrink only like $d^{-1/4}$, which is why the gap keeps widening as models grow. The price is that HMC needs gradients (modern software computes them exactly by **automatic differentiation**) and that its two tuning parameters, the step size and the number of leapfrog steps, interact in awkward ways: too many steps and the puck loops back towards where it started, which is why the program jitters the step size.
+
+The **No-U-Turn Sampler (NUTS)** of Matthew Hoffman and Andrew Gelman removes the second tuning parameter by extending each trajectory until it starts to turn back on itself, and Stan and PyMC adapt the step size during warm-up. HMC also gives a diagnostic that random-walk methods lack: a **divergent transition**, where the leapfrog simulation blows up because the posterior curves too sharply for the step size, typically in the narrow neck of a hierarchical model. Divergences are a warning that part of the posterior is not being explored, and the usual cure is to reparametrise the model, not to ignore them.
+
+The frost model in Stan (not run here):
+
+```stan
+// Stan, not run here: the frost-tolerance model
+data {
+  int<lower=1> K;                 // number of temperatures
+  vector[K] x;                    // temperature + 6
+  array[K] int<lower=0> n;        // seedlings per batch
+  array[K] int<lower=0> y;        // survivors
+}
+parameters {
+  real alpha;
+  real beta;
+}
+model {
+  alpha ~ normal(0, 2.5);
+  beta ~ normal(0, 2.5);
+  y ~ binomial_logit(n, alpha + beta * x);
+}
+generated quantities {
+  real lt50 = -6 - alpha / beta;  // computed for every draw
+}
+```
+
+and in PyMC, followed by the standard diagnostic summary from ArviZ (not run here; neither library is available in the browser):
+
+```python
+# PyMC and ArviZ, not run here
+import arviz as az
+import numpy as np
+import pymc as pm
+
+x = np.array([4.0, 2.0, 0.0, -2.0, -4.0])
+n = np.array([20, 20, 20, 20, 20])
+y = np.array([19, 16, 12, 5, 1])
+
+with pm.Model():
+    alpha = pm.Normal("alpha", 0, 2.5)
+    beta = pm.Normal("beta", 0, 2.5)
+    pm.Binomial("y", n=n, logit_p=alpha + beta * x, observed=y)
+    pm.Deterministic("lt50", -6 - alpha / beta)
+    idata = pm.sample(draws=1000, tune=1000, chains=4, random_seed=1)
+
+print(az.summary(idata))   # means, sds, intervals, ess_bulk, ess_tail, r_hat
+```
+
+Both run NUTS (here with four chains), report $\hat R$ and bulk and tail effective sample sizes for every parameter, and warn about divergences. Their summaries should agree with our hand-built sampler to within Monte Carlo error.
+
+</Section>
+
+<Section id="practice" kind="human" title="MCMC in practice and in history">
+
+**History.** The algorithm was born at Los Alamos in 1953, where Nicholas Metropolis, Arianna and Marshall Rosenbluth, and Augusta and Edward Teller used one of the first electronic computers to simulate the behaviour of a fluid of hard spheres; Arianna Rosenbluth wrote the program. W. K. Hastings generalised it in 1970. Stuart and Donald Geman's **Gibbs sampler** (1984), which updates one parameter at a time from its conditional distribution, came from image processing, and Alan Gelfand and Adrian Smith's 1990 paper showed statisticians how these methods could compute Bayesian posteriors. The BUGS project made Gibbs sampling available to applied researchers in the 1990s. Hamiltonian ("hybrid") Monte Carlo was invented by physicists for lattice quantum chromodynamics in 1987, brought into statistics by Radford Neal, and made automatic by NUTS and by Stan, first released in 2012.
+
+**Tools in 2026.** NUTS in [Stan](https://mc-stan.org/), [PyMC](https://www.pymc.io/), NumPyro and Turing is the default for models with continuous parameters; ArviZ computes diagnostics for all of them. Gibbs-based tools such as JAGS remain in use, especially where parameters are discrete. When MCMC is too slow — huge data sets, models refitted constantly — practitioners turn to approximations: **variational inference** fits a simple distribution close to the posterior by optimisation and is fast but tends to understate uncertainty; INLA computes accurate approximations for the large class of latent Gaussian models; sequential Monte Carlo suits data that arrive over time. Each trades some accuracy for speed, and a careful analyst checks the approximation against MCMC on a smaller version of the problem.
+
+**Good practice.** Run several chains from dispersed starting points; check $\hat R$, bulk and tail effective sample sizes and divergences for every quantity you report; look at trace plots; report Monte Carlo standard errors when precision matters; and test the whole pipeline on simulated data where you know the truth, a technique called simulation-based calibration that the <LessonLink slug="resampling-and-simulation">next lesson</LessonLink> carries out.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The draws are a random sample from the posterior."** They are a *correlated* sequence whose distribution approaches the posterior. Averages still converge, but 10,000 draws can be worth 600 independent ones, or 12. Always look at the effective sample size, not the number of iterations.
+
+</Misconception>
+
+<Misconception>
+
+**"A high acceptance rate means the sampler is working well."** The tiny-step chain above accepted 90% of its proposals and was nearly useless. For random-walk Metropolis, rates around 0.2 to 0.5 usually mix best; for HMC, Stan targets an acceptance statistic of about 0.8 by default.
+
+</Misconception>
+
+<Misconception>
+
+**"$\hat R = 1.00$ proves convergence."** It shows that the chains agree with each other, not that they have found the whole posterior. Chains trapped in the same mode, or a posterior region too narrow for the sampler to enter (signalled in HMC by divergences), can leave $\hat R$ at 1.00.
+
+</Misconception>
+
+<Misconception>
+
+**"Thinning — keeping only every tenth draw — makes the estimates better."** Thinning reduces autocorrelation between the draws you keep, but it throws away information, so estimates from the thinned chain are never more precise than from the full one. Its legitimate use is saving storage or memory.
+
+</Misconception>
+
+<Misconception>
+
+**"If something looks wrong, just run the chain longer."** Sometimes that works. But when the sampler cannot handle the posterior's geometry — strong correlations, a funnel in a hierarchical model, divergences — more iterations only produce more biased draws. The cure is usually to reparametrise the model, rescale the data or use a better sampler.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

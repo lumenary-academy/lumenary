@@ -1,0 +1,480 @@
+---
+title: Data science in production
+subtitle: From a notebook to a service that keeps working — packaging and serving models, watching for drift, retraining, feature stores, the tooling, decision support, and knowing when not to deploy.
+minutes: 85
+objectives:
+  - Turn a notebook model into a reproducible artefact with metadata, and describe batch, online and streaming serving
+  - Validate inputs at the boundary of a model service, and explain why loading untrusted model files is dangerous
+  - Distinguish data drift, label shift and concept drift, and say which can be detected without labels
+  - Implement a drift detector with the population stability index, and explain its thresholds and its noise
+  - Compare retraining policies on a simulated concept drift, and recognise feedback loops
+  - Explain what feature stores and MLOps tools are for, and when a small team does not need them
+  - Design model outputs as decision support, and argue when a model should not be deployed at all
+narrators: [chloe, margaret, gideon]
+prerequisites: [the-data-science-workflow, machine-learning-for-tabular-data, experiments-in-products]
+related: [math.prob.statistics, math.applied.information-theory]
+references:
+  - title: "Challenges in deploying machine learning: a survey of case studies"
+    author: Andrei Paleyes, Raoul-Gabriel Urma and Neil D. Lawrence
+    year: 2022
+    url: https://arxiv.org/abs/2011.09926
+  - title: "Operationalizing machine learning: an interview study"
+    author: Shreya Shankar, Rolando Garcia, Joseph M. Hellerstein and Aditya G. Parameswaran
+    year: 2022
+    url: https://arxiv.org/abs/2209.09125
+  - title: Hidden technical debt in machine learning systems
+    author: D. Sculley and colleagues
+    year: 2015
+    note: NeurIPS 2015. The classic account of why the model code is the smallest part of a production ML system.
+  - title: Rules of machine learning
+    author: Martin Zinkevich
+    url: https://developers.google.com/machine-learning/guides/rules-of-ml
+    note: Practical advice from building production ML systems, beginning with when not to use ML.
+  - title: "Failing loudly: an empirical study of methods for detecting dataset shift"
+    author: Stephan Rabanser, Stephan Günnemann and Zachary C. Lipton
+    year: 2019
+    url: https://arxiv.org/abs/1810.11953
+  - title: A survey on concept drift adaptation
+    author: João Gama, Indrė Žliobaitė, Albert Bifet, Mykola Pechenizkiy and Abdelhamid Bouchachia
+    year: 2014
+    url: https://doi.org/10.1145/2523813
+  - title: Detecting and correcting for label shift with black box predictors
+    author: Zachary C. Lipton, Yu-Xiang Wang and Alexander J. Smola
+    year: 2018
+    url: https://arxiv.org/abs/1802.03916
+  - title: Model cards for model reporting
+    author: Margaret Mitchell and colleagues
+    year: 2019
+    url: https://arxiv.org/abs/1810.03993
+  - title: "pickle: Python object serialization (security warning)"
+    url: https://docs.python.org/3/library/pickle.html
+  - title: ONNX
+    url: https://onnx.ai/
+    note: An open format for exchanging trained models between frameworks and runtimes.
+---
+
+<Section id="motivation" kind="motivation" title="The model that worked until it did not">
+
+A courier company built a model that predicts, each morning, which parcels are likely to be delivered late, so that dispatchers can reorder routes and warn customers. In the notebook it was good: honest cross-validation, sensible features, a test AUC of 0.70. It went live in March. In June a new depot opened in a rural region with longer routes. In August road works closed the main bridge for three months. Customer complaints about lateness rose steadily, and for weeks nobody connected them to the model: the dashboard showed how many parcels the model flagged each day, which looked normal, and nothing showed whether its flags were *right*.
+
+This is the most common way models fail. Not with an error message, but by being quietly wrong in a world that has moved on from the one they learned. Surveys of practitioners find the same pattern again and again: most of the work of machine learning in production is not modelling but plumbing, monitoring and maintenance ([Paleyes, Urma and Lawrence, 2022](https://arxiv.org/abs/2011.09926); [Shankar and colleagues, 2022](https://arxiv.org/abs/2209.09125)). Engineers at Google described this a decade ago as *technical debt*: the model code is a small box in the middle of a large system of data collection, feature computation, configuration, serving and monitoring, all of which can break (Sculley and colleagues, 2015).
+
+This lesson follows a model from the notebook into service and through its first year: packaging and serving it, detecting when the data drift away from the training data, deciding when to retrain, and the infrastructure that helps. It ends with the most important judgement of all, which is sometimes not to deploy a model.
+
+</Section>
+
+<Section id="notebook-to-service" kind="intuition" title="From notebook to service">
+
+A notebook is a record of exploration. A production model is a piece of software that other software depends on, so it needs what all such software needs: code in version control, tests, reproducible builds, monitoring, and someone responsible for it ([testing](/en/cs/testing/) and [reliability engineering](/en/cs/reliability-engineering/) in Lumenary CS). The usual path has four steps.
+
+1. **A training pipeline.** The code that loads data, builds features, fits the model and evaluates it moves out of the notebook into functions and scripts that run end to end from raw data, with tests and pinned dependencies (the habits of <LessonLink slug="the-data-science-workflow">the data science workflow</LessonLink>). It is run by a scheduler or a pipeline tool, not by hand.
+2. **An artefact.** Training produces a versioned package: the fitted pipeline (preprocessing and model together, as in <LessonLink slug="machine-learning-for-tabular-data">machine learning for tabular data</LessonLink>), plus metadata saying what data it was trained on, with which code and library versions, how well it did, and what inputs it expects. A **model registry** stores artefacts and records which version is live.
+3. **Serving.** The artefact is loaded by something that makes predictions where they are needed.
+4. **Monitoring and retraining.** Inputs, outputs and, when labels arrive, accuracy are watched; the model is retrained or retired when they go wrong.
+
+<Definition term="batch, online and streaming serving">
+
+**Batch** serving scores many records on a schedule (every night, every morning) and writes the predictions to a table that other systems read. **Online** serving answers one request at a time through an API, within a latency budget (often tens of milliseconds). **Streaming** serving scores events as they flow through a stream-processing system. **Training–serving skew** is any difference between how features are computed in training and in serving; it silently degrades a model that looked fine in evaluation.
+
+</Definition>
+
+Batch is the simplest and the most common: the courier model scores tomorrow's parcels at 05:00, and dispatchers read a table. Choose online serving only when the prediction depends on information that exists only at request time (the basket a customer is building now, the transaction being authorised now), because it brings servers, latency, scaling and on-call duty with it.
+
+<Figure caption="The production loop. Training produces a versioned artefact in a registry; serving loads it and makes predictions; monitoring compares live inputs with the training data at once, and live accuracy when labels arrive; and retraining, triggered by schedule or by monitoring, closes the loop. A feature store, when there is one, computes features the same way for training and for serving.">
+<svg viewBox="0 0 680 270" role="img" aria-label="Diagram of a loop. Raw data and a feature store feed a training pipeline. The training pipeline writes an artefact, a model plus metadata, to a model registry. The registry feeds serving, either batch or online, which produces predictions used by decisions. Serving logs inputs and predictions to monitoring, which also receives labels that arrive later. Monitoring has an arrow labelled drift or decay back to the training pipeline, labelled retrain. The feature store also feeds serving.">
+  <defs>
+    <marker id="prod-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="10" y="30" width="110" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="65" y="55" textAnchor="middle" fill="currentColor" fontSize="12">raw data</text>
+  <rect x="10" y="160" width="110" height="40" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="65" y="185" textAnchor="middle" fill="currentColor" fontSize="12">feature store</text>
+  <rect x="170" y="30" width="130" height="40" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="235" y="55" textAnchor="middle" fill="currentColor" fontSize="12">training pipeline</text>
+  <rect x="350" y="30" width="140" height="40" rx="6" fill="var(--gold)" fillOpacity="0.35" stroke="currentColor" />
+  <text x="420" y="48" textAnchor="middle" fill="currentColor" fontSize="11">registry: model +</text>
+  <text x="420" y="62" textAnchor="middle" fill="currentColor" fontSize="11">metadata, versioned</text>
+  <rect x="540" y="30" width="130" height="40" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="605" y="48" textAnchor="middle" fill="currentColor" fontSize="11">serving</text>
+  <text x="605" y="62" textAnchor="middle" fill="currentColor" fontSize="11">batch or online</text>
+  <rect x="540" y="130" width="130" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="605" y="155" textAnchor="middle" fill="currentColor" fontSize="12">decisions</text>
+  <rect x="300" y="200" width="180" height="50" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="390" y="220" textAnchor="middle" fill="currentColor" fontSize="12">monitoring</text>
+  <text x="390" y="238" textAnchor="middle" fill="currentColor" fontSize="10">inputs, outputs, accuracy</text>
+  <line x1="120" y1="50" x2="168" y2="50" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#prod-arrow)" />
+  <line x1="300" y1="50" x2="348" y2="50" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#prod-arrow)" />
+  <line x1="490" y1="50" x2="538" y2="50" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#prod-arrow)" />
+  <line x1="605" y1="70" x2="605" y2="128" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#prod-arrow)" />
+  <line x1="100" y1="160" x2="200" y2="72" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#prod-arrow)" />
+  <path d="M 120 180 C 300 150, 480 120, 560 72" fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#prod-arrow)" />
+  <line x1="580" y1="70" x2="460" y2="198" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 3" markerEnd="url(#prod-arrow)" />
+  <text x="530" y="118" fill="currentColor" fontSize="10">logs</text>
+  <line x1="605" y1="170" x2="482" y2="225" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 3" markerEnd="url(#prod-arrow)" />
+  <text x="560" y="214" fill="currentColor" fontSize="10">labels, later</text>
+  <path d="M 300 225 C 230 225, 235 140, 235 72" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 3" markerEnd="url(#prod-arrow)" />
+  <text x="190" y="240" fill="currentColor" fontSize="10">drift or decay: retrain</text>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="packaging" kind="computation" title="Packaging and serving a model">
+
+The block trains the courier model on synthetic deliveries, saves it with its metadata, loads it back as a service would, and puts a validation layer in front of it. Validation at the boundary matters more than it looks. A model will happily score nonsense: a distance sent as text, a van with 1,200 parcels, a region spelled with a capital letter. Without checks, the one-hot encoder silently treats "Valley" as an unknown region, and the prediction is quietly wrong.
+
+```python run
+import hashlib
+import json
+import pickle
+import platform
+import tempfile
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+# Synthetic parcel deliveries: will this parcel arrive late?
+rng = np.random.default_rng(3)
+n = 6000
+df = pd.DataFrame({"distance_km": rng.gamma(2.0, 6.0, n).round(1),
+                   "parcels_on_van": rng.integers(20, 160, n),
+                   "region": rng.choice(["north", "coast", "valley"], n),
+                   "hour": rng.integers(8, 20, n)})
+logit = -3.2 + 0.07 * df["distance_km"] + 0.012 * df["parcels_on_van"] + 0.5 * (df["region"] == "valley")
+df["late"] = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+
+FEATURES = {"distance_km": (0.0, 300.0), "parcels_on_van": (1, 400), "hour": (0, 23)}
+CATEGORIES = {"region": ["north", "coast", "valley"]}
+X_tr, X_te, y_tr, y_te = train_test_split(df.drop(columns="late"), df["late"], test_size=0.25, random_state=0)
+model = make_pipeline(ColumnTransformer([("num", StandardScaler(), list(FEATURES)),
+                                         ("cat", OneHotEncoder(handle_unknown="ignore"), list(CATEGORIES))]),
+                      LogisticRegression(max_iter=1000)).fit(X_tr, y_tr)
+
+# Package: the fitted pipeline plus everything needed to trust, reproduce and monitor it.
+metadata = {
+    "model": "late-delivery", "version": "2026.11.1",
+    "trained_on_rows": len(X_tr),
+    "training_data_sha256": hashlib.sha256(X_tr.to_csv(index=False).encode()).hexdigest()[:16],
+    "test_auc": round(roc_auc_score(y_te, model.predict_proba(X_te)[:, 1]), 3),
+    "features": FEATURES, "categories": CATEGORIES,
+    "python": platform.python_version(), "sklearn": sklearn.__version__,
+}
+with tempfile.TemporaryDirectory() as tmp:                       # stands in for a model registry
+    folder = Path(tmp)
+    (folder / "model.pkl").write_bytes(pickle.dumps(model))
+    (folder / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    print("artefact:", sorted(p.name for p in folder.iterdir()), "| test AUC", metadata["test_auc"])
+    # Serve: load once at start-up, then validate every request before scoring it.
+    loaded = pickle.loads((folder / "model.pkl").read_bytes())   # only ever unpickle files you trust
+    meta = json.loads((folder / "metadata.json").read_text())
+
+def predict(request):
+    problems = []
+    for name, (low, high) in meta["features"].items():
+        value = request.get(name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            problems.append(f"{name}: expected a number, got {value!r}")
+        elif not low <= value <= high:
+            problems.append(f"{name}: {value} is outside the range {low}..{high}")
+    for name, allowed in meta["categories"].items():
+        if request.get(name) not in allowed:
+            problems.append(f"{name}: {request.get(name)!r} is not one of {allowed}")
+    if problems:
+        return {"error": problems, "model_version": meta["version"]}
+    p = loaded.predict_proba(pd.DataFrame([request]))[0, 1]
+    return {"p_late": round(float(p), 3), "model_version": meta["version"]}
+
+print(predict({"distance_km": 18.5, "parcels_on_van": 120, "region": "valley", "hour": 15}))
+print(predict({"distance_km": "18.5", "parcels_on_van": 1200, "region": "Valley", "hour": 15}))
+```
+
+The artefact is two files: the fitted pipeline and a metadata record with the version, a fingerprint of the training data, the test AUC, the expected inputs and their valid ranges, and the library versions. The valid request gets a probability (0.47) tagged with the model version, so that every logged prediction can be traced to the model that made it. The invalid request is refused with a list of every problem, instead of being scored. In a real service the same checks are usually written as a schema with a validation library, and the same schema is used to check the training data, so training and serving agree on what valid input is.
+
+<Note>
+
+Python's `pickle` (and `joblib`, built on it) can execute arbitrary code when a file is loaded, as the [Python documentation](https://docs.python.org/3/library/pickle.html) warns. Never load a model file from a source you do not trust, any more than you would run a program from one ([security](/en/cs/security/)). Pickled models are also tied to library versions: a model saved with one version of scikit-learn may not load, or may behave differently, under another, which is why the metadata records them. Safer or more portable formats exist: [skops](https://skops.readthedocs.io/) for scikit-learn models without arbitrary code execution, and [ONNX](https://onnx.ai/) for running models from many frameworks in a common runtime, including from languages other than Python.
+
+</Note>
+
+For online serving, the `predict` function is wrapped in a small web service, packaged in a container image with its pinned environment, and run behind a load balancer; the infrastructure is the subject of the [cloud computing](/en/cs/electives/cloud-computing/) elective (see [virtualisation and containers](/en/cs/electives/cloud-computing/virtualisation-and-containers/) and [serverless and event-driven](/en/cs/electives/cloud-computing/serverless-and-event-driven/)). A sketch with one of several Python web frameworks (others, such as Flask or Django, work the same way):
+
+```python
+# Not run here: a minimal online prediction service.
+from fastapi import FastAPI
+
+app = FastAPI()
+# load the artefact once, at start-up, as in the block above
+
+@app.post("/predict")
+def predict_endpoint(request: dict) -> dict:
+    return predict(request)          # validate, score, return the probability and model version
+```
+
+New versions are released cautiously. In **shadow** mode, the new model scores live traffic but its predictions are only logged, so they can be compared with the current model's without affecting anyone. A **canary** sends a small share of traffic to the new model and widens it if nothing breaks. And when the question is whether the new model improves the business outcome, rather than a test metric, the answer is an experiment (<LessonLink slug="experiments-in-products">experiments in products</LessonLink>).
+
+</Section>
+
+<Section id="drift" kind="definitions" title="Data drift and concept drift">
+
+A model learns the joint distribution of inputs $X$ and outcome $Y$ in its training data. Writing it as $P(X, Y) = P(Y \mid X)\,P(X)$ shows two ways the world can move.
+
+<Definition term="data drift, label shift and concept drift">
+
+**Data drift** (or covariate shift) is a change in the distribution of the inputs, $P(X)$, with the relationship $P(Y \mid X)$ unchanged: the new rural depot sends longer routes. **Label shift** (or prior shift) is a change in how common each outcome is, $P(Y)$, with $P(X \mid Y)$ unchanged: a flu season raises the share of patients who have flu. **Concept drift** is a change in the relationship itself, $P(Y \mid X)$: after the bridge closes, the same distance means a different chance of lateness.
+
+</Definition>
+
+The distinction matters because they are detected differently. Data drift can be seen immediately, from the inputs alone, before any outcome is known. Concept drift is invisible in the inputs; it shows only as falling accuracy, which can be measured only when labels arrive, and labels often arrive late: a delivery is known to be late within a day, a loan default only after months. Label shift can sometimes be estimated from the distribution of the model's own predictions ([Lipton, Wang and Smola, 2018](https://arxiv.org/abs/1802.03916)).
+
+<Figure caption="Two ways the world drifts. Left: data drift. The distribution of delivery distances moves to the right (dashed), but the chance of lateness at each distance is unchanged, so the model is still right where it has data, and only the mix of cases changes. Right: concept drift. Distances are distributed as before, but the curve relating distance to lateness changes (dashed), so the model is wrong everywhere and the inputs give no warning.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Two panels. Left panel, titled data drift: two humped histograms of distance, the dashed one shifted to the right of the solid one, with a single unchanged curve of lateness probability above them. Right panel, titled concept drift: one histogram of distance, and two curves of lateness probability, the solid original curve rising steeply and the dashed new curve higher on the left and flatter.">
+  <text x="160" y="20" textAnchor="middle" fill="currentColor" fontSize="12">data drift: P(X) changes</text>
+  <text x="480" y="20" textAnchor="middle" fill="currentColor" fontSize="12">concept drift: P(Y | X) changes</text>
+  <line x1="30" y1="200" x2="290" y2="200" stroke="currentColor" strokeWidth="1" />
+  <line x1="350" y1="200" x2="610" y2="200" stroke="currentColor" strokeWidth="1" />
+  <text x="160" y="220" textAnchor="middle" fill="currentColor" fontSize="11">distance</text>
+  <text x="480" y="220" textAnchor="middle" fill="currentColor" fontSize="11">distance</text>
+  <path d="M 30 200 C 60 120, 90 120, 130 170 C 160 195, 200 199, 290 200" fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.2" />
+  <path d="M 30 200 C 90 198, 120 140, 160 140 C 200 140, 230 190, 290 198" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 4" />
+  <path d="M 30 150 C 120 140, 200 90, 290 50" fill="none" stroke="var(--human)" strokeWidth="2" />
+  <text x="250" y="48" textAnchor="end" fill="currentColor" fontSize="10">P(late | distance)</text>
+  <path d="M 350 200 C 380 120, 410 120, 450 170 C 480 195, 520 199, 610 200" fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.2" />
+  <path d="M 350 150 C 440 140, 520 90, 610 50" fill="none" stroke="var(--human)" strokeWidth="2" />
+  <path d="M 350 100 C 440 92, 520 80, 610 70" fill="none" stroke="var(--human)" strokeWidth="2" strokeDasharray="5 4" />
+  <text x="600" y="98" textAnchor="end" fill="currentColor" fontSize="10">after the change</text>
+</svg>
+</Figure>
+
+<Narrator who="chloe">
+
+What question are we really asking when we monitor a model? Not "has anything changed?", because something always has, but "has the world moved away from the one this model learned, in a way that matters for the decisions it supports?" Drift in a feature the model barely uses can be ignored; a small drift in its most important feature cannot.
+
+</Narrator>
+
+</Section>
+
+<Section id="psi" kind="computation" title="A drift detector: the population stability index">
+
+<Definition term="population stability index">
+
+Divide a variable's range into bins (commonly the deciles of the reference data). If a fraction $r_i$ of the reference data and $a_i$ of the current data fall in bin $i$, the **population stability index** is
+
+$$\mathrm{PSI} = \sum_i (a_i - r_i) \ln\frac{a_i}{r_i}.$$
+
+It is zero when the shares match and grows as they diverge. It is the symmetric form of the Kullback–Leibler divergence, $\mathrm{KL}(a \Vert r) + \mathrm{KL}(r \Vert a)$, from <TopicLink id="math.applied.information-theory">information theory</TopicLink>.
+
+</Definition>
+
+PSI comes from credit scoring, where lenders have long used it to check that the people applying for loans still resemble those the scorecard was built on. Its conventional thresholds (below 0.1 stable, 0.1 to 0.25 worth watching, above 0.25 a significant shift) are rules of thumb from that practice, not results of a theorem. The block implements PSI, applies it to twelve weeks of delivery distances in which a rural depot opens in week 7, and then measures how large PSI is when nothing has changed at all.
+
+```python run
+import numpy as np
+
+def psi(reference, current, bins=10, eps=1e-4):
+    """Population stability index of `current` against `reference`, using decile bins of the reference."""
+    edges = np.quantile(reference, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf                      # catch values outside the old range
+    ref = np.histogram(reference, edges)[0] / len(reference)
+    cur = np.histogram(current, edges)[0] / len(current)
+    ref, cur = np.clip(ref, eps, None), np.clip(cur, eps, None)  # an empty bin would give log(0)
+    return float(np.sum((cur - ref) * np.log(cur / ref)))
+
+rng = np.random.default_rng(7)
+reference = rng.gamma(2.0, 6.0, 20_000)                          # delivery distances (km) at training time
+
+# Twelve weeks in production. From week 7 a new, more rural depot opens and its share grows each week.
+print("week  rural share  mean km   PSI   status")
+for week in range(1, 13):
+    rural_share = 0.0 if week < 7 else 0.05 * (week - 6)
+    n = 3000
+    n_rural = int(rural_share * n)
+    current = np.concatenate([rng.gamma(2.0, 6.0, n - n_rural), rng.gamma(3.0, 9.0, n_rural)])
+    value = psi(reference, current)
+    status = "investigate" if value > 0.25 else "watch" if value > 0.10 else "stable"
+    print(f"{week:4d} {rural_share:10.0%} {current.mean():9.1f} {value:6.3f}   {status}")
+
+# PSI is never exactly zero, and small samples make it noisy even when nothing has changed.
+print("\nno drift at all, PSI by size of the weekly sample (median and 95th percentile of 300 weeks):")
+for n in (100, 500, 3000, 20000):
+    values = [psi(reference, rng.gamma(2.0, 6.0, n)) for _ in range(300)]
+    print(f"  n = {n:6d}: median {np.median(values):.3f}, 95th percentile {np.quantile(values, 0.95):.3f}")
+```
+
+The depot's routes add 5% of longer trips in week 7, rising to 30% by week 12. With the 0.1 rule, PSI first raises a flag in week 11 (0.118), the fifth week of the change, when the mean distance has already moved from 12.0 to 15.8 km. The rule of thumb is conservative for samples of 3,000.
+
+The second table shows why a single threshold cannot suit every sample size. With nothing changed, PSI computed on 100 cases has a median of 0.088 and exceeds 0.179 one week in twenty: a monitor using the 0.1 rule on small samples would cry wolf constantly. On 3,000 cases, 95% of no-change weeks stay below 0.006. A better threshold therefore comes from the data: simulate or bootstrap PSI under no change at your actual sample size ([resampling and simulation](/en/statistics/resampling-and-simulation/)) and flag values beyond, say, its 99th percentile.
+
+<Narrator who="margaret">
+
+I reran the no-change simulation at the weekly sample size of 3,000 for 300 more weeks: the 99th percentile of PSI was about 0.008. Week 7's 0.007 sits just inside that, but week 8's 0.017 is twice beyond it, so a threshold calibrated this way flags the depot in week 8, three weeks before the rule of thumb. With 100 cases a week, the same simulation put PSI above 0.1 in more than a third of weeks in which nothing had changed.
+
+</Narrator>
+
+PSI is one of several tests for a change in distribution. The Kolmogorov–Smirnov test and the chi-squared test give p-values (with the caveat that on huge samples they flag trivial changes); the Wasserstein distance measures *how far* a distribution moved, in the variable's own units; and a **classifier two-sample test** trains a model to tell reference rows from current rows, which can catch changes in combinations of features that per-feature tests miss ([Rabanser, Günnemann and Lipton, 2019](https://arxiv.org/abs/1810.11953)). Whatever the test, monitoring fifty features weekly is fifty tests a week, so expect false alarms, prioritise the features the model relies on most, and always also monitor the distribution of the model's *predictions*, which summarises every input in one number.
+
+</Section>
+
+<Section id="concept-drift" kind="computation" title="Concept drift and retraining">
+
+Now the bridge closes. The block simulates thirty weeks in which the distribution of inputs never changes, but from week 14 every delivery is more likely to be late and distance matters less. It compares three policies, all starting from a model trained on weeks 0 to 7: never retrain; retrain every four weeks on the last eight weeks; and retrain when the weekly log loss, computed as each week's labels arrive, is worse than the model's first week by more than 0.03 for two weeks in a row.
+
+```python run
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss
+
+rng = np.random.default_rng(11)
+WEEKS, N, CHANGE = 30, 2000, 14
+
+def week_data(week):
+    """Distances and van loads have the same distribution every week. From week 14, road works close
+    the main bridge: every delivery becomes more likely to be late, and distance matters less than
+    the bridge. P(late | x) changes; P(x) does not."""
+    km = rng.gamma(2.0, 6.0, N)
+    load = rng.integers(20, 160, N)
+    if week < CHANGE:
+        logit = -3.2 + 0.07 * km + 0.012 * load
+    else:
+        logit = -1.6 + 0.01 * km + 0.012 * load
+    late = (rng.random(N) < 1 / (1 + np.exp(-logit))).astype(int)
+    return np.column_stack([km, load]), late
+
+data = [week_data(w) for w in range(WEEKS)]
+
+def fit(weeks):
+    X = np.vstack([data[w][0] for w in weeks])
+    y = np.concatenate([data[w][1] for w in weeks])
+    return LogisticRegression(max_iter=1000).fit(X, y)
+
+names = ["never retrain", "every 4 weeks", "when loss rises"]
+model = {k: fit(range(0, 8)) for k in names}                    # all deployed after weeks 0-7
+loss = {k: [] for k in names}
+last_fit, reference, retrained = 8, None, []
+for w in range(8, WEEKS):
+    X, y = data[w]
+    for k in names:
+        loss[k].append(log_loss(y, model[k].predict_proba(X)[:, 1]))
+    # Week w's labels arrive at the end of the week: decide whether to retrain before week w + 1.
+    if w + 1 - last_fit >= 4:
+        model["every 4 weeks"], last_fit = fit(range(w - 7, w + 1)), w + 1   # last 8 weeks
+    if reference is None:
+        reference = loss["when loss rises"][-1]                 # first week after (re)training
+    elif min(loss["when loss rises"][-2:]) > reference + 0.03:   # two bad weeks in a row
+        model["when loss rises"], reference = fit([w - 1, w]), None
+        retrained.append(w + 1)
+
+late_rate = [data[w][1].mean() for w in range(WEEKS)]
+mean_km = [data[w][0][:, 0].mean() for w in range(WEEKS)]
+print(f"mean distance, weeks 0-13: {np.mean(mean_km[:CHANGE]):.1f} km; weeks 14-29: {np.mean(mean_km[CHANGE:]):.1f} km")
+print(f"late rate,     weeks 0-13: {np.mean(late_rate[:CHANGE]):.1%};   weeks 14-29: {np.mean(late_rate[CHANGE:]):.1%}")
+print(f"'when loss rises' retrained before weeks {retrained}\n")
+print("week   " + "".join(f"{k:>17s}" for k in names))
+for w in range(8, WEEKS, 2):
+    print(f"{w:4d}   " + "".join(f"{loss[k][w - 8]:17.3f}" for k in names))
+print("mean, weeks 14-29: " + " ".join(f"{k} {np.mean(loss[k][CHANGE - 8:]):.3f};" for k in names))
+```
+
+The input monitor would have seen nothing: mean distance 12.0 km before and after. Only the outcomes changed, the late rate rising from 24.1% to 40.3%, and the never-retrained model's log loss jumped from about 0.51 to about 0.75 and stayed there. Retraining every four weeks helped, but slowly: for several weeks its training window still mixed bridge-open and bridge-closed data. Retraining when loss rose waited for two bad weeks, then retrained on the two weeks since the change, before week 16, and did best (a mean log loss of 0.659 against 0.672 and 0.747).
+
+The lesson is not that triggered retraining always wins. A trigger reacts to noise as well as to change; retraining on two weeks of data gives a noisier model; and a scheduled policy is simpler to operate and audit. The defensible practice is to **backtest** retraining policies on your own history, as this simulation does, and to keep the trigger and the window under review. Three cautions apply whatever the policy:
+
+- **Labels may come too late to help.** If outcomes take six months to arrive, monitor inputs and predictions, and use proxies (early arrears for loan defaults, say) while you wait.
+- **Automatic retraining needs guards.** Retraining on a week of corrupted or manipulated data deploys the corruption. Validate the new training data, compare the new model with the current one on recent held-out data (a **champion–challenger** comparison), and keep a human sign-off for large changes.
+- **The model changes the data it learns from.** If technicians visit the pumps the model flags as high risk (<LessonLink slug="machine-learning-for-tabular-data">machine learning for tabular data</LessonLink>), those pumps fail less, and a model retrained on the outcomes learns that high-risk pumps do not fail. A fraud model whose blocked transactions never get a label, and a lending model that never sees whether rejected applicants would have repaid, have the same problem. Keeping a small random holdout (pumps visited regardless of score, a sample of decisions made without the model) is the standard remedy, and it is a small experiment with the ethical questions of <LessonLink slug="experiments-in-products">experiments in products</LessonLink>.
+
+<Narrator who="gideon">
+
+The simulation measured each week's loss on that week's labels, all arriving at the week's end. Real labels trickle in: deliveries made late on Friday are known on Monday, defaults months later. A monitor that computes accuracy on the labels available so far is measuring a biased subset, usually the outcomes that resolve fastest, so record when each label arrived and compare like with like.
+
+</Narrator>
+
+</Section>
+
+<Section id="feature-stores-mlops" kind="human" title="Feature stores and MLOps tooling">
+
+A **feature store** is a system that computes, stores and serves features so that the same definitions are used everywhere. It keeps an **offline store** of feature history for training, with **point-in-time correct** joins (each training row gets the feature values as they were at that row's prediction time, avoiding exactly the leak of the June snapshot in <LessonLink slug="machine-learning-for-tabular-data">machine learning for tabular data</LessonLink>), and an **online store** that serves the latest values to live models in milliseconds. It also lets teams reuse each other's features. Open-source options include [Feast](https://feast.dev/) and Hopsworks, and the major cloud and data platforms offer managed ones. A team with a few batch models usually does not need one: a well-tested feature module used by both the training and the scoring job, and a table of feature snapshots, deliver most of the benefit.
+
+**MLOps** is the name for applying software-engineering and operations practice to machine learning. The tooling changes quickly; the jobs it does do not. In outline, as of 2026, with a few open-source examples of each (every large cloud provider also bundles managed versions of most of them):
+
+| Job | What it does | Examples |
+| --- | --- | --- |
+| Experiment tracking | Records parameters, metrics, code versions and artefacts of every training run | [MLflow](https://mlflow.org/), Aim, DVC experiments |
+| Pipelines and orchestration | Runs training and scoring jobs on schedules, with dependencies and retries | Airflow, Dagster, Prefect, Kubeflow Pipelines |
+| Data validation | Checks every new batch of data against expectations | pandera, Great Expectations |
+| Model registry | Stores versioned artefacts and records which is live | MLflow's registry, cloud registries |
+| Serving | Turns artefacts into scalable batch jobs or APIs | BentoML, KServe, Ray Serve |
+| Monitoring | Tracks drift, prediction distributions and accuracy | Evidently, NannyML, alongside general observability tools |
+
+Data engineers build much of this, and the data side is taught in [pipelines and orchestration](/en/cs/electives/data-engineering/pipelines-and-orchestration/) and [data quality and governance](/en/cs/electives/data-engineering/data-quality-and-governance/); the operational side in [observability and autoscaling](/en/cs/electives/cloud-computing/observability-and-autoscaling/). Adopt tools for problems you actually have. A scheduled script, a database table of predictions, a weekly drift report and a person who reads it are a respectable production system for many organisations, and they are far better than an elaborate platform that nobody maintains.
+
+</Section>
+
+<Section id="decision-support" kind="human" title="Dashboards and decision support">
+
+A model in production is only useful through the decisions it changes, and those are usually made by people: dispatchers, technicians, nurses, loan officers. Designing for them is part of the job (<LessonLink slug="visualisation-and-storytelling">visualisation and storytelling</LessonLink> covers the craft of presenting data). A few principles hold widely.
+
+- **Show the decision, not just the score.** "Call these 12 customers before 10:00" is more useful than a column of probabilities, and it makes the model's threshold an explicit, reviewable choice.
+- **Show uncertainty and reasons.** A probability band and the two or three factors behind a prediction help people judge when to trust it. Calibrated probabilities make this honest ([conformal prediction](/en/statistics/conformal-prediction/) gives intervals with guaranteed coverage).
+- **Let people disagree, and record it.** Overrides are valuable data about where the model is wrong, and the ability to override protects the people affected.
+- **Monitor the system, not just the model.** Track whether recommendations are followed and what happens when they are. A perfect model that dispatchers ignore has no effect.
+- **Keep alerts rare and meaningful.** A drift dashboard with forty red cells every Monday trains everyone to ignore it. Alert on what demands action; summarise the rest.
+
+</Section>
+
+<Section id="when-not" kind="human" title="When not to deploy a model">
+
+The first of Zinkevich's widely read [rules of machine learning](https://developers.google.com/machine-learning/guides/rules-of-ml) is, in effect, not to be afraid of launching without it. A model is a long-term commitment: data pipelines to maintain, monitoring to read, retraining to run, and people to answer for its errors. Before deploying one, ask:
+
+- **Does any decision change?** If dispatchers would reorder the same routes anyway, the model adds cost and no value.
+- **Does a simple rule do almost as well?** "Flag parcels over 30 km on vans with more than 120 parcels" may capture most of the benefit, and everyone can understand, check and adjust it. Measure the model against the best simple rule, not against nothing.
+- **Can you monitor it?** If outcomes are never observed, or only years later, you will not know when it breaks. Plan the monitoring before the launch, or do not launch.
+- **Who bears the errors, and can they contest them?** Models that affect people's access to money, housing, work, healthcare or justice need much more: documentation (model cards, [Mitchell and colleagues, 2019](https://arxiv.org/abs/1810.03993)), fairness evaluation, a route to human review, and often legal obligations, such as those of the EU's AI Act for high-risk systems. <LessonLink slug="responsible-data-science">Responsible data science</LessonLink> takes this up.
+- **Will it create a feedback loop you cannot measure?** If the model's decisions determine what data you see next, plan a holdout from the start.
+- **Are you allowed to use the data this way?** Data collected for one purpose cannot always be used for another.
+
+Declining to deploy is not a failure of the analysis. An analysis that shows a decision does not need a model, or that a model would cause harm nobody can detect, has done its job.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Deployment is the finish line."** It is the start of the model's working life. Most of the cost, and most of the failures, come afterwards, as the world drifts away from the training data.
+
+</Misconception>
+
+<Misconception>
+
+**"If the inputs have not drifted, the model is fine."** Concept drift leaves the inputs untouched. In the simulation, mean distance stayed at 12.0 km while the never-retrained model's log loss rose from about 0.51 to about 0.75. Monitor accuracy as soon as labels allow.
+
+</Misconception>
+
+<Misconception>
+
+**"PSI above 0.1 means drift; below means none."** The thresholds are conventions, and PSI's noise depends on sample size: with 100 cases, PSI exceeded 0.1 in more than a third of weeks with no change at all, while with 3,000 cases a real change sat below 0.1 for four weeks. Calibrate thresholds to your sample size.
+
+</Misconception>
+
+<Misconception>
+
+**"Retrain as often as possible."** Frequent automatic retraining reacts to noise, can deploy corrupted data, and makes behaviour hard to audit. Choose a policy by backtesting, validate every new model against the current one, and keep humans in the loop for big changes.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

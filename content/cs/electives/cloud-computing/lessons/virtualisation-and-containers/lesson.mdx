@@ -1,0 +1,505 @@
+---
+title: Virtualisation and containers
+subtitle: How one physical server becomes many — hypervisors, microVMs, namespaces and cgroups, images and layers — and how a provider decides which server your machine lands on.
+minutes: 65
+objectives:
+  - Explain how a hypervisor runs unmodified operating systems, using the trap-and-emulate idea and hardware support for CPU, memory and I/O
+  - Distinguish type 1 and type 2 hypervisors, full virtual machines, microVMs and sandboxes
+  - Explain a container as ordinary processes in namespaces and cgroups, and what it does and does not isolate
+  - Read a Dockerfile, explain image layers, digests and registries, and order a build so that the cache works
+  - Choose an isolation boundary for a workload by its trust, start-up and density needs
+  - Simulate placing virtual machines on hosts as a bin-packing problem, and prove a guarantee for first fit
+narrators: [chloe, margaret, gideon]
+prerequisites: [what-is-the-cloud]
+related: [math.applied.optimisation, math.discrete.combinatorics]
+references:
+  - title: "Formal requirements for virtualizable third generation architectures"
+    author: Gerald J. Popek and Robert P. Goldberg
+    year: 1974
+    url: https://doi.org/10.1145/361011.361073
+  - title: "Xen and the art of virtualization"
+    author: Paul Barham and colleagues
+    year: 2003
+    url: https://doi.org/10.1145/945445.945462
+  - title: "Firecracker: Lightweight Virtualization for Serverless Applications"
+    author: Alexandru Agache and colleagues
+    year: 2020
+    url: https://www.usenix.org/conference/nsdi20/presentation/agache
+  - title: Firecracker
+    url: https://firecracker-microvm.github.io/
+  - title: Cloud Hypervisor
+    url: https://www.cloudhypervisor.org/
+  - title: Kata Containers
+    url: https://katacontainers.io/
+  - title: gVisor
+    url: https://gvisor.dev/
+  - title: KVM
+    url: https://linux-kvm.org/
+  - title: "namespaces(7), Linux manual page"
+    url: https://man7.org/linux/man-pages/man7/namespaces.7.html
+  - title: "Control Group v2 (Linux kernel documentation)"
+    url: https://docs.kernel.org/admin-guide/cgroup-v2.html
+  - title: "OCI Image Format Specification"
+    url: https://github.com/opencontainers/image-spec
+  - title: "OCI Distribution Specification"
+    url: https://github.com/opencontainers/distribution-spec
+  - title: "Dockerfile reference"
+    url: https://docs.docker.com/reference/dockerfile/
+  - title: Podman
+    url: https://podman.io/
+    note: A daemonless container engine that builds from the same file format.
+  - title: "Large-scale cluster management at Google with Borg"
+    author: Abhishek Verma and colleagues
+    year: 2015
+    url: https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/
+  - title: "Protean: VM Allocation Service at Scale"
+    author: Ori Hadary and colleagues
+    year: 2020
+    url: https://www.usenix.org/conference/osdi20/presentation/hadary
+    note: How Azure places virtual machines on servers.
+---
+
+<Section id="motivation" kind="motivation" title="Twenty strangers on one server">
+
+A modern server has perhaps 64 to 192 processor cores and half a terabyte of memory or more. Almost no single customer needs that much, and the <LessonLink slug="what-is-the-cloud">previous lesson</LessonLink> showed that the cloud's economics depend on pooling many customers onto shared hardware. So a provider must cut each server into pieces and hand them to customers who do not know each other, do not trust each other, and may include the occasional attacker.
+
+Each piece must behave like a computer of its own. A customer must be able to run any operating system and install anything, and must not be able to see, slow down or crash a neighbour. Pieces must be created in seconds, metered, moved and destroyed. And developers want something else as well: a way to package an application with everything it needs, so that what ran on a laptop in Hanoi runs identically on a server in Frankfurt.
+
+Two technologies answer these needs, at different depths of the stack. **Virtual machines** divide the hardware and give each tenant a whole simulated computer with its own kernel. **Containers** divide one operating system and give each application its own view of it. This lesson explains how both work, what each isolates, and how a provider decides which physical server a new machine lands on. Lumenary CS's [operating systems](/en/cs/operating-systems/) lesson — processes, virtual memory, kernel and user mode — is the background throughout.
+
+</Section>
+
+<Section id="hypervisors" kind="definitions" title="Virtual machines and hypervisors">
+
+<Definition term="Virtual machine and hypervisor">
+
+A **virtual machine** (VM) is an efficient, isolated duplicate of a real computer: software running in it behaves as it would on the hardware, except perhaps for timing. A **hypervisor**, or *virtual machine monitor*, is the software that creates and runs virtual machines, keeping control of the real hardware. The operating system inside a VM is the **guest**; the machine it runs on is the **host**.
+
+</Definition>
+
+The naive way to build a VM is to simulate every instruction in software, as emulators of old game consoles do, at tens of times slower than the hardware. The key idea that makes virtual machines fast is **trap and emulate**: let the guest run *directly* on the processor, in a less privileged mode, and arrange that whenever it tries something that would affect the real machine — changing page tables, disabling interrupts, talking to a device — the processor *traps* to the hypervisor, which performs the operation on the guest's behalf, on the guest's *virtual* hardware, and resumes it. Ordinary arithmetic, loads and stores, which are almost all instructions, run at full speed.
+
+When does that work? Gerald Popek and Robert Goldberg answered in 1974. Call an instruction **sensitive** if it reads or changes the machine's configuration (its privilege mode, memory mapping or devices), and **privileged** if it traps when executed outside the most privileged mode.
+
+<Theorem name="Popek and Goldberg (1974), informally">
+
+A processor can be virtualised by trap and emulate — with every guest instruction either run directly or emulated after a trap, giving faithful behaviour, full control to the hypervisor, and native speed for ordinary instructions — if every sensitive instruction is privileged.
+
+</Theorem>
+
+The reason is simple. If every sensitive instruction traps, the hypervisor gets control at exactly the moments when the guest touches the machine's configuration, and can apply the operation to the guest's virtual hardware instead; everything else is harmless to run natively. Conversely, a sensitive instruction that ran in the guest's unprivileged mode *without* trapping would either change the real machine (breaking the hypervisor's control) or quietly behave differently from bare hardware (breaking faithfulness), and the hypervisor would never get the chance to intervene.
+
+The x86 processors of the 1990s failed the test. A well-known example is `POPF`, which, run in user mode, silently ignores an attempt to change the interrupt flag instead of trapping; a 2000 study by John Robin and Cynthia Irvine counted seventeen such instructions. The industry found three ways round:
+
+- **Binary translation** (VMware, 1999): scan the guest's kernel code just before it runs and rewrite the problem instructions into safe sequences.
+- **Paravirtualisation** (Xen, 2003): modify the guest kernel so that it calls the hypervisor explicitly (*hypercalls*) instead of executing the problem instructions.
+- **Hardware support** (Intel VT-x in 2005, AMD-V in 2006): a new processor mode for guests, in which every sensitive operation can be made to cause a **VM exit** to the hypervisor. Arm's server processors provide the same with a dedicated hypervisor privilege level (EL2).
+
+Hardware support won. Today the guest's kernel runs unmodified in the guest mode, and the hypervisor handles a VM exit, which costs on the order of a microsecond, only when needed. Good hypervisors work hard to make exits rare.
+
+Hypervisors are traditionally sorted into two types:
+
+| | Type 1 ("bare metal") | Type 2 ("hosted") |
+| --- | --- | --- |
+| Runs on | the hardware directly | an ordinary operating system, as an application |
+| Typical use | servers, clouds | a developer's laptop or desktop |
+| Examples | Xen, VMware ESXi, Microsoft Hyper-V; KVM, which turns Linux itself into a hypervisor | Oracle VirtualBox, VMware Workstation, Parallels Desktop, QEMU without hardware acceleration |
+
+The line is blurrier than the table suggests: KVM is a module of a general-purpose kernel, and is usually counted as type 1 because guests run directly on the hardware under it. The large providers made different choices: AWS's Nitro hypervisor and Google Compute Engine are built on KVM, Azure runs on Hyper-V, and Alibaba Cloud's recent instances use its own Dragonfly hypervisor.
+
+</Section>
+
+<Section id="hardware" kind="intuition" title="Processor, memory and devices">
+
+A virtual machine needs three things virtualised: the processor, memory and input/output.
+
+**The processor** is handled by the guest mode just described. Each virtual CPU (vCPU) of a guest is, to the host, a thread that the hypervisor schedules on a physical core (or on one *hardware thread*, when a core runs two with simultaneous multithreading — which is why a cloud "vCPU" is often half a core).
+
+**Memory** needs two translations. The guest's kernel maps its processes' virtual addresses to what it believes are physical addresses — *guest-physical* addresses — and the hypervisor must map those to real, *host-physical* memory. Early hypervisors kept *shadow page tables* in software, at a high cost on every guest page-table change. Since about 2008, processors walk both levels in hardware (Intel's *extended page tables*, AMD's *nested page tables*).
+
+<Narrator who="margaret">
+
+The two-level walk is expensive when the TLB misses. With four-level page tables in both guest and host, each of the guest's four page-table entries sits at a guest-physical address that takes a four-step host walk plus the read itself, and the final data address needs one more host walk: $4 \times (4+1) + 4 = 24$ memory references instead of 4. With five-level tables on both sides it is $5 \times 6 + 5 = 35$. TLBs, page-walk caches and huge pages are why most memory-heavy code nevertheless runs in a VM within a few per cent of its speed on bare metal.
+
+</Narrator>
+
+**Input and output** is where the overhead used to be. Emulating a real network card, register by register, causes a VM exit on almost every access. Three improvements followed:
+
+1. **Paravirtual devices.** The guest uses a driver that knows it is virtualised and exchanges batches of requests with the hypervisor through shared-memory queues. The open standard is **virtio**, built into Linux, available as drivers for Windows, and supported by most hypervisors.
+2. **Device assignment.** With an IOMMU, a physical device — or one of the many virtual *functions* that an SR-IOV network card or GPU presents — can be handed to a guest directly, with the hypervisor out of the data path.
+3. **Offload hardware.** The large providers moved network and storage virtualisation, and much of the hypervisor's management work, onto dedicated cards or chips beside the main processor: AWS's Nitro cards, Azure Boost, Google's Titanium and Alibaba Cloud's CIPU are examples, and *data processing units* (DPUs) from several chip makers bring the same idea to other operators. This frees nearly all of the server's cores for customers and puts the security-critical code on separate hardware.
+
+</Section>
+
+<Section id="microvms" kind="human" title="MicroVMs and sandboxes">
+
+A general-purpose hypervisor emulates a whole PC: a BIOS, a PCI bus, USB, graphics, dozens of devices. That generality costs boot time (seconds), memory, and — more importantly — **attack surface**: every emulated device is code that a malicious guest can poke at.
+
+A **microVM** strips the virtual machine to the minimum a modern Linux guest needs. **Firecracker**, written in Rust and open-sourced by AWS in 2018, offers only a handful of devices — virtio network and block devices, a virtio socket, a serial console and a minimal keyboard controller used to stop the VM — and its [project pages](https://firecracker-microvm.github.io/) report start-up in under 125 ms with less than 5 MiB of memory overhead per microVM. It was built so that functions and containers from many customers (AWS Lambda and Fargate) could each get a hardware-virtualisation boundary at container-like speed and density; the [NSDI 2020 paper](https://www.usenix.org/conference/nsdi20/presentation/agache) explains the design. [Cloud Hypervisor](https://www.cloudhypervisor.org/), a Linux Foundation project, takes a similar minimal approach for longer-running workloads, and both share components through the rust-vmm project; QEMU, the workhorse open-source emulator, has a stripped-down `microvm` machine type of its own.
+
+Two other designs sit between containers and VMs:
+
+- [**Kata Containers**](https://katacontainers.io/), an OpenInfra Foundation project, runs each container (or Kubernetes pod) inside its own lightweight VM, using QEMU, Cloud Hypervisor or Firecracker underneath, while looking like an ordinary container runtime to the tools above it.
+- [**gVisor**](https://gvisor.dev/), from Google, is not a VM at all: it is a kernel written in Go that runs in user space and intercepts the application's system calls, so the application never talks to the host kernel directly. It is lighter than a VM but adds overhead to system-call-heavy work.
+
+</Section>
+
+<Section id="containers" kind="definitions" title="Containers: namespaces and cgroups">
+
+A virtual machine gives each tenant its own kernel. A **container** shares the host's kernel and isolates something smaller: a group of processes.
+
+<Definition term="Container">
+
+A **container** is a group of ordinary processes that the kernel runs with **namespaces**, which give them their own view of system resources, **cgroups** (control groups), which limit and account for the resources they use, and further restrictions on what they may ask the kernel to do. A **container image** is a packaged file system and configuration from which containers are started.
+
+</Definition>
+
+On Linux, each kind of **namespace** isolates one kind of name:
+
+| Namespace | Gives the group its own… |
+| --- | --- |
+| mount | file-system tree (its own `/`) |
+| PID | process numbers (its first process is PID 1) |
+| network | interfaces, IP addresses, routing table, ports |
+| UTS | host name |
+| IPC | System V IPC and POSIX message queues |
+| user | mapping of user IDs, so "root" inside can be an unprivileged user outside |
+| cgroup | view of the cgroup hierarchy |
+| time | offsets for some system clocks |
+
+**Cgroups** (version 2 is the current interface) put processes into a hierarchy and apply limits at each level: CPU time (`cpu.max`), memory (`memory.max`, beyond which the kernel reclaims memory and, if it cannot, kills a process in the group), I/O bandwidth, and the number of processes. Further layers reduce what a contained process can do even as "root": Linux **capabilities** split root's powers into pieces that can be dropped one by one; **seccomp** filters block system calls the application does not need; and security modules such as **SELinux** and **AppArmor** confine file and network access.
+
+There is no "container" object in the Linux kernel; a container is a convention for combining these pieces, standardised by the [Open Container Initiative](https://opencontainers.org/) (OCI) runtime specification and implemented by low-level runtimes such as runc and crun. You can build one by hand with the same kernel interfaces the runtimes use:
+
+```bash
+# Not run here: needs a Linux machine, root, and cgroup v2 with the cpu and memory
+# controllers enabled (the default on most current distributions).
+
+# A shell in new PID and mount namespaces: inside it, the shell is process 1,
+# and ps sees only the processes started inside.
+sudo unshare --pid --fork --mount-proc bash
+
+# A cgroup that caps memory at 256 MiB and CPU at half of one core
+# (50 ms of CPU time in every 100 ms period), then moves this shell into it.
+sudo mkdir /sys/fs/cgroup/demo
+echo 256M          | sudo tee /sys/fs/cgroup/demo/memory.max
+echo "50000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max
+echo $$            | sudo tee /sys/fs/cgroup/demo/cgroup.procs
+```
+
+Container engines such as Docker and Podman, and Kubernetes' runtimes containerd and CRI-O, add the rest: images, networking between containers, storage volumes and an API.
+
+<Figure caption="Virtual machines and containers on one host. Each VM brings its own guest kernel and sees virtual hardware; containers are processes sharing the host's kernel, each with its own namespaces and cgroup limits.">
+
+<svg viewBox="0 0 680 270" role="img" aria-label="Two stacks side by side. Left, virtual machines: hardware at the bottom, a hypervisor above it, then three virtual machines, each containing a guest kernel, libraries and an application. Right, containers: hardware at the bottom, one host kernel above it with namespaces and cgroups, then three containers each holding libraries and an application, all sharing the one kernel.">
+  <text x="165" y="20" fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">Virtual machines</text>
+  <text x="515" y="20" fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">Containers</text>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="20" y="225" width="290" height="30" rx="4" />
+    <rect x="370" y="225" width="290" height="30" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="var(--sky)" strokeWidth="1.5">
+    <rect x="20" y="188" width="290" height="30" rx="4" />
+    <rect x="370" y="188" width="290" height="30" rx="4" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="var(--gold)" strokeWidth="1.2">
+    <rect x="20" y="40" width="90" height="140" rx="5" />
+    <rect x="120" y="40" width="90" height="140" rx="5" />
+    <rect x="220" y="40" width="90" height="140" rx="5" />
+    <rect x="370" y="100" width="90" height="80" rx="5" strokeDasharray="5 3" />
+    <rect x="470" y="100" width="90" height="80" rx="5" strokeDasharray="5 3" />
+    <rect x="570" y="100" width="90" height="80" rx="5" strokeDasharray="5 3" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="28" y="140" width="74" height="30" rx="3" />
+    <rect x="128" y="140" width="74" height="30" rx="3" />
+    <rect x="228" y="140" width="74" height="30" rx="3" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="65" y="70">app</text>
+    <text x="65" y="105">libraries</text>
+    <text x="65" y="159">guest kernel</text>
+    <text x="165" y="70">app</text>
+    <text x="165" y="105">libraries</text>
+    <text x="165" y="159">guest kernel</text>
+    <text x="265" y="70">app</text>
+    <text x="265" y="105">libraries</text>
+    <text x="265" y="159">guest kernel</text>
+    <text x="415" y="128">app</text>
+    <text x="415" y="160">libraries</text>
+    <text x="515" y="128">app</text>
+    <text x="515" y="160">libraries</text>
+    <text x="615" y="128">app</text>
+    <text x="615" y="160">libraries</text>
+  </g>
+  <g fill="currentColor" fontSize="12" textAnchor="middle">
+    <text x="165" y="208">hypervisor</text>
+    <text x="515" y="208">one host kernel: namespaces + cgroups</text>
+    <text x="165" y="245">hardware</text>
+    <text x="515" y="245">hardware</text>
+  </g>
+</svg>
+
+</Figure>
+
+</Section>
+
+<Section id="images" kind="computation" title="Images, layers and registries">
+
+A container needs a file system: the application, its libraries, a language runtime, perhaps a shell. The OCI [image format](https://github.com/opencontainers/image-spec) packages it as a stack of **layers**. Each layer is a tar archive of the files added, changed or deleted relative to the layer below; a JSON **manifest** lists the layers and a configuration (command, environment, user). At run time an overlay file system stacks the read-only layers and adds a thin writable layer on top for the container; a file changed by the container is copied up into that layer first (*copy-on-write*), so a hundred containers from one image share one copy of its layers on disk and in the page cache.
+
+Every layer, configuration and manifest is identified by its **digest**, the SHA-256 hash of its bytes: `sha256:3f9a…`. This **content addressing** gives three properties at once. A layer is stored and transferred once, however many images use it. Anything downloaded can be checked against its name. And an image referred to by digest can never change underneath you. **Registries** store these blobs and serve them over HTTP following the OCI [distribution specification](https://github.com/opencontainers/distribution-spec): public ones such as Docker Hub, GitHub Container Registry and Quay; each provider's own (Amazon ECR, Azure Container Registry, Google Artifact Registry, Alibaba Cloud Container Registry); or self-hosted ones such as the CNCF project Harbor. A **tag** such as `python:3.13-slim` is only a movable pointer to a digest, which is why production systems pin images by digest.
+
+Images are built step by step, and each step's result is cached under a key made from the parent layer, the instruction and the files it reads. Change one input, and that step *and every step after it* must run again. The simulation below builds a small Python service with two orderings of the same instructions, pushes it to a registry, then changes one line of application code and builds and pushes again.
+
+```python run
+import hashlib, json
+
+def digest(*parts):
+    """A content address: the SHA-256 of the parts (shortened here for printing)."""
+    return "sha256:" + hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:12]
+
+BASE = [("base-os", 29), ("python-runtime", 46)]        # (layer, size in MB), shared by many images
+builds = [0]                                             # RUN steps are not reproducible: count builds
+
+def build(steps, files, cache):
+    """Build an image; return its list of (layer digest, MB) and the steps that had to run."""
+    layers = [(digest(name), mb) for name, mb in BASE]
+    key, ran = digest("FROM", BASE), []
+    for instr, inputs, mb in steps:
+        key = digest(key, instr, [files[f] for f in inputs])   # parent + instruction + inputs
+        if key not in cache:                                    # cache miss: execute the step
+            ran.append(instr)
+            if instr.startswith("COPY"):                        # a COPY layer is its files' contents
+                layer = digest([files[f] for f in inputs])
+            else:                                               # a RUN layer differs every build
+                builds[0] += 1
+                layer = digest(instr, builds[0])
+            cache[key] = layer
+        layers.append((cache[key], mb))
+    return layers, ran
+
+def push(layers, registry):
+    """Upload only the layers the registry does not already hold; return MB sent."""
+    sent = sum(mb for d, mb in layers if d not in registry)
+    registry.update(d for d, mb in layers)
+    return sent
+
+files_v1 = {"requirements.txt": "flask==3.1\nnumpy==2.2", "app.py": "print('v1')"}
+files_v2 = dict(files_v1, **{"app.py": "print('v2')"})          # a one-line code change
+ALL = ["requirements.txt", "app.py"]
+
+naive = [("COPY . /app", ALL, 2), ("RUN pip install -r requirements.txt", ["requirements.txt"], 180)]
+better = [("COPY requirements.txt /app/", ["requirements.txt"], 1),
+          ("RUN pip install -r requirements.txt", ["requirements.txt"], 180),
+          ("COPY . /app", ALL, 2)]
+
+for name, steps in [("copy everything first", naive), ("dependencies first", better)]:
+    cache, registry = {}, set()
+    v1, _ = build(steps, files_v1, cache)
+    first = push(v1, registry)
+    v2, ran = build(steps, files_v2, cache)
+    second = push(v2, registry)
+    print(f"{name}: first push {first} MB; after editing app.py, re-ran {len(ran)} step(s),"
+          f" pushed {second} MB")
+    for d, mb in v2:
+        print(f"    {d}  {mb:4d} MB")
+```
+
+Copying all the source code before installing dependencies means every code change invalidates the dependency layer: the 180 MB `pip install` runs again and is pushed again. Copying only `requirements.txt` first, installing, and copying the code last makes the same change cost one step and 2 MB. Notice too that the final `COPY . /app` layer has the same digest in both builds: identical files give an identical layer, whichever file produced it.
+
+<Narrator who="gideon">
+
+The simulation gives each rebuilt `RUN` layer a new digest, and real builds behave the same way: file timestamps, package-index downloads and unpinned versions make most build steps non-reproducible, so "the same Dockerfile" can produce different images on different days. If you need to know exactly what is running — for security patching or for an audit — record and deploy by digest, pin dependency versions, and generate a software bill of materials for each image.
+
+</Narrator>
+
+</Section>
+
+<Section id="dockerfile" kind="examples" title="A Dockerfile, line by line">
+
+The most common way to describe an image build is a *Dockerfile* ([reference](https://docs.docker.com/reference/dockerfile/)); Podman and Buildah read the same format, sometimes under the name *Containerfile*, and `docker build` and `podman build` both take it. Here is one for a small Python web service, written with the lessons above in mind.
+
+```dockerfile
+# Not run here. A small Python web service, built in two stages.
+
+FROM python:3.13-slim AS build
+WORKDIR /src
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=build /install /usr/local
+COPY app/ ./app/
+RUN groupadd --system --gid 10001 app \
+ && useradd --system --uid 10001 --gid app --no-create-home app
+USER 10001:10001
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+CMD ["python", "-m", "app.server"]
+```
+
+<Example title="What each line does">
+
+- `FROM python:3.13-slim AS build` starts the first stage from an official Python image on a minimal Debian base, and names the stage. In production you would pin it by digest (`python:3.13-slim@sha256:…`) and update the digest deliberately.
+- `WORKDIR /src` sets (and creates) the working directory for the following instructions.
+- `COPY requirements.txt .` then `RUN pip install …` installs dependencies *before* any application code is copied, so the slow layer is reused until the requirements change. `--no-cache-dir` keeps pip's download cache out of the layer; `--prefix=/install` puts the installed packages in one directory that is easy to copy out.
+- The second `FROM` starts a fresh stage. Only what is explicitly copied from `build` survives, so compilers or build tools needed during installation never reach the final image. This **multi-stage build** makes images smaller and gives an attacker fewer tools.
+- `COPY --from=build /install /usr/local` brings in the installed packages; `COPY app/ ./app/` brings in the code, last, because it changes most often.
+- `groupadd`/`useradd` and `USER 10001:10001` make the service run as an unprivileged user. A numeric user lets an orchestrator verify that the container does not run as root.
+- `ENV PYTHONUNBUFFERED=1` makes Python write log lines immediately.
+- `EXPOSE 8000` documents the port the service listens on; it does not open anything by itself.
+- `CMD [...]`, in this JSON *exec form*, runs Python directly as the container's main process, so it receives the stop signal when the container is shut down. (The shell form, `CMD python -m app.server`, would wrap it in a shell that may not pass the signal on.)
+
+</Example>
+
+A `.dockerignore` file next to the Dockerfile keeps the version-control directory, local virtual environments and, above all, secrets such as `.env` files out of the build context. Secrets must never be written into a layer: deleting a file in a later layer hides it from the container but leaves it in the earlier layer, readable by anyone who can pull the image.
+
+</Section>
+
+<Section id="tradeoffs" kind="human" title="Isolation trade-offs">
+
+Each boundary trades isolation against speed and density. Orders of magnitude, as of 2026:
+
+| Boundary | What a tenant shares with others | Start-up | Typical use |
+| --- | --- | --- | --- |
+| Process | everything but its memory | milliseconds | programs of one user |
+| Container | the host kernel (hundreds of system calls) | well under a second | one organisation's services |
+| Container with a user-space kernel (gVisor) | a narrow slice of the host kernel | under a second | untrusted code, moderate density |
+| MicroVM | a minimal hypervisor and a few virtual devices | about 100–200 ms | many tenants' functions and containers |
+| Full VM | a hypervisor and an emulated PC | seconds to tens of seconds | general-purpose cloud servers |
+| Dedicated (bare-metal) host | nothing but the network | minutes | licensing, compliance, special hardware |
+
+The decisive question is **trust**. Containers from one team, on hosts that team controls, are well isolated by namespaces, cgroups, seccomp and an unprivileged user. Code from tenants who may be hostile is a different matter: a single bug in any of the kernel's system calls could let one tenant escape into the host. For that reason public clouds generally put a hardware-virtualisation boundary — often a microVM — or a user-space kernel between different customers' containers, and the same rule is wise for anyone running untrusted code, such as a programming-exercise site or a platform that runs AI agents' code.
+
+Even a VM boundary shares the physical processor. **Noisy neighbours** compete for caches, memory bandwidth and network capacity, which is why performance on small shared instances varies. And **side channels** can leak information across the boundary: the Spectre and Meltdown disclosures of 2018 showed that speculative execution could reveal memory across privilege boundaries. Providers responded with microcode and kernel mitigations, and many stopped letting different tenants share the two hardware threads of one core.
+
+<Narrator who="chloe">
+
+Notice what changes as you move down the table: the size of the interface between a tenant and the code that protects everyone else. A Linux kernel offers hundreds of system calls with complex semantics; Firecracker's guest sees five virtual devices. Security engineers call this minimising the *trusted computing base*, and it is the real reason microVMs exist — speed alone would have favoured containers.
+
+</Narrator>
+
+</Section>
+
+<Section id="placement" kind="computation" title="Which host? Placement as bin packing">
+
+When a customer asks for a virtual machine with 16 vCPUs and 64 GiB, the provider's **allocator** must choose a physical host with that much free — among tens of thousands, in a fraction of a second — and choose well, because every host it powers on costs money and every gap it leaves is capacity it paid for and cannot sell. This is the **bin-packing** problem: put items of given sizes into as few bins of fixed capacity as possible. It is NP-hard (see Lumenary CS's [hard problems](/en/cs/hard-problems/) lesson), so allocators use fast heuristics, and with *two* resources, CPU and memory, a host can be full in one while half empty in the other.
+
+The simulation places about 600 VM requests — sizes from 2 to 40 vCPUs, in compute-, general- and memory-optimised shapes with 2, 4 or 8 GiB per vCPU — on hosts of 64 vCPUs and 256 GiB. **First fit** puts each VM on the oldest host with room; **best fit** on the host it leaves fullest; **balanced** on the host whose leftover CPU and memory stay most in proportion. The *decreasing* variants sort the requests from largest to smallest first, which is possible only when all requests are known in advance (*offline*).
+
+```python run
+import math
+import random
+
+rng = random.Random(2)
+FAMILIES = {"compute": 2, "general": 4, "memory": 8}          # GiB of memory per vCPU
+vms = []                                                       # 600 requests: (vCPUs, GiB)
+for _ in range(600):
+    cpu = rng.choices([2, 4, 8, 16, 24, 40], weights=[20, 20, 20, 15, 15, 10])[0]
+    family = rng.choices(list(FAMILIES), weights=[25, 50, 25])[0]
+    vms.append((cpu, cpu * FAMILIES[family]))
+vms = [(c, m) for c, m in vms if m <= 256]                     # drop the few that fit no host
+
+def place(requests, choose, host_cpu, host_mem):
+    """Place VMs one at a time; `choose` picks one of the hosts with room for the VM."""
+    hosts = []                                                 # each host: [free vCPUs, free GiB]
+    for cpu, mem in requests:
+        fits = [h for h in hosts if h[0] >= cpu and h[1] >= mem]
+        if fits:
+            h = choose(fits, cpu, mem, host_cpu, host_mem)
+        else:
+            h = [host_cpu, host_mem]                           # power on a new host
+            hosts.append(h)
+        h[0] -= cpu
+        h[1] -= mem
+    return hosts
+
+def first_fit(fits, cpu, mem, C, M):
+    return fits[0]                                             # the oldest host with room
+
+def best_fit(fits, cpu, mem, C, M):                            # the host left fullest
+    return min(fits, key=lambda h: (h[0] - cpu) / C + (h[1] - mem) / M)
+
+def balanced(fits, cpu, mem, C, M):                            # keep leftovers in proportion
+    return min(fits, key=lambda h: abs((h[0] - cpu) / C - (h[1] - mem) / M))
+
+def report(host_cpu, host_mem, strategies):
+    need_cpu, need_mem = sum(c for c, m in vms), sum(m for c, m in vms)
+    bound = max(math.ceil(need_cpu / host_cpu), math.ceil(need_mem / host_mem))
+    print(f"hosts of {host_cpu} vCPUs and {host_mem} GiB: no packing can use fewer than {bound}")
+    for name, decreasing, choose in strategies:
+        order = sorted(vms, key=lambda v: max(v[0] / host_cpu, v[1] / host_mem), reverse=decreasing)
+        if not decreasing:
+            order = vms
+        hosts = place(order, choose, host_cpu, host_mem)
+        n = len(hosts)
+        print(f"  {name:34} {n:4d} hosts   CPU {need_cpu / (n * host_cpu):4.0%} used"
+              f"   memory {need_mem / (n * host_mem):4.0%} used")
+
+print(f"{len(vms)} VM requests, {sum(c for c, m in vms)} vCPUs, {sum(m for c, m in vms)} GiB\n")
+report(64, 256, [("first fit (online)", False, first_fit),
+                 ("best fit (online)", False, best_fit),
+                 ("balanced (online)", False, balanced),
+                 ("first fit decreasing (offline)", True, first_fit),
+                 ("balanced decreasing (offline)", True, balanced)])
+print()
+report(64, 512, [("first fit (online)", False, first_fit)])
+```
+
+No packing of these 581 machines can use fewer than 118 hosts, because that many are needed for the memory alone. The online strategies use 126 to 128, about 7–8% more; knowing the whole list in advance and placing the big machines first brings it down to 120 or 121. The last line shows a different kind of waste: on hosts with 512 GiB, the processors run out first, and nearly half the memory — paid for, powered — can never be sold. Choosing host shapes that match the demand matters as much as the algorithm.
+
+<Theorem name="First fit is never worse than twice optimal (one resource)">
+
+Pack items of sizes in $(0, 1]$ into bins of capacity 1 with first fit, in any order. If it uses $B$ bins and the best possible packing uses $\mathrm{OPT}$, then $B \le 2\,\mathrm{OPT}$.
+
+</Theorem>
+
+<Proof>
+
+First, at most one bin ends up at most half full. Suppose bins $i < j$ both did. Consider the moment the first item of bin $j$ was placed: it went into a new bin, so it did not fit into bin $i$. But that item's size is at most bin $j$'s final load, $\le \frac12$, and bin $i$'s load at that moment was at most its final load, $\le \frac12$, so the item fitted after all — a contradiction.
+
+So at least $B - 1$ bins are more than half full, and the total size $S$ of the items satisfies $S > \frac{B - 1}{2}$, that is $B < 2S + 1$. Any packing needs at least $S$ bins, so $\mathrm{OPT} \ge S$ and $B < 2\,\mathrm{OPT} + 1$. Both sides are integers, so $B \le 2\,\mathrm{OPT}$.
+
+</Proof>
+
+Sharper results are known: first fit uses at most about $1.7\,\mathrm{OPT}$ bins, and first fit decreasing at most $\frac{11}{9}\mathrm{OPT} + \frac{6}{9}$ (György Dósa, 2007). With $d$ resources the guarantees weaken — the classic bound for first fit grows to about $d + 0.7$ times optimal — which is one reason allocators pay attention to the *shape* of what is left on each host, as the balanced rule does.
+
+Real allocators face more: requests arrive and depart continuously, hosts differ in hardware, and a customer's VMs may need spreading over racks for fault tolerance or keeping together for latency. Google's [Borg paper](https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/) describes scoring candidate machines to reduce stranded resources, Azure's [Protean](https://www.usenix.org/conference/osdi20/presentation/hadary) describes the rule-based service that places its VMs, and OpenStack's Nova scheduler and the [Kubernetes scheduler](https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/) both work in two phases: *filter* out hosts that cannot take the request, then *score* the rest. Providers also **overcommit** — sell more vCPUs than there are hardware threads, betting that not every VM is busy at once — on some instance types, and the <LessonLink slug="kubernetes">Kubernetes</LessonLink> lesson shows how requests and limits express the same bet for containers.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A container is a lightweight virtual machine."** A container has no kernel of its own and no virtual hardware: it is processes on the host's kernel with a restricted view. That is why it starts fast — and why a kernel vulnerability affects every container on the host.
+
+</Misconception>
+
+<Misconception>
+
+**"Root inside a container is harmless."** Without a user namespace, root in a container is root on the host, held back only by dropped capabilities, seccomp and security modules. Run services as an unprivileged user and give containers only the capabilities they need.
+
+</Misconception>
+
+<Misconception>
+
+**"Virtual machines are slow."** With hardware support for processor and memory virtualisation and paravirtual or assigned devices, most workloads run within a few per cent of bare metal. The overheads that remain are in VM exits, two-level page walks on TLB misses, and noisy neighbours, and they can be measured.
+
+</Misconception>
+
+<Misconception>
+
+**"The `latest` tag is the newest version."** A tag is just a name that someone last pointed at some digest; `latest` is the default name, not a promise. Deploy by digest or by an explicit version tag that your process never moves.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

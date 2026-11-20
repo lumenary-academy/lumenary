@@ -1,0 +1,440 @@
+---
+title: Likelihood and model selection
+subtitle: The likelihood function as the common thread of statistical models — maximum likelihood by numerical optimisation, likelihood-ratio tests, AIC, BIC and cross-validation, overfitting seen in action, and what parsimony can and cannot promise.
+minutes: 80
+objectives:
+  - Write down the likelihood function of a model, explain what it is and is not, and find the maximum-likelihood estimate analytically and numerically with SciPy
+  - Compute standard errors from the observed information, and likelihood-ratio intervals and tests, and check Wilks' theorem by simulation
+  - Compute and interpret AIC and BIC, and explain why they penalise complexity differently
+  - Estimate out-of-sample error by k-fold and leave-one-out cross-validation, including the leverage shortcut for linear models
+  - Demonstrate overfitting, choose a model with several criteria, and explain the limits of parsimony and the cost of selecting a model from the same data used for inference
+prerequisites: [estimation-and-confidence-intervals, hypothesis-testing, linear-regression, multiple-regression-and-diagnostics, generalised-linear-models]
+related: [math.prob.statistics, math.applied.optimisation, math.applied.information-theory, math.prob.probability-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "SciPy: optimisation (scipy.optimize)"
+    url: https://docs.scipy.org/doc/scipy/reference/optimize.html
+    note: The minimisers and root finders used in this lesson.
+  - title: "SciPy: statistical functions (scipy.stats)"
+    url: https://docs.scipy.org/doc/scipy/reference/stats.html
+    note: Every distribution has a fit method for maximum likelihood.
+  - title: "scikit-learn: cross-validation"
+    url: https://scikit-learn.org/stable/modules/cross_validation.html
+    note: k-fold, grouped and time-series cross-validation, and nested cross-validation for tuned models.
+  - title: A new look at the statistical model identification
+    author: Hirotugu Akaike
+    year: 1974
+    note: IEEE Transactions on Automatic Control, volume 19. The paper that introduced AIC to a wide audience.
+  - title: Estimating the dimension of a model
+    author: Gideon Schwarz
+    year: 1978
+    note: Annals of Statistics, volume 6. The Bayesian information criterion.
+  - title: The Elements of Statistical Learning
+    author: Trevor Hastie, Robert Tibshirani and Jerome Friedman
+    url: https://hastie.su.domains/ElemStatLearn/
+    note: Free online. Its chapter on model assessment and selection covers AIC, BIC, cross-validation and the bias–variance trade-off in depth.
+  - title: "loo: efficient leave-one-out cross-validation for Bayesian models"
+    url: https://mc-stan.org/loo/
+    note: The Stan project's package for approximate leave-one-out cross-validation, with its documentation and papers.
+  - title: The garden of forking paths
+    author: Andrew Gelman and Eric Loken
+    year: 2013
+    note: Why data-dependent choices of analysis invalidate p-values, even without any deliberate fishing.
+---
+
+<Section id="motivation" kind="motivation" title="One principle behind every fit">
+
+The previous lessons fitted models by three apparently different recipes: least squares for linear regression, Newton's method on a log-likelihood for logistic and Poisson regression, and sums of squares for analysis of variance. They are one idea in three costumes. The idea is the **likelihood**: a model assigns a probability to the data we observed, and parameter values under which our data would have been more probable are better supported by them.
+
+Likelihood is the most widely used tool of statistical modelling. It gives estimates for models with no formula for the answer (the shape of a distribution of wind speeds, the parameters of an epidemic curve), standard errors for those estimates, tests that compare models, and the starting point of Bayesian inference. It also raises the second question of this lesson. Given several models, simple and complicated, all fitted to the same data, which should we believe? A more complicated model always fits the data in hand better. Does it describe the world better? Answering that honestly, with AIC, BIC and cross-validation, is the subject of **model selection**, and it is where statistics meets machine learning.
+
+<Narrator who="chloe">
+
+Probability runs from model to data: if the coin is fair, how likely are 7 heads in 10? Likelihood runs the other way: we *have* 7 heads in 10, so how well supported is each possible coin? The formula is the same; the question, and what varies, are reversed.
+
+</Narrator>
+
+</Section>
+
+<Section id="likelihood" kind="definitions" title="The likelihood function">
+
+<Definition term="likelihood">
+
+Let $f(\mathbf y; \theta)$ be the probability (or density) of data $\mathbf y$ under a model with parameter $\theta$. Once $\mathbf y$ is observed, the **likelihood function** is $L(\theta) = f(\mathbf y; \theta)$, viewed as a function of $\theta$ with the data fixed. For independent observations it is a product, $L(\theta) = \prod_i f(y_i; \theta)$, so the **log-likelihood** $\ell(\theta) = \log L(\theta) = \sum_i \log f(y_i; \theta)$ is a sum. Constant factors that do not depend on $\theta$ can be dropped.
+
+</Definition>
+
+<Definition term="maximum-likelihood estimate">
+
+The **maximum-likelihood estimate** (MLE) $\hat\theta$ is the value of $\theta$ that maximises $L(\theta)$, equivalently $\ell(\theta)$. The **score** is $\ell'(\theta)$, and the **observed information** $J(\hat\theta) = -\ell''(\hat\theta)$ measures how sharply the log-likelihood curves at its peak.
+
+</Definition>
+
+A first example. Thandiwe tests a new batch of bean seeds: 7 of 10 germinate. If seeds germinate independently with probability $p$, the probability of this particular outcome is $p^7(1-p)^3$ (times a constant counting the orders, which we drop), so $\ell(p) = 7\log p + 3\log(1-p)$. Setting $\ell'(p) = 7/p - 3/(1-p) = 0$ gives $\hat p = 0.7$: the MLE is the observed proportion, as intuition says. Likelihood is not a probability distribution over $p$: it need not integrate to 1, and only *ratios* of likelihoods mean anything. Comparing $p = 0.5$ with $p = 0.7$, the data are $0.439$ times as probable under the first, which is weak evidence against $p = 0.5$.
+
+```python run
+import numpy as np
+from scipy import stats, optimize
+
+# 7 of 10 seeds germinated. Log-likelihood of the germination probability p (constants dropped):
+def loglik(p, k, n):
+    return k * np.log(p) + (n - k) * np.log(1 - p)
+
+for p in [0.3, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    print(f"p = {p:.1f}: likelihood {np.exp(loglik(p, 7, 10)):.5f}, "
+          f"relative to the maximum {np.exp(loglik(p, 7, 10) - loglik(0.7, 7, 10)):.3f}")
+
+def lr_interval(k, n, level=0.95):
+    """All p whose log-likelihood is within chi2(1) quantile / 2 of the maximum."""
+    p_hat, cut = k / n, stats.chi2.ppf(level, 1)
+    g = lambda p: 2 * (loglik(p_hat, k, n) - loglik(p, k, n)) - cut
+    return optimize.brentq(g, 1e-12, p_hat), optimize.brentq(g, p_hat, 1 - 1e-12)
+
+for k, n in [(7, 10), (70, 100)]:
+    p_hat = k / n
+    se = np.sqrt(p_hat * (1 - p_hat) / n)
+    lo, hi = lr_interval(k, n)
+    print(f"{k:2d} of {n:3d}: likelihood-ratio 95% interval {lo:.3f} to {hi:.3f};"
+          f" Wald interval {p_hat - 1.96 * se:.3f} to {p_hat + 1.96 * se:.3f}")
+```
+
+Two features of maximum likelihood make it the default estimator, under regularity conditions (a smooth log-likelihood, a parameter inside its range rather than on a boundary, a number of parameters that does not grow with $n$).
+
+<Theorem name="Large-sample behaviour of the MLE">
+
+As $n \to \infty$, $\hat\theta$ is **consistent** (it converges to the true $\theta$) and **asymptotically normal**: approximately $\hat\theta \sim N\big(\theta, J(\hat\theta)^{-1}\big)$, so $\text{SE}(\hat\theta) \approx 1/\sqrt{J(\hat\theta)}$, with the inverse information matrix in several dimensions. Its asymptotic variance attains the Cramér–Rao lower bound, the smallest possible for unbiased estimators under the same conditions. And the MLE is **invariant**: the MLE of $g(\theta)$ is $g(\hat\theta)$.
+
+</Theorem>
+
+For the seeds, $J(\hat p) = n/(\hat p(1-\hat p))$, so $\text{SE} = \sqrt{\hat p(1 - \hat p)/n}$, the familiar formula behind the **Wald interval** $\hat p \pm 1.96\,\text{SE}$. The program also computes a **likelihood-ratio interval**: all values of $p$ whose log-likelihood is within $1.92$ of the maximum (half of 3.84, the 95% point of $\chi^2_1$, for reasons the next section explains). With 7 of 10 seeds the Wald interval, 0.416 to 0.984, is symmetric and reaches almost to 1; the likelihood-ratio interval, 0.393 to 0.915, follows the asymmetric shape of the likelihood. With 70 of 100, the two nearly agree (0.606–0.784 and 0.610–0.790), because the log-likelihood has become nearly quadratic, which is exactly what asymptotic normality means.
+
+<Figure caption="Relative likelihood of the germination probability: 7 of 10 seeds (solid) and 70 of 100 (dashed). Both peak at the maximum-likelihood estimate 0.7, but ten times the data give a much narrower curve. The shaded band is the 95% likelihood-ratio interval from 7 of 10 seeds, all values whose likelihood is at least 0.147 of the maximum.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Two bell-like curves over the probability axis from 0 to 1, both peaking at height 1 at p = 0.7. The solid curve for 7 of 10 seeds is wide and skewed to the left. The dashed curve for 70 of 100 seeds is narrow. A dotted horizontal line at relative likelihood 0.147 cuts the solid curve at 0.393 and 0.915, and the band between them is shaded.">
+  <line x1="70" y1="250" x2="600" y2="250" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="70" y1="250" x2="70" y2="40" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="70.0" y1="250" x2="70.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="70.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">0.0</text>
+  <line x1="176.0" y1="250" x2="176.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="176.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">0.2</text>
+  <line x1="282.0" y1="250" x2="282.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="282.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">0.4</text>
+  <line x1="388.0" y1="250" x2="388.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="388.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">0.6</text>
+  <line x1="494.0" y1="250" x2="494.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="494.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">0.8</text>
+  <line x1="600.0" y1="250" x2="600.0" y2="254" stroke="currentColor" strokeWidth="1" />
+  <text x="600.0" y="268" textAnchor="middle" fontSize="12" fill="currentColor">1.0</text>
+  <text x="62" y="254.0" textAnchor="end" fontSize="12" fill="currentColor">0</text>
+  <text x="62" y="149.0" textAnchor="end" fontSize="12" fill="currentColor">0.5</text>
+  <text x="62" y="44.0" textAnchor="end" fontSize="12" fill="currentColor">1</text>
+  <rect x="278.3" y="40.0" width="276.7" height="210.0" fill="var(--sky-soft)" stroke="none" />
+  <path d="M 70.5 250.0 L 73.2 250.0 L 75.8 250.0 L 78.5 250.0 L 81.2 250.0 L 83.8 250.0 L 86.5 250.0 L 89.1 250.0 L 91.8 250.0 L 94.5 250.0 L 97.1 250.0 L 99.8 250.0 L 102.4 250.0 L 105.1 250.0 L 107.7 250.0 L 110.4 250.0 L 113.1 250.0 L 115.7 250.0 L 118.4 250.0 L 121.0 250.0 L 123.7 250.0 L 126.3 250.0 L 129.0 250.0 L 131.7 250.0 L 134.3 250.0 L 137.0 250.0 L 139.6 250.0 L 142.3 249.9 L 145.0 249.9 L 147.6 249.9 L 150.3 249.9 L 152.9 249.9 L 155.6 249.8 L 158.2 249.8 L 160.9 249.8 L 163.6 249.7 L 166.2 249.7 L 168.9 249.6 L 171.5 249.5 L 174.2 249.4 L 176.8 249.3 L 179.5 249.2 L 182.2 249.1 L 184.8 249.0 L 187.5 248.8 L 190.1 248.7 L 192.8 248.5 L 195.5 248.3 L 198.1 248.0 L 200.8 247.8 L 203.4 247.5 L 206.1 247.1 L 208.7 246.8 L 211.4 246.4 L 214.1 246.0 L 216.7 245.5 L 219.4 245.1 L 222.0 244.5 L 224.7 243.9 L 227.4 243.3 L 230.0 242.7 L 232.7 241.9 L 235.3 241.2 L 238.0 240.3 L 240.6 239.4 L 243.3 238.5 L 246.0 237.5 L 248.6 236.4 L 251.3 235.3 L 253.9 234.1 L 256.6 232.8 L 259.2 231.4 L 261.9 230.0 L 264.6 228.5 L 267.2 226.9 L 269.9 225.2 L 272.5 223.5 L 275.2 221.7 L 277.9 219.7 L 280.5 217.7 L 283.2 215.6 L 285.8 213.5 L 288.5 211.2 L 291.1 208.8 L 293.8 206.4 L 296.5 203.9 L 299.1 201.2 L 301.8 198.5 L 304.4 195.7 L 307.1 192.9 L 309.7 189.9 L 312.4 186.8 L 315.1 183.7 L 317.7 180.5 L 320.4 177.2 L 323.0 173.8 L 325.7 170.4 L 328.4 166.8 L 331.0 163.3 L 333.7 159.6 L 336.3 155.9 L 339.0 152.2 L 341.6 148.4 L 344.3 144.5 L 347.0 140.6 L 349.6 136.7 L 352.3 132.8 L 354.9 128.8 L 357.6 124.8 L 360.3 120.8 L 362.9 116.9 L 365.6 112.9 L 368.2 108.9 L 370.9 105.0 L 373.5 101.1 L 376.2 97.2 L 378.9 93.4 L 381.5 89.7 L 384.2 86.0 L 386.8 82.4 L 389.5 78.8 L 392.1 75.4 L 394.8 72.1 L 397.5 68.8 L 400.1 65.7 L 402.8 62.8 L 405.4 60.0 L 408.1 57.3 L 410.8 54.8 L 413.4 52.4 L 416.1 50.2 L 418.7 48.3 L 421.4 46.5 L 424.0 44.9 L 426.7 43.5 L 429.4 42.3 L 432.0 41.4 L 434.7 40.7 L 437.3 40.2 L 440.0 40.0 L 442.6 40.0 L 445.3 40.3 L 448.0 40.9 L 450.6 41.7 L 453.3 42.8 L 455.9 44.1 L 458.6 45.7 L 461.3 47.6 L 463.9 49.7 L 466.6 52.1 L 469.2 54.8 L 471.9 57.7 L 474.5 60.9 L 477.2 64.4 L 479.9 68.1 L 482.5 72.0 L 485.2 76.2 L 487.8 80.6 L 490.5 85.2 L 493.2 90.0 L 495.8 95.0 L 498.5 100.1 L 501.1 105.5 L 503.8 111.0 L 506.4 116.6 L 509.1 122.3 L 511.8 128.2 L 514.4 134.1 L 517.1 140.1 L 519.7 146.1 L 522.4 152.1 L 525.0 158.1 L 527.7 164.1 L 530.4 170.1 L 533.0 176.0 L 535.7 181.8 L 538.3 187.4 L 541.0 193.0 L 543.7 198.3 L 546.3 203.5 L 549.0 208.5 L 551.6 213.3 L 554.3 217.8 L 556.9 222.0 L 559.6 226.0 L 562.3 229.7 L 564.9 233.0 L 567.6 236.1 L 570.2 238.8 L 572.9 241.2 L 575.5 243.3 L 578.2 245.1 L 580.9 246.6 L 583.5 247.7 L 586.2 248.6 L 588.8 249.2 L 591.5 249.7 L 594.2 249.9 L 596.8 250.0 L 599.5 250.0" fill="none" stroke="var(--sky)" strokeWidth="2.5" />
+  <path d="M 70.5 250.0 L 73.2 250.0 L 75.8 250.0 L 78.5 250.0 L 81.2 250.0 L 83.8 250.0 L 86.5 250.0 L 89.1 250.0 L 91.8 250.0 L 94.5 250.0 L 97.1 250.0 L 99.8 250.0 L 102.4 250.0 L 105.1 250.0 L 107.7 250.0 L 110.4 250.0 L 113.1 250.0 L 115.7 250.0 L 118.4 250.0 L 121.0 250.0 L 123.7 250.0 L 126.3 250.0 L 129.0 250.0 L 131.7 250.0 L 134.3 250.0 L 137.0 250.0 L 139.6 250.0 L 142.3 250.0 L 145.0 250.0 L 147.6 250.0 L 150.3 250.0 L 152.9 250.0 L 155.6 250.0 L 158.2 250.0 L 160.9 250.0 L 163.6 250.0 L 166.2 250.0 L 168.9 250.0 L 171.5 250.0 L 174.2 250.0 L 176.8 250.0 L 179.5 250.0 L 182.2 250.0 L 184.8 250.0 L 187.5 250.0 L 190.1 250.0 L 192.8 250.0 L 195.5 250.0 L 198.1 250.0 L 200.8 250.0 L 203.4 250.0 L 206.1 250.0 L 208.7 250.0 L 211.4 250.0 L 214.1 250.0 L 216.7 250.0 L 219.4 250.0 L 222.0 250.0 L 224.7 250.0 L 227.4 250.0 L 230.0 250.0 L 232.7 250.0 L 235.3 250.0 L 238.0 250.0 L 240.6 250.0 L 243.3 250.0 L 246.0 250.0 L 248.6 250.0 L 251.3 250.0 L 253.9 250.0 L 256.6 250.0 L 259.2 250.0 L 261.9 250.0 L 264.6 250.0 L 267.2 250.0 L 269.9 250.0 L 272.5 250.0 L 275.2 250.0 L 277.9 250.0 L 280.5 250.0 L 283.2 250.0 L 285.8 250.0 L 288.5 250.0 L 291.1 250.0 L 293.8 250.0 L 296.5 250.0 L 299.1 250.0 L 301.8 250.0 L 304.4 250.0 L 307.1 250.0 L 309.7 250.0 L 312.4 250.0 L 315.1 250.0 L 317.7 250.0 L 320.4 250.0 L 323.0 250.0 L 325.7 250.0 L 328.4 250.0 L 331.0 250.0 L 333.7 250.0 L 336.3 249.9 L 339.0 249.9 L 341.6 249.9 L 344.3 249.8 L 347.0 249.7 L 349.6 249.6 L 352.3 249.4 L 354.9 249.1 L 357.6 248.8 L 360.3 248.4 L 362.9 247.8 L 365.6 247.0 L 368.2 246.1 L 370.9 244.8 L 373.5 243.3 L 376.2 241.3 L 378.9 238.8 L 381.5 235.9 L 384.2 232.3 L 386.8 227.9 L 389.5 222.8 L 392.1 216.8 L 394.8 209.9 L 397.5 202.1 L 400.1 193.2 L 402.8 183.4 L 405.4 172.6 L 408.1 161.0 L 410.8 148.7 L 413.4 135.8 L 416.1 122.6 L 418.7 109.4 L 421.4 96.4 L 424.0 83.9 L 426.7 72.5 L 429.4 62.2 L 432.0 53.6 L 434.7 46.9 L 437.3 42.4 L 440.0 40.2 L 442.6 40.5 L 445.3 43.3 L 448.0 48.6 L 450.6 56.2 L 453.3 65.9 L 455.9 77.5 L 458.6 90.5 L 461.3 104.5 L 463.9 119.2 L 466.6 134.1 L 469.2 148.8 L 471.9 163.1 L 474.5 176.5 L 477.2 188.8 L 479.9 200.0 L 482.5 209.8 L 485.2 218.3 L 487.8 225.4 L 490.5 231.4 L 493.2 236.1 L 495.8 239.9 L 498.5 242.8 L 501.1 245.0 L 503.8 246.6 L 506.4 247.8 L 509.1 248.6 L 511.8 249.1 L 514.4 249.4 L 517.1 249.7 L 519.7 249.8 L 522.4 249.9 L 525.0 249.9 L 527.7 250.0 L 530.4 250.0 L 533.0 250.0 L 535.7 250.0 L 538.3 250.0 L 541.0 250.0 L 543.7 250.0 L 546.3 250.0 L 549.0 250.0 L 551.6 250.0 L 554.3 250.0 L 556.9 250.0 L 559.6 250.0 L 562.3 250.0 L 564.9 250.0 L 567.6 250.0 L 570.2 250.0 L 572.9 250.0 L 575.5 250.0 L 578.2 250.0 L 580.9 250.0 L 583.5 250.0 L 586.2 250.0 L 588.8 250.0 L 591.5 250.0 L 594.2 250.0 L 596.8 250.0 L 599.5 250.0" fill="none" stroke="var(--human)" strokeWidth="2" strokeDasharray="6 4" />
+  <line x1="70" y1="219.2" x2="600" y2="219.2" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+  <text x="596" y="213.2" textAnchor="end" fontSize="12" fill="currentColor">relative likelihood 0.147</text>
+  <line x1="441.0" y1="250" x2="441.0" y2="40.0" stroke="currentColor" strokeWidth="1" />
+  <text x="441.0" y="32.0" textAnchor="middle" fontSize="12" fill="currentColor">MLE 0.7</text>
+  <text x="335" y="288" textAnchor="middle" fontSize="13" fill="currentColor">germination probability p</text>
+  <text x="22" y="145" textAnchor="middle" fontSize="13" fill="currentColor" transform="rotate(-90 22 145)">L(p) / L(0.7)</text>
+  <line x1="90" y1="60" x2="120" y2="60" stroke="var(--sky)" strokeWidth="2.5" />
+  <text x="128" y="64" fontSize="12" fill="currentColor">7 of 10 seeds</text>
+  <line x1="90" y1="80" x2="120" y2="80" stroke="var(--human)" strokeWidth="2" strokeDasharray="6 4" />
+  <text x="128" y="84" fontSize="12" fill="currentColor">70 of 100 seeds</text>
+</svg>
+</Figure>
+
+For the normal linear model, maximising the likelihood over $\boldsymbol\beta$ means minimising $\sum (y_i - \mathbf x_i^\top\boldsymbol\beta)^2$: least squares *is* maximum likelihood when errors are normal, and the logistic and Poisson fits of the <LessonLink slug="generalised-linear-models">previous lesson</LessonLink> were maximum likelihood with other distributions. The deviance used there is $-2$ times a log-likelihood ratio.
+
+</Section>
+
+<Section id="numerical" kind="computation" title="Maximum likelihood by numerical optimisation">
+
+Most likelihoods have no closed-form maximum, and we maximise them numerically. A classic case comes from wind energy. Engineers assessing a site in, say, the Atacama or on the coast of Tamil Nadu summarise a year of hourly wind speeds by a **Weibull distribution**, with density $f(v) = \frac{k}{c}\left(\frac{v}{c}\right)^{k-1} e^{-(v/c)^k}$ for $v > 0$: a scale $c$ near the typical speed and a shape $k$ describing how variable the wind is. The fitted distribution feeds the estimate of energy output, which depends heavily on the frequency of strong winds.
+
+The program fits a Weibull distribution to 300 synthetic hourly speeds by minimising the negative log-likelihood with SciPy's BFGS optimiser. Two practical habits are visible. The parameters are optimised on the **log scale**, so the optimiser cannot wander into negative shapes or scales. And the answer is checked against an independent implementation, `scipy.stats.weibull_min.fit`. Standard errors come from the **observed information**, the matrix of second derivatives of the negative log-likelihood at the optimum, computed by finite differences. Finally, the program tests two simpler models nested inside the Weibull: the exponential distribution ($k = 1$) and the Rayleigh distribution ($k = 2$), which wind engineers often assume when data are scarce.
+
+```python run
+import numpy as np
+from scipy import stats, optimize
+
+# 300 synthetic hourly mean wind speeds (m/s) at a candidate wind-farm site.
+rng = np.random.default_rng(2024)
+v = stats.weibull_min.rvs(2.1, scale=7.5, size=300, random_state=rng)
+
+def nll(theta):
+    """Negative log-likelihood of the Weibull(shape k, scale c), with theta = (log k, log c) so both stay positive."""
+    k, c = np.exp(theta)
+    return -np.sum(np.log(k / c) + (k - 1) * np.log(v / c) - (v / c) ** k)
+
+res = optimize.minimize(nll, x0=[0.0, np.log(v.mean())], method="BFGS")
+k_hat, c_hat = np.exp(res.x)
+print(f"our MLE:    shape k = {k_hat:.3f}, scale c = {c_hat:.3f} m/s  (log-likelihood {-res.fun:.3f})")
+k_sp, _, c_sp = stats.weibull_min.fit(v, floc=0)
+print(f"SciPy fit:  shape k = {k_sp:.3f}, scale c = {c_sp:.3f} m/s")
+
+# Standard errors from the observed information: the Hessian of nll in (k, c), by central differences.
+def nll_kc(p):
+    return nll(np.log(p))
+p0, h = np.array([k_hat, c_hat]), 1e-4
+H = np.zeros((2, 2))
+for i in range(2):
+    for j in range(2):
+        ei, ej = np.eye(2)[i] * h, np.eye(2)[j] * h
+        H[i, j] = (nll_kc(p0 + ei + ej) - nll_kc(p0 + ei - ej) - nll_kc(p0 - ei + ej) + nll_kc(p0 - ei - ej)) / (4 * h * h)
+se = np.sqrt(np.diag(np.linalg.inv(H)))
+print(f"standard errors: k {se[0]:.3f}, c {se[1]:.3f};  95% CI for k: {k_hat - 1.96 * se[0]:.2f} to {k_hat + 1.96 * se[0]:.2f}")
+
+# Likelihood-ratio tests of two simpler models nested in the Weibull
+ll_full = -res.fun
+for name, k0 in [("exponential (k = 1)", 1.0), ("Rayleigh (k = 2)", 2.0)]:
+    fixed = optimize.minimize_scalar(lambda logc: nll([np.log(k0), logc]), bounds=(-5, 5), method="bounded")
+    lr = 2 * (ll_full + fixed.fun)
+    print(f"{name:>20}: LR = {lr:7.2f} on 1 df, p = {stats.chi2.sf(lr, 1):.2g}")
+print(f"fitted P(v > 3 m/s, a typical cut-in speed) = {np.exp(-(3 / c_hat) ** k_hat):.3f}; observed {np.mean(v > 3):.3f}")
+```
+
+Our optimiser and SciPy agree: $\hat k = 2.080$ and $\hat c = 7.195$ m/s, with standard errors 0.093 and 0.211. The exponential model is rejected overwhelmingly (likelihood ratio 188.10), while the Rayleigh model fits about as well as the full Weibull ($p = 0.39$): with these data, the simpler model is good enough. The fitted distribution says the wind exceeds 3 m/s, a typical turbine cut-in speed, 85.0% of the time, against 86.0% in the data.
+
+Numerical maximum likelihood has failure modes worth knowing: an optimiser may stop at a local maximum (try several starting points), the likelihood may be flat in some direction because two parameters trade off against each other (the model is barely identifiable, and standard errors explode), or the maximum may sit on the boundary of the parameter space. The theory of <TopicLink id="math.applied.optimisation">optimisation</TopicLink> in Lumenary Math explains when such methods converge.
+
+</Section>
+
+<Section id="lrt" kind="computation" title="Likelihood-ratio tests and Wilks' theorem">
+
+Comparing a model with a simpler one **nested** inside it (obtained by fixing some parameters) is the job of the likelihood-ratio test. The bigger model always has the higher maximised likelihood; the question is whether the gain is more than chance would produce.
+
+<Theorem name="Wilks' theorem">
+
+Suppose model $M_0$, with $p_0$ free parameters, is nested in model $M_1$, with $p_1$, and $M_0$ is true. Under regularity conditions, as $n \to \infty$,
+
+$$\Lambda = 2\big(\ell_1(\hat\theta_1) - \ell_0(\hat\theta_0)\big) \;\longrightarrow\; \chi^2_{p_1 - p_0}$$
+
+in distribution.
+
+</Theorem>
+
+The idea of the proof is a Taylor expansion: near its maximum the log-likelihood is approximately quadratic, the MLE approximately normal, and twice the drop in a quadratic from its maximum, along $p_1 - p_0$ directions, is a sum of $p_1 - p_0$ squared standard normal variables. Samuel Wilks proved it in 1938. The theorem also justifies the likelihood-ratio interval above (the values of $\theta$ that such a test would not reject), and the deviance tests of the previous lesson. Is the approximation good at realistic sample sizes? The program simulates 1000 samples of 50 wind speeds from a Rayleigh distribution, so that the simpler model is true, and compares the likelihood-ratio statistic with $\chi^2_1$.
+
+```python run
+import numpy as np
+from scipy import stats, optimize
+
+# Wilks' theorem by simulation: when the simpler model is true, is 2 * (gain in log-likelihood) ~ chi-squared(1)?
+rng = np.random.default_rng(1938)
+
+def weibull_loglik(k, c, v):
+    return np.sum(np.log(k / c) + (k - 1) * np.log(v / c) - (v / c) ** k)
+
+def lr_statistic(v):
+    full = optimize.minimize(lambda t: -weibull_loglik(*np.exp(t), v), x0=[np.log(2.0), np.log(v.mean())], method="BFGS")
+    c_rayleigh = np.sqrt(np.mean(v ** 2))            # the MLE of the scale when the shape is fixed at 2
+    return 2 * (-full.fun - weibull_loglik(2.0, c_rayleigh, v))
+
+lr = np.array([lr_statistic(stats.weibull_min.rvs(2.0, scale=7.5, size=50, random_state=rng)) for _ in range(1000)])
+print(f"{'quantile':>8} {'simulated':>10} {'chi-squared(1)':>15}")
+for q in [0.5, 0.9, 0.95, 0.99]:
+    print(f"{q:8.2f} {np.quantile(lr, q):10.2f} {stats.chi2.ppf(q, 1):15.2f}")
+print(f"share of LR > 3.84 (a 5% test): {np.mean(lr > stats.chi2.ppf(0.95, 1)):.1%}")
+```
+
+<Narrator who="margaret">
+
+Close, but not exact. The simulated median, 0.44, matches $\chi^2_1$'s 0.45, but the upper quantiles run a little high (4.17 against 3.84 at 95%), so a nominal 5% test rejects a true Rayleigh model 6.2% of the time with 50 observations. That is typical: Wilks' theorem is a large-sample result, and when the exact level matters, simulate it, as here, or use a parametric bootstrap.
+
+</Narrator>
+
+<Narrator who="gideon">
+
+The regularity conditions bite in practice. Testing whether a variance component is zero, or whether a mixture has two components rather than one, puts the null value on the boundary of the parameter space or makes a parameter vanish, and then $\Lambda$ is *not* $\chi^2$: for a single variance component it is a 50:50 mixture of 0 and $\chi^2_1$. Using the $\chi^2$ table there gives a conservative test at best and a meaningless one at worst.
+
+</Narrator>
+
+</Section>
+
+<Section id="criteria" kind="human" title="AIC and BIC">
+
+Likelihood-ratio tests compare two nested models. Often we have many candidate models, not all nested, and the goal is not to test a hypothesis but to choose a model that will serve well. The maximised log-likelihood cannot choose on its own, because it always favours the biggest model: each extra parameter can only raise it.
+
+Hirotugu Akaike, at the Institute of Statistical Mathematics in Tokyo, asked in the early 1970s how well a fitted model would predict *new* data from the same process, measured by the expected log-likelihood of new data, which is related to the **Kullback–Leibler divergence** from the truth (see <TopicLink id="math.applied.information-theory">information theory</TopicLink>). The maximised log-likelihood is an optimistic estimate of that, because the parameters were tuned to the data in hand, and he showed that the optimism is approximately $k$, the number of estimated parameters. Correcting for it, and multiplying by $-2$ by convention, gives
+
+$$\text{AIC} = -2\ell(\hat\theta) + 2k, \qquad \text{BIC} = -2\ell(\hat\theta) + k\log n.$$
+
+The **Bayesian information criterion**, proposed by Gideon Schwarz in 1978, comes from a different question: which model has the highest posterior probability, with equal prior probabilities on the models? For large $n$, $-\tfrac12\text{BIC}$ approximates the log of the marginal likelihood of the data under the model (<LessonLink slug="bayesian-inference">Bayesian inference</LessonLink> explains marginal likelihoods). Smaller is better for both, and only *differences* matter: a difference in AIC of about 2 or less is weak evidence, while 10 or more is strong.
+
+The two criteria want different things. BIC's penalty, $\log n$ per parameter, exceeds AIC's 2 once $n \geq 8$, so BIC chooses simpler models. If one candidate is the true model, BIC finds it with probability tending to 1 (it is **consistent**), while AIC keeps a positive chance of choosing a model that is too big. But the true model is rarely among the candidates. When the goal is prediction and reality is more complex than any candidate, AIC's willingness to add parameters as data accumulate is an advantage, and it is **asymptotically efficient** for prediction. Neither is "right"; they answer different questions. For small samples, the corrected $\text{AIC}_c = \text{AIC} + \frac{2k(k+1)}{n - k - 1}$ is preferable.
+
+Both criteria compare models of the **same data**: the same observations, the same response on the same scale. Comparing the AIC of a model for rent with that of a model for log rent is meaningless without a correction for the transformation.
+
+</Section>
+
+<Section id="cv" kind="computation" title="Cross-validation and overfitting">
+
+The most direct way to estimate how a model will do on new data is to *hold some data back*. In **$K$-fold cross-validation** the data are split at random into $K$ parts (folds); each part in turn is left out, the model is fitted to the other $K - 1$, and its prediction error is measured on the left-out part. The average over folds estimates the out-of-sample error. **Leave-one-out** cross-validation (LOO-CV) is the case $K = n$. For linear least squares it needs no refitting at all: the residual that observation $i$ would have if it were left out is $e_i/(1 - h_{ii})$, with $h_{ii}$ the leverage from the <LessonLink slug="multiple-regression-and-diagnostics">hat matrix</LessonLink>, so
+
+$$\text{LOO-CV} = \frac{1}{n}\sum_{i=1}^n \left(\frac{e_i}{1 - h_{ii}}\right)^2.$$
+
+Cross-validation assumes almost nothing about the model (it works for neural networks and random forests as well as for regressions), and Mervyn Stone showed in 1977 that LOO-CV and AIC are asymptotically equivalent for comparing models. The price is computation, and some care, discussed below, about what counts as "new" data.
+
+Here is overfitting in action. Twenty noisy points come from a smooth curve, $y = \sin 3x + \varepsilon$ with noise standard deviation 0.3, and polynomials of degree 0 to 10 are fitted to them. Because the data are synthetic, we can also measure each fitted curve's true error on 5000 fresh points.
+
+```python run
+import numpy as np
+
+# 20 noisy observations of a smooth curve; fit polynomials of degree 0 to 10.
+rng = np.random.default_rng(1974)
+f = lambda x: np.sin(3 * x)
+n, sigma = 20, 0.3
+x = rng.uniform(-1, 1, n)
+y = f(x) + rng.normal(0, sigma, n)
+x_new = rng.uniform(-1, 1, 5000)                       # fresh data from the same process, for the "truth"
+y_new = f(x_new) + rng.normal(0, sigma, 5000)
+folds = rng.permutation(n) % 5                          # 5-fold cross-validation, same folds for every degree
+
+rows = []
+for d in range(11):
+    X = np.vander(x, d + 1)
+    b = np.linalg.lstsq(X, y, rcond=None)[0]
+    sse = np.sum((y - X @ b) ** 2)
+    k = d + 2                                           # d + 1 coefficients plus the error variance
+    loglik = -n / 2 * (np.log(2 * np.pi * sse / n) + 1)  # maximised Gaussian log-likelihood
+    h = np.diag(X @ np.linalg.pinv(X))                  # leverages, for the leave-one-out shortcut
+    loo = np.mean(((y - X @ b) / (1 - h)) ** 2)
+    cv5 = 0.0
+    for fold in range(5):
+        tr, te = folds != fold, folds == fold
+        bf = np.linalg.lstsq(X[tr], y[tr], rcond=None)[0]
+        cv5 += np.sum((y[te] - X[te] @ bf) ** 2) / n
+    test = np.mean((y_new - np.vander(x_new, d + 1) @ b) ** 2)
+    rows.append((d, sse / n, test, -2 * loglik + 2 * k, -2 * loglik + k * np.log(n), loo, cv5))
+
+print(f"{'degree':>6} {'train MSE':>9} {'test MSE':>9} {'AIC':>6} {'BIC':>6} {'LOO-CV':>8} {'5-fold':>8}")
+for r in rows:
+    print(f"{r[0]:6d} {r[1]:9.4f} {r[2]:9.4f} {r[3]:6.1f} {r[4]:6.1f} {r[5]:8.4g} {r[6]:8.4g}")
+R = np.array(rows)
+for j, name in [(1, "training error"), (2, "test error"), (3, "AIC"), (4, "BIC"), (5, "LOO-CV"), (6, "5-fold CV")]:
+    print(f"{name:>14} picks degree {int(R[np.argmin(R[:, j]), 0])}")
+```
+
+<Figure caption="Error on the 20 points used for fitting (solid) and on 5000 new points from the same process (dashed), for polynomials of degree 0 to 10, on a log scale. Training error can only fall as the degree rises. Error on new data falls until degree 3, stays nearly flat, then rises steeply as the polynomial starts to fit the noise; at degree 10 it is nine times its best value. The dotted line is the noise variance, 0.09, below which no model can predict new data.">
+<svg viewBox="0 0 640 310" role="img" aria-label="Two lines against polynomial degree from 0 to 10, on a logarithmic error scale. The training error line falls steadily from about 0.56 to 0.056. The new-data error line falls to about 0.10 at degree 3, stays near 0.10 to 0.16 up to degree 9, and jumps to about 0.95 at degree 10. A dotted horizontal line at 0.09 marks the noise variance.">
+  <line x1="80" y1="260" x2="600" y2="260" stroke="currentColor" strokeWidth="1.5" />
+  <line x1="80" y1="260" x2="80" y2="40" stroke="currentColor" strokeWidth="1.5" />
+  <text x="80.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">0</text>
+  <text x="132.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">1</text>
+  <text x="184.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">2</text>
+  <text x="236.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">3</text>
+  <text x="288.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">4</text>
+  <text x="340.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">5</text>
+  <text x="392.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">6</text>
+  <text x="444.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">7</text>
+  <text x="496.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">8</text>
+  <text x="548.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">9</text>
+  <text x="600.0" y="278" textAnchor="middle" fontSize="12" fill="currentColor">10</text>
+  <line x1="76" y1="245.6" x2="80" y2="245.6" stroke="currentColor" strokeWidth="1" />
+  <text x="72" y="249.6" textAnchor="end" fontSize="12" fill="currentColor">0.05</text>
+  <line x1="76" y1="200.7" x2="80" y2="200.7" stroke="currentColor" strokeWidth="1" />
+  <text x="72" y="204.7" textAnchor="end" fontSize="12" fill="currentColor">0.1</text>
+  <line x1="76" y1="155.9" x2="80" y2="155.9" stroke="currentColor" strokeWidth="1" />
+  <text x="72" y="159.9" textAnchor="end" fontSize="12" fill="currentColor">0.2</text>
+  <line x1="76" y1="96.6" x2="80" y2="96.6" stroke="currentColor" strokeWidth="1" />
+  <text x="72" y="100.6" textAnchor="end" fontSize="12" fill="currentColor">0.5</text>
+  <line x1="76" y1="51.8" x2="80" y2="51.8" stroke="currentColor" strokeWidth="1" />
+  <text x="72" y="55.8" textAnchor="end" fontSize="12" fill="currentColor">1</text>
+  <line x1="80" y1="207.5" x2="600" y2="207.5" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+  <text x="95.6" y="222.5" fontSize="12" fill="currentColor">noise variance 0.09: no model can do better on new data</text>
+  <path d="M 80.0 89.7 L 132.0 141.4 L 184.0 141.9 L 236.0 209.8 L 288.0 210.0 L 340.0 210.7 L 392.0 212.9 L 444.0 213.4 L 496.0 219.4 L 548.0 219.9 L 600.0 237.9" fill="none" stroke="var(--sky)" strokeWidth="2.5" />
+  <circle cx="80.0" cy="89.7" r="3.5" fill="var(--sky)" />
+  <circle cx="132.0" cy="141.4" r="3.5" fill="var(--sky)" />
+  <circle cx="184.0" cy="141.9" r="3.5" fill="var(--sky)" />
+  <circle cx="236.0" cy="209.8" r="3.5" fill="var(--sky)" />
+  <circle cx="288.0" cy="210.0" r="3.5" fill="var(--sky)" />
+  <circle cx="340.0" cy="210.7" r="3.5" fill="var(--sky)" />
+  <circle cx="392.0" cy="212.9" r="3.5" fill="var(--sky)" />
+  <circle cx="444.0" cy="213.4" r="3.5" fill="var(--sky)" />
+  <circle cx="496.0" cy="219.4" r="3.5" fill="var(--sky)" />
+  <circle cx="548.0" cy="219.9" r="3.5" fill="var(--sky)" />
+  <circle cx="600.0" cy="237.9" r="3.5" fill="var(--sky)" />
+  <path d="M 80.0 82.0 L 132.0 137.6 L 184.0 137.3 L 236.0 199.6 L 288.0 199.1 L 340.0 195.9 L 392.0 195.5 L 444.0 192.6 L 496.0 172.9 L 548.0 169.4 L 600.0 55.1" fill="none" stroke="var(--human)" strokeWidth="2.5" strokeDasharray="6 4" />
+  <rect x="76.5" y="78.5" width="7" height="7" fill="var(--human)" />
+  <rect x="128.5" y="134.1" width="7" height="7" fill="var(--human)" />
+  <rect x="180.5" y="133.8" width="7" height="7" fill="var(--human)" />
+  <rect x="232.5" y="196.1" width="7" height="7" fill="var(--human)" />
+  <rect x="284.5" y="195.6" width="7" height="7" fill="var(--human)" />
+  <rect x="336.5" y="192.4" width="7" height="7" fill="var(--human)" />
+  <rect x="388.5" y="192.0" width="7" height="7" fill="var(--human)" />
+  <rect x="440.5" y="189.1" width="7" height="7" fill="var(--human)" />
+  <rect x="492.5" y="169.4" width="7" height="7" fill="var(--human)" />
+  <rect x="544.5" y="165.9" width="7" height="7" fill="var(--human)" />
+  <rect x="596.5" y="51.6" width="7" height="7" fill="var(--human)" />
+  <line x1="236.0" y1="50" x2="236.0" y2="260" stroke="currentColor" strokeWidth="1" strokeDasharray="2 4" />
+  <text x="242.0" y="62" fontSize="12" fill="currentColor">best on new data: degree 3</text>
+  <line x1="371.2" y1="70" x2="402.4" y2="70" stroke="var(--sky)" strokeWidth="2.5" />
+  <text x="410.2" y="74" fontSize="12" fill="currentColor">error on the 20 fitted points</text>
+  <line x1="371.2" y1="92" x2="402.4" y2="92" stroke="var(--human)" strokeWidth="2.5" strokeDasharray="6 4" />
+  <text x="410.2" y="96" fontSize="12" fill="currentColor">error on 5000 new points</text>
+  <text x="340" y="298" textAnchor="middle" fontSize="13" fill="currentColor">degree of the polynomial</text>
+  <text x="24" y="150" textAnchor="middle" fontSize="13" fill="currentColor" transform="rotate(-90 24 150)">mean squared error (log scale)</text>
+</svg>
+</Figure>
+
+The training error falls with every added degree, from 0.557 to 0.056: by that measure the degree-10 polynomial is the best model, and it is the worst. Its error on new data is 0.950, nine times the best achievable here. The true error is smallest at degree 3 (0.102, close to the noise floor of 0.09), and AIC, BIC, leave-one-out and 5-fold cross-validation all choose degree 3, without ever seeing the 5000 new points. Notice also how the cross-validation errors explode for high degrees (to 347.5 for 5-fold at degree 10): leaving out a point near the edge of the data forces a high-degree polynomial to extrapolate, and it swings wildly. That is overfitting made visible.
+
+Two rules keep cross-validation honest. **Everything that learns from the data must happen inside the folds**: choosing variables, scaling, imputing missing values or tuning settings on the whole dataset, then cross-validating, leaks information from the held-out folds and makes the estimate optimistic. And **the folds must respect the structure of the data**: with repeated measurements of the same patients, leave out whole patients; with time series, never train on the future to predict the past. If a model's settings are tuned by cross-validation, an honest estimate of its performance needs a second, outer layer (**nested cross-validation**) or a test set locked away until the end.
+
+</Section>
+
+<Section id="parsimony" kind="human" title="Parsimony and its limits">
+
+Every method in this lesson rewards **parsimony**: a model should be no more complicated than the data can support. This is a statistical version of Occam's razor, and it has a precise justification, the bias–variance trade-off. A simple model may be biased, missing real structure; a complex one has low bias but high variance, because its many parameters are each estimated from limited information and chase the noise. The best predictions balance the two, and how much complexity the data can support grows with the amount of data.
+
+George Box put the attitude in a famous phrase in 1979: all models are wrong, but some are useful. Model selection does not find the true model; it finds a useful one for a stated purpose. Several limits follow, and they are where good statisticians earn their keep.
+
+- **Selection invalidates naive inference.** If you try many models and report the standard errors and $p$-values of the one you chose, those numbers are too optimistic, because they ignore the selection. This is one of Andrew Gelman and Eric Loken's "forking paths": even without deliberate fishing, analysis choices that depend on the data make $p$-values unreliable. The remedies are to pre-register the analysis, to split the data (select on one part, infer on the other), to average over models, or to use methods of **post-selection inference** designed for the purpose. See <LessonLink slug="multiple-testing-and-reproducibility">multiple testing and reproducibility</LessonLink>.
+- **The best predictive model is not the best explanatory one.** A model chosen by AIC or cross-validation to predict well may drop a confounder that matters for causal interpretation, or keep a proxy that predicts without explaining. Selection criteria answer "what predicts?", not "what causes?" (<LessonLink slug="causal-inference">causal inference</LessonLink>).
+- **Sometimes there is no single best model.** When several models are within a couple of AIC units of each other, choosing one and discarding the rest understates uncertainty. **Model averaging**, weighting the predictions of several models, often predicts better and is more honest.
+- **Shrinkage is often better than selection.** Rather than including or excluding each parameter, **regularisation** (ridge regression, the lasso) keeps many parameters but shrinks them towards zero, choosing the amount of shrinkage by cross-validation; this is the main tool when there are many predictors, in <LessonLink slug="high-dimensional-statistics">high-dimensional statistics</LessonLink>.
+- **Modern machine learning stretches the classical picture.** Deep neural networks often have far more parameters than data points, fit the training data exactly, and still predict well, a phenomenon studied under names such as "benign overfitting" and "double descent". The bias–variance trade-off is not repealed, but parameter count turns out to be a poor measure of complexity for such models. <LessonLink slug="statistical-learning-theory">Statistical learning theory</LessonLink> takes this up.
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+In R, `logLik()`, `AIC()` and `BIC()` work for almost every fitted model, `anova(fit0, fit1, test = "LRT")` performs likelihood-ratio tests between nested GLMs, and `optim()` maximises custom likelihoods. In Python, statsmodels results carry `.llf`, `.aic` and `.bic`, SciPy's `optimize.minimize` handles custom likelihoods, and [scikit-learn](https://scikit-learn.org/stable/modules/cross_validation.html) provides cross-validation splitters, including grouped and time-series splits, and tools for nested cross-validation. In Bayesian work with Stan and similar tools, approximate leave-one-out cross-validation by Pareto-smoothed importance sampling, implemented in the [loo package](https://mc-stan.org/loo/), has largely replaced older information criteria; that is the subject of the <LessonLink slug="markov-chain-monte-carlo">Markov chain Monte Carlo</LessonLink> lesson.
+
+In applied work, the most important decisions come before any criterion is computed: which candidate models are scientifically plausible, what the model is for (prediction, explanation, a decision), and how its performance will be judged on data it has never seen. In regulated fields such as medical devices, credit scoring and official statistics, the validation plan is usually written down before the model is built, and the final test data are kept away from the modellers.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The likelihood is the probability that the parameter is correct."** $L(\theta)$ is the probability of the *data* under $\theta$, read as a function of $\theta$. It does not integrate to 1 over $\theta$, and turning it into probabilities about $\theta$ requires a prior distribution, which is Bayesian inference.
+
+</Misconception>
+
+<Misconception>
+
+**"The model with the lowest AIC is the true model."** AIC estimates relative predictive accuracy among the candidates you supplied. All of them may be wrong, and models within about 2 units are practically indistinguishable.
+
+</Misconception>
+
+<Misconception>
+
+**"Cross-validation error measures how the final model will do in deployment."** Only if the folds mimic deployment. Random folds on time-ordered data, or on repeated measurements of the same people, or after selecting features on all the data, give optimistic estimates. And a model chosen as the best of many by cross-validation is itself optimistically evaluated by that same cross-validation.
+
+</Misconception>
+
+<Misconception>
+
+**"Overfitting means the model is too big."** Overfitting means fitting noise, and it depends on the model's flexibility relative to the information in the data. Twenty points cannot support a degree-10 polynomial; twenty thousand could. And a large model with suitable regularisation can generalise well.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

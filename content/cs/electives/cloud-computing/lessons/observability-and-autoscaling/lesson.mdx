@@ -1,0 +1,621 @@
+---
+title: Observability and autoscaling
+subtitle: Seeing inside a running cloud system, and letting it grow and shrink with demand — without waking anyone up for nothing.
+minutes: 85
+objectives:
+  - Distinguish metrics, logs and traces, and explain how OpenTelemetry carries a request's context from service to service
+  - Read a trace to find where a slow request spent its time, and keep metric cardinality under control
+  - Measure SLOs from cloud telemetry and alert on error-budget burn rate rather than raw thresholds
+  - Simulate target-tracking, step and predictive autoscaling against a daily traffic curve, and explain what boot time and headroom cost
+  - Configure autoscaling on the major platforms and on Kubernetes, and know what it cannot do
+  - Run an incident on a cloud platform, from the first page to the postmortem
+prerequisites: [what-is-the-cloud, virtualisation-and-containers, kubernetes]
+related: [math.prob.statistics-intro, math.prob.probability-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: OpenTelemetry documentation
+    url: https://opentelemetry.io/docs/
+    note: The CNCF project's own documentation — concepts, the Collector, language SDKs and semantic conventions.
+  - title: "OpenTelemetry: signals"
+    url: https://opentelemetry.io/docs/concepts/signals/
+  - title: "W3C Recommendation: Trace Context"
+    url: https://www.w3.org/TR/trace-context/
+    note: The standard traceparent and tracestate headers.
+  - title: "Dapper, a Large-Scale Distributed Systems Tracing Infrastructure"
+    author: Benjamin H. Sigelman et al.
+    year: 2010
+    url: https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/
+    note: The Google technical report behind most modern tracing systems.
+  - title: "Prometheus: overview"
+    url: https://prometheus.io/docs/introduction/overview/
+  - title: "Prometheus: instrumentation practices"
+    url: https://prometheus.io/docs/practices/instrumentation/
+    note: Includes the warning about labels with many values.
+  - title: "SRE workbook: Alerting on SLOs"
+    url: https://sre.google/workbook/alerting-on-slos/
+    note: The derivation of multiwindow, multi-burn-rate alerts.
+  - title: "SRE workbook: Implementing SLOs"
+    url: https://sre.google/workbook/implementing-slos/
+  - title: "SRE book: Managing Incidents"
+    url: https://sre.google/sre-book/managing-incidents/
+  - title: "Kubernetes: Horizontal Pod Autoscaling"
+    url: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+  - title: "Kubernetes: Autoscaling workloads"
+    url: https://kubernetes.io/docs/concepts/workloads/autoscaling/
+  - title: KEDA — Kubernetes event-driven autoscaling
+    url: https://keda.sh/
+  - title: "Amazon EC2 Auto Scaling user guide"
+    url: https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html
+  - title: "Amazon EC2 Auto Scaling: predictive scaling"
+    url: https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-predictive-scaling.html
+  - title: "Azure Monitor autoscale overview"
+    url: https://learn.microsoft.com/en-us/azure/azure-monitor/autoscale/autoscale-overview
+  - title: "Azure Monitor: predictive autoscale"
+    url: https://learn.microsoft.com/en-us/azure/azure-monitor/autoscale/autoscale-predictive
+  - title: "Google Cloud: autoscaling groups of instances"
+    url: https://docs.cloud.google.com/compute/docs/autoscaler
+  - title: "Google Cloud: predictive autoscaling"
+    url: https://docs.cloud.google.com/compute/docs/autoscaler/predictive-autoscaling
+  - title: Alibaba Cloud Auto Scaling documentation
+    url: https://www.alibabacloud.com/help/en/auto-scaling/
+---
+
+<Section id="motivation" kind="motivation" title="Running blind, paying for idle">
+
+Picture a food-delivery service that runs in Lagos, Jakarta and Lima. Every evening, between about six and nine, orders arrive five times faster than at lunch and twenty times faster than at four in the morning. Two things can go wrong, and in the first year they usually both do.
+
+The first is that the team cannot *see*. A customer posts that checkout has been "spinning" for ten minutes; every dashboard is green; nobody knows which of the twelve services behind checkout is slow, or whether it is slow for everyone or only for card payments in Peru. The second is that the team pays for capacity it does not use. To survive the dinner peak they run enough machines for the dinner peak all day long, and most of that fleet idles for twenty hours out of twenty-four.
+
+This lesson is about the two practices that fix those problems, and about how they depend on each other. **Observability** is the ability to understand what a running system is doing from what it emits. **Autoscaling** changes how much capacity a system has, automatically, in response to what it measures — so it is only as good as the measurements behind it. Both put Lumenary CS's [reliability engineering](/en/cs/reliability-engineering/) — SLOs, error budgets, alerting on symptoms, blameless incident response — into daily practice on a cloud. We will build a small tracer, simulate autoscaling policies against a day of traffic, and test alerting rules against a month of synthetic incidents.
+
+</Section>
+
+<Section id="signals" kind="definitions" title="Metrics, logs and traces">
+
+<Definition term="Observability">
+
+The degree to which you can explain a system's internal behaviour from its external outputs — including behaviour nobody anticipated — without changing and redeploying it. The word comes from control theory, where a system is observable if its internal state can be reconstructed from its outputs.
+
+</Definition>
+
+Monitoring asks known questions ("is the error rate above 1%?"); observability lets you answer new ones at three in the morning ("is it only Android users in Peru paying by card?"). It rests on three kinds of telemetry, called **signals**.
+
+- **Metrics** are numbers aggregated over time: a **counter** that only goes up (requests served, bytes sent), a **gauge** that goes up and down (queue length, memory in use), and a **histogram** that counts observations in buckets (how many requests took under 50 ms, under 100 ms, …), from which percentiles are estimated. Each series carries **labels** (in OpenTelemetry, *attributes*) such as `service`, `endpoint` and `status`. Metrics are cheap to store and fast to query, so they drive dashboards, alerts and autoscalers.
+- **Logs** are timestamped records of individual events. **Structured** logs — one JSON object per event, with fields rather than prose — can be searched and aggregated like data. They are rich, and they are the most expensive signal at scale: a busy service can write terabytes a day, and most providers bill per gigabyte ingested and per month retained.
+- **Traces** follow one request across every service it touches. A trace is a tree of **spans**; each span records one operation (an HTTP call, a database query) with its start, duration, attributes and the identifier of its parent span. Traces answer the question metrics cannot: *where did this request's time go?*
+
+<Narrator who="margaret">
+
+Labels multiply. A latency histogram with 12 buckets is 14 series per label combination (the buckets plus a sum and a count). Label it by 40 endpoints, 5 status classes and 300 pods and you have 840,000 series. Add a `user_id` label with a million values and it becomes 840 billion, which no metrics system will store. Per-user detail belongs in traces and logs, not in metric labels.
+
+</Narrator>
+
+Tracing works only if every service passes the trace's identity on to the next. This is **context propagation**: when a service makes an outgoing call, it *injects* the trace identifier and its own span identifier into the request — for HTTP, the `traceparent` header standardised by the W3C [Trace Context](https://www.w3.org/TR/trace-context/) recommendation — and the receiving service *extracts* them and makes its span a child of the caller's. The design descends from Google's Dapper system, described in a 2010 report.
+
+**OpenTelemetry** (OTel), a Cloud Native Computing Foundation project formed in 2019 by merging the OpenTracing and OpenCensus projects, is the vendor-neutral standard for producing all three signals: APIs and SDKs for most languages, automatic instrumentation for common frameworks, **semantic conventions** (agreed attribute names such as `http.response.status_code`, so that dashboards work across services), a wire protocol (OTLP) and the **Collector**, a pipeline that receives, filters, samples and forwards telemetry to whichever backends you choose. Instrument once, and the back end can change later without touching application code.
+
+The tracer below is a toy version of what an OpenTelemetry SDK does: each simulated service extracts the `traceparent` it receives, records a span, and injects a new header into its own calls. Then we read the trace.
+
+```python run
+import random
+
+rng = random.Random(2026)
+def new_id(bits):                  # W3C Trace Context: 128-bit trace ids, 64-bit span ids
+    return f"{rng.getrandbits(bits):0{bits // 4}x}"
+
+exported = []                      # what an SDK would send to a tracing backend
+
+class Span:
+    def __init__(self, name, service, traceparent, start_ms):
+        if traceparent:            # extract: continue the caller's trace
+            version, trace_id, parent_id, flags = traceparent.split("-")
+        else:                      # no header: this request starts a new trace
+            trace_id, parent_id = new_id(128), None
+        self.trace_id, self.parent_id, self.span_id = trace_id, parent_id, new_id(64)
+        self.name, self.service, self.start, self.end = name, service, start_ms, None
+        exported.append(self)
+
+    def traceparent(self):         # inject: the header put on every outgoing call
+        return f"00-{self.trace_id}-{self.span_id}-01"
+
+# Five services, each a function (incoming header, arrival time in ms) -> finish time.
+def stock_db(tp, t):
+    s = Span("SELECT stock", "orders-db", tp, t); s.end = t + 18; return s.end
+
+def fraud_check(tp, t):
+    s = Span("POST /score", "fraud", tp, t); s.end = t + 35; return s.end
+
+def card_network(tp, t):
+    s = Span("POST /authorise", "card-network", tp, t); s.end = t + 260; return s.end
+
+def payments(tp, t):
+    s = Span("POST /payments", "payments", tp, t)
+    t = fraud_check(s.traceparent(), t + 2)
+    t = card_network(s.traceparent(), t + 1)
+    s.end = t + 4
+    return s.end
+
+def orders(tp, t):
+    s = Span("POST /orders", "orders", tp, t)
+    t = stock_db(s.traceparent(), t + 1)
+    t = payments(s.traceparent(), t + 3)
+    s.end = t + 6
+    return s.end
+
+def cart(tp, t):
+    s = Span("GET /cart", "cart", tp, t); s.end = t + 31; return s.end
+
+def gateway(t):
+    s = Span("POST /checkout", "gateway", None, t)
+    t = cart(s.traceparent(), t + 2)
+    t = orders(s.traceparent(), t + 2)
+    s.end = t + 3
+    return s
+
+root = gateway(0)
+print("header sent from the gateway to the cart service:")
+print("  traceparent:", root.traceparent(), "\n")
+
+by_id = {s.span_id: s for s in exported}
+def depth(s):
+    return 0 if s.parent_id is None else 1 + depth(by_id[s.parent_id])
+def self_time(s):                  # time not covered by the span's children (calls are sequential here)
+    return (s.end - s.start) - sum(c.end - c.start for c in exported if c.parent_id == s.span_id)
+
+total, width = root.end - root.start, 40
+print(f"trace {root.trace_id[:8]}...  {total} ms in total")
+print(f"{'span':24s} {'service':13s} {'start':>5s} {'ms':>4s} {'self':>4s}  timeline")
+for s in sorted(exported, key=lambda s: s.start):
+    a, b = round(s.start / total * width), max(round(s.end / total * width), round(s.start / total * width) + 1)
+    bar = " " * a + "#" * (b - a) + " " * (width - b)
+    name = "  " * depth(s) + s.name
+    print(f"{name:24s} {s.service:13s} {s.start:5d} {s.end - s.start:4d} {self_time(s):4d}  |{bar}|")
+
+worst = max(exported, key=self_time)
+print(f"\nmost self time: {worst.name} in {worst.service}, "
+      f"{self_time(worst)} of {total} ms ({self_time(worst) / total:.0%})")
+```
+
+The trace answers in one glance what twelve dashboards could not: checkout is slow because the card network's authorisation takes 260 of its 368 ms. **Self time** — a span's duration minus its children's — points at the work done *in* a span rather than merely beneath it. (Here every call is sequential; with parallel calls, the critical path is what matters.) Real systems produce far too many traces to keep them all, so they **sample**: *head* sampling decides at the start of a request (keep 1 in 100), while *tail* sampling, usually done in the Collector, waits until a trace is complete and keeps all the slow and failed ones.
+
+</Section>
+
+<Section id="slos" kind="human" title="SLOs from cloud telemetry">
+
+Lumenary CS's [reliability engineering](/en/cs/reliability-engineering/) lesson defined the tools; here is how they meet the telemetry above. A **service level indicator** is a ratio of good events to valid events, and on a cloud platform the most faithful place to count them is usually the **load balancer** or API gateway, which sees every request including those that never reached a healthy server. An availability SLI counts responses that are not server errors; a latency SLI counts requests faster than a threshold, read from a histogram. An **SLO** sets a target over a window (99.9% over 30 days), and the **error budget** — 0.1% of requests, about 43 minutes of total outage — is what the team may spend on deploys, experiments and bad luck.
+
+<Narrator who="gideon">
+
+A latency SLI read from a histogram is exact only at bucket boundaries. If the SLO says "under 300 ms" and your buckets are 250 ms and 500 ms, every request between them is either all counted good or all counted bad, depending on how the query interpolates. Put a bucket boundary exactly at each SLO threshold.
+
+</Narrator>
+
+Two cloud-specific points matter. Your service depends on the provider's services, and availabilities multiply: three dependencies in series, each at 99.95%, give at best 99.85%. A provider's **SLA** promises a partial refund when a service misses a stated level, not that it will not; surviving a failed zone or managed service is your design's job. And SLOs connect to autoscaling and cost: they say how much headroom you must buy, and headroom has a price.
+
+</Section>
+
+<Section id="control-loop" kind="intuition" title="Autoscaling as a control loop">
+
+**Horizontal** scaling changes the number of instances (virtual machines, containers or functions); **vertical** scaling changes the size of each. Horizontal scaling is the cloud's native move, because stateless servers behind a load balancer are interchangeable; vertical scaling usually needs a restart, and stateful systems such as databases scale in their own, slower ways (read replicas, sharding, storage that grows automatically).
+
+An autoscaler is a **feedback controller**. Every evaluation period it reads a metric, compares it with a goal, and asks the platform for more or fewer instances. The platform launches them — which takes time — and the new capacity eventually changes the metric.
+
+<Figure caption="An autoscaler is a feedback loop with two delays: the metric reaches the policy late, and new instances serve traffic only after they boot.">
+
+<svg viewBox="0 0 680 190" role="img" aria-label="A loop of four boxes. Requests flow into Instances. Instances emit Metrics such as CPU, requests per second and queue length. Metrics reach the Scaling policy after a reporting delay of one to five minutes. The policy sends a launch or stop request back to Instances along the bottom of the diagram, labelled: new instances serve only after booting, typically minutes.">
+  <defs>
+    <marker id="oa-loop-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="2">
+    <rect x="10" y="40" width="120" height="48" rx="6" stroke="var(--sky)" />
+    <rect x="190" y="40" width="130" height="48" rx="6" stroke="var(--gold)" />
+    <rect x="380" y="40" width="130" height="48" rx="6" stroke="var(--gold)" />
+    <rect x="550" y="40" width="120" height="48" rx="6" stroke="var(--compute)" />
+  </g>
+  <g fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">
+    <text x="70" y="69">Requests</text>
+    <text x="255" y="69">Instances</text>
+    <text x="445" y="69">Metrics</text>
+    <text x="610" y="69">Scaling policy</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" fill="none" markerEnd="url(#oa-loop-arrow)">
+    <line x1="130" y1="64" x2="187" y2="64" />
+    <line x1="320" y1="64" x2="377" y2="64" />
+    <line x1="510" y1="64" x2="547" y2="64" />
+    <path d="M610,88 L610,150 L255,150 L255,92" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="158" y="30">load</text>
+    <text x="349" y="30">CPU, req/s,</text>
+    <text x="349" y="18">queue length</text>
+    <text x="529" y="30">late by</text>
+    <text x="529" y="18">1–5 min</text>
+    <text x="432" y="172">launch or stop instances: new ones serve only after booting (minutes)</text>
+  </g>
+</svg>
+
+</Figure>
+
+Three families of policy fill in the box on the right.
+
+- **Target tracking** keeps a metric near a set point, the way a thermostat keeps a room near 21 °C. If 12 instances run at 84% CPU and the target is 60%, the group needs about $12 \times 84 / 60 = 16.8$, so 17 instances. Kubernetes' Horizontal Pod Autoscaler uses exactly this proportional rule, with a tolerance (10% by default) inside which it does nothing.
+- **Step scaling** maps bands of the metric to fixed changes: above 80% add 30%, between 70% and 80% add 10%, below 40% remove 10%, then wait out a **cooldown** before acting again.
+- **Predictive scaling** forecasts demand from history — most services repeat a daily and weekly rhythm — and launches capacity *before* it is needed, by at least the boot time. It is combined with a reactive policy, which still handles whatever the forecast missed. **Scheduled** scaling is its manual cousin: "at 17:30 on match days, at least 40 instances".
+
+<Narrator who="chloe">
+
+The idea that makes autoscaling work is feedback, and the thing that makes it hard is delay. A controller that reacts to a stale metric with slow actuators either reacts too little and lets the system saturate, or keeps adding capacity that is already on its way and overshoots — like adjusting a shower whose hot water takes a minute to arrive. Headroom, warm-up periods, stabilisation windows and forecasts are all ways of living with that delay.
+
+</Narrator>
+
+Scaling in needs more caution than scaling out. Removing capacity too early means scaling out again minutes later (**flapping**), and an instance must first be **drained** — no new requests, in-flight ones allowed to finish. So autoscalers scale out quickly and in slowly; Kubernetes by default waits until its scale-down recommendation has been stable for five minutes.
+
+</Section>
+
+<Section id="simulation" kind="computation" title="Policies against a day of traffic">
+
+The simulation below gives the delivery service a week of history and one more day to scale. Each instance serves 100 requests per second at 100% CPU and takes 8 minutes from launch to serving traffic; the metric reaches the policy a minute late, and CPU cannot read above 100%. Requests beyond capacity fail, and minutes above 85% utilisation count as "hot", because queueing makes latency climb steeply there. At 18:30 marketing sends a push notification that nobody told the operations team about.
+
+```python run
+import math
+import random
+
+rng = random.Random(42)
+DAY = 1440                                     # minutes
+
+def bump(minute, centre_h, width_h, height):
+    d = (minute / 60 - centre_h) / width_h
+    return height * math.exp(-d * d)
+
+def traffic(days, promo_at=None):
+    """Requests per second, minute by minute: a quiet night, a lunch peak, a bigger dinner peak."""
+    out = []
+    for day in range(days):
+        level = 1 + 0.04 * rng.uniform(-1, 1)                    # some days are a little busier
+        for m in range(DAY):
+            rps = 250 + bump(m, 12.5, 1.6, 1900) + bump(m, 19.5, 1.9, 3300)
+            out.append(rps * level * (1 + 0.03 * rng.gauss(0, 1)))
+    if promo_at is not None:                                     # a push notification ops did not expect
+        for k in range(45):
+            out[promo_at + k] *= 1 + 0.8 * min(1, k / 2) * math.exp(-k / 30)
+    return out
+
+history = traffic(7)                                             # the previous seven days
+PROMO = 18 * 60 + 30
+today = traffic(1, promo_at=PROMO)
+
+PER_INSTANCE = 100       # requests per second one instance serves at 100% CPU
+BOOT = 8                 # minutes from launch to serving traffic
+LO, HI = 2, 80           # smallest and largest allowed group
+
+def run(policy):
+    serving, pending, state = 10, [], {}                         # pending: minutes when launches finish
+    billed = failed = total = hot = hot_outside = 0
+    util_seen, sizes = today[0] / (serving * PER_INSTANCE), []
+    for m, rps in enumerate(today):
+        serving += pending.count(m)
+        pending = [t for t in pending if t > m]
+        current = serving + len(pending)
+        desired = max(LO, min(HI, policy(m, util_seen, serving, current, state)))
+        if desired > current:
+            pending += [m + BOOT] * (desired - current)          # new instances must boot first
+        elif desired < current:
+            cancel = min(current - desired, len(pending))        # cancel launches first,
+            pending = pending[:len(pending) - cancel]
+            serving -= min(current - desired - cancel, serving - LO)   # then stop serving ones
+        util = rps / (serving * PER_INSTANCE)
+        failed += max(0.0, rps - serving * PER_INSTANCE) * 60    # requests beyond capacity fail
+        total += rps * 60
+        hot += util > 0.85                                       # latency suffers above about 85%
+        hot_outside += util > 0.85 and not PROMO <= m < PROMO + 45
+        billed += serving + len(pending)                         # booting instances are billed too
+        util_seen = min(util, 1.0)                               # CPU reads at most 100%, a minute late
+        sizes.append(serving)
+    return billed / 60, failed / total, hot, hot_outside, sizes
+
+def fixed(n):
+    return lambda m, u, serving, current, st: n
+
+def target_tracking(target, window=10):
+    def policy(m, u, serving, current, st):
+        want = math.ceil(serving * u / target)                   # what the measured load needs
+        recent = st.setdefault("recent", [])
+        recent.append(want)
+        del recent[:-window]
+        return want if want >= current else max(recent)          # scale in only after 10 calm minutes
+    return policy
+
+def step_scaling(m, u, serving, current, st):
+    if m < st.get("cooldown_until", 0):
+        return current
+    if u > 0.80:   change = max(2, math.ceil(0.3 * current))
+    elif u > 0.70: change = max(1, math.ceil(0.1 * current))
+    elif u < 0.40: change = -max(1, math.floor(0.1 * current))
+    else:          return current
+    st["cooldown_until"] = m + 3
+    return current + change
+
+forecast = [sum(history[d * DAY + m] for d in range(7)) / 7 for m in range(DAY)]
+def predictive(target):
+    reactive = target_tracking(target)
+    def policy(m, u, serving, current, st):
+        ahead = forecast[min(m + BOOT, DAY - 1)]                 # plan for when launches will be ready
+        return max(math.ceil(ahead / (PER_INSTANCE * target)), reactive(m, u, serving, current, st))
+    return policy
+
+policies = {
+    "fixed for last week's peak": fixed(math.ceil(max(history) / (PER_INSTANCE * 0.6))),
+    "fixed for the average":      fixed(math.ceil(sum(history) / len(history) / PER_INSTANCE)),
+    "step scaling":               step_scaling,
+    "target tracking, 60% CPU":   target_tracking(0.60),
+    "target tracking, 80% CPU":   target_tracking(0.80),
+    "predictive + target, 80%":   predictive(0.80),
+}
+PRICE = 0.10   # USD per instance-hour: a made-up round number, for comparison only
+print(f"today's peak {max(today):,.0f} req/s (promotion at 18:30); last week's peak {max(history):,.0f}\n")
+print(f"{'policy':27s} {'inst-h':>6s} {'USD':>6s} {'failed':>7s} {'min>85%':>8s} {'not promo':>9s}")
+sizes = {}
+for name, policy in policies.items():
+    hours, fail, hot, outside, sizes[name] = run(policy)
+    print(f"{name:27s} {hours:6.0f} {hours * PRICE:6.2f} {fail:7.2%} {hot:8d} {outside:9d}")
+
+print("\nthe promotion: requests per second and instances serving")
+print("time   req/s  target 60%  predictive 80%")
+for m in range(PROMO - 4, PROMO + 16, 2):
+    print(f"{m // 60}:{m % 60:02d}  {today[m]:6.0f}  {sizes['target tracking, 60% CPU'][m]:10d}"
+          f"  {sizes['predictive + target, 80%'][m]:14d}")
+```
+
+<Figure caption="The simulated day under target tracking at 60% CPU: demand (gold) and the full capacity of the instances serving (blue). Capacity follows the lunch and dinner peaks with a margin, but the 18:30 promotion arrives faster than new instances can boot.">
+
+<svg viewBox="0 0 680 240" role="img" aria-label="A line chart over 24 hours, requests per second from 0 to 8,000. Demand is near 250 overnight, rises to about 2,200 at lunch, falls back, then climbs to a peak; at 18:30 it jumps suddenly to about 4,900. The capacity line stays above demand all day by a margin, except just after the 18:30 jump, when demand exceeds capacity for several minutes until capacity rises steeply to 8,000 and then declines with demand.">
+  <g stroke="currentColor" strokeWidth="1" fill="none">
+    <line x1="60" y1="200" x2="660" y2="200" />
+    <line x1="60" y1="20" x2="60" y2="200" />
+  </g>
+  <g stroke="currentColor" strokeWidth="0.5" strokeDasharray="2 4" opacity="0.5">
+    <line x1="60" y1="155" x2="660" y2="155" />
+    <line x1="60" y1="110" x2="660" y2="110" />
+    <line x1="60" y1="65" x2="660" y2="65" />
+    <line x1="60" y1="20" x2="660" y2="20" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="end">
+    <text x="54" y="204">0</text>
+    <text x="54" y="159">2,000</text>
+    <text x="54" y="114">4,000</text>
+    <text x="54" y="69">6,000</text>
+    <text x="54" y="24">8,000</text>
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="60" y="218">00:00</text>
+    <text x="210" y="218">06:00</text>
+    <text x="360" y="218">12:00</text>
+    <text x="510" y="218">18:00</text>
+    <text x="660" y="218">24:00</text>
+    <text x="360" y="236">time of day (requests per second on the vertical axis)</text>
+  </g>
+  <polyline fill="none" stroke="var(--sky)" strokeWidth="2" points="60,189 64,189 68,189 72,189 77,189 81,189 85,189 89,189 93,189 98,189 102,189 106,189 110,189 114,189 118,189 122,189 127,189 131,189 135,189 139,189 143,189 148,189 152,189 156,189 160,189 164,189 168,189 172,189 177,189 181,189 185,189 189,189 193,189 198,189 202,189 206,189 210,189 214,189 218,189 222,189 227,189 231,189 235,189 239,189 243,189 248,189 252,189 256,189 260,189 264,189 268,189 272,189 277,189 281,189 285,189 289,189 293,189 298,189 302,184 306,184 310,184 314,184 318,180 322,178 327,175 331,168 335,164 339,160 343,153 348,146 352,139 356,135 360,124 364,121 368,124 372,119 377,114 381,117 385,121 389,124 393,130 398,137 402,142 406,148 410,153 414,160 418,166 422,168 427,175 431,178 435,182 439,182 443,184 448,186 452,184 456,186 460,186 464,182 468,180 472,180 477,178 481,173 485,171 489,166 493,160 498,157 502,148 506,139 510,130 514,121 518,112 520,108 520,108 521,106 521,101 522,101 522,101 522,101 523,101 523,99 524,99 524,96 525,96 525,96 525,96 526,90 526,90 527,56 527,31 528,27 528,27 528,27 529,27 529,20 530,20 530,20 530,20 531,20 531,20 532,20 532,22 532,22 533,27 533,27 534,27 534,29 535,29 535,34 539,34 543,40 548,65 552,60 556,67 560,70 564,72 568,83 572,88 577,92 581,108 585,117 589,124 593,132 598,139 602,150 606,155 610,162 614,168 618,173 622,178 627,180 631,182 635,184 639,184 643,186 648,186 652,189 656,189 660,189" />
+  <polyline fill="none" stroke="var(--gold)" strokeWidth="2" points="60,194 66,194 72,195 79,195 85,194 91,195 98,195 104,194 110,194 116,194 122,195 129,194 135,195 141,195 148,194 154,195 160,195 166,194 172,195 179,194 185,195 191,194 198,194 204,194 210,195 216,194 222,194 229,195 235,195 241,195 248,194 254,194 260,195 266,194 272,194 279,194 285,194 291,194 298,193 304,192 310,191 316,189 322,185 329,182 335,178 341,172 348,166 354,162 360,160 366,152 372,153 379,155 385,157 391,161 398,166 404,173 410,178 416,182 422,186 429,189 435,191 441,191 448,192 454,192 460,192 466,190 472,189 479,186 485,181 491,177 498,171 504,165 510,153 516,146 520,141 521,141 522,139 522,141 523,90 524,94 525,99 526,100 527,99 528,93 528,94 529,101 529,102 530,106 531,105 532,101 532,102 533,105 534,106 535,102 541,122 548,117 554,125 560,124 566,134 572,136 579,146 585,155 591,162 598,171 604,176 610,182 616,185 622,188 629,190 635,192 641,193 648,194 654,194 660,194" />
+  <g fontSize="12">
+    <line x1="80" y1="34" x2="104" y2="34" stroke="var(--gold)" strokeWidth="2" />
+    <text x="110" y="38" fill="currentColor">demand</text>
+    <line x1="80" y1="52" x2="104" y2="52" stroke="var(--sky)" strokeWidth="2" />
+    <text x="110" y="56" fill="currentColor">capacity of instances serving</text>
+  </g>
+</svg>
+
+</Figure>
+
+A fleet sized for last week's peak never fails but costs USD 158 a day at this made-up price; one sized for the average costs USD 24 and fails 41% of requests. Every autoscaling policy costs between USD 32 and 46, much nearer the second than the first, with nearly the first's reliability: target tracking at 60% cuts the bill by 73%. None survives the promotion untouched: demand nearly doubles within two minutes, and nothing launched after 18:30 can serve before 18:38.
+
+The last two rows show what forecasting buys. Raising the target to 80% saves another quarter of the cost, but with only 20% headroom the group cannot keep up with the ordinary evening ramp, and 83 minutes run hot outside the promotion. Adding the forecast floor at the same 80% target removes all of those hot minutes, so predictive scaling plus target tracking costs 22% less than target tracking at 60% with the same behaviour on an ordinary day. What it cannot do is predict the push notification; with less headroom, it fails more requests during the surprise than the 60% policy does. Headroom is insurance against what you did not predict, forecasts pay for what you can, and the cheapest fix for the promotion is not technical at all: tell the operations team, and schedule capacity for 18:25.
+
+<Narrator who="gideon">
+
+The policies above trust a metric that stops telling the truth exactly when it matters: CPU cannot read above 100%, so a saturated group reports "100%" whether demand is 10% or 100% above capacity, and target tracking under-reacts. That is one reason to scale web tiers on requests per instance or on queue depth, which keep growing under overload. Target tracking also assumes that load spreads evenly and that capacity grows linearly with instances; a shared database behind the fleet breaks both.
+
+</Narrator>
+
+</Section>
+
+<Section id="platforms" kind="human" title="Autoscaling on real platforms">
+
+Every major platform offers the same ideas under different names, and each documents them in full. The table is a map, as of 2026, not a ranking.
+
+| Platform | Unit that scales | Policy types offered |
+| --- | --- | --- |
+| Amazon Web Services: [EC2 Auto Scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html) | Auto Scaling groups of VMs | target tracking, step and simple scaling, scheduled actions, [predictive scaling](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-predictive-scaling.html) |
+| Microsoft Azure: [autoscale](https://learn.microsoft.com/en-us/azure/azure-monitor/autoscale/autoscale-overview) | Virtual Machine Scale Sets, App Service and others | metric threshold rules, schedules and profiles, [predictive autoscale](https://learn.microsoft.com/en-us/azure/azure-monitor/autoscale/autoscale-predictive) (CPU, scale-out only) |
+| Google Cloud: [autoscaler](https://docs.cloud.google.com/compute/docs/autoscaler) | managed instance groups | target utilisation (CPU, load-balancer capacity, monitoring metrics), schedules, [predictive autoscaling](https://docs.cloud.google.com/compute/docs/autoscaler/predictive-autoscaling) |
+| Alibaba Cloud: [Auto Scaling](https://www.alibabacloud.com/help/en/auto-scaling/) | scaling groups of ECS instances or elastic container instances | simple, step, target tracking and predictive scaling rules, scheduled and event-triggered tasks |
+| Kubernetes (open source, on any provider) | pods, and the nodes under them | [Horizontal Pod Autoscaler](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) (proportional), Vertical Pod Autoscaler, node autoscalers such as Cluster Autoscaler and Karpenter, [KEDA](https://keda.sh/) for event-driven scaling |
+
+On Kubernetes, which the <LessonLink slug="kubernetes">Kubernetes</LessonLink> lesson introduced, a target-tracking policy is a short manifest. This one (not run here) keeps the `checkout` Deployment near 60% CPU, adds up to 100% more pods per minute, and removes at most 10% per minute, only after the recommendation has been lower for ten minutes:
+
+```yaml
+# Not run here: a Kubernetes manifest (autoscaling/v2), applied with kubectl apply -f.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  minReplicas: 4
+  maxReplicas: 80
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60     # percent of each pod's CPU request
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+```
+
+Pods can only be scheduled onto nodes that exist, so a pod autoscaler on its own simply creates pending pods when the cluster is full; a **node autoscaler** adds machines underneath, and its boot delay adds to the pods' own. Functions and other serverless platforms, the subject of <LessonLink slug="serverless-and-event-driven">Serverless and event-driven design</LessonLink>, scale per request and down to zero, trading the boot delay for a **cold start** on the first request after a quiet spell.
+
+Experience adds a few rules that no policy type removes:
+
+- **Shorten the loop.** Smaller images, pre-baked machine images and **warm pools** of stopped, pre-initialised instances cut the boot delay that every policy fights.
+- **Set the maximum deliberately.** It is a cost guardrail and protects whatever sits behind the fleet: a hundred new web servers can open enough connections to topple a database. Provider **quotas** per region also cap you, and raising them takes a request in advance.
+- **Scale on what predicts trouble**: requests per instance for web tiers, backlog per worker for queue consumers, never on a metric the fleet's own size does not change.
+- **Test scaling**: load tests that ramp as fast as real traffic, and drills for when a zone or instance type has no capacity left.
+
+</Section>
+
+<Section id="alerting" kind="computation" title="Designing alerts that deserve to wake someone">
+
+An alert that pages a person should be urgent, actionable and about something users feel; everything else becomes a ticket for working hours or a line on a dashboard. Error budgets make "something users feel" measurable: a page should mean that the budget is burning fast enough to matter. The **burn rate** is the observed error ratio divided by the ratio the SLO allows, so a burn rate of 1 spends the budget exactly over the window. The SRE workbook derives a scheme that pages when the burn rate exceeds 14.4 over the last hour (2% of a 30-day budget in one hour) or 6 over the last six hours, and opens a ticket when it exceeds 1 over three days. Each long window is paired with a short one (five and thirty minutes), so the alert also *stops* soon after the problem does.
+
+The program below runs three alerting rules over a synthetic month with four incidents and a dozen ordinary one- or two-minute hiccups, and counts how often each would notify someone.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(5)
+DAYS, M = 30, 1440
+minute = np.arange(DAYS * M)
+hour = (minute % M) / 60
+requests = (2_000 + 18_000 * np.exp(-((hour - 14) / 4.5) ** 2)).round()   # per minute: quiet nights
+bad_ratio = np.full(minute.size, 0.0002)                                  # 0.02% background errors
+
+incidents = [   # (name, day, start hour, minutes, error ratio)
+    ("3-minute blip at night",   3,  2.2,    3, 0.04),
+    ("bad deploy",               9, 14.0,  240, 0.02),
+    ("major outage",            17, 19.5,   25, 0.30),
+    ("slow leak over two days", 23,  0.0, 2880, 0.0025),
+]
+hiccups = np.zeros(minute.size, bool)
+for start in rng.choice(DAYS * M - 5, size=12, replace=False):   # everyday hiccups: a pod restarts,
+    length = rng.integers(1, 3)                                    # a cache is cold for a minute
+    bad_ratio[start:start + length] = rng.uniform(0.015, 0.06)
+    hiccups[start:start + length] = True
+spans = []
+for name, day, h, length, ratio in incidents:
+    start = day * M + int(h * 60)
+    bad_ratio[start:start + length] = ratio
+    spans.append((name, start, start + length))
+errors = rng.binomial(requests.astype(int), bad_ratio)
+
+SLO = 0.999
+def burn(window):
+    """Burn rate over the trailing `window` minutes, ending at each minute."""
+    e, r = np.cumsum(errors), np.cumsum(requests)
+    e_w = e - np.concatenate([np.zeros(window), e[:-window]])
+    r_w = r - np.concatenate([np.zeros(window), r[:-window]])
+    return (e_w / r_w) / (1 - SLO)
+
+def notifications(firing, quiet=60):
+    """Minutes at which someone is notified: firing, after `quiet` minutes without firing."""
+    out, last = [], -10**9
+    for t in np.flatnonzero(firing):
+        if t - last > quiet:
+            out.append(int(t))
+        last = t
+    return out
+
+H = 60
+alerts = {
+    "page: 1-min errors > 1%":  {"page": burn(1) > 10},
+    "page: 5-min errors > SLO": {"page": burn(5) > 1},
+    "multiwindow burn rate":    {"page": ((burn(H) > 14.4) & (burn(5) > 14.4)) |
+                                         ((burn(6 * H) > 6) & (burn(30) > 6)),
+                                 "ticket": (burn(3 * 24 * H) > 1) & (burn(6 * H) > 1)},
+}
+
+budget = (1 - SLO) * requests.sum()
+print(f"30-day error budget: {budget:,.0f} failed requests\n")
+for name, a, b in spans:
+    print(f"{name:25s} used {errors[a:b].sum() / budget:6.1%} of the budget")
+
+print(f"{'12 hiccups of 1-2 minutes':25s} used {errors[hiccups].sum() / budget:6.1%} of the budget, together")
+for rule, kinds in alerts.items():
+    sent = {kind: notifications(firing) for kind, firing in kinds.items()}
+    print(f"\n{rule}: {len(sent['page'])} pages, {len(sent.get('ticket', []))} tickets")
+    for name, a, b in spans:
+        hits = sorted((t, kind) for kind in sent for t in sent[kind] if a <= t < b + 60)
+        if hits:
+            t, kind = hits[0]
+            print(f"   {name:25s} {kind:6s} after {t - a:4d} min, {errors[a:t + 1].sum() / budget:5.1%} of budget spent")
+        else:
+            print(f"   {name:25s} not noticed")
+```
+
+The two threshold rules notice almost everything within the first minute — including twelve hiccups and a three-minute blip at night that together cost under 2% of the budget, and that were over before anyone could have opened a laptop. Thirteen or fourteen pages a month, most of them needing no action, is how a rotation learns to ignore its pager. The 1% rule also never notices the slow leak that quietly spends a sixth of the budget over two days, while the SLO-threshold rule pages for it at one minute past midnight, waking someone for a problem that could have waited for the morning.
+
+The burn-rate rules page twice: for the major outage after 3 minutes, and for the bad deploy after 43 minutes, by which time it has spent about 5% of the budget. They stay silent for the blip and the hiccups, and the slow leak becomes a ticket after about 29 hours, having spent under 9% of the month's budget. That is the trade the scheme makes deliberately — slower detection of moderate problems in exchange for pages that are almost always worth answering — and the thresholds can be tuned when the trade is wrong for a service. Two more habits help: every alert links to a **runbook** that says what to check first, and alerts are **grouped**, so that one broken dependency produces one page rather than forty.
+
+</Section>
+
+<Section id="incidents" kind="human" title="Incident response on a cloud platform">
+
+The structure of incident response — an incident commander who coordinates rather than debugs, an operations lead who makes changes, a communications lead, one shared record, mitigation before diagnosis, a blameless postmortem — is in the [reliability engineering](/en/cs/reliability-engineering/) lesson and the SRE book's chapter on [managing incidents](https://sre.google/sre-book/managing-incidents/). Here is how the simulated promotion might have run, with the telemetry above doing its work.
+
+<Example title="The promotion, as an incident">
+
+**18:30** The push notification goes out. **18:31** Error ratio jumps; load-balancer metrics show the web tier rejecting requests; CPU across the fleet reads 100%. **18:33** The fast burn-rate alert pages the on-call engineer, Thandiwe, with a link to the checkout runbook. **18:35** She declares an incident and takes the commander role; Rafael joins as operations lead. The trace view shows requests failing at the gateway, not deep inside payments, which rules out the card network. **18:36** Mitigation: Rafael raises the group's minimum size so that capacity no longer depends on the policy catching up, and turns on load shedding for the recommendations widget to protect checkout. **18:38–18:44** New instances come into service; errors fall back inside the SLO. **18:50** The communications lead posts an all-clear on the status page. **Next week** The postmortem's action items: a calendar of promotions shared with the operations team, scheduled scaling ten minutes before each, a warm pool to halve the boot delay, and scaling on requests per instance instead of CPU.
+
+</Example>
+
+Cloud incidents add one early question: **is it us or them?** Each provider publishes a public status page and a personalised health dashboard for the resources in your account — the [AWS Health Dashboard](https://health.aws.amazon.com/health/status), [Azure status](https://azure.status.microsoft/) and Azure Service Health, the [Google Cloud Service Health](https://status.cloud.google.com/) dashboard, and [Alibaba Cloud's status page](https://status.alibabacloud.com/). Public pages often lag the start of a problem, so your own telemetry, broken down by region and zone, is usually the first and best evidence. If a provider's zone or region is failing, the mitigations are the ones your architecture prepared — shift traffic, fail over the database, degrade gracefully — and a failover never practised should not be expected to work. The telemetry pipeline must also survive the incident it is meant to explain: if your dashboards run in the same region as the system that is down, you may be blind exactly when you need to see.
+
+</Section>
+
+<Section id="professional" kind="reading" title="The professional view">
+
+As of 2026, most organisations instrument with OpenTelemetry and choose where to send the data separately. Open-source back ends include [Prometheus](https://prometheus.io/docs/introduction/overview/) for metrics, [Jaeger](https://www.jaegertracing.io/) for traces, the [Grafana](https://grafana.com/docs/) projects (Grafana for dashboards, Loki for logs, Tempo for traces, Mimir for metrics) and [OpenSearch](https://opensearch.org/) for logs and search. Each large provider runs a managed observability suite that also accepts OpenTelemetry data: [Amazon CloudWatch](https://docs.aws.amazon.com/cloudwatch/) with AWS X-Ray, [Azure Monitor](https://learn.microsoft.com/en-us/azure/azure-monitor/) with Application Insights, [Google Cloud Observability](https://docs.cloud.google.com/stackdriver/docs) (Cloud Monitoring, Logging and Trace), and on Alibaba Cloud [CloudMonitor](https://www.alibabacloud.com/help/en/cms/), [Simple Log Service](https://www.alibabacloud.com/help/en/sls/), [Application Real-Time Monitoring Service](https://www.alibabacloud.com/help/en/arms/) and [Managed Service for OpenTelemetry](https://www.alibabacloud.com/help/en/opentelemetry/). Commercial observability vendors compete in the same space. Self-hosting gives control and can cost less at scale, at the price of running another critical system; managed suites remove that work and bill by volume ingested, stored and queried.
+
+Telemetry can grow to a noticeable fraction of the cost of the system it observes, so teams sample traces, drop debug logs at the Collector, and keep high-resolution metrics for days and downsampled ones for months. Active areas in 2026 include **profiles** as a fourth signal (continuous, low-overhead sampling of where CPU time and memory go), kernel-level instrumentation with eBPF, and machine-learning help with incident triage — useful for correlating signals, but no substitute for a well-defined SLO. The cost side returns in <LessonLink slug="cost-and-finops">Cost and FinOps</LessonLink>.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Observability means having lots of dashboards."** Dashboards answer the questions someone thought of in advance. Observability is the ability to ask new ones — which needs high-quality traces and structured events with the right attributes, not more graphs.
+
+</Misconception>
+
+<Misconception>
+
+**"With autoscaling we no longer need capacity planning."** Autoscaling moves capacity planning from "how many machines?" to "how fast can we add them, up to what maximum, within which quotas, and what breaks behind the fleet when we do?" Boot time, quotas and dependencies are still planned.
+
+</Misconception>
+
+<Misconception>
+
+**"Autoscaling protects against sudden spikes."** It protects against spikes slower than its loop. A spike that arrives in two minutes, against an eight-minute boot, is absorbed by headroom, load shedding or scheduled capacity — or not at all.
+
+</Misconception>
+
+<Misconception>
+
+**"Log everything; storage is cheap."** Ingestion, indexing and retention are billed per gigabyte and add up quickly, and logs full of noise are slower to search during an incident. Logs should also never contain secrets or more personal data than needed, as <LessonLink slug="cloud-security-and-identity">Cloud security and identity</LessonLink> discusses.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

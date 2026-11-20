@@ -1,0 +1,452 @@
+---
+title: Lakehouses and open table formats
+subtitle: How a folder of Parquet files in object storage becomes a table with transactions, snapshots, time travel and safe schema changes — and the housekeeping that keeps it fast.
+minutes: 85
+objectives:
+  - Explain why a plain data lake of files in object storage lacks atomic commits, consistent reads and reliable schemas
+  - Describe how Apache Iceberg, Delta Lake and Apache Hudi add a metadata layer of snapshots, manifests and logs
+  - Implement a toy table format with manifests, column statistics and atomic snapshot commits by compare-and-swap, including conflict detection
+  - Use time travel, and explain why schema evolution matches columns by field id rather than by name
+  - Plan compaction and snapshot expiry, and explain copy-on-write against merge-on-read
+  - Describe the role of catalogs and compare the main options fairly
+prerequisites: [data-models-and-file-formats, analytical-databases, distributed-processing]
+related: [math.found.sets, math.discrete.graph-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: Apache Iceberg table specification
+    url: https://iceberg.apache.org/spec/
+    note: Metadata files, snapshots, manifest lists, manifests, field ids, partition transforms and delete files.
+  - title: Delta Lake transaction log protocol
+    url: https://github.com/delta-io/delta/blob/master/PROTOCOL.md
+  - title: Apache Hudi documentation
+    url: https://hudi.apache.org/docs/overview
+  - title: "Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores"
+    author: Michael Armbrust et al.
+    year: 2020
+    url: https://www.vldb.org/pvldb/vol13/p3411-armbrust.pdf
+  - title: "Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics"
+    author: Michael Armbrust, Ali Ghodsi, Reynold Xin and Matei Zaharia
+    year: 2021
+    url: https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf
+    note: The CIDR paper that named and argued for the lakehouse architecture.
+  - title: Apache Polaris (incubating)
+    url: https://polaris.apache.org/
+    note: An open-source implementation of the Iceberg REST catalog.
+  - title: Unity Catalog (open source)
+    url: https://www.unitycatalog.io/
+  - title: Project Nessie
+    url: https://projectnessie.org/
+    note: A catalog with Git-like branches and commits across tables.
+  - title: Apache XTable (incubating)
+    url: https://xtable.apache.org/
+    note: Translates table metadata between Iceberg, Delta Lake and Hudi.
+---
+
+<Section id="motivation" kind="motivation" title="A folder is not a table">
+
+A national statistics office in Latin America keeps ten years of anonymised household-survey extracts and administrative records as Parquet files in object storage: one folder per dataset, one subfolder per month. Storage is cheap, every engine can read Parquet, and analysts query it with Spark, Trino and DuckDB. It is a **data lake**, and for a while it works.
+
+Then the problems arrive, one after another. A nightly job that rewrites a month's folder fails halfway, and for six hours readers see a mixture of old and new files. Two jobs write to the same folder at once and one overwrites the other's output. A query planner must *list* hundreds of thousands of objects before reading any, and listing is slow and billed per request. A column renamed in 2023 silently reads as empty in the older files. A correction to forty rows means rewriting whole files by hand. And when a data subject's records must be erased, nobody can say which files contain them.
+
+Databases solved these problems decades ago, with transactions, a catalogue and a log. An **open table format** brings those ideas to files in object storage, so that many engines can share one copy of the data as real tables. The architecture built on them — open files, open table metadata, any engine — is called a **lakehouse**. This lesson builds a small table format to see how it works, then looks at the three main formats, their housekeeping, and the catalogs that tie them together.
+
+</Section>
+
+<Section id="object-storage" kind="intuition" title="What object storage does and does not give you">
+
+Object stores — Amazon S3, Google Cloud Storage, Azure Blob Storage, Alibaba Cloud OSS, and S3-compatible systems such as Ceph and MinIO that can run on premises — store immutable objects under keys, replicate them durably, and scale almost without limit at a low price per gigabyte-month. Lumenary CS's [storage at scale](/en/cs/storage-at-scale/) lesson explains how. For tables they have three gaps.
+
+1. **No multi-object transactions.** A job writes objects one at a time. There is no way to make twenty new files appear together, or to replace a folder's contents atomically; S3, for example, offers no atomic rename of a whole directory.
+2. **Listing is slow and costly.** "Folders" are only key prefixes; finding a table's files means paging through listings, a thousand keys per request. A table of a million small files takes a thousand requests just to plan a query.
+3. **The files carry no table-level truth.** Which files belong to the table now? Which schema is current? What did the table look like yesterday? A folder cannot say.
+
+What object stores *do* offer, as of 2026, is strong read-after-write consistency on the major clouds (S3 since December 2020) and **conditional writes**: create an object only if none exists at that key, or replace it only if it is unchanged since you read it (S3 added both in 2024; Google Cloud Storage and Azure have long supported preconditions). A single atomic conditional write is enough to build transactions on, as the next section shows.
+
+</Section>
+
+<Section id="table-formats" kind="definitions" title="Snapshots, manifests and atomic commits">
+
+<Definition term="Table format">
+
+An **open table format** is a specification for storing, alongside a table's immutable data files, **metadata** that defines exactly which files make up the table at each point in time. A **snapshot** is the complete set of data files at one version. A writer adds new files, then creates a new snapshot that references them and atomically makes it the **current** one; readers always read one snapshot, so they see either all of a change or none of it.
+
+</Definition>
+
+The three formats in wide use differ in how they record snapshots.
+
+- **Apache Iceberg**, created at Netflix in 2017 and an Apache top-level project since 2020, uses a tree. A **catalog** stores a pointer to the table's current **metadata file** (schema, partitioning, the list of snapshots). Each snapshot points to a **manifest list**, which points to **manifests**, which list data files with per-column statistics (row counts, null counts, minimum and maximum values). A commit writes new manifests and a new metadata file, then swaps the catalog's pointer from the old metadata file to the new one with an atomic compare-and-swap.
+- **Delta Lake**, created at Databricks and open-sourced in 2019, now a Linux Foundation project, uses a log: a `_delta_log/` folder of numbered JSON commit files (`…000.json`, `…001.json`, …), each listing files added and removed, with periodic Parquet **checkpoints** that summarise the log so far. A commit succeeds if its writer is the one to create the next number — a put-if-absent, which on S3 used to need an external coordination service (a DynamoDB-based log store) until conditional writes arrived.
+- **Apache Hudi**, created at Uber in 2016 for fast upserts, keeps a **timeline** of actions on the table and offers two table types, **copy-on-write** and **merge-on-read**, with indexes that locate the file holding a given record key.
+
+<Figure caption="An Iceberg table with two snapshots. The catalog points to the current metadata file, v3. Each snapshot's manifest list names its manifests, and manifests name data files with their column statistics. Snapshots share unchanged manifests and files: manifest m1 belongs to both. File d3 is referenced only by snapshot 2, so it can be deleted physically only when snapshot 2 is expired.">
+
+<svg viewBox="0 0 680 290" role="img" aria-label="Five rows. Top: a box catalog, orders points to v3. Second row: metadata files v2 and v3, with a dashed arrow from v3 back to v2 labelled previous. Third row: manifest lists for snapshot 2 and snapshot 3. Fourth row: manifests m2, m1 and m3; snapshot 2's list points to m2 and m1, snapshot 3's list points to m1 and m3. Bottom row: data files; m2 points to d3, m1 to d1 and d2, m3 to d4 and d5. The current path from the catalog through v3 is highlighted.">
+  <defs>
+    <marker id="lh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+    <marker id="lh-arrow-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--gold)" />
+    </marker>
+  </defs>
+  <g fill="currentColor" fontSize="11" fontWeight="600">
+    <text x="8" y="31">catalog</text>
+    <text x="8" y="90">metadata files</text>
+    <text x="8" y="150">manifest lists</text>
+    <text x="8" y="210">manifests</text>
+    <text x="8" y="267">data files</text>
+  </g>
+  <g fill="none" strokeWidth="1.6">
+    <rect x="330" y="12" width="180" height="30" rx="5" stroke="var(--gold)" />
+    <rect x="200" y="72" width="120" height="28" rx="4" stroke="currentColor" strokeDasharray="4 3" />
+    <rect x="500" y="72" width="120" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="200" y="132" width="120" height="28" rx="4" stroke="currentColor" strokeDasharray="4 3" />
+    <rect x="500" y="132" width="120" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="180" y="192" width="80" height="28" rx="4" stroke="currentColor" strokeDasharray="4 3" />
+    <rect x="360" y="192" width="80" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="560" y="192" width="80" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="190" y="250" width="60" height="26" rx="3" stroke="currentColor" strokeDasharray="4 3" />
+    <rect x="340" y="250" width="60" height="26" rx="3" stroke="var(--sky)" />
+    <rect x="410" y="250" width="60" height="26" rx="3" stroke="var(--sky)" />
+    <rect x="540" y="250" width="55" height="26" rx="3" stroke="var(--sky)" />
+    <rect x="605" y="250" width="55" height="26" rx="3" stroke="var(--sky)" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="420" y="31">catalog: orders → v3</text>
+    <text x="260" y="90">v2.metadata.json</text>
+    <text x="560" y="90">v3.metadata.json</text>
+    <text x="410" y="80">previous</text>
+    <text x="260" y="150">snapshot 2 list</text>
+    <text x="560" y="150">snapshot 3 list</text>
+    <text x="220" y="210">m2</text>
+    <text x="400" y="210">m1</text>
+    <text x="600" y="210">m3</text>
+    <text x="220" y="267">d3</text>
+    <text x="370" y="267">d1</text>
+    <text x="440" y="267">d2</text>
+    <text x="567" y="267">d4</text>
+    <text x="632" y="267">d5</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.1" markerEnd="url(#lh-arrow)">
+    <line x1="500" y1="86" x2="322" y2="86" strokeDasharray="4 3" />
+    <line x1="260" y1="100" x2="260" y2="130" />
+    <line x1="235" y1="160" x2="222" y2="190" />
+    <line x1="300" y1="160" x2="372" y2="190" />
+    <line x1="220" y1="220" x2="220" y2="248" />
+  </g>
+  <g stroke="var(--gold)" strokeWidth="1.6" markerEnd="url(#lh-arrow-gold)">
+    <line x1="440" y1="42" x2="540" y2="70" />
+    <line x1="560" y1="100" x2="560" y2="130" />
+    <line x1="525" y1="160" x2="430" y2="190" />
+    <line x1="585" y1="160" x2="598" y2="190" />
+    <line x1="385" y1="220" x2="372" y2="248" />
+    <line x1="420" y1="220" x2="438" y2="248" />
+    <line x1="585" y1="220" x2="570" y2="248" />
+    <line x1="620" y1="220" x2="630" y2="248" />
+  </g>
+</svg>
+
+</Figure>
+
+<Narrator who="chloe">
+
+The trick that gives files transactions is to never change anything that already exists. Data files, manifests and metadata files are all immutable; a commit only *adds* new objects and then moves one pointer. Since moving one pointer is a single atomic operation, the whole commit is atomic, and since nothing old is altered, every past snapshot remains readable — time travel comes free.
+
+</Narrator>
+
+</Section>
+
+<Section id="toy-format" kind="computation" title="A table format in one page">
+
+The block implements a toy format in the Iceberg style, with Parquet data files written by pyarrow and JSON metadata in a temporary folder that stands in for a bucket. Every change goes through two steps. `prepare` writes the new data files and a manifest listing them with their minimum and maximum `day`, remembering which snapshot it started from. `publish` builds a new snapshot — rewriting any manifests that list files the change removes — writes a new metadata file, and asks the catalog to swap the table's pointer from the metadata file it started from to the new one. If another writer got there first, the swap fails and `publish` retries on top of the newer snapshot — unless a file the change meant to replace no longer exists, which is a genuine conflict.
+
+The script then plays out a week: an ingestion job appends two small files per day; two writers append concurrently; a compaction job plans to merge everything into one file per day; meanwhile a deletion removes one store's orders for 12 March; and finally compaction runs again.
+
+```python run
+import json
+import os
+import random
+import tempfile
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+root = tempfile.mkdtemp()                     # stands in for an object-storage bucket
+os.makedirs(os.path.join(root, "data"))
+os.makedirs(os.path.join(root, "metadata"))
+names = iter(range(1, 1_000_000))
+
+def put_json(obj, kind):
+    name = f"metadata/{kind}-{next(names)}.json"
+    with open(os.path.join(root, name), "w") as f:
+        json.dump(obj, f)
+    return name
+
+def get_json(name):
+    with open(os.path.join(root, name)) as f:
+        return json.load(f)
+
+class Catalog:
+    """Maps each table to its current metadata file. Its only write is an atomic compare-and-swap."""
+    def __init__(self):
+        self.pointer = {}
+    def swap(self, table, expected, new):
+        if self.pointer.get(table) != expected:
+            return False                       # someone else committed first
+        self.pointer[table] = new
+        return True
+
+catalog = Catalog()
+
+def snapshots(meta_name=None):
+    return get_json(meta_name or catalog.pointer["orders"])["snapshots"] if catalog.pointer else []
+
+def live_files(snap):
+    return [e for m in snap["manifests"] for e in get_json(m)]
+
+def write_file(table):
+    """Write an immutable Parquet data file; return its manifest entry with column statistics."""
+    name = f"data/part-{next(names)}.parquet"
+    pq.write_table(table, os.path.join(root, name))
+    return {"file": name, "rows": table.num_rows,
+            "min_day": pc.min(table["day"]).as_py(), "max_day": pc.max(table["day"]).as_py()}
+
+def prepare(op, new_tables=(), removed=()):
+    """Write new data files and their manifest, remembering which snapshot the change was based on."""
+    added = [write_file(t) for t in new_tables]
+    return {"op": op, "base": catalog.pointer.get("orders"), "removed": set(removed),
+            "manifest": put_json(added, "manifest") if added else None}
+
+def publish(change):
+    base = change["base"]
+    while True:
+        snaps = snapshots(base) if base else []
+        current = snaps[-1] if snaps else {"id": 0, "manifests": []}
+        if not change["removed"] <= {e["file"] for e in live_files(current)}:
+            return f"{change['op']}: conflict, a file it replaces is gone; abort and re-plan"
+        manifests = []
+        for m in current["manifests"]:          # rewrite manifests that list a removed file
+            entries = get_json(m)
+            kept = [e for e in entries if e["file"] not in change["removed"]]
+            manifests += [m] if len(kept) == len(entries) else ([put_json(kept, "manifest")] if kept else [])
+        manifests += [change["manifest"]] if change["manifest"] else []
+        snap = {"id": current["id"] + 1, "parent": current["id"], "op": change["op"], "manifests": manifests}
+        meta = put_json({"schema": ["day", "store", "amount"], "snapshots": snaps + [snap]}, "v")
+        if catalog.swap("orders", base, meta):
+            return f"{change['op']}: committed snapshot {snap['id']}"
+        print(f"  {change['op']}: swap failed, retrying on top of the newer snapshot")
+        base = catalog.pointer["orders"]
+
+def scan(day=None, snapshot=None):
+    """Read a snapshot (default: the latest), skipping files whose statistics rule out `day`."""
+    snap = snapshots()[-1] if snapshot is None else snapshots()[snapshot - 1]
+    files = [e for e in live_files(snap) if day is None or e["min_day"] <= day <= e["max_day"]]
+    t = pa.concat_tables([pq.read_table(os.path.join(root, e["file"])) for e in files])
+    if day is not None:
+        t = t.filter(pc.equal(t["day"], day))
+    return t, len(files), len(live_files(snap))
+
+rng = random.Random(6)
+def orders(day, n=50):
+    return pa.table({"day": [day] * n, "store": [rng.choice(["NBO-1", "KLA-1", "DAR-1"]) for _ in range(n)],
+                     "amount": [rng.randint(5, 500) for _ in range(n)]})
+
+for d in range(10, 16):                         # an ingestion job appends two small files a day
+    for _ in range(2):
+        publish(prepare("append", [orders(f"2026-03-{d}")]))
+t, read, total = scan(day="2026-03-14")
+print(f"14 March: {t.num_rows} orders, revenue {pc.sum(t['amount']).as_py()}; read {read} of {total} files")
+
+a, b = prepare("append", [orders("2026-03-16")]), prepare("append", [orders("2026-03-16")])
+print(publish(a)); print(publish(b))           # two writers, same base snapshot: b must rebase
+
+plan = [e["file"] for e in live_files(snapshots()[-1])]
+compact = prepare("compact", [scan(day=f"2026-03-{d}")[0] for d in range(10, 17)], removed=plan)
+old12 = [e["file"] for e in live_files(snapshots()[-1]) if e["min_day"] == "2026-03-12"]
+day12 = scan(day="2026-03-12")[0]
+kept = day12.filter(pc.not_equal(day12["store"], "KLA-1"))      # copy-on-write: rewrite without them
+print(publish(prepare("delete", [kept], removed=old12)))  # delete one store's orders on 12 March
+print(publish(compact))                                   # planned before the delete: must not win
+plan = [e["file"] for e in live_files(snapshots()[-1])]
+print(publish(prepare("compact", [scan(day=f"2026-03-{d}")[0] for d in range(10, 17)], removed=plan)))
+
+print("\nsnapshot  op       live files  rows")
+for s in snapshots()[-5:]:
+    print(f"{s['id']:8d}  {s['op']:8s} {len(live_files(s)):10d}  {sum(e['rows'] for e in live_files(s)):4d}")
+print("latest snapshot:", snapshots()[-1])
+then, now = scan(day="2026-03-12", snapshot=14)[0], scan(day="2026-03-12")[0]
+print(f"\n12 March, KLA-1 orders: {pc.sum(pc.equal(then['store'], 'KLA-1')).as_py()} as of snapshot 14 "
+      f"(time travel), {pc.sum(pc.equal(now['store'], 'KLA-1')).as_py()} now")
+print("Parquet files on disk:", len(os.listdir(os.path.join(root, "data"))),
+      "| live in the latest snapshot:", len(live_files(snapshots()[-1])))
+```
+
+Every behaviour of a real table format appears here in miniature.
+
+- **Pruning by statistics.** The query for 14 March read 2 of 12 files, using only the manifests' `min_day` and `max_day` — no listing of the bucket, no opening of the other ten files.
+- **Optimistic concurrency.** Both concurrent appends started from snapshot 12. The first committed snapshot 13; the second's swap failed, it rebuilt its snapshot on top of 13, and committed 14. Appends never truly conflict, so the retry always succeeds.
+- **Conflict detection.** The compaction was planned against snapshot 14, but the deletion committed first and replaced the two files for 12 March. When compaction tried to publish, two of the files it meant to replace were no longer live, so it aborted instead of resurrecting deleted orders. Re-planned on snapshot 15, it committed snapshot 16: the same 674 rows in 7 files instead of 13.
+- **Time travel.** Snapshot 14 still shows the 26 orders of store `KLA-1` on 12 March; the current snapshot shows none.
+- **Garbage.** There are 29 Parquet files on disk and 7 in the current snapshot. Old snapshots still reference most of the others, and the aborted compaction left seven **orphan files** that no snapshot references at all.
+
+That last line matters beyond storage bills. The "deleted" orders are still in a file on disk, reachable through snapshot 14, until old snapshots are expired and unreferenced files removed.
+
+<Narrator who="gideon">
+
+The toy's catalog is a Python dictionary, and its compare-and-swap is atomic only because one process runs everything. The whole correctness argument rests on that one operation being atomic across machines. In a real deployment it is a database transaction in the catalog service, or a conditional write to object storage; with a catalog that cannot guarantee it — some early setups used plain file renames on stores that lacked atomic rename — two writers can both "win" and one commit silently vanishes.
+
+</Narrator>
+
+</Section>
+
+<Section id="evolution" kind="computation" title="Time travel and schema evolution">
+
+Because snapshots are immutable, engines expose them directly. In Spark SQL with Iceberg or Delta Lake, for example (not run here):
+
+```sql
+-- Not run here: Spark SQL on Iceberg or Delta tables.
+SELECT region, SUM(amount) FROM lake.sales.orders VERSION AS OF 14 GROUP BY region;   -- a Delta version or an Iceberg snapshot id
+SELECT region, SUM(amount) FROM lake.sales.orders TIMESTAMP AS OF '2026-03-14 06:00:00' GROUP BY region;
+```
+
+Time travel reproduces a report exactly as it was, audits what changed, and undoes a bad write by rolling the pointer back to an earlier snapshot. Cloud warehouses offer the same idea for their own tables (Snowflake's `AT` clause, BigQuery's `FOR SYSTEM_TIME AS OF`), usually for a limited retention period.
+
+Schemas change too: columns are added, renamed, widened, dropped. A folder of Parquet files has no record of these changes, and engines that match columns **by name** go wrong in two ways. Iceberg gives every column a permanent **field id** when it is created, stores the id in each data file's schema, and records in the table's metadata the current name of each id. A rename changes only the metadata; a dropped id is never reused. The block writes an old file and a new one, after a rename, a drop and the addition of a new column that reuses an old *name*, and reads both into the current schema by name and by id.
+
+```python run
+import os
+import tempfile
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+def field(name, typ, fid):
+    """A column that carries a permanent field id in the Parquet file, as Iceberg writes them."""
+    return pa.field(name, typ, metadata={b"PARQUET:field_id": str(fid).encode()})
+
+folder = tempfile.mkdtemp()
+# Schema v1, used for last year's files: 1 day, 2 store (an old numeric store code), 3 amount.
+v1 = pa.schema([field("day", pa.string(), 1), field("store", pa.int32(), 2), field("amount", pa.int64(), 3)])
+pq.write_table(pa.table({"day": ["2025-11-02", "2025-11-02"], "store": [17, 42], "amount": [1250, 830]},
+                        schema=v1), os.path.join(folder, "old.parquet"))
+
+# Schema v2: rename 3 to amount_minor, drop 2, add 4 channel, and add a NEW column 5 named "store".
+current = [("day", 1, pa.string()), ("amount_minor", 3, pa.int64()), ("channel", 4, pa.string()),
+           ("store", 5, pa.string())]
+v2 = pa.schema([field(n, t, i) for n, i, t in current])
+pq.write_table(pa.table({"day": ["2026-03-14"], "amount_minor": [990], "channel": ["app"], "store": ["NBO-1"]},
+                        schema=v2), os.path.join(folder, "new.parquet"))
+
+def read(file, by):
+    """Project a data file onto the current schema, matching columns by name or by field id."""
+    t = pq.read_table(os.path.join(folder, file))
+    ids = {int(f.metadata[b"PARQUET:field_id"]): f.name for f in t.schema}
+    cols = {}
+    for name, fid, typ in current:
+        source = name if by == "name" else ids.get(fid)
+        if source in t.column_names:
+            cols[name] = t[source].cast(typ, safe=False) if by == "name" else t[source]
+        else:
+            cols[name] = pa.nulls(t.num_rows, typ)           # column did not exist when file was written
+    return pa.table(cols).to_pylist()
+
+for by in ("name", "id"):
+    print(f"matching by {by}:")
+    for file in ("old.parquet", "new.parquet"):
+        for row in read(file, by):
+            print("   ", row)
+```
+
+Matching by name loses last year's amounts, because the file calls them `amount` and the table now calls them `amount_minor`. Worse, it fills the new text column `store` with the dropped numeric store codes 17 and 42 — a column that was deliberately removed, resurrected under a new meaning, with no error. Matching by id reads the old amounts correctly and leaves the new columns empty for old files, as they should be. Delta Lake achieves the same with its column-mapping mode, which also records stable physical names or ids.
+
+Iceberg applies the same separation to **partitioning**. A table is partitioned by a *transform* of a column — `days(ordered_at)`, `bucket(16, customer_id)` — recorded in metadata, so queries filter on the column itself and the engine prunes partitions without users knowing the layout (**hidden partitioning**). When data grows, the partition spec can change for new data while old files keep their old layout (**partition evolution**), with no rewrite.
+
+</Section>
+
+<Section id="housekeeping" kind="examples" title="Compaction, deletes and expiry">
+
+A table format makes writes safe; it does not make them tidy. Three kinds of housekeeping keep a lakehouse fast and its storage honest.
+
+**Compaction.** Streaming and frequent small batches write many small files. Each costs a request to open and some planning time, and small files compress and prune poorly.
+
+<Narrator who="margaret">
+
+A 1 TB table written by a stream job as 4 MB files has 250,000 files; a query that must touch all of them makes 250,000 requests before reading a byte, and at around 20 ms each, done 100 at a time, that alone is about 50 seconds. Compacted into 512 MB files it has about 2,000, and the same overhead falls to well under a second. That is why table formats ship compaction procedures, and why streaming writers are usually followed by a scheduled compaction job.
+
+</Narrator>
+
+**Row-level deletes and updates** come in two styles. **Copy-on-write** rewrites every data file that contains an affected row, as the toy's deletion did: reads stay simple and fast, but deleting one row from a 512 MB file rewrites 512 MB. **Merge-on-read** writes a small **delete file** (or a deletion vector, a bitmap of deleted row positions) beside the data file, and readers merge the two; writes are cheap, reads pay a little more, and compaction eventually folds the deletes in. Iceberg, Delta Lake and Hudi all support both styles; the choice depends on whether a table is written or read more often.
+
+**Expiry and orphan cleanup.** Every snapshot pins its files. Expiring snapshots older than a retention period, and deleting files that no remaining snapshot references (including orphans from failed writes), is what finally removes data physically — and what limits how far back time travel can reach. Each format has its own commands (not run here):
+
+```sql
+-- Not run here: Spark SQL procedures for Iceberg ...
+CALL lake.system.rewrite_data_files(table => 'sales.orders');                    -- compaction
+CALL lake.system.expire_snapshots(table => 'sales.orders', older_than => TIMESTAMP '2026-03-01 00:00:00');
+CALL lake.system.remove_orphan_files(table => 'sales.orders');
+-- ... and the equivalents for Delta Lake
+OPTIMIZE sales.orders;
+VACUUM sales.orders RETAIN 168 HOURS;
+```
+
+<Example title="An erasure request, end to end">
+
+A data subject exercises their right to erasure, and their rows sit in an Iceberg table with 30 days of snapshot retention. Running `DELETE FROM … WHERE subject_id = …` commits a new snapshot without the rows, but the rows remain in older files referenced by up to 30 days of snapshots. The deletion is complete only when (1) the delete has committed, (2) snapshots older than the deletion have been expired, (3) unreferenced files have been removed, and (4) the same has happened to every copy elsewhere: replicas, extracts, backups, training datasets. A team that promises erasure within a deadline must set snapshot retention, and schedule expiry, so that the four steps fit inside it. <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink> returns to retention and deletion.
+
+</Example>
+
+</Section>
+
+<Section id="catalogs" kind="human" title="Catalogs and the lakehouse, fairly">
+
+The catalog is the one stateful service in a lakehouse: it holds each table's current pointer, performs the atomic commits, and increasingly enforces who may read and write what. For years the Hive Metastore, from the Hadoop era, filled this role; most new deployments use one of these instead, as of 2026.
+
+- **The Iceberg REST catalog specification**, an open HTTP protocol that any engine can speak to any catalog service. Implementations include **Apache Polaris** (incubating, begun at Snowflake), **Apache Gravitino**, **Lakekeeper**, and the managed catalogs of the clouds and vendors: AWS Glue Data Catalog and S3 Tables, Google's BigLake metastore, Snowflake, Databricks, Dremio and others.
+- **Unity Catalog**, from Databricks, open-sourced in 2024 and donated to the Linux Foundation, which governs Delta and Iceberg tables as well as files and models.
+- **Project Nessie**, which adds Git-like branches and commits across many tables, so a whole pipeline's changes can be written on a branch, audited, and merged atomically — the write-audit-publish pattern of <LessonLink slug="pipelines-and-orchestration">Pipelines and orchestration</LessonLink> at the scale of a catalog. Iceberg also supports branches and tags on a single table.
+- **DuckLake**, from the DuckDB team (2025), takes a different path: it keeps all table metadata in an ordinary SQL database rather than in metadata files, trading the file-only design for simpler, faster commits.
+
+On top of these, most engines read and write the formats: Spark, Flink, Trino, Presto, DuckDB, Dremio, StarRocks, Doris, ClickHouse, and the warehouses Snowflake, BigQuery, Redshift, Databricks SQL and Microsoft Fabric, with support that varies by format, version and feature. Interoperability between the formats is improving — Delta Lake's UniForm writes Iceberg metadata alongside its own, and Apache XTable translates metadata between all three — and Iceberg has become the most widely supported common target. Its version 3 specification (2025) adds, among other things, deletion vectors, a variant type for semi-structured data, and row lineage.
+
+<Note>
+
+"Open" has layers. The file format (Parquet) and the table format (Iceberg, Delta, Hudi) are open specifications with open-source implementations. A catalog may be open source, or a managed service with an open protocol, or proprietary. Before adopting a lakehouse, check which layer would be hard to leave: data in open formats behind a proprietary catalog is portable only if you can export the metadata too.
+
+</Note>
+
+The honest trade-offs: a lakehouse keeps one copy of the data in your own storage, readable by many engines, usually at lower storage cost than a warehouse's managed storage. In return you take on what a warehouse does for you — compaction, expiry, statistics, catalog operations, access control across engines — either yourself or through a vendor's managed services, which have their own costs. Small teams with modest data are often better served by a warehouse, or by DuckDB on Parquet, than by assembling a lakehouse. The architecture pays off when several engines and teams need the same large data, or when owning the storage matters.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A table format is a file format."** Iceberg, Delta Lake and Hudi store their data *in* Parquet (or ORC or Avro) files. What they add is metadata — snapshots, manifests, logs — that turns a set of files into a table.
+
+</Misconception>
+
+<Misconception>
+
+**"`DELETE` removes the data."** In a table format it creates a new snapshot without the rows. The bytes remain in files referenced by older snapshots until those snapshots are expired and unreferenced files are removed.
+
+</Misconception>
+
+<Misconception>
+
+**"ACID on object storage means the lakehouse behaves like an OLTP database."** The commits are atomic and isolated, but each costs object writes and a catalog round trip — tens to hundreds of milliseconds — and concurrent writers to the same files conflict and retry. Table formats suit batch and micro-batch writes, not thousands of small transactions per second.
+
+</Misconception>
+
+<Misconception>
+
+**"Partition by every column people filter on."** Over-partitioning produces tiny files, as in <LessonLink slug="analytical-databases">Analytical databases</LessonLink>. Partition coarsely (often by day), and let file-level statistics, sorting and compaction do the fine pruning.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
