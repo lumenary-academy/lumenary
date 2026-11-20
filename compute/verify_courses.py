@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the code in Lumenary CS and Lumenary Lingua lessons and write the course code report.
+"""Run the code in the course lessons (Lumenary CS, EE, Robotics) and write the course code report.
 
 For every lesson of every course (content/<course>/lessons/<slug>: Lumenary CS, its programming
-languages and electives, Lumenary EE, Lumenary Robotics and Lumenary Lingua; see docs/courses.md):
+languages and electives, Lumenary EE and Lumenary Robotics; see docs/courses.md):
 
 * every fenced ```python run block in lesson.mdx runs in a fresh interpreter
   (``python -I -X utf8``), the way the browser runs it: top-level ``await`` is
@@ -21,7 +21,7 @@ snippet and exercise in it passed. Exits non-zero if anything failed.
 
 Usage:  compute/.venv/bin/python compute/verify_courses.py [--only cs/complexity] [--timeout 60]
 (or ``npm run verify:courses``). ``--only`` takes a lesson ("cs/complexity"), a
-course ("cs", "lingua/spanish") or several, and updates just those rows.
+course ("cs", "cs/languages/rust") or several, and updates just those rows.
 """
 
 import argparse
@@ -179,22 +179,22 @@ def run_check(lang, code, timeout):
 
 
 def lesson_dirs():
-    """(key, path) for every lesson in a syllabus, key like "cs/complexity" or "lingua/spanish/sounds-and-greetings"."""
+    """(key, path) for every lesson in a syllabus, key like "cs/complexity" or "cs/languages/rust/control-flow-and-patterns"."""
     for course, key, path in course_lessons():
         yield key, path
 
 
 # Directories under content/ that are not courses, and the families of courses nested in a subject
 # (mirrors courseDirs() in src/lib/courses.ts).
-NOT_COURSES = {"math", "pages", "registry", "verification", "lingua"}
+NOT_COURSES = {"math", "pages", "registry", "verification"}
 COLLECTIONS = ("cs/languages", "cs/electives")
 
 
 def course_dirs():
-    """Every course directory under content/: subjects ("cs", "ee", "robotics"), the courses nested in
-    a subject ("cs/languages/rust", "cs/electives/<id>") and Lumenary Lingua's ("lingua/spanish")."""
+    """Every course directory under content/: subjects ("cs", "ee", "robotics") and the courses nested
+    in a subject ("cs/languages/rust", "cs/electives/<id>")."""
     courses = [d.name for d in sorted(CONTENT.iterdir()) if d.name not in NOT_COURSES and (d / "course.json").exists()]
-    for family in (*COLLECTIONS, "lingua"):
+    for family in COLLECTIONS:
         base = CONTENT / family
         if base.exists():
             courses += [f"{family}/{d.name}" for d in sorted(base.iterdir()) if (d / "course.json").exists()]
@@ -282,7 +282,7 @@ SKIPS = set()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--only", nargs="*", default=None, help="lessons or courses to check, e.g. cs/complexity or lingua/spanish")
+    parser.add_argument("--only", nargs="*", default=None, help="lessons or courses to check, e.g. cs/complexity or cs/languages/rust")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("--no-write", action="store_true", help="check only; leave the report as it is")
@@ -306,7 +306,7 @@ def main():
         sys.stderr.write(proc.stderr)
         return proc.returncode
 
-    # --only takes whole courses ("cs", "cs/languages/rust", "lingua/spanish") or single lessons ("cs/complexity").
+    # --only takes whole courses ("cs", "cs/languages/rust") or single lessons ("cs/complexity").
     selected = [
         (key, path) for course, key, path in course_lessons()
         if not args.only or any(o.rstrip("/") in (course, key) for o in args.only)

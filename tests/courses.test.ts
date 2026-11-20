@@ -1,6 +1,6 @@
 /**
- * The courses (Lumenary CS with its languages and electives, Lumenary EE, Lumenary Robotics, Lumenary
- * Lingua): every course's syllabus, lessons and exercises are well formed,
+ * The courses (Lumenary CS with its languages and electives, Lumenary EE, Lumenary Robotics): every
+ * course's syllabus, lessons and exercises are well formed,
  * every lesson compiles, uses only the components courses support, and links only to lessons and
  * topics that exist; and the generated code report is current and all green (docs/courses.md).
  */
@@ -19,16 +19,16 @@ import generatedLocales from "@/lib/generated/content-locales.json";
 import { dirs, exists, fm, json } from "./helpers";
 
 /** The MDX components a course lesson may use (src/components/course/CoursePages.tsx). */
-const COMPONENTS = new Set(["Section", "Definition", "Theorem", "Proof", "Example", "Misconception", "Note", "Analogy", "Figure", "Reflection", "Exercises", "TopicLink", "LessonLink", "Say", "Viewpoint", "Narrator"]);
+const COMPONENTS = new Set(["Section", "Definition", "Theorem", "Proof", "Example", "Misconception", "Note", "Analogy", "Figure", "Reflection", "Exercises", "TopicLink", "LessonLink", "Viewpoint", "Narrator"]);
 /** Plain HTML/SVG elements are allowed too (figures are inline SVG). */
-const MIN_EXERCISES = { scientia: 4, lingua: 6 } as const;
+const MIN_EXERCISES = 4;
 
-/** Every course directory, as src/lib/courses.ts finds them: subjects, the courses nested in a subject, and Lingua's. */
-const NOT_COURSES = new Set(["math", "pages", "registry", "verification", "lingua"]);
+/** Every course directory, as src/lib/courses.ts finds them: subjects and the courses nested in a subject. */
+const NOT_COURSES = new Set(["math", "pages", "registry", "verification"]);
 const COLLECTIONS = ["cs/languages", "cs/electives"];
 const courseDirs = [
   ...dirs("content").filter((d) => !NOT_COURSES.has(d) && exists(`content/${d}/course.json`)).sort(),
-  ...[...COLLECTIONS, "lingua"].flatMap((family) => (exists(`content/${family}`) ? dirs(`content/${family}`).filter((d) => exists(`content/${family}/${d}/course.json`)).sort().map((d) => `${family}/${d}`) : [])),
+  ...COLLECTIONS.flatMap((family) => (exists(`content/${family}`) ? dirs(`content/${family}`).filter((d) => exists(`content/${family}/${d}/course.json`)).sort().map((d) => `${family}/${d}`) : [])),
 ];
 const topics = new Set(GraphFile.parse(json("content/math/graph/graph.json")).topics.map((t) => t.id));
 /** The Scientia subjects with courses ("cs", "ee", …): Markdown links into them are checked. */
@@ -38,7 +38,7 @@ const coursePages = new Set<string>(["/en/cs/languages/", "/en/cs/electives/"]);
 for (const dir of courseDirs) {
   try {
     const c = CourseFile.parse(json(`content/${dir}/course.json`));
-    const base = `/${c.locale}/${c.division === "lingua" ? `lingua/${c.id}` : dir}/`;
+    const base = `/${c.locale}/${dir}/`;
     coursePages.add(base);
     for (const slug of c.levels.flatMap((l) => l.lessons)) coursePages.add(`${base}${slug}/`);
   } catch {
@@ -61,8 +61,8 @@ function checkBlocks(body: string): string[] {
   return [...body.matchAll(/^```([\w#+-]+)[ \t]+check[ \t]*\n([\s\S]*?)^```\s*$/gm)].map((m) => m[1]!);
 }
 
-it("there are Lumenary CS, EE, Robotics and Chemistry, the blockchain elective and at least the two first Lingua courses", () => {
-  expect(courseDirs).toEqual(expect.arrayContaining(["cs", "ee", "robotics", "chemistry", "cs/electives/blockchains-verifiable-computation", "lingua/spanish", "lingua/ingles"]));
+it("there are Lumenary CS, EE, Robotics and Chemistry and the blockchain elective", () => {
+  expect(courseDirs).toEqual(expect.arrayContaining(["cs", "ee", "robotics", "chemistry", "cs/electives/blockchains-verifiable-computation"]));
 });
 
 it("the index of course locales is current (node scripts/gen-content-locales.mjs)", () => {
@@ -79,8 +79,7 @@ describe.each(courseDirs)("course %s", (dir) => {
     expect(new Set(slugs).size).toBe(slugs.length);
     expect(new Set(course.levels.map((l) => l.id)).size).toBe(course.levels.length);
     expect(dirs(`content/${dir}/lessons`).sort()).toEqual([...slugs].sort());
-    if (course.division === "lingua") expect(dir).toBe(`lingua/${course.id}`);
-    else if (dir.startsWith("cs/languages/")) {
+    if (dir.startsWith("cs/languages/")) {
       expect(dir).toBe(`cs/languages/${course.id}`);
       expect(course.group, "a language course names its family").toBeTruthy();
     } else if (dir.startsWith("cs/electives/")) expect(dir).toBe(`cs/electives/${course.id}`);
@@ -116,12 +115,11 @@ describe.each(courseDirs)("course %s", (dir) => {
     it("has enough well-formed exercises", () => {
       const file = ExercisesFile.parse(json(`${base}/exercises.json`));
       expect(file.lesson).toBe(slug);
-      expect(exercises.length).toBeGreaterThanOrEqual(MIN_EXERCISES[course.division]);
+      expect(exercises.length).toBeGreaterThanOrEqual(MIN_EXERCISES);
       expect(new Set(exercises.map((e) => e.id)).size).toBe(exercises.length);
       for (const ex of exercises) {
         if (ex.type === "python") expect(ex.reference, `${ex.id} needs a reference solution`).toBeTruthy();
         if (ex.type === "choice") expect(ex.options.filter((o) => o.correct).length, ex.id).toBeGreaterThanOrEqual(1);
-        if (ex.type === "text" && course.division === "lingua") expect(ex.lang, `${ex.id} needs lang`).toBeTruthy();
       }
     });
 
@@ -145,12 +143,10 @@ describe.each(courseDirs)("course %s", (dir) => {
         const target = m[1]!.endsWith("/") ? m[1]! : `${m[1]}/`;
         expect(coursePages.has(target), `link to ${m[1]}`).toBe(true);
       }
-      for (const m of text.matchAll(/<Say\b([^>]*)>/g)) expect(m[1], "<Say> needs lang").toMatch(/lang="[a-z]{2}(-[A-Z]{2})?"/);
       // The cat guides: every cat who speaks is listed in the frontmatter, and every listed cat speaks.
       const speakers = new Set([...text.matchAll(/<Narrator\s+who="([^"]*)"/g)].map((m) => m[1]!));
       for (const who of speakers) expect(["chloe", "margaret", "gideon"], `<Narrator who="${who}">`).toContain(who);
       expect([...speakers].sort(), "frontmatter narrators lists exactly the cats who speak").toEqual([...new Set(front.narrators)].sort());
-      if (course.division === "lingua") expect(speakers.size, "Lingua lessons have no cat guides").toBe(0);
     });
 
     it("compiles as MDX with valid maths", async () => {
@@ -178,9 +174,9 @@ describe.each(courseDirs)("course %s", (dir) => {
 it("course pages are linked to their teaching locale", async () => {
   const { href } = await import("@/lib/href");
   expect(href("es", "cs/complexity")).toBe("/en/cs/complexity/");
-  expect(href("ar", "lingua/ingles")).toBe("/es/lingua/ingles/");
-  expect(href("es", "lingua/spanish/sounds-and-greetings")).toBe("/en/lingua/spanish/sounds-and-greetings/");
-  expect(href("hi", "lingua")).toBe("/hi/lingua/");
+  expect(href("ar", "cs/languages/rust/")).toBe("/en/cs/languages/rust/");
+  expect(href("hi", "ee#levels")).toBe("/en/ee/#levels");
+  expect(href("es", "divisions")).toBe("/es/divisions/");
 });
 
 it("links into a Scientia subject that is not published yet are plain text until it is", async () => {
@@ -203,8 +199,7 @@ it("every subject's cat guides have a role and a question in every set, and cour
     for (const key of ["chloeRole", "chloeQ", "margaretRole", "margaretQ", "gideonRole", "gideonQ"]) expect(en.narrators.sets[set]?.[key], `narrators.sets.${set}.${key}`).toBeTruthy();
   for (const c of getCourses()) {
     const set = guideSet(c);
-    if (c.course.division === "lingua") expect(set, c.dir).toBeUndefined();
-    else expect(GUIDE_SETS, c.dir).toContain(set);
+    expect(GUIDE_SETS, c.dir).toContain(set);
     if (c.collection === "cs/languages" && !c.course.guides) expect(set, c.dir).toBe("programming");
   }
 });

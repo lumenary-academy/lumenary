@@ -8,12 +8,12 @@ import { ROOT } from "./content";
 
 /**
  * Courses outside Lumenary Math: Lumenary Scientia's other subjects (content/cs, content/ee,
- * content/robotics), the courses nested in a subject (Lumenary CS's programming languages,
- * content/cs/languages/<id>, and electives, content/cs/electives/<id>), and Lumenary Lingua's
- * courses (content/lingua/<id>). A course is a syllabus (course.json: levels, each an ordered list
- * of lesson slugs) and one directory per lesson (lesson.mdx, exercises.json). Pages are generated
- * only in the locale the course is taught in (see src/lib/href.ts). docs/courses.md is the
- * authoring guide.
+ * content/robotics) and the courses nested in a subject (Lumenary CS's programming languages,
+ * content/cs/languages/<id>, and electives, content/cs/electives/<id>). A course is a syllabus
+ * (course.json: levels, each an ordered list of lesson slugs) and one directory per lesson
+ * (lesson.mdx, exercises.json). Pages are generated only in the locale the course is taught in
+ * (see src/lib/href.ts). docs/courses.md is the authoring guide. Lumenary Lingua's language
+ * courses live in their own repository and site (lingua.lumenary.academy).
  */
 
 const CONTENT = path.join(ROOT, "content");
@@ -27,14 +27,14 @@ export const COLLECTIONS = {
 } as const;
 export type Collection = keyof typeof COLLECTIONS;
 
-/** Directories under content/ that are not courses (Lingua's courses are one level down). */
-const NOT_COURSES = new Set(["math", "pages", "registry", "verification", "lingua"]);
+/** Directories under content/ that are not courses. */
+const NOT_COURSES = new Set(["math", "pages", "registry", "verification"]);
 
 export interface LoadedCourse {
   course: CourseFile;
-  /** Directory under content/, e.g. "cs", "ee", "cs/languages/rust" or "lingua/spanish". */
+  /** Directory under content/, e.g. "cs", "ee" or "cs/languages/rust". */
   dir: string;
-  /** Site path of the course page, without locale: "cs" or "lingua/spanish". */
+  /** Site path of the course page, without locale: the same as `dir` ("cs", "cs/languages/rust"). */
   path: string;
   /** The family the course is nested in ("cs/languages", "cs/electives"), if any. */
   collection?: Collection;
@@ -55,13 +55,13 @@ function cached<T>(key: string, load: () => T): T {
   return memo.get(key) as T;
 }
 
-/** content/ directories that hold a course.json: subjects (cs, ee, robotics), cs/languages/<id>, cs/electives/<id>, lingua/<id>. */
+/** content/ directories that hold a course.json: subjects (cs, ee, robotics), cs/languages/<id>, cs/electives/<id>. */
 export function courseDirs(): string[] {
   const out = fs
     .readdirSync(CONTENT)
     .sort()
     .filter((d) => !NOT_COURSES.has(d) && exists(path.join(CONTENT, d, "course.json")));
-  for (const family of [...Object.keys(COLLECTIONS), "lingua"]) {
+  for (const family of Object.keys(COLLECTIONS)) {
     const base = path.join(CONTENT, family);
     if (!exists(base)) continue;
     for (const d of fs.readdirSync(base).sort()) if (exists(path.join(base, d, "course.json"))) out.push(`${family}/${d}`);
@@ -75,7 +75,7 @@ export function getCourses(): LoadedCourse[] {
   return cached("courses", () =>
     courseDirs().map((dir) => {
       const course = CourseFile.parse(JSON.parse(read(path.join(CONTENT, dir, "course.json"))));
-      return { course, dir, path: course.division === "lingua" ? `lingua/${course.id}` : dir, collection: collectionOf(dir), slugs: course.levels.flatMap((l) => l.lessons) };
+      return { course, dir, path: dir, collection: collectionOf(dir), slugs: course.levels.flatMap((l) => l.lessons) };
     }),
   );
 }
@@ -83,7 +83,7 @@ export function getCourses(): LoadedCourse[] {
 /**
  * The cat guides' roles in a course: the course's own `guides`, else the programming-language set for
  * cs/languages, else its subject's set (cs and its electives, ee, robotics, chemistry…). Undefined for
- * Lingua, which has no cat guides.
+ * a subject with no guide set of its own (its guides keep Lumenary Math's roles).
  */
 export function guideSet(c: LoadedCourse): GuideSet | undefined {
   if (c.course.guides) return c.course.guides;
@@ -92,7 +92,7 @@ export function guideSet(c: LoadedCourse): GuideSet | undefined {
   return (GUIDE_SETS as readonly string[]).includes(subject) ? (subject as GuideSet) : undefined;
 }
 
-/** A subject (cs, ee, robotics) or a Lingua course, by id; never a course nested in a collection. */
+/** A subject (cs, ee, robotics), by id; never a course nested in a collection. */
 export function getCourse(id: string, division?: CourseFile["division"]): LoadedCourse | undefined {
   return getCourses().find((c) => c.course.id === id && (!division || c.course.division === division) && !c.collection);
 }
@@ -129,7 +129,7 @@ export function getCourseExercises(c: LoadedCourse, slug: string): Exercise[] {
   return exists(p) ? ExercisesFile.parse(JSON.parse(read(p))).exercises : [];
 }
 
-/** The locale a course's pages are generated in, by course path ("cs", "ee", "cs/languages/rust", "lingua/spanish"). */
+/** The locale a course's pages are generated in, by course path ("cs", "ee", "cs/languages/rust"). */
 export function courseLocales(): Record<string, Locale> {
   return Object.fromEntries(getCourses().map((c) => [c.path, c.course.locale]));
 }

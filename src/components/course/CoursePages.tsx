@@ -18,7 +18,6 @@ import { VerificationBadge } from "@/components/ui/Badges";
 import { NarratorAvatar } from "@/components/brand/Narrators";
 import { CatToggle } from "@/components/site/CatToggle";
 import { CodeBlock } from "./CodeBlock";
-import { Say } from "./Say";
 
 const lessonHref = (locale: string, c: LoadedCourse, slug: string) => href(locale, `${c.path}/${slug}`);
 
@@ -44,8 +43,6 @@ export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; lo
               <Link href={parent.href} className="hover:underline">
                 Lumenary CS · {parent.label}
               </Link>
-            ) : course.division === "lingua" ? (
-              "Lumenary Lingua"
             ) : (
               "Lumenary Scientia"
             )}
@@ -169,7 +166,6 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
   const components = {
     ...makeMdxComponents({ locale, t, exercises, guides: guideSet(c) }),
     pre: CodeBlock,
-    Say,
     // A link into a subject that is not published yet (Robotics before its release) is plain text until it is.
     a: ({ href: to, children, ...props }: React.ComponentProps<"a">) =>
       linksToUnpublished(to) ? (
@@ -200,7 +196,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
   const parent = parentOf(c, locale);
 
   return (
-    <Messages locale={locale} ns={["exercise", "python", "lesson", "lingua", ...widgetMessageNamespaces(lesson.body)]}>
+    <Messages locale={locale} ns={["exercise", "python", "lesson", ...widgetMessageNamespaces(lesson.body)]}>
       <div lang={course.locale} dir={LOCALE_META[course.locale].dir}>
         <header className="relative overflow-hidden border-b border-line">
           <div className="bg-grid pointer-events-none absolute inset-0 opacity-40 [mask-image:radial-gradient(ellipse_at_top_right,black,transparent_65%)]" aria-hidden="true" />

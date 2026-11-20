@@ -60,8 +60,7 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/en/ee/`, `/en/ee/[slug]/` | Lumenary EE: the course page and its lessons (English only) |
 | `/en/robotics/`, `/en/robotics/[slug]/` | Lumenary Robotics: the course page and its lessons (English only) |
 | `/en/chemistry/`, `/en/chemistry/[slug]/` | Lumenary Chemistry: the course page and its lessons (English only) |
-| `/[locale]/lingua/` | Lumenary Lingua's courses |
-| `/[course locale]/lingua/[course]/`, `…/[slug]/` | A Lingua course and its lessons, generated only in the locale it is taught in |
+| `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site (see "Lumenary Lingua and Lumenary Prep" below), and `vercel.json` redirects these old addresses there |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
 
 ## Lesson architecture
@@ -78,7 +77,13 @@ Exercises live in `exercises.json` (types: `choice`, `integer`, `set`, `python`)
 
 ## Extending to other subjects
 
-Topic ids are namespaced (`math.*`) and subjects/levels are data. Subjects other than mathematics are **courses** (`src/lib/courses.ts`): a syllabus and lesson directories under `content/cs/` or `content/lingua/<id>/`, rendered by `src/components/course/CoursePages.tsx` with the same lesson components, plus highlighted and runnable code blocks (`CodeBlock`) and browser speech for language learners (`Say`). Their code is run by `compute/verify_courses.py`, which writes `content/verification/course-code-report.json`. See [courses.md](courses.md).
+Topic ids are namespaced (`math.*`) and subjects/levels are data. Subjects other than mathematics are **courses** (`src/lib/courses.ts`): a syllabus and lesson directories under `content/cs/`, `content/ee/` or `content/robotics/`, rendered by `src/components/course/CoursePages.tsx` with the same lesson components, plus highlighted and runnable code blocks (`CodeBlock`). Their code is run by `compute/verify_courses.py`, which writes `content/verification/course-code-report.json`. See [courses.md](courses.md).
+
+## Lumenary Lingua and Lumenary Prep
+
+Two of the academy's three divisions are not built here. **Lumenary Lingua**, the language courses, lives at [lingua.lumenary.academy](https://lingua.lumenary.academy), built from its own repository, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua), on the shared [@lumenary/core](https://github.com/lumenary-academy/lumenary-core) library. Its courses exist only in their teaching locale there: Spanish at `/en/spanish/`, English at `/es/ingles/`. **Lumenary Prep** lives at [prep.lumenary.academy](https://prep.lumenary.academy). This site links to both from the front page and the divisions page, with their base URLs in one place, `src/lib/sites.ts` (`LINGUA_URL`, `PREP_URL`).
+
+Lingua's courses used to be part of this site, at `/[locale]/lingua/…`. Those addresses redirect permanently (308) to the Lingua site in `vercel.json`: `…/lingua/spanish/…` to `/en/spanish/…` and `…/lingua/ingles/…` to `/es/ingles/…` from any locale, and anything else under `/[locale]/lingua/` to Lingua's front page in the same locale. The course rules come before the general one. Because the site is exported with `trailingSlash: true`, the sources end in an optional `/:path(.*)?` rather than `/:path*`, which Vercel compiles strictly and which would not match a trailing slash.
 
 ## Page weight
 

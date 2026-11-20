@@ -1,12 +1,12 @@
-# Courses: Lumenary CS, EE, Robotics, Chemistry, ME, Materials and Lingua
+# Courses: Lumenary CS, EE, Robotics, Chemistry, ME and Materials
 
 Lumenary Math has its own knowledge graph, Lean library and experiments (see the [authoring guide](authoring-guide.md)). The other subjects are **courses**: a syllabus and a directory per lesson, rendered by the same lesson components. This guide is the contract for writing one.
+
+Lumenary Lingua's language courses are no longer in this repository. They live in their own, [lumenary-academy/lumenary-lingua](https://github.com/lumenary-academy/lumenary-lingua) (whose README and CONTRIBUTING.md say how to write one), and are published at [lingua.lumenary.academy](https://lingua.lumenary.academy). This site's old Lingua addresses, `/<locale>/lingua/…`, redirect there (`vercel.json`).
 
 | Course | Directory | Taught in | Pages |
 | --- | --- | --- | --- |
 | Lumenary CS | `content/cs/` | English | `/en/cs/`, `/en/cs/<slug>/` |
-| Spanish, taught in English | `content/lingua/spanish/` | English | `/en/lingua/spanish/`, `/en/lingua/spanish/<slug>/` |
-| Inglés, enseñado en español | `content/lingua/ingles/` | Spanish | `/es/lingua/ingles/`, `/es/lingua/ingles/<slug>/` |
 | Programming languages (Assembly … Zig) | `content/cs/languages/<id>/` | English | `/en/cs/languages/`, `/en/cs/languages/<id>/`, `/en/cs/languages/<id>/<slug>/` |
 | Lumenary CS electives (Blockchains & Verifiable Computation …) | `content/cs/electives/<id>/` | English | `/en/cs/electives/`, `/en/cs/electives/<id>/`, `/en/cs/electives/<id>/<slug>/` |
 | Lumenary EE (electrical engineering) | `content/ee/` | English | `/en/ee/`, `/en/ee/<slug>/` |
@@ -15,7 +15,7 @@ Lumenary Math has its own knowledge graph, Lean library and experiments (see the
 | Lumenary ME (mechanical engineering) | `content/me/` | English | `/en/me/`, `/en/me/<slug>/` |
 | Lumenary Materials (materials science) | `content/materials/` | English | `/en/materials/`, `/en/materials/<slug>/` |
 
-A Scientia subject is a directory under `content/` with a `course.json` (`cs`, `ee`, `robotics`, `chemistry`, `me`, `materials`); it is listed on the front page by `src/lib/subjects.ts`, and its routes are `src/app/[locale]/<id>/`; the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`). `/[locale]/lingua/` lists the Lingua courses in every locale.
+A Scientia subject is a directory under `content/` with a `course.json` (`cs`, `ee`, `robotics`, `chemistry`, `me`, `materials`); it is listed on the front page by `src/lib/subjects.ts`, and its routes are `src/app/[locale]/<id>/`; the families of courses nested in a subject are listed in `COLLECTIONS` in `src/lib/courses.ts` (`cs/languages`, `cs/electives`), and each has an index page at its path. A course's pages are generated only in the locale it is taught in; links from other locales point there (`src/lib/href.ts`, from `src/lib/generated/content-locales.json`).
 
 ## Files
 
@@ -63,7 +63,6 @@ Prose in Markdown. Inline maths with $O(n \log n)$; display maths with $$ … $$
 Leave a blank line after every opening tag and before every closing tag. Section `id`s are unique within the lesson; `kind` is one of:
 
 - CS: `motivation`, `intuition`, `definitions`, `examples`, `human` (shown as "Explanation"), `computation`, `visualization`, `misconceptions`, `history`, `reading`, `exercises`
-- Lingua adds: `vocabulary`, `grammar`, `dialogue`, `pronunciation`, `culture`
 
 Every lesson has at least three sections and exactly one `<Exercises/>`, inside a section of kind `exercises`, normally the last.
 
@@ -78,11 +77,10 @@ Components (anything else fails the tests):
 | `<Note>` | an aside |
 | `<Analogy>` | an everyday analogy, clearly marked as one |
 | `<Figure caption="…">` | an inline SVG figure (`<svg viewBox=… role="img" aria-label=…>`; use `currentColor`, never fixed black or white, so dark mode works) |
-| `<Narrator who="chloe\|margaret\|gideon">` | Lumenary Scientia courses (not Lingua): an aside by one of the three cat guides (see "The cat guides" below); list every cat who speaks in the frontmatter `narrators` |
+| `<Narrator who="chloe\|margaret\|gideon">` | an aside by one of the three cat guides (see "The cat guides" below); list every cat who speaks in the frontmatter `narrators` |
 | `<Reflection title="…">` | an optional, collapsed Christian reflection; at most one per lesson, never preachy, never required to follow the lesson |
 | `<LessonLink slug="…">text</LessonLink>` | a link to another lesson of the same course |
 | `<TopicLink id="math.…">text</TopicLink>` | a link to a Lumenary Math topic |
-| `<Say lang="es">texto</Say>` | Lingua: a word or phrase the browser can read aloud; plain text only inside, `lang` a BCP 47 tag (`es`, `en`, `es-MX`, `en-GB`) |
 | `<Exercises/>` | where the lesson's exercises appear |
 
 Plain Markdown is encouraged: headings (`###`, `####`; `##` is the section title), lists, tables (GFM), **bold**, *italics*, `inline code`, blockquotes, links.
@@ -133,12 +131,12 @@ Every `python run` block is executed by `npm run verify:courses` in a fresh inte
 }
 ```
 
-At least 4 exercises per CS lesson and 6 per Lingua lesson, with unique kebab-case `id`s. Every exercise has `id`, `type`, `prompt` (Markdown), `difficulty` (`warm-up`, `core`, `stretch`), `mode` (`H` for ideas, `C` for code), `hints` (at least one, progressive) and `solution` (Markdown, a worked solution, not just the answer). By type:
+At least 4 exercises per lesson, with unique kebab-case `id`s. Every exercise has `id`, `type`, `prompt` (Markdown), `difficulty` (`warm-up`, `core`, `stretch`), `mode` (`H` for ideas, `C` for code), `hints` (at least one, progressive) and `solution` (Markdown, a worked solution, not just the answer). By type:
 
 - `choice`: `options` (`id`, `label`, `correct`, `feedback`: say *why* each option is right or wrong), optional `multiple: true`.
 - `integer`: `answer` (an integer) and optional `feedback` (`match`: a wrong answer as a string, `message`).
 - `set`: `answer` (strings; order and repeats ignored).
-- `text`: `answers` (every accepted answer: list the reasonable variants, e.g. with and without contractions), `lang` (the answer's language, required in Lingua), optional `feedback`. Case, spacing, surrounding punctuation and ¿¡ are ignored; accents are not, and a learner whose answer differs only in accents is told so.
+- `text`: `answers` (every accepted answer: list the reasonable variants, e.g. with and without contractions), optional `lang` (the answer's language, BCP 47, for the input's `lang` attribute), optional `feedback`. Case, spacing, surrounding punctuation and ¿¡ are ignored; accents are not, and a learner whose answer differs only in accents is told so.
 - `python`: `starter` (what the learner edits), `tests` (Python with `assert`s, run after their code in the same namespace), `reference` (a correct solution). `npm run verify:courses` checks that the reference passes the tests and that the starter does not. The reference is never sent to the browser; the `solution` should still explain the approach and may show code.
 
 Feedback never shames: "Not yet — …" rather than "Wrong".
@@ -161,7 +159,7 @@ One course per language under `content/cs/languages/<id>/` (`id` is the director
 
 ### The cat guides
 
-Lumenary Math's three cat guides appear in every Lumenary Scientia course too — Lumenary CS, its programming languages and electives, Lumenary EE and Lumenary Robotics (not in Lingua). They are shown by default; anyone can hide them with the cat button, and then only the role ("The Formalist") and the text remain, so every aside must read well without the cat. Each `<Narrator who="…">` aside is 1–4 sentences and must add something; put it inside a section, between paragraphs, never inside another component. Every lesson has at least one; from the second level on, two to four, from more than one cat. List every cat who speaks in the frontmatter `narrators`.
+Lumenary Math's three cat guides appear in every Lumenary Scientia course too — Lumenary CS, its programming languages and electives, Lumenary EE and Lumenary Robotics. They are shown by default; anyone can hide them with the cat button, and then only the role ("The Formalist") and the text remain, so every aside must read well without the cat. Each `<Narrator who="…">` aside is 1–4 sentences and must add something; put it inside a section, between paragraphs, never inside another component. Every lesson has at least one; from the second level on, two to four, from more than one cat. List every cat who speaks in the frontmatter `narrators`.
 
 Each cat keeps one character everywhere: **Chloe** brings the idea and the "why"; **Margaret** the numbers, measurements, computations and experiments; **Gideon** precision: the hidden assumption, the edge case, the precise condition, the limit of a model, safety. In Lumenary Math they are the Mathematician ("Why is this true?"), the Computationalist ("What happens if we calculate it?") and the Formalist ("Can we prove this precisely?"). Those roles don't fit other subjects, so every subject gives the cats its own roles: the label shown above each aside and on the course page, and the question that guides what the cat says. Write each aside in your subject's role, and don't name the role inside it (the page shows it).
 
@@ -197,10 +195,6 @@ They follow the same pattern as Lumenary EE and Robotics: a Start level for abou
 - **Materials science.** Heat treatment, casting, furnaces and chemical etching are described, not suggested as home activities.
 
 tests/safety.test.ts scans these courses too.
-
-### Lumenary Lingua
-
-Each lesson has: vocabulary (a table: the word, its translation, a note on gender, register or usage; 20–30 items at A1–B1), grammar explained in the learner's language with clear tables and many examples, an original dialogue (A1–B1) or text (B2–C2) in the target language with a translation or glossary, pronunciation notes, a culture note, and at least 6 exercises mixing `choice` and `text` (translate, fill the gap, conjugate). Use `<Say>` for vocabulary and key phrases. Levels follow the CEFR's can-do descriptions ([Council of Europe](https://www.coe.int/en/web/common-european-framework-reference-languages)); write your own wording of them. At A1–A2 keep target-language passages short and fully glossed; at C1–C2 most of the lesson may be in the target language. Point out differences between regional varieties (Spain and Latin America; British and American English) without ranking them.
 
 ## Checking
 
