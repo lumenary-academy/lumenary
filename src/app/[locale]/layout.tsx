@@ -9,6 +9,7 @@ import { SiteHeader } from "@/components/site/SiteHeader";
 import { COLLECTIONS, getCourses } from "@/lib/courses";
 import { SiteFooter } from "@/components/site/SiteFooter";
 import { initScript } from "@/components/site/init-scripts";
+import { SITE_URL } from "@/lib/sites";
 
 const inter = Inter({ subsets: ["latin", "latin-ext"], variable: "--font-inter", display: "swap" });
 // One serif family for headings and reading text; its optical-size axis gives large headings the display cut.
@@ -23,13 +24,11 @@ export function generateStaticParams() {
   return LOCALES.map((locale) => ({ locale }));
 }
 
-/** Canonical origin of the public site (absolute URLs in metadata and the sitemap). */
-const SITE_URL = "https://lumenary.academy";
-
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
   const locale = await resolveLocale(params);
   const t = makeT(await getMessages(locale));
   return {
+    // The canonical origin of the public site, for absolute URLs in metadata.
     metadataBase: new URL(SITE_URL),
     title: { default: `${t("meta.siteName")} — ${t("meta.tagline")}`, template: `%s · ${t("meta.siteName")}` },
     description: t("meta.description"),

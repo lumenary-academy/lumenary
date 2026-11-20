@@ -1,6 +1,6 @@
 import "../globals.css";
 
-export const metadata = { title: "Lumenary Academy" };
+export const metadata = { title: "Lumenary Scientia" };
 
 export default function RootRedirectLayout({ children }: { children: React.ReactNode }) {
   return (
