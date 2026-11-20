@@ -66,6 +66,10 @@ Lean source shown on the site is extracted from the `.lean` files by region mark
 | `/[locale]/lingua/…` | No pages: Lumenary Lingua has its own site (see "Lumenary Lingua and Lumenary Prep" below), and `vercel.json` redirects these old addresses there |
 | `/[locale]/about/`, `/[locale]/divisions/`, `/[locale]/contribute/` | Project pages |
 
+### Header and footer
+
+The header and footer show the navigation of the part of the academy a page belongs to (`src/lib/site-nav.ts`, `siteSection`). Lumenary Math's pages (`/math/…`, the labs, practice, progress and the educator resources) keep Math's navigation, its tools and its motto. The other subjects' pages link the subjects to one another, with the programming languages, the electives, the divisions and the project pages. Every other page (the front page, divisions, about, contribute, languages, verification) shows only the three divisions and the project pages. The footer is rendered by the layout, which cannot know the page, so it hands every set of columns to a small client component (`FooterNav`) that picks one from the pathname; each exported page's HTML contains only its own.
+
 ## Lesson architecture
 
 A lesson is `content/math/lessons/<slug>/en.mdx`, with frontmatter validated by `LessonFrontmatter`. Its body is a sequence of `<Section id kind title>` blocks whose `kind` maps to the standard lesson architecture (motivation, intuition, definitions, examples, proof, formal, computation, visualization, exercises, misconceptions, viewpoints, trails, sets, categories, history, reading) and to a reasoning mode (H/F/C). From early undergraduate onwards a `viewpoints` section is required, showing the topic through other mathematicians' eyes as well as set theory and category theory (see `docs/curriculum/viewpoints.md`). The full contract for authors is `docs/authoring-guide.md`. Available components:
