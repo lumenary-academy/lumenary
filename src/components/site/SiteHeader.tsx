@@ -26,12 +26,12 @@ const NAV = [
 /** On the pages of Lumenary Scientia's other subjects, the header links the subjects to one another (the rest of the list is in the menu). */
 const SCIENTIA_NAV = [
   { key: "math", path: "math" },
+  { key: "chemistry", path: "chemistry" },
   { key: "statistics", path: "statistics" },
   { key: "cs", path: "cs" },
   { key: "programming", path: "cs/languages" },
   { key: "ee", path: "ee" },
   { key: "robotics", path: "robotics" },
-  { key: "chemistry", path: "chemistry" },
   { key: "me", path: "me" },
   { key: "materials", path: "materials" },
 ] as const;

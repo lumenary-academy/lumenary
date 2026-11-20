@@ -16,12 +16,12 @@ type Entry = { key: string; path?: string; course?: string; collection?: Collect
 /** Lumenary Scientia's subjects in the order the site lists them. A subject is open once its content exists. */
 const SUBJECTS: Entry[] = [
   { key: "mathematics", path: "math", math: true },
+  { key: "chemistry", path: "chemistry", course: "chemistry" },
   { key: "statistics", path: "statistics", course: "statistics" },
   { key: "computerScience", path: "cs", course: "cs" },
   { key: "programmingLanguages", path: "cs/languages", collection: "cs/languages" },
   { key: "electricalEngineering", path: "ee", course: "ee" },
   { key: "robotics", path: "robotics", course: "robotics" },
-  { key: "chemistry", path: "chemistry", course: "chemistry" },
   { key: "mechanicalEngineering", path: "me", course: "me" },
   { key: "materialsScience", path: "materials", course: "materials" },
   { key: "physics" },
