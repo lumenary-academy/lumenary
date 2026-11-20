@@ -3,13 +3,15 @@ import type { Locale } from "@/i18n/config";
 import type { TFunction } from "@/i18n/dictionary";
 import { href } from "@/lib/href";
 import { LogoMark, Wordmark } from "@/components/brand/Logo";
+import { linguaHome } from "@/lib/sites";
 import { scientiaSubjects } from "@/lib/subjects";
 
 export function SiteFooter({ locale, t }: { locale: Locale; t: TFunction }) {
-  // Every open subject first, then Lumenary Math's own tools, then the project pages.
+  // Every open subject first, then Lumenary Math's own tools, then the project pages. Paths are on
+  // this site; full URLs (Lumenary Lingua, on its own site) are linked as they are.
   const subjects: [string, string][] = [
     ...scientiaSubjects().open.map((sub): [string, string] => [t(`divisions.${sub.key}`), sub.path]),
-    ["Lumenary Lingua", "lingua"],
+    ["Lumenary Lingua", linguaHome(locale)],
   ];
   const math: [string, string][] = (
     [
@@ -56,9 +58,15 @@ export function SiteFooter({ locale, t }: { locale: Locale; t: TFunction }) {
             <ul className="mt-4 space-y-2.5">
               {links.map(([label, path]) => (
                 <li key={path}>
-                  <Link href={href(locale, path)} className="text-sm text-ink-2 hover:text-ink hover:underline">
-                    {label}
-                  </Link>
+                  {path.startsWith("https://") ? (
+                    <a href={path} className="text-sm text-ink-2 hover:text-ink hover:underline">
+                      {label}
+                    </a>
+                  ) : (
+                    <Link href={href(locale, path)} className="text-sm text-ink-2 hover:text-ink hover:underline">
+                      {label}
+                    </Link>
+                  )}
                 </li>
               ))}
             </ul>

@@ -2,9 +2,9 @@
 /**
  * gen-content-locales.mjs — write src/lib/generated/content-locales.json: for every lesson, the
  * non-English locales that have a translation (`content/math/lessons/<slug>/<locale>.mdx`); and for
- * every course outside Lumenary Math (content/cs, content/ee, content/robotics, their nested courses such as
- * content/cs/languages/<id>, and content/lingua/<id>), the one locale it is taught
- * in, keyed by its site path ("cs", "lingua/spanish").
+ * every course outside Lumenary Math (content/cs, content/ee, content/robotics and their nested courses such as
+ * content/cs/languages/<id>), the one locale it is taught in, keyed by its site path ("cs",
+ * "cs/languages/rust").
  *
  * Lesson, practice and worksheet pages are generated only in English and in locales with a
  * translation; links in other locales point to the English page (see src/lib/href.ts). This
@@ -21,7 +21,7 @@ const OUT = path.join(ROOT, "src/lib/generated/content-locales.json");
 const CONTENT = path.join(ROOT, "content");
 
 /** Directories under content/ that are not courses, and the course families nested in a subject (mirrors courseDirs() in src/lib/courses.ts). */
-const NOT_COURSES = new Set(["math", "pages", "registry", "verification", "lingua"]);
+const NOT_COURSES = new Set(["math", "pages", "registry", "verification"]);
 const COLLECTIONS = ["cs/languages", "cs/electives"];
 
 /** The locale each course's pages are generated in (mirrors getCourses() in src/lib/courses.ts). */
@@ -30,10 +30,10 @@ function courseLocales() {
   const add = (file) => {
     if (!fs.existsSync(file)) return;
     const c = JSON.parse(fs.readFileSync(file, "utf8"));
-    out[c.division === "lingua" ? `lingua/${c.id}` : path.relative(CONTENT, path.dirname(file))] = c.locale;
+    out[path.relative(CONTENT, path.dirname(file))] = c.locale;
   };
   for (const d of fs.readdirSync(CONTENT).sort()) if (!NOT_COURSES.has(d)) add(path.join(CONTENT, d, "course.json"));
-  for (const family of [...COLLECTIONS, "lingua"]) {
+  for (const family of COLLECTIONS) {
     const base = path.join(CONTENT, family);
     if (fs.existsSync(base)) for (const d of fs.readdirSync(base).sort()) add(path.join(base, d, "course.json"));
   }

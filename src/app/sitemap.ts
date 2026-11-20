@@ -25,7 +25,6 @@ export default function sitemap(): MetadataRoute.Sitemap {
     "contribute/",
     "languages/",
     "verification/",
-    "lingua/",
     // the index pages of the course collections (Lumenary CS's programming languages and electives)
     ...Object.keys(COLLECTIONS).map((c) => `${c}/`),
     ...getCourses().flatMap((c) => [`${c.path}/`, ...c.slugs.map((s) => `${c.path}/${s}/`)]),

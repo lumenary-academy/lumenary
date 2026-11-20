@@ -244,7 +244,7 @@ export const ExercisesFile = z.object({
 });
 
 /* ------------------------------------------------------------------ */
-/* Courses: Lumenary CS and Lumenary Lingua (content/cs, content/lingua/<id>) */
+/* Courses: Lumenary Scientia's subjects outside Lumenary Math (content/cs, content/ee, …) */
 /* ------------------------------------------------------------------ */
 
 const Slug = z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, "slugs are kebab-case");
@@ -270,15 +270,14 @@ export type GuideSet = (typeof GUIDE_SETS)[number];
 export const CourseFile = z.object({
   version: z.literal(1),
   id: Slug,
-  division: z.enum(["scientia", "lingua"]),
+  /** Lumenary Lingua's courses live in their own repository; every course here is Lumenary Scientia's. */
+  division: z.enum(["scientia"]),
   title: z.string(),
   subtitle: z.string(),
   /** Markdown paragraphs for the course page. */
   description: z.array(z.string()).min(1),
   /** The language the course is taught in; its pages are generated in this site locale only. */
   locale: z.enum(["en", "es", "ar", "hi", "zh-Hans", "sw"]),
-  /** Lingua: the language being learned (BCP 47). */
-  learn: z.string().optional(),
   /** Programming-language courses: the family they are listed under on /cs/languages/, and the year the language appeared. */
   group: z.string().optional(),
   year: z.number().int().optional(),
