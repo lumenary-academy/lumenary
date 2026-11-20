@@ -1,0 +1,507 @@
+---
+title: Wrangling data with pandas
+subtitle: Series and DataFrames, reading messy files, types, dates and missing values, joins that do not lie, reshaping, group-by — and how to make it fast.
+minutes: 80
+objectives:
+  - Explain Series, DataFrames, indexes and dtypes, and what makes a table tidy
+  - Read CSV and JSON into pandas with correct types, dates and missing values
+  - Select and filter rows and columns with masks, .loc, .iloc and query
+  - Predict and measure the size of a join, catch duplicated keys with validate, and join on time with merge_asof
+  - Reshape between wide and long with melt and pivot, and summarise with group-by, named aggregation and transform
+  - Write readable method chains, and choose vectorised operations over loops after measuring both
+narrators: [chloe, margaret, gideon]
+prerequisites: [the-data-science-workflow]
+related: [math.prob.statistics-intro]
+references:
+  - title: pandas user guide
+    url: https://pandas.pydata.org/docs/user_guide/index.html
+    note: The official guide; the chapters on merging, reshaping, group-by, missing data and copy-on-write repay careful reading.
+  - title: "pandas: merge, join, concatenate and compare"
+    url: https://pandas.pydata.org/docs/user_guide/merging.html
+  - title: "pandas: reshaping and pivot tables"
+    url: https://pandas.pydata.org/docs/user_guide/reshaping.html
+  - title: "pandas: copy-on-write"
+    url: https://pandas.pydata.org/docs/user_guide/copy_on_write.html
+  - title: Tidy data
+    author: Hadley Wickham
+    year: 2014
+    url: https://doi.org/10.18637/jss.v059.i10
+    note: The paper that named and defined tidy data.
+  - title: The split-apply-combine strategy for data analysis
+    author: Hadley Wickham
+    year: 2011
+    url: https://doi.org/10.18637/jss.v040.i01
+  - title: Python for Data Analysis, 3rd edition (open access)
+    author: Wes McKinney
+    url: https://wesmckinney.com/book/
+    note: By the creator of pandas.
+  - title: Polars
+    url: https://pola.rs/
+  - title: DuckDB
+    url: https://duckdb.org/
+  - title: Apache Arrow
+    url: https://arrow.apache.org/
+---
+
+<Section id="motivation" kind="motivation" title="Most of the work is getting the table right">
+
+A citizen-science group in a port city runs thirty low-cost air-quality sensors on schools, roadsides and parks, and wants to know whether fine-particle pollution (PM2.5) is worse in some districts than others. The data arrive in three pieces: a CSV export of hourly readings from the sensors' cloud service, a JSON file describing each sensor (its district, the kind of site, its height above the ground), and a spreadsheet of when sensors were moved. Before any question about districts can be asked, those pieces have to become one table you trust.
+
+That job is **data wrangling**: reading data, fixing types, handling missing values, joining tables, reshaping them and summarising them. It is unglamorous, and it is where most analyses either earn their correctness or quietly lose it. A sensor ID read as a number loses its leading zeros and no longer matches the registry. A join on a key with duplicates silently counts some readings twice. A missing-value code of `-999` drags an average below zero. None of these raises an error.
+
+This lesson teaches the core of [pandas](https://pandas.pydata.org/docs/user_guide/index.html), the most widely used Python library for tables, through that kind of work. All the data are synthetic and generated with fixed seeds, so every number printed is reproducible. It assumes Python as taught in Lumenary CS's Start and Core levels; the [Python course](/en/cs/languages/python/the-python-way/) covers the language itself.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Series, DataFrames and tidy data">
+
+<Definition term="Series and DataFrame">
+
+A **Series** is a one-dimensional array of values of one type (its **dtype**: `float64`, `int64`, `bool`, `datetime64`, `string`, `category`, …), together with an **index**: a label for each value. A **DataFrame** is a table: an ordered collection of Series (the columns), each with its own dtype, sharing one row index. Operations between Series and DataFrames **align on labels**, not on positions.
+
+</Definition>
+
+<Definition term="tidy data">
+
+A table is **tidy** when each variable is a column, each observation is a row, and each kind of observational unit has its own table. Data that store one variable across several columns (a column per pollutant, or per month) are **wide**; their tidy equivalent is **long**.
+
+</Definition>
+
+Alignment on labels is pandas's most powerful idea and its most surprising one. Adding two Series lines values up by index label, and a label present in only one of them gives a missing value. That is exactly right when the labels are sensor IDs, and a source of confusion when you expected positions to match.
+
+Tidiness is not about neatness; it is about matching the table's shape to the operations you will run. Group-by, plotting libraries and models all expect one observation per row. Wide tables are better for people to read, and for some calculations across columns, so a typical analysis moves between the two shapes several times.
+
+<Narrator who="chloe">
+
+What question are we really asking when we ask whether a table is tidy? We are asking what one observation is. For a study of hourly exposure, it is one sensor, one hour, one pollutant; for a monthly report to the city, it is one district and one month. The same data can be tidy for one question and untidy for the next.
+
+</Narrator>
+
+</Section>
+
+<Section id="reading" kind="computation" title="Reading data and getting the types right">
+
+Real files are read from disk or from an API. Here the CSV and JSON are written into strings, so the block runs anywhere without touching the network; `io.StringIO` makes a string behave like a file.
+
+```python run
+import io
+import json
+import pandas as pd
+
+# Two exports from a network of low-cost air-quality sensors (synthetic).
+readings_csv = """sensor_id,time,pm25,pm10
+007,02/03/2026 08:00,12.5,20.1
+007,02/03/2026 09:00,-999,22.4
+012,02/03/2026 08:00,n/a,31.0
+012,02/03/2026 09:00,35.2,40.8
+031,02/03/2026 08:00,err,18.0
+031,02/03/2026 09:00,9.4,15.2
+"""
+sensors_json = """[
+  {"id": "007", "district": "Harbour", "site": {"kind": "roadside", "height_m": 3.0}},
+  {"id": "012", "district": "Old Town", "site": {"kind": "school", "height_m": 2.5}},
+  {"id": "031", "district": "Hillside", "site": {"kind": "park", "height_m": 2.0}}
+]"""
+
+naive = pd.read_csv(io.StringIO(readings_csv))
+print("naive types:", dict(naive.dtypes.astype(str)))
+print("naive sensor ids:", naive["sensor_id"].unique().tolist())
+print("naive pm25 mean, forced to numbers:", pd.to_numeric(naive["pm25"], errors="coerce").mean())
+
+readings = pd.read_csv(
+    io.StringIO(readings_csv),
+    dtype={"sensor_id": "string"},          # identifiers are labels, not numbers
+    na_values=["-999", "err"],              # this network's own codes for "no value"
+)
+readings["time"] = pd.to_datetime(readings["time"], format="%d/%m/%Y %H:%M")
+print("fixed types:", dict(readings.dtypes.astype(str)))
+print("missing pm25:", readings["pm25"].isna().sum(), "| mean pm25:", round(readings["pm25"].mean(), 2))
+
+sensors = pd.json_normalize(json.loads(sensors_json))   # nested fields become site.kind, site.height_m
+sensors = sensors.rename(columns={"id": "sensor_id"}).astype({"sensor_id": "string"})
+print(sensors.to_string(index=False))
+
+# A Series is a column of values with labels (its index); a DataFrame is a table of Series
+# sharing one index. Arithmetic lines values up by label, not by position.
+pm25 = pd.Series([12.5, 9.4], index=["007", "031"])
+pm10 = pd.Series([20.1, 15.2, 31.0], index=["007", "031", "012"])
+print("pm25 + pm10 by label:", (pm25 + pm10).to_dict())
+
+# Selecting: rows by a Boolean mask and columns by name with .loc; by position with .iloc.
+print(readings.loc[readings["pm10"] > 20, ["sensor_id", "time", "pm10"]].to_string(index=False))
+print("row 0, column 2:", readings.iloc[0, 2], "| same rows via query:", len(readings.query("pm10 > 20")))
+```
+
+Read the first three lines of output as a list of things that went wrong without a single error message.
+
+- **Identifiers became numbers.** `007` became `7`. The registry has `"007"`, so a later join would match nothing. Identifiers (sensor IDs, postcodes, phone numbers, product codes) are labels: read them as strings with `dtype=`.
+- **A text code turned the column into text.** One `err` made the whole `pm25` column `object` (Python strings), so arithmetic on it fails or does something odd.
+- **A numeric code poisoned the average.** Forcing the column to numbers turned `err` and `n/a` into missing values, but `-999`, this network's code for "no reading", stayed a number and dragged the mean PM2.5 to −235. Always find out what codes a source uses for "missing" and pass them as `na_values`.
+
+pandas already treats a list of strings as missing by default (including empty fields, `NA`, `n/a`, `NaN`, `null` and `None`), which is helpful until a real value happens to look like one: the ISO country code for Namibia is `NA`. When that matters, pass `keep_default_na=False` and list your own codes.
+
+**Dates and times** need three decisions. *Format*: `02/03/2026` is 2 March in most of the world and 3 February in the United States; give `format=` explicitly rather than letting pandas guess. *Time zone*: a sensor service that reports local time will produce one hour that occurs twice when clocks go back and one that never occurs when they go forward; store times in UTC (`tz_localize` then `tz_convert`) and convert for display. *Resolution*: pandas can store datetimes in seconds, milliseconds, microseconds or nanoseconds, and some operations (such as `merge_asof` below) insist that both sides match.
+
+**Missing values** come in several forms. For floating-point columns pandas uses `NaN`, which compares unequal to everything, itself included, so `df[df["pm25"] == np.nan]` finds nothing; use `isna()`. Nullable types such as `"Int64"`, `"boolean"` and `"string"` use `pd.NA`, which lets an integer column hold a missing value without turning into floats. And, by default, most reductions skip missing values: `mean()` above averaged the three readings that existed. That is usually what you want, provided you report how many values were missing and ask *why* they are missing, which matters more (see <LessonLink slug="exploratory-data-analysis">exploratory data analysis</LessonLink>).
+
+**Selecting** follows a few rules. `df["col"]` gives a column; `df[["a", "b"]]` a smaller table; `df.loc[rows, cols]` selects by label or Boolean mask, `df.iloc[i, j]` by integer position, and `df.query("pm10 > 20")` is a readable alternative for filters. To change values in place, select and assign in a single `.loc` call: `df.loc[df["pm25"] > 100, "flag"] = True`. Two-step "chained" assignment, `df[df["pm25"] > 100]["flag"] = True`, modifies a temporary copy and leaves `df` unchanged; pandas 2 warns about it, and pandas 3.0, which makes **copy-on-write** the default, never lets it modify the original.
+
+</Section>
+
+<Section id="joins" kind="examples" title="Joins and their pitfalls">
+
+<Definition term="join (merge)">
+
+A **join** combines two tables by matching rows whose **key** columns are equal. An **inner** join keeps only matched rows; a **left** join keeps every row of the left table, with missing values where nothing matched; an **outer** join keeps every row of both. If a key value appears $m$ times on the left and $n$ times on the right, the join produces $m \times n$ rows for it, so the result has $\sum_k m_k n_k$ rows (plus, for a left join, one row for each unmatched left row).
+
+</Definition>
+
+The formula is the whole story of join explosions. When the right table has exactly one row per key (a **many-to-one** join, such as readings to a sensor registry), every left row matches at most once and the row count cannot grow. When a key is duplicated on the right, every matching left row is copied. When keys are duplicated on both sides (**many-to-many**), the copies multiply.
+
+<Figure caption="A many-to-one join that is not. Sensor 031 has two registry records (it was moved), so a plain merge pairs every reading with both, and each reading appears twice in the result.">
+<svg viewBox="0 0 620 245" role="img" aria-label="Three tables. On the left, readings: sensor 031 at 08:00, 09:00 and 10:00. In the middle, the registry: two rows for sensor 031, one in Hillside and one in Harbour. On the right, the merged table has six rows: each of the three times appears twice, once with Hillside and once with Harbour.">
+  <defs>
+    <marker id="dw-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <text x="10" y="42" fill="currentColor" fontSize="12" fontWeight="bold">readings (3 rows)</text>
+  <rect x="10" y="50" width="120" height="22" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="16" y="65" fill="currentColor" fontSize="11" fontWeight="bold">sensor</text>
+  <text x="76" y="65" fill="currentColor" fontSize="11" fontWeight="bold">time</text>
+  <rect x="10" y="72" width="120" height="22" fill="none" stroke="currentColor" />
+  <text x="16" y="87" fill="currentColor" fontSize="11">031</text>
+  <text x="76" y="87" fill="currentColor" fontSize="11">08:00</text>
+  <rect x="10" y="94" width="120" height="22" fill="none" stroke="currentColor" />
+  <text x="16" y="109" fill="currentColor" fontSize="11">031</text>
+  <text x="76" y="109" fill="currentColor" fontSize="11">09:00</text>
+  <rect x="10" y="116" width="120" height="22" fill="none" stroke="currentColor" />
+  <text x="16" y="131" fill="currentColor" fontSize="11">031</text>
+  <text x="76" y="131" fill="currentColor" fontSize="11">10:00</text>
+  <text x="170" y="42" fill="currentColor" fontSize="12" fontWeight="bold">registry (2 rows)</text>
+  <rect x="170" y="50" width="140" height="22" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="176" y="65" fill="currentColor" fontSize="11" fontWeight="bold">sensor</text>
+  <text x="236" y="65" fill="currentColor" fontSize="11" fontWeight="bold">district</text>
+  <rect x="170" y="72" width="140" height="22" fill="var(--gold)" fillOpacity="0.3" stroke="currentColor" />
+  <text x="176" y="87" fill="currentColor" fontSize="11">031</text>
+  <text x="236" y="87" fill="currentColor" fontSize="11">Hillside</text>
+  <rect x="170" y="94" width="140" height="22" fill="var(--gold)" fillOpacity="0.3" stroke="currentColor" />
+  <text x="176" y="109" fill="currentColor" fontSize="11">031</text>
+  <text x="236" y="109" fill="currentColor" fontSize="11">Harbour</text>
+  <text x="400" y="42" fill="currentColor" fontSize="12" fontWeight="bold">merged on sensor (6 rows)</text>
+  <rect x="400" y="50" width="200" height="22" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="406" y="65" fill="currentColor" fontSize="11" fontWeight="bold">sensor</text>
+  <text x="466" y="65" fill="currentColor" fontSize="11" fontWeight="bold">time</text>
+  <text x="526" y="65" fill="currentColor" fontSize="11" fontWeight="bold">district</text>
+  <rect x="400" y="72" width="200" height="22" fill="none" stroke="currentColor" />
+  <text x="406" y="87" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="87" fill="currentColor" fontSize="11">08:00</text>
+  <text x="526" y="87" fill="currentColor" fontSize="11">Hillside</text>
+  <rect x="400" y="94" width="200" height="22" fill="var(--gold)" fillOpacity="0.3" stroke="currentColor" />
+  <text x="406" y="109" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="109" fill="currentColor" fontSize="11">08:00</text>
+  <text x="526" y="109" fill="currentColor" fontSize="11">Harbour</text>
+  <rect x="400" y="116" width="200" height="22" fill="none" stroke="currentColor" />
+  <text x="406" y="131" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="131" fill="currentColor" fontSize="11">09:00</text>
+  <text x="526" y="131" fill="currentColor" fontSize="11">Hillside</text>
+  <rect x="400" y="138" width="200" height="22" fill="var(--gold)" fillOpacity="0.3" stroke="currentColor" />
+  <text x="406" y="153" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="153" fill="currentColor" fontSize="11">09:00</text>
+  <text x="526" y="153" fill="currentColor" fontSize="11">Harbour</text>
+  <rect x="400" y="160" width="200" height="22" fill="none" stroke="currentColor" />
+  <text x="406" y="175" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="175" fill="currentColor" fontSize="11">10:00</text>
+  <text x="526" y="175" fill="currentColor" fontSize="11">Hillside</text>
+  <rect x="400" y="182" width="200" height="22" fill="var(--gold)" fillOpacity="0.3" stroke="currentColor" />
+  <text x="406" y="197" fill="currentColor" fontSize="11">031</text>
+  <text x="466" y="197" fill="currentColor" fontSize="11">10:00</text>
+  <text x="526" y="197" fill="currentColor" fontSize="11">Harbour</text>
+  <line x1="322" y1="110" x2="392" y2="110" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#dw-arrow)" />
+  <text x="357" y="102" textAnchor="middle" fill="currentColor" fontSize="11">merge</text>
+  <text x="10" y="232" fill="currentColor" fontSize="11">Each reading matches both registry records: 3 × 2 = 6 rows, and every reading is counted twice.</text>
+</svg>
+</Figure>
+
+In the next block, the registry of thirty sensors has three duplicated keys, because three sensors were moved to Hillside on 9 March and the registry keeps both their old and new records. That is a perfectly reasonable way to keep a registry, and a trap for anyone who joins on `sensor_id` alone.
+
+```python run
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+ids = [f"{i:03d}" for i in range(1, 31)]                       # 30 sensors, "001" .. "030"
+hours = pd.date_range("2026-03-02", periods=14 * 24, freq="h")  # two weeks, hourly
+readings = pd.DataFrame({
+    "sensor_id": np.repeat(ids, len(hours)),
+    "time": np.tile(hours, len(ids)),
+    "pm25": rng.gamma(4.0, 4.0, len(ids) * len(hours)).round(1),
+})
+districts = ["Harbour", "Old Town", "Hillside"]
+sensors = pd.DataFrame({"sensor_id": ids, "district": [districts[i % 3] for i in range(30)],
+                        "valid_from": pd.Timestamp("2025-09-01")})
+# Three sensors were moved on 9 March; the registry keeps both records.
+moved = sensors[sensors["sensor_id"].isin(["004", "017", "025"])].assign(
+    district="Hillside", valid_from=pd.Timestamp("2026-03-09"))
+registry = pd.concat([sensors, moved], ignore_index=True)
+registry["valid_from"] = registry["valid_from"].astype("datetime64[ns]")   # match the readings' resolution
+
+print("readings:", len(readings), "| registry rows:", len(registry),
+      "| duplicated keys:", registry["sensor_id"].duplicated().sum())
+joined = readings.merge(registry, on="sensor_id", how="left")
+print("after a plain merge:", len(joined), "rows (+", len(joined) - len(readings), ")")
+
+# Predict the size of a join before running it: sum over keys of (left count x right count).
+lc, rc = readings["sensor_id"].value_counts(), registry["sensor_id"].value_counts()
+print("predicted:", int((lc * rc.reindex(lc.index, fill_value=1)).sum()))
+
+try:
+    readings.merge(registry, on="sensor_id", how="left", validate="many_to_one")
+except pd.errors.MergeError as e:
+    print("validate caught it:", e)
+
+# The right join is in time: each reading takes the registry record in force at that moment.
+asof = pd.merge_asof(readings.sort_values("time"), registry.sort_values("valid_from"),
+                     left_on="time", right_on="valid_from", by="sensor_id")
+print("merge_asof:", len(asof), "rows;", "sensor 004 districts:",
+      asof.loc[asof["sensor_id"] == "004", "district"].value_counts().to_dict())
+
+# Totals tell the story: a plain merge counts the moved sensors' readings twice.
+print("readings per district, plain merge vs time-aware:")
+print(pd.DataFrame({"plain": joined.groupby("district")["pm25"].size(),
+                    "time-aware": asof.groupby("district")["pm25"].size()}).to_string())
+
+# Anti-join: readings from a sensor the registry has never heard of.
+stray = pd.DataFrame({"sensor_id": ["031"], "time": [hours[0]], "pm25": [11.0]})
+check = pd.concat([readings, stray]).merge(sensors, on="sensor_id", how="left", indicator=True)
+print("readings with no registry record:", (check["_merge"] == "left_only").sum())
+```
+
+The plain merge added 1,008 rows, and the district counts show where they went: Hillside appears to have 4,368 readings when it has 3,864. Every average, total and chart built on that table is wrong, and nothing failed. Three tools prevent this.
+
+1. **Predict the size before joining.** Counting keys on each side (`value_counts`) and summing the products gives the exact row count, here 11,088, before the join runs. On large tables this check is cheap, while an accidental many-to-many join of two million-row tables can need more memory than the machine has.
+2. **State the relationship you expect.** `validate="many_to_one"` (or `"one_to_one"`, `"one_to_many"`) makes pandas raise an error if the keys disagree, so a broken assumption stops the analysis instead of corrupting it.
+3. **Join on the right key.** The registry records are valid from a date onwards, so the correct key is *(sensor, time)*: each reading should take the record in force when it was taken. `pd.merge_asof` does exactly this kind of nearest-earlier match. The result has 10,080 rows, one per reading, and sensor 004 is counted in its old district for the first week and in Hillside for the second.
+
+The last lines show an **anti-join**: `indicator=True` adds a `_merge` column saying whether each row matched, and filtering on `"left_only"` finds readings from a sensor (031) that the registry does not know about. Orphaned rows like these are often the first sign that two systems disagree; a left join keeps them with missing districts, and an inner join drops them without a word.
+
+<Narrator who="margaret">
+
+The explosion is easy to account for once you count: 3 moved sensors × 336 hourly readings = 1,008 extra rows, exactly what the merge added, and exactly what the `value_counts` prediction said before the join ran. I make a habit of printing row counts before and after every join; they are the cheapest test in data science.
+
+</Narrator>
+
+</Section>
+
+<Section id="reshaping" kind="computation" title="Reshaping, group-by and method chaining">
+
+<Figure caption="The same readings, wide and long. melt moves the pollutant columns into rows (one row per measurement); pivot moves them back. Long tables suit group-by and plotting; wide tables suit people and some calculations across columns.">
+<svg viewBox="0 0 640 175" role="img" aria-label="On the left, a wide table with columns sensor, time, pm25 and pm10 and two rows: 007 at 08:00 with 12.5 and 20.1, and 012 at 08:00 with 35.2 and 40.8. On the right, a long table with columns sensor, time, pollutant and value and four rows, one for each measurement. An arrow labelled melt points from wide to long, and an arrow labelled pivot points back.">
+  <defs>
+    <marker id="dw-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <text x="10" y="42" fill="currentColor" fontSize="12" fontWeight="bold">wide: one column per pollutant</text>
+  <rect x="10" y="50" width="215" height="22" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="16" y="65" fill="currentColor" fontSize="11" fontWeight="bold">sensor</text>
+  <text x="76" y="65" fill="currentColor" fontSize="11" fontWeight="bold">time</text>
+  <text x="131" y="65" fill="currentColor" fontSize="11" fontWeight="bold">pm25</text>
+  <text x="181" y="65" fill="currentColor" fontSize="11" fontWeight="bold">pm10</text>
+  <rect x="10" y="72" width="215" height="22" fill="none" stroke="currentColor" />
+  <text x="16" y="87" fill="currentColor" fontSize="11">007</text>
+  <text x="76" y="87" fill="currentColor" fontSize="11">08:00</text>
+  <text x="131" y="87" fill="currentColor" fontSize="11">12.5</text>
+  <text x="181" y="87" fill="currentColor" fontSize="11">20.1</text>
+  <rect x="10" y="94" width="215" height="22" fill="none" stroke="currentColor" />
+  <text x="16" y="109" fill="currentColor" fontSize="11">012</text>
+  <text x="76" y="109" fill="currentColor" fontSize="11">08:00</text>
+  <text x="131" y="109" fill="currentColor" fontSize="11">35.2</text>
+  <text x="181" y="109" fill="currentColor" fontSize="11">40.8</text>
+  <text x="390" y="42" fill="currentColor" fontSize="12" fontWeight="bold">long: one row per measurement</text>
+  <rect x="390" y="50" width="235" height="22" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="396" y="65" fill="currentColor" fontSize="11" fontWeight="bold">sensor</text>
+  <text x="456" y="65" fill="currentColor" fontSize="11" fontWeight="bold">time</text>
+  <text x="511" y="65" fill="currentColor" fontSize="11" fontWeight="bold">pollutant</text>
+  <text x="581" y="65" fill="currentColor" fontSize="11" fontWeight="bold">value</text>
+  <rect x="390" y="72" width="235" height="22" fill="none" stroke="currentColor" />
+  <text x="396" y="87" fill="currentColor" fontSize="11">007</text>
+  <text x="456" y="87" fill="currentColor" fontSize="11">08:00</text>
+  <text x="511" y="87" fill="currentColor" fontSize="11">pm25</text>
+  <text x="581" y="87" fill="currentColor" fontSize="11">12.5</text>
+  <rect x="390" y="94" width="235" height="22" fill="none" stroke="currentColor" />
+  <text x="396" y="109" fill="currentColor" fontSize="11">012</text>
+  <text x="456" y="109" fill="currentColor" fontSize="11">08:00</text>
+  <text x="511" y="109" fill="currentColor" fontSize="11">pm25</text>
+  <text x="581" y="109" fill="currentColor" fontSize="11">35.2</text>
+  <rect x="390" y="116" width="235" height="22" fill="none" stroke="currentColor" />
+  <text x="396" y="131" fill="currentColor" fontSize="11">007</text>
+  <text x="456" y="131" fill="currentColor" fontSize="11">08:00</text>
+  <text x="511" y="131" fill="currentColor" fontSize="11">pm10</text>
+  <text x="581" y="131" fill="currentColor" fontSize="11">20.1</text>
+  <rect x="390" y="138" width="235" height="22" fill="none" stroke="currentColor" />
+  <text x="396" y="153" fill="currentColor" fontSize="11">012</text>
+  <text x="456" y="153" fill="currentColor" fontSize="11">08:00</text>
+  <text x="511" y="153" fill="currentColor" fontSize="11">pm10</text>
+  <text x="581" y="153" fill="currentColor" fontSize="11">40.8</text>
+  <line x1="235" y1="72" x2="380" y2="72" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#dw-arrow2)" />
+  <text x="307" y="64" textAnchor="middle" fill="currentColor" fontSize="11" fontFamily="var(--font-mono)">melt</text>
+  <line x1="380" y1="112" x2="235" y2="112" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#dw-arrow2)" />
+  <text x="307" y="130" textAnchor="middle" fill="currentColor" fontSize="11" fontFamily="var(--font-mono)">pivot</text>
+</svg>
+</Figure>
+
+Most summaries follow the pattern Hadley Wickham called **split-apply-combine**: split the rows into groups, apply a function to each group, and combine the results. In pandas that is `groupby` followed by an aggregation. **Named aggregation**, `agg(mean=("value", "mean"), n=("value", "size"))`, says which column each output comes from and what it is called, which keeps results readable. `transform` applies a group function but returns a result with the *original* shape, which is how you compare each row with its own group's average. And `pivot` (or `pivot_table`, which also aggregates duplicates) turns a long result into a wide table for people.
+
+**Method chaining** writes a sequence of steps as one expression, each method returning a new DataFrame. `assign` adds columns (a `lambda` lets it refer to the table as it is at that point in the chain), and `pipe` passes the table to any function of your own. Chains read top to bottom like a recipe and leave no half-finished intermediate tables lying around; break them into named steps when a chain gets longer than a screen or needs checking in the middle.
+
+```python run
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+hours = pd.date_range("2026-03-02", periods=3 * 24, freq="h")
+ids = ["001", "002", "003", "004", "005", "006"]
+wide = pd.DataFrame({
+    "sensor_id": np.repeat(ids, len(hours)),
+    "time": np.tile(hours, len(ids)),
+    "pm25": rng.gamma(4.0, 4.0, 6 * len(hours)).round(1),
+    "pm10": rng.gamma(5.0, 6.0, 6 * len(hours)).round(1),
+    "no2": rng.gamma(6.0, 5.0, 6 * len(hours)).round(1),
+})
+wide.loc[rng.choice(len(wide), 20, replace=False), "no2"] = np.nan    # the NO2 cell drops out at times
+sensors = pd.DataFrame({"sensor_id": ids, "district": ["Harbour", "Harbour", "Old Town",
+                                                         "Old Town", "Hillside", "Hillside"]})
+print("wide:", wide.shape)
+
+# Wide to long: one row per (sensor, time, pollutant). Long ("tidy") data is what group-by wants.
+long = wide.melt(id_vars=["sensor_id", "time"], var_name="pollutant", value_name="value")
+print("long:", long.shape)
+print(long.head(3).to_string(index=False))
+
+# One method chain: join, derive, filter, group, aggregate, reshape for reading.
+daily = (
+    long.merge(sensors, on="sensor_id", how="left", validate="many_to_one")
+        .assign(day=lambda d: d["time"].dt.date)
+        .dropna(subset=["value"])
+        .groupby(["district", "pollutant", "day"], as_index=False)
+        .agg(mean=("value", "mean"), peak=("value", "max"), n=("value", "size"))
+)
+print(daily.head(4).round(1).to_string(index=False))
+
+# Long to wide again, for people: districts as rows, days as columns.
+table = daily.pivot(index=["district", "pollutant"], columns="day", values="mean").round(1)
+print(table.loc[(slice(None), "pm25"), :].to_string())
+
+# transform keeps the original shape: each reading compared with its own sensor's mean.
+long["vs_sensor_mean"] = long["value"] - long.groupby(["sensor_id", "pollutant"])["value"].transform("mean")
+print("rows still:", len(long), "| average deviation:", round(abs(long["vs_sensor_mean"].mean()), 6))
+print("NO2 readings per district and day (2 sensors x 24 h = 48 expected):")
+print(daily[daily["pollutant"] == "no2"].pivot(index="district", columns="day", values="n").to_string())
+```
+
+The last table is the kind of check worth printing after every group-by: the expected count is 48 NO2 readings per district per day, and the actual counts of 43 to 47 show how many dropped out. An average built on 43 readings out of 48 is probably fine; one built on 5 out of 48 is not, and the `mean` column alone would never tell you which.
+
+<Narrator who="gideon">
+
+Two defaults deserve suspicion. `groupby` drops rows whose group key is missing (`dropna=True`), so readings from a sensor with no district simply vanish from every district total; pass `dropna=False` to see them as their own group. And `size` counts rows while `count` counts non-missing values, which is why this chain drops missing values before aggregating.
+
+</Narrator>
+
+</Section>
+
+<Section id="performance" kind="computation" title="Performance: vectorise, then measure">
+
+pandas and NumPy are fast when the work happens inside their compiled code, on whole columns at once: this is **vectorisation**. They are slow when Python code runs once per row, because each row then costs a Python function call and the creation of Python objects. The difference is easy to measure.
+
+```python run
+import time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+n = 200_000
+df = pd.DataFrame({"pm25": rng.gamma(4.0, 4.0, n).round(1),
+                   "district": rng.choice(["Harbour", "Old Town", "Hillside"], n)})
+
+def band(x):
+    return "low" if x <= 15 else ("moderate" if x <= 35 else "high")
+
+def timed(label, f, rows):
+    start = time.perf_counter()
+    out = f()
+    secs = time.perf_counter() - start
+    print(f"{label:28} {1e6 * secs / rows:8.3f} microseconds per row")
+    return out
+
+small = df.head(20_000)
+a = timed("iterrows loop (20k rows)", lambda: [band(r["pm25"]) for _, r in small.iterrows()], len(small))
+b = timed("Series.apply", lambda: df["pm25"].apply(band), n)
+c = timed("vectorised (np.select)", lambda: np.select(
+    [df["pm25"] <= 15, df["pm25"] <= 35], ["low", "moderate"], default="high"), n)
+d = timed("vectorised (pd.cut)", lambda: pd.cut(
+    df["pm25"], [-np.inf, 15, 35, np.inf], labels=["low", "moderate", "high"]), n)
+e = timed("Python loop, arithmetic", lambda: [x * 0.5 + 1.0 for x in df["pm25"]], n)
+f = timed("vectorised arithmetic", lambda: df["pm25"] * 0.5 + 1.0, n)
+print("all band methods agree:", a == list(b[:20_000]) and (b == c).all() and (b == d.astype(str)).all())
+
+mb = lambda s: s.memory_usage(deep=True) / 1e6
+print(f"district as text: {mb(df['district']):.1f} MB, as category: {mb(df['district'].astype('category')):.1f} MB")
+```
+
+On the machine where this lesson was checked, `iterrows` took about 12 to 14 microseconds per row, `Series.apply` about 0.1, and the vectorised versions about 0.02: several hundred times faster than `iterrows`. For plain arithmetic, a Python loop took about 0.07 microseconds per value against about 0.004 for the vectorised expression. Your numbers will differ, and the browser is slower, but the order will not. Storing a column with three distinct district names as a `category` (small integer codes plus a table of labels) also cut its memory from 11.3 MB to 0.2 MB, which matters once tables have tens of millions of rows.
+
+A few rules of thumb follow:
+
+- Never use `iterrows` for computation. If you must loop, loop over plain arrays (`df["pm25"].to_numpy()`), or use `itertuples`, which is much faster.
+- `apply` with a Python function is a loop in disguise. Look for a vectorised equivalent first: arithmetic, comparisons, `np.where`, `np.select`, `pd.cut`, the `.str` and `.dt` accessors, `groupby` aggregations.
+- Measure before optimising. A loop that takes 0.2 seconds once a day needs no attention; one inside a function called a million times does.
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+pandas is the default tool for tables that fit in memory, and in 2026 it is one of several good options. **pandas 3.0** made copy-on-write the default (so selections behave like copies, and chained assignment can no longer silently fail) and stores text in a dedicated string type by default; code written for pandas 2 mostly runs unchanged, but anything relying on chained assignment needs fixing. This lesson's code runs on pandas 2.3, the version the in-browser Python provides.
+
+- [**Polars**](https://pola.rs/) is a DataFrame library written in Rust, with a lazy mode in which you describe the whole query and an optimiser plans it, using every processor core. It is often much faster than pandas on large tables, with a different and stricter API.
+- [**DuckDB**](https://duckdb.org/) is an analytical SQL database that runs inside your Python process and can query pandas DataFrames, Parquet and CSV files directly. Many analysts mix it with pandas: SQL for big joins and aggregations, pandas for the rest. The join types of this lesson are the same as SQL's (see [databases](/en/cs/databases/) in Lumenary CS).
+- [**Apache Arrow**](https://arrow.apache.org/) is a standard in-memory columnar format that pandas, Polars, DuckDB and Spark can all share without copying data; Parquet is its on-disk companion (see [data models and file formats](/en/cs/electives/data-engineering/data-models-and-file-formats/) in the Data Engineering elective).
+- When data no longer fit on one machine, the same operations run on clusters with Spark and similar engines ([distributed processing](/en/cs/electives/data-engineering/distributed-processing/)).
+
+Whatever the tool, professional wrangling code has the same habits: identifiers read as strings, missing-value codes listed explicitly, dates parsed with a format and stored in UTC, every join validated and its row counts logged, and the cleaning written as tested functions rather than a sequence of notebook cells.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"An inner join is the safe default."** An inner join silently drops every row whose key does not match, so a typo in one sensor ID removes its readings from the analysis without a trace. Use a left join with `indicator=True` and look at what did not match; then decide.
+
+</Misconception>
+
+<Misconception>
+
+**"A join cannot add rows if the left table has no duplicates."** It can: duplicates on the *right* copy left rows. The number of rows is $\sum_k m_k n_k$, and a single duplicated key in a lookup table is enough to inflate totals.
+
+</Misconception>
+
+<Misconception>
+
+**"`NaN == NaN` is `True`, so I can filter for missing values with `==`."** It is `False`, by the floating-point standard. Use `isna()` and `notna()`.
+
+</Misconception>
+
+<Misconception>
+
+**"`apply` is vectorised because it is a pandas method."** It calls your Python function once per row or element. It is convenient, and it is a loop; vectorised alternatives are often five to a hundred times faster.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

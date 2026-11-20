@@ -1,0 +1,819 @@
+---
+title: Data for AI
+subtitle: The data engineering inside machine learning — training corpora built from the web, features served without leaking the future, vectors searched approximately, and evaluation sets kept honest.
+minutes: 90
+objectives:
+  - Describe the stages of a training-data pipeline for a large model, and state the main positions in the debates over crawling and licensing fairly
+  - Prove why MinHash estimates Jaccard similarity, implement MinHash with locality-sensitive banding, and choose bands and rows for a target threshold
+  - Estimate the cost of tokenising and storing a multi-trillion-token corpus, and compare ways of packing documents into training sequences
+  - Explain what a feature store does, and write a point-in-time correct join that keeps future information out of training data
+  - Implement an inverted-file vector index and measure its recall against exact search, and explain how HNSW and product quantisation differ
+  - Manage evaluation data so that scores stay meaningful — versioned, decontaminated, documented and partly held back
+prerequisites: [batch-processing-and-mapreduce, data-quality-and-governance]
+related: [math.prob.probability-theory, math.algebra.linear-algebra]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "On the resemblance and containment of documents"
+    author: Andrei Z. Broder
+    year: 1997
+    note: Compression and Complexity of Sequences 1997. Introduced MinHash, used at the time to find near-duplicate pages for the AltaVista search engine.
+  - title: "Approximate nearest neighbors: towards removing the curse of dimensionality"
+    author: Piotr Indyk and Rajeev Motwani
+    year: 1998
+    note: STOC 1998. The paper that introduced locality-sensitive hashing.
+  - title: "Deduplicating Training Data Makes Language Models Better"
+    author: Katherine Lee et al.
+    year: 2021
+    url: https://arxiv.org/abs/2107.06499
+  - title: "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale"
+    author: Guilherme Penedo et al.
+    year: 2024
+    url: https://arxiv.org/abs/2406.17557
+    note: An openly documented web-data pipeline, with ablations of each filtering and deduplication choice.
+  - title: "Dolma: an Open Corpus of Three Trillion Tokens for Language Model Pretraining Research"
+    author: Luca Soldaini et al.
+    year: 2024
+    url: https://arxiv.org/abs/2402.00159
+  - title: "DataComp-LM: In search of the next generation of training sets for language models"
+    author: Jeffrey Li et al.
+    year: 2024
+    url: https://arxiv.org/abs/2406.11794
+    note: A benchmark that holds the model fixed and compares data-curation strategies.
+  - title: "Documenting Large Webtext Corpora: A Case Study on the Colossal Clean Crawled Corpus"
+    author: Jesse Dodge et al.
+    year: 2021
+    url: https://arxiv.org/abs/2104.08758
+  - title: "Consent in Crisis: The Rapid Decline of the AI Data Commons"
+    author: Shayne Longpre et al.
+    year: 2024
+    url: https://arxiv.org/abs/2407.14933
+    note: An audit of how websites' robots.txt files and terms changed towards AI crawlers.
+  - title: "RFC 9309: Robots Exclusion Protocol"
+    url: https://www.rfc-editor.org/rfc/rfc9309
+  - title: "Datasheets for Datasets"
+    author: Timnit Gebru et al.
+    year: 2018
+    url: https://arxiv.org/abs/1803.09010
+  - title: "Language Model Tokenizers Introduce Unfairness Between Languages"
+    author: Aleksandar Petrov et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.15425
+  - title: "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"
+    author: Yu. A. Malkov and D. A. Yashunin
+    year: 2016
+    url: https://arxiv.org/abs/1603.09320
+  - title: "Product quantization for nearest neighbor search"
+    author: Hervé Jégou, Matthijs Douze and Cordelia Schmid
+    year: 2011
+    note: IEEE Transactions on Pattern Analysis and Machine Intelligence; the compression behind most billion-scale vector indexes.
+  - title: "Billion-scale similarity search with GPUs"
+    author: Jeff Johnson, Matthijs Douze and Hervé Jégou
+    year: 2017
+    url: https://arxiv.org/abs/1702.08734
+    note: The paper behind the FAISS library.
+  - title: ANN-Benchmarks
+    url: https://ann-benchmarks.com/
+    note: An open comparison of approximate nearest-neighbour libraries on public datasets, as recall against queries per second.
+  - title: Feast, an open-source feature store
+    url: https://feast.dev/
+  - title: "The Curse of Recursion: Training on Generated Data Makes Models Forget"
+    author: Ilia Shumailov et al.
+    year: 2023
+    url: https://arxiv.org/abs/2305.17493
+    note: The preprint of the study of "model collapse", later published in Nature (2024).
+---
+
+<Section id="motivation" kind="motivation" title="Four kinds of data a model needs">
+
+Ask the people who build machine-learning systems where their time goes, and most of it goes on data: finding it, cleaning it, moving it, keeping it correct and keeping it legal. A model meets data in four ways, each a data-engineering problem of its own:
+
+- **Training corpora.** A large language model is pretrained on trillions of tokens of text and code. Building such a corpus is a batch pipeline of enormous scale whose quality shows up directly in the model.
+- **Features.** A model that predicts whether a bike station will run empty needs inputs such as "share of the last day the station was empty", both for millions of past training examples and, in milliseconds, for each live prediction — and the two must agree.
+- **Vectors.** Search, recommendation and retrieval-augmented generation turn documents into **embeddings**, vectors whose closeness means similarity, and need a query's nearest neighbours among hundreds of millions of them, fast.
+- **Evaluation data.** The test sets that decide whether a model ships. If they leak into training or are mislabelled, every decision based on them is wrong.
+
+This lesson builds the central algorithm of each: near-duplicate detection with MinHash, packing tokens into sequences, a point-in-time join and an approximate nearest-neighbour index. Lumenary CS's [language models](/en/cs/language-models/) lesson explains what models do with their data; here we look at the pipes.
+
+</Section>
+
+<Section id="corpus" kind="human" title="A training-data pipeline">
+
+The pipelines that build pretraining corpora are now well documented in public, thanks largely to groups that released their data and code: Hugging Face's [FineWeb](https://arxiv.org/abs/2406.17557), the Allen Institute for AI's [Dolma](https://arxiv.org/abs/2402.00159), the [DataComp-LM](https://arxiv.org/abs/2406.11794) collaboration, and others. Closed labs disclose less, but describe broadly the same stages.
+
+<Figure caption="The stages of a pretraining-data pipeline. Each stage removes or rewrites data; a provenance record follows every document, so that any decision can be audited and any source removed from the next version.">
+
+<svg viewBox="0 0 680 250" role="img" aria-label="Two rows of five boxes joined by arrows. Top row: collect (web crawls, licensed sources, code, books), extract (HTML to text, language identification), filter (heuristic rules, quality classifiers), deduplicate (exact, near-duplicate, substring) and clean (personal data, unsafe content). An arrow wraps to the bottom row: decontaminate (remove evaluation sets), tokenise and pack (token ids in shards), mix (weights per source, order), train, and evaluate. A band along the bottom reads: provenance and lineage — source, crawl date, licence, robots and opt-out status, every filter decision, dataset version.">
+  <defs>
+    <marker id="dai-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="1.6">
+    <rect x="10" y="20" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="146" y="20" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="282" y="20" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="418" y="20" width="116" height="62" rx="6" stroke="var(--gold)" />
+    <rect x="554" y="20" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="10" y="120" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="146" y="120" width="116" height="62" rx="6" stroke="var(--gold)" />
+    <rect x="282" y="120" width="116" height="62" rx="6" stroke="var(--sky)" />
+    <rect x="418" y="120" width="116" height="62" rx="6" stroke="currentColor" />
+    <rect x="554" y="120" width="116" height="62" rx="6" stroke="currentColor" />
+    <rect x="10" y="202" width="660" height="38" rx="6" stroke="currentColor" strokeDasharray="5 4" />
+  </g>
+  <g stroke="currentColor" strokeWidth="1.4" fill="none" markerEnd="url(#dai-arrow)">
+    <line x1="126" y1="51" x2="144" y2="51" />
+    <line x1="262" y1="51" x2="280" y2="51" />
+    <line x1="398" y1="51" x2="416" y2="51" />
+    <line x1="534" y1="51" x2="552" y2="51" />
+    <path d="M612,82 L612,101 L68,101 L68,118" />
+    <line x1="126" y1="151" x2="144" y2="151" />
+    <line x1="262" y1="151" x2="280" y2="151" />
+    <line x1="398" y1="151" x2="416" y2="151" />
+    <line x1="534" y1="151" x2="552" y2="151" />
+  </g>
+  <g fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">
+    <text x="68" y="40">collect</text>
+    <text x="204" y="40">extract</text>
+    <text x="340" y="40">filter</text>
+    <text x="476" y="40">deduplicate</text>
+    <text x="612" y="40">clean</text>
+    <text x="68" y="140">decontaminate</text>
+    <text x="204" y="140">tokenise, pack</text>
+    <text x="340" y="140">mix</text>
+    <text x="476" y="140">train</text>
+    <text x="612" y="140">evaluate</text>
+  </g>
+  <g fill="currentColor" fontSize="10.5" textAnchor="middle">
+    <text x="68" y="58">crawls, licensed</text>
+    <text x="68" y="72">sources, code</text>
+    <text x="204" y="58">HTML to text,</text>
+    <text x="204" y="72">language ID</text>
+    <text x="340" y="58">rules, quality</text>
+    <text x="340" y="72">classifiers</text>
+    <text x="476" y="58">exact, near,</text>
+    <text x="476" y="72">substring</text>
+    <text x="612" y="58">personal data,</text>
+    <text x="612" y="72">unsafe content</text>
+    <text x="68" y="158">remove copies</text>
+    <text x="68" y="172">of test sets</text>
+    <text x="204" y="158">token ids,</text>
+    <text x="204" y="172">sequences, shards</text>
+    <text x="340" y="158">weights per source,</text>
+    <text x="340" y="172">order, epochs</text>
+    <text x="476" y="158">many GPUs,</text>
+    <text x="476" y="172">weeks</text>
+    <text x="612" y="158">held-out,</text>
+    <text x="612" y="172">versioned sets</text>
+    <text x="340" y="225">provenance and lineage: source, crawl date, licence, robots and opt-out status, every filter decision, dataset version</text>
+  </g>
+</svg>
+
+</Figure>
+
+Most text corpora start from [Common Crawl](https://commoncrawl.org/), a nonprofit that has published crawls of billions of web pages since 2008 in the WARC archive format (ISO 28500), plus labs' own crawlers, licensed archives, public-domain books, papers and public code. Extraction turns HTML into text and identifies the language; filters remove what should not be learned from, by heuristic rules (too short, too many symbols, repeated lines) and, increasingly, by small classifiers that score quality or educational value. Each choice is tested empirically: teams train small "ablation" models on candidate versions of the data and keep what trains better models, which is why the open pipelines publish ablation tables and why DataComp-LM fixes the model and lets participants compete only on the data.
+
+### Crawling, licensing and consent
+
+Whether, and on what terms, publicly reachable text, images and code may be used for training is contested in courts and in public argument, and the law differs by country. Lumenary CS's [language models](/en/cs/language-models/) lesson sets out the positions and the state of the law as of 2026. In brief, one side holds that training learns statistical patterns rather than copying works and is a transformative, broadly beneficial use; the other, that creators' work is taken at industrial scale, without permission or payment, to build products that can compete with them. Both deserve a hearing, and neither is settled. Some obligations hold whichever way the arguments go:
+
+- **Honour the signals that exist.** Obey `robots.txt` (standardised as [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309) in 2022), identify crawlers honestly and keep request rates gentle. Many sites restricted AI crawlers sharply from 2023, as the [Consent in Crisis](https://arxiv.org/abs/2407.14933) audit documented, and the IETF has begun work on machine-readable statements of AI-use preferences.
+- **Record provenance for every document**: source, date, licence or terms, opt-out status at crawl time, and the filters it passed. Without it you cannot honour a removal request, answer a regulator or explain what the model saw; the EU's AI Act, for one, requires providers of general-purpose models to publish a summary of their training content.
+- **Treat "public" as different from "consented".** Scraped personal data is still personal data, and detecting it is imperfect, so minimise collection rather than relying on scrubbing afterwards.
+- **Document the dataset** — contents, exclusions and known gaps — in the spirit of [Datasheets for Datasets](https://arxiv.org/abs/1803.09010). An audit of the C4 corpus ([Dodge et al., 2021](https://arxiv.org/abs/2104.08758)) found that a blocklist filter had disproportionately removed text by and about some minority groups: the kind of effect only documentation and audits reveal.
+
+Image–text data raises the stakes. In December 2023 LAION withdrew its LAION-5B dataset of image links after researchers at the Stanford Internet Observatory found links to child sexual abuse material in it; a cleaned version, prepared with child-safety organisations, followed in 2024. Filtering at this scale needs the hash-matching services such organisations run, not ad hoc scripts.
+
+</Section>
+
+<Section id="dedup" kind="computation" title="Near-duplicates at web scale">
+
+The web repeats itself: mirrors, syndicated news, templated pages, spam. [Lee et al. (2021)](https://arxiv.org/abs/2107.06499) found that removing duplicates made language models train more efficiently and reproduce memorised text far less often. **Exact** duplicates are easy: hash each normalised document and keep one per hash. **Near**-duplicates need a similarity measure and a way to avoid comparing every pair, because a billion documents make $5 \times 10^{17}$ pairs.
+
+<Definition term="Shingles and Jaccard similarity">
+
+A document's **shingles** are its overlapping runs of $k$ consecutive words ($k$-grams). The **Jaccard similarity** of two shingle sets $A$ and $B$ is $J(A, B) = |A \cap B| / |A \cup B|$, between 0 (nothing shared) and 1 (identical sets).
+
+</Definition>
+
+**MinHash** replaces each set by a short **signature** whose agreement estimates $J$.
+
+<Theorem name="MinHash">
+
+Let $h$ be a random permutation of the universe of shingles, and let $\min h(A)$ be the smallest value $h$ takes on $A$. For non-empty sets $A$ and $B$,
+$$\Pr\big[\min h(A) = \min h(B)\big] = J(A, B).$$
+
+</Theorem>
+
+<Proof>
+
+Consider the element $x$ of $A \cup B$ with the smallest value of $h$. Since $h$ is a uniformly random permutation, $x$ is equally likely to be any of the $|A \cup B|$ elements. If $x \in A \cap B$, then $x$ attains the minimum of both sets, so the minima are equal. If $x$ lies in only one of the sets, say $A$, then $\min h(A) = h(x)$, while every element of $B$ has a larger value, so the minima differ. Hence the minima agree exactly when $x \in A \cap B$, which has probability $|A \cap B| / |A \cup B|$.
+
+</Proof>
+
+With $K$ independent hash functions, the fraction of the $K$ signature positions on which two documents agree is an unbiased estimate of $J$ with standard deviation at most $1/(2\sqrt{K})$; for $K = 128$, about 0.04. In practice the random permutations are replaced by hash functions such as $h(x) = (ax + b) \bmod p$, which behave closely enough to random.
+
+Signatures make each comparison cheap, but there are still too many pairs. **Locality-sensitive hashing** (LSH) by **banding** finds the similar pairs without looking at the others: cut each signature into $b$ bands of $r$ values and put each document into one bucket per band, keyed by that band's values. Documents sharing a bucket in any band become **candidates**. At similarity $s$, one band matches with probability $s^r$, so
+$$\Pr[\text{candidate}] = 1 - (1 - s^r)^b,$$
+an S-shaped curve that rises steeply near $s \approx (1/b)^{1/r}$.
+
+<Figure caption="The probability that a pair becomes a candidate, against its Jaccard similarity, for 128 hash values split two ways. More rows per band make the curve steeper and move it right; more bands move it left.">
+
+<svg viewBox="0 0 640 270" role="img" aria-label="A graph with Jaccard similarity from 0 to 1 on the horizontal axis and probability of becoming a candidate from 0 to 1 on the vertical axis. Two S-shaped curves rise from 0 to 1. The curve for 32 bands of 4 rows rises around similarity 0.42; the curve for 16 bands of 8 rows rises more steeply around 0.71.">
+  <g stroke="currentColor" strokeWidth="1.2" fill="none">
+    <line x1="60" y1="230" x2="384" y2="230" />
+    <line x1="60" y1="230" x2="60" y2="26" />
+    <line x1="60" y1="30" x2="380" y2="30" strokeDasharray="2 4" />
+    <line x1="380" y1="30" x2="380" y2="230" strokeDasharray="2 4" />
+  </g>
+  <path d="M60.0,230.0 L68.0,230.0 L76.0,230.0 L84.0,229.8 L92.0,229.4 L100.0,228.4 L108.0,226.8 L116.0,224.1 L124.0,220.0 L132.0,214.2 L140.0,206.5 L148.0,196.5 L156.0,184.2 L164.0,169.7 L172.0,153.3 L180.0,135.5 L188.0,117.2 L196.0,99.2 L204.0,82.4 L212.0,67.6 L220.0,55.4 L228.0,46.0 L236.0,39.3 L244.0,34.9 L252.0,32.4 L260.0,31.0 L268.0,30.4 L276.0,30.1 L284.0,30.0 L380.0,30.0" fill="none" stroke="var(--sky)" strokeWidth="2.2" />
+  <path d="M60.0,230.0 L140.0,230.0 L148.0,229.9 L156.0,229.8 L164.0,229.6 L172.0,229.3 L180.0,228.8 L188.0,227.9 L196.0,226.6 L204.0,224.7 L212.0,221.9 L220.0,217.9 L228.0,212.3 L236.0,204.8 L244.0,195.0 L252.0,182.5 L260.0,167.2 L268.0,149.1 L276.0,128.8 L284.0,107.3 L292.0,86.1 L300.0,67.0 L308.0,51.5 L316.0,40.6 L324.0,34.2 L332.0,31.2 L340.0,30.2 L348.0,30.0 L380.0,30.0" fill="none" stroke="var(--gold)" strokeWidth="2.2" />
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="60" y="246">0</text>
+    <text x="140" y="246">0.25</text>
+    <text x="220" y="246">0.5</text>
+    <text x="300" y="246">0.75</text>
+    <text x="380" y="246">1</text>
+    <text x="220" y="264">Jaccard similarity s</text>
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="end">
+    <text x="52" y="234">0</text>
+    <text x="52" y="134">0.5</text>
+    <text x="52" y="34">1</text>
+  </g>
+  <text x="18" y="130" fill="currentColor" fontSize="11" textAnchor="middle" transform="rotate(-90 18 130)">P(candidate)</text>
+  <g fontSize="12">
+    <line x1="410" y1="80" x2="440" y2="80" stroke="var(--sky)" strokeWidth="2.2" />
+    <text x="448" y="84" fill="currentColor">b = 32 bands of r = 4</text>
+    <text x="448" y="100" fill="currentColor" fontSize="11">rises near s = 0.42</text>
+    <line x1="410" y1="130" x2="440" y2="130" stroke="var(--gold)" strokeWidth="2.2" />
+    <text x="448" y="134" fill="currentColor">b = 16 bands of r = 8</text>
+    <text x="448" y="150" fill="currentColor" fontSize="11">rises near s = 0.71</text>
+  </g>
+</svg>
+
+</Figure>
+
+The block builds 1,000 synthetic pages — 800 originals and 200 near-copies of four kinds — computes 128-value MinHash signatures over word 5-gram shingles, bands them 16 × 8, checks each candidate's estimated similarity, and merges near-duplicates with union–find (Lumenary CS's [spanning trees and union–find](/en/cs/spanning-trees-union-find/)). For ground truth it also computes every pair's exact similarity, through an inverted index from shingle to documents.
+
+```python run
+import zlib
+from collections import defaultdict
+from itertools import combinations
+import numpy as np
+
+rng = np.random.default_rng(7)
+
+# A synthetic corpus: 800 original "web pages" plus near-copies made the way the web makes them.
+syll = ["ka", "lo", "mi", "ra", "tu", "se", "no", "vi", "da", "pe", "zu", "ha", "ri", "mo", "ne", "sa"]
+vocab = [a + b + c for a in syll for b in syll for c in syll[:6]]          # 1,536 made-up words
+zipf = 1 / np.arange(1, len(vocab) + 1) ** 1.1
+zipf /= zipf.sum()
+
+def page():
+    return [vocab[i] for i in rng.choice(len(vocab), rng.integers(120, 300), p=zipf)]
+
+def mutate(words, rate):
+    """Replace a fraction of the words, as a light rewrite or a template change would."""
+    out = list(words)
+    for i in np.flatnonzero(rng.random(len(out)) < rate):
+        out[i] = vocab[rng.integers(len(vocab))]
+    return out
+
+docs = [page() for _ in range(800)]
+nav = page()[:40]                                    # one site's menu and footer
+source = {}
+for i in range(200):                                 # 200 near-copies of earlier pages
+    source[len(docs)] = s = int(rng.integers(800))
+    src = docs[s]
+    kind = i % 4
+    if kind == 0:
+        docs.append(list(src))                                       # exact copy
+    elif kind == 1:
+        docs.append(nav[:20] + src + nav[20:])                       # same text, new boilerplate
+    elif kind == 2:
+        docs.append(mutate(src, 0.02))                               # light edits
+    else:
+        docs.append(mutate(src, 0.10))                               # heavier rewrite
+
+def shingles(words, k=5):
+    """Word 5-grams, hashed to 31 bits with a stable hash (Python's str hash changes per process)."""
+    return {zlib.crc32(" ".join(words[i:i + k]).encode()) & 0x7FFFFFFF for i in range(len(words) - k + 1)}
+
+S = [shingles(d) for d in docs]
+N = len(docs)
+
+# MinHash: 128 random hash functions h(x) = (a*x + b) mod p; keep the minimum of each over the shingles.
+P, K = 2**31 - 1, 128
+A = rng.integers(1, P, K, dtype=np.int64)
+B = rng.integers(0, P, K, dtype=np.int64)
+def signature(sh):
+    x = np.fromiter(sh, dtype=np.int64)
+    return ((A[:, None] * x[None, :] + B[:, None]) % P).min(axis=1)
+sig = np.array([signature(s) for s in S])            # N x 128
+
+# LSH banding: 16 bands of 8 rows. Two documents are candidates if any whole band agrees.
+bands, rows = 16, 8
+buckets = defaultdict(list)
+for d in range(N):
+    for b in range(bands):
+        buckets[(b, sig[d, b * rows:(b + 1) * rows].tobytes())].append(d)
+candidates = {pair for ids in buckets.values() for pair in combinations(ids, 2)}
+
+# Ground truth, exactly: count shared shingles through an inverted index (shingle -> documents).
+def jaccard(a, b):
+    return len(a & b) / len(a | b)
+postings = defaultdict(list)
+for d, sh in enumerate(S):
+    for x in sh:
+        postings[x].append(d)
+shared = defaultdict(int)
+for ids in postings.values():
+    for pair in combinations(ids, 2):
+        shared[pair] += 1
+all_pairs = N * (N - 1) // 2
+true = {(i, j) for (i, j), c in shared.items() if c / (len(S[i]) + len(S[j]) - c) >= 0.7}
+
+est = {(i, j): float(np.mean(sig[i] == sig[j])) for i, j in candidates}
+found = {p for p in candidates if est[p] >= 0.7}
+print(f"{N} documents, {all_pairs:,} pairs; {sum(map(len, S)):,} shingles in all")
+print(f"pairs sharing at least one shingle: {len(shared):,}; pairs with Jaccard >= 0.7: {len(true)}")
+print(f"LSH candidate pairs: {len(candidates)} ({len(candidates) / all_pairs:.3%} of all pairs)")
+print(f"kept after checking the MinHash estimate >= 0.7: {len(found)}; "
+      f"recall {len(found & true) / len(true):.3f}, false positives {len(found - true)}")
+err = [abs(est[p] - jaccard(S[p[0]], S[p[1]])) for p in candidates]
+print(f"MinHash estimate vs exact Jaccard on candidates: mean abs error {np.mean(err):.3f}")
+
+# Cluster near-duplicates with union-find and keep one document per cluster.
+parent = list(range(N))
+def find(x):
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+    return x
+for i, j in found:
+    parent[find(i)] = find(j)
+kept = {find(d) for d in range(N)}
+print(f"after deduplication: {len(kept)} documents kept, {N - len(kept)} removed")
+
+print("\nwhich near-copies were caught, by kind:")
+names = ["exact copy", "new boilerplate", "2% of words changed", "10% of words changed"]
+for kind in range(4):
+    ids = [800 + i for i in range(200) if i % 4 == kind]
+    sims = [jaccard(S[d], S[source[d]]) for d in ids]
+    caught = sum(find(d) == find(source[d]) for d in ids)
+    print(f"  {names[kind]:22s} median Jaccard to its source {np.median(sims):.2f}; caught {caught}/{len(ids)}")
+
+print("\nprobability that a pair becomes a candidate, 1 - (1 - s^r)^b, with b = 16, r = 8:")
+for s in [0.3, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    print(f"  s = {s:.1f}: {1 - (1 - s**rows) ** bands:.3f}")
+```
+
+Of 499,500 pairs, LSH proposed 170 — 0.034% — and every one it kept after checking was a true near-duplicate. It found 163 of the 172 pairs above 0.7, a recall of 0.948. All nine misses have true similarities between 0.71 and 0.80, just above the threshold: seven never became candidates, since the S-curve gives such pairs only a 61% to 95% chance, and two were rejected by estimates of 0.695. Pages with 10% of their words changed were not caught, and should not be: changing one word in ten breaks about four 5-grams in ten, so their similarity to the source is only 0.44. The shingle length and the threshold *define* what counts as a duplicate.
+
+<Narrator who="chloe">
+
+The trick is to replace "are these two sets similar?" by "did two random experiments come out the same?" — a question you can ask of each document alone, by writing its outcomes down. Banding then turns "the outcomes mostly agree" into "some block of outcomes agrees exactly", which a hash table can find without ever comparing the dissimilar pairs.
+
+</Narrator>
+
+At real scale this is a distributed batch job of the kind in <LessonLink slug="batch-processing-and-mapreduce">Batch processing and MapReduce</LessonLink>: map each document to its band keys, shuffle by key, emit candidate pairs per bucket, then compute connected components. **Substring** deduplication with suffix arrays (as in Lee et al.) removes long repeated passages inside otherwise different documents, and **semantic** deduplication clusters embeddings to catch paraphrases. More deduplication is not automatically better: the FineWeb authors reported that deduplicating each crawl separately gave better models than deduplicating across all crawls at once, because in their experiments the pages that survived global deduplication were, on average, of lower quality than those it removed.
+
+<Narrator who="gideon">
+
+Two silent bugs wait here. Python's built-in `hash` of a string changes from process to process, so a distributed job that uses it puts the same shingle in different buckets on different machines; the block uses `zlib.crc32` for that reason. And the inverted index that gave the exact answer cheaply works only because unrelated pages share few shingles: one boilerplate phrase found on ten million pages would generate $5 \times 10^{13}$ pairs on its own.
+
+</Narrator>
+
+</Section>
+
+<Section id="tokens" kind="computation" title="From text to training sequences">
+
+The chosen text is converted to token ids — by byte-pair encoding in most current models, as Lumenary CS's [language models](/en/cs/language-models/) lesson explains — and packed into fixed-length training sequences. That raises three questions: how fast tokenisation runs, how much space the ids take, and how to pack documents of very different lengths. The block learns 300 BPE merges, times the encoder with and without a cache of already-encoded words, scales the result to 15 trillion tokens, and compares three ways of packing 10,000 documents into sequences of 2,048 tokens.
+
+```python run
+import time
+from bisect import bisect_left, insort
+from collections import Counter
+import numpy as np
+
+rng = np.random.default_rng(11)
+syll = ["ka", "lo", "mi", "ra", "tu", "se", "no", "vi", "da", "pe", "zu", "ha", "ri", "mo", "ne", "sa"]
+words = [a + b + c for a in syll for b in syll for c in syll[:8]]           # 2,048 made-up words
+zipf = 1 / np.arange(1, len(words) + 1) ** 1.1
+zipf /= zipf.sum()
+corpus_words = [words[i] for i in rng.choice(len(words), 120_000, p=zipf)]
+
+# Learn 300 byte-pair merges from word counts (Lumenary CS's language-models lesson explains BPE).
+counts = Counter(corpus_words[:20_000])
+split = {w: tuple(w) for w in counts}
+ranks = {}
+for r in range(300):
+    pairs = Counter()
+    for w, c in counts.items():
+        s = split[w]
+        for a, b in zip(s, s[1:]):
+            pairs[a, b] += c
+    best = max(pairs, key=lambda p: (pairs[p], p))
+    ranks[best] = r
+    for w, s in split.items():
+        out, i = [], 0
+        while i < len(s):
+            if i + 1 < len(s) and (s[i], s[i + 1]) == best:
+                out.append(s[i] + s[i + 1])
+                i += 2
+            else:
+                out.append(s[i])
+                i += 1
+        split[w] = tuple(out)
+
+def bpe(word):
+    """Apply the learned merges to one word, lowest rank first, as BPE encoders do."""
+    parts = list(word)
+    while len(parts) > 1:
+        pair = min(zip(parts, parts[1:]), key=lambda p: ranks.get(p, 1 << 30))
+        if pair not in ranks:
+            break
+        i = next(i for i in range(len(parts) - 1) if (parts[i], parts[i + 1]) == pair)
+        parts[i:i + 2] = [pair[0] + pair[1]]
+    return parts
+
+def encode(ws, cache=None):
+    out = []
+    for w in ws:
+        if cache is None:
+            out += bpe(w)
+        else:
+            if w not in cache:
+                cache[w] = bpe(w)
+            out += cache[w]
+    return out
+
+rates = {}
+for label, cache in [("no cache", None), ("word cache", {})]:
+    t0 = time.perf_counter()
+    toks = encode(corpus_words[:30_000] if cache is None else corpus_words, cache)
+    rates[label] = len(toks) / (time.perf_counter() - t0)
+    print(f"{label:10s}: {len(toks):8,} tokens, about {rates[label] / 1e6:.2f} million tokens per second")
+text_bytes = sum(len(w) + 1 for w in corpus_words)
+print(f"{text_bytes / len(toks):.2f} bytes per token; the cache holds {len(cache):,} distinct words")
+
+target = 15e12
+core_hours = target / rates["no cache"] / 3600       # the pessimistic rate
+print(f"\n15 trillion tokens at the no-cache rate: {core_hours:,.0f} core-hours, "
+      f"{core_hours / 1000:,.1f} hours on 1,000 cores")
+for vocab in [50_000, 200_000]:
+    item = 2 if vocab <= 2**16 else 4
+    print(f"  vocabulary {vocab:,}: {item}-byte ids, {target * item / 1e12:.0f} TB of token ids")
+
+# Packing documents into training sequences of L tokens.
+L = 2048
+lengths = np.round(rng.lognormal(6.3, 1.1, 10_000)).astype(int) + 1
+total = int(lengths.sum())
+print(f"\n{len(lengths):,} documents, {total:,} tokens, median {int(np.median(lengths))}, "
+      f"{np.mean(lengths > L):.1%} longer than {L}")
+
+kept = int(np.minimum(lengths, L).sum())                  # (a) one document per sequence
+print(f"one per sequence: {len(lengths):6,} sequences, {1 - kept / (len(lengths) * L):5.1%} padding, "
+      f"{1 - kept / total:5.1%} of tokens cut off")
+
+ends = np.cumsum(lengths + 1)                             # (b) concatenate with a separator, cut every L
+n_seq = int(np.ceil(ends[-1] / L))
+starts = ends - lengths - 1
+split_docs = int(np.sum((starts // L) != ((ends - 2) // L)))
+print(f"concatenate:      {n_seq:6,} sequences, {1 - ends[-1] / (n_seq * L):5.1%} padding, "
+      f"{split_docs:,} documents split across sequences")
+
+# (c) best-fit decreasing: cut only documents longer than L, then fill sequences tightest-first
+pieces = sorted((p for n in lengths for p in [L] * int(n // L) + [int(n % L)] if p), reverse=True)
+free, n_seq = [], 0                                       # free room in each open sequence, sorted
+for p in pieces:
+    i = bisect_left(free, p)                              # the tightest open sequence with room
+    if i == len(free):
+        n_seq += 1
+        room = L - p
+    else:
+        room = free.pop(i) - p
+    if room:
+        insort(free, room)
+print(f"best-fit packing: {n_seq:6,} sequences, {1 - total / (n_seq * L):5.1%} padding, "
+      f"{int(np.sum(lengths > L)):,} documents split (only those longer than {L})")
+```
+
+Timings are the least reproducible numbers in this lesson: on the machine that tested the lesson, with other jobs running, the uncached encoder managed 0.05 to 0.25 million tokens a second and the cached one 2.5 to 9.6 million. The cache flatters, since our made-up language has only 2,048 words, and production tokenizers, written in Rust or C++, are far faster per word. Even at the slowest rate, 15 trillion tokens take under 90,000 core-hours — about four days on 1,000 cores — while training on them takes millions of accelerator-hours. Storage has one trap: ids fit in 2 bytes only for vocabularies up to 65,536 tokens, and the 100,000- to 260,000-token vocabularies of many 2026 models need 4, doubling 30 TB to 60 TB.
+
+Packing matters more than it looks. One document per sequence wasted 62% of every batch on padding *and* cut off 22% of the tokens. Concatenating with a separator wastes nothing but splits 3,783 documents across boundaries and puts unrelated documents in one context, which many setups handle with attention masks. Best-fit packing, a classic bin-packing heuristic, wastes almost nothing and splits only the 1,126 documents longer than a sequence anyway.
+
+<Note>
+
+Token counts are not language-neutral. A tokenizer trained mostly on English text needs many more tokens for the same content in, say, Amharic or Burmese, so speakers of those languages pay more per word and fit less into a context window ([Petrov et al., 2023](https://arxiv.org/abs/2305.15425)). Measuring bytes, and meaning, per token for each language in the corpus is part of the data work.
+
+</Note>
+
+The packed ids are written as **shards** of fixed size — flat id arrays, tar-based WebDataset shards or Parquet — for streaming to thousands of accelerators. The loader must be **deterministic and resumable**: a run of several weeks restarts from checkpoints many times and must continue each time with exactly the next batch. The **mixture** — how much web, code, mathematics and each language, in what order — is a recorded, versioned part of the recipe.
+
+</Section>
+
+<Section id="features" kind="computation" title="Features without leaking the future">
+
+Most deployed machine learning is predictions on tables — fraud scores, delivery times, demand — from **features** computed from event data (see the Data Science elective's [machine learning for tabular data](/en/cs/electives/data-science/machine-learning-for-tabular-data/)). Each feature is needed twice: for training, as its value at millions of past moments, and for serving, as its current value within milliseconds.
+
+<Definition term="Feature store">
+
+A **feature store** keeps feature definitions and values for both uses: an **offline store** (usually tables in a warehouse or lakehouse) with the full history of each feature's values and the times they became available, for building training sets; an **online store** (a low-latency key–value database) with the latest value per entity, for serving; a **materialisation** job that computes values once and writes both; and a **registry** of definitions, owners and lineage.
+
+</Definition>
+
+Uber's description of its Michelangelo platform in 2017 popularised the idea; open-source options such as [Feast](https://feast.dev/) and Hopsworks, and the feature stores of the clouds' and data platforms' ML services, followed. Their two jobs are to prevent **training–serving skew** (a feature computed by different code or from differently cleaned data offline and online) and to make training sets **point-in-time correct**.
+
+<Definition term="Point-in-time join">
+
+Given labelled examples, each an (entity, timestamp, label), and a history of feature values, each an (entity, availability time, value), a **point-in-time join** (or **as-of join**) attaches to each example the most recent value whose availability time is at or before the example's timestamp.
+
+</Definition>
+
+The block simulates 40 bike-share stations over 120 days. Each night a batch job writes each station's share of the previous 24 hours spent empty, with the time it became available; the model predicts, four times a day, whether the station will be empty in the next hour. It builds the training set in SQLite two ways: as of the prediction time, and joined on the calendar day — an easy mistake, since the feature row and the example share a date.
+
+```python run
+import sqlite3
+import numpy as np
+
+rng = np.random.default_rng(5)
+stations, days = 40, 120
+
+# Synthetic bike-share data: how often a station runs out of bikes depends on the station
+# (its location) and on the day (weather, events), plus hour-to-hour noise.
+station_effect = rng.normal(-1.0, 1.2, (stations, 1, 1))
+day_effect = rng.normal(0, 1.2, (stations, days, 1))
+logit = (station_effect + day_effect + rng.normal(0, 0.5, (stations, days, 24))).reshape(stations, -1)
+empty = rng.random(logit.shape) < 1 / (1 + np.exp(-logit))      # empty during hour h?
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE features (station INTEGER, computed_at INTEGER, empty_share_24h REAL);  -- hours since start
+CREATE TABLE labels   (station INTEGER, at INTEGER, empty_next_hour INTEGER);
+CREATE INDEX f_idx ON features (station, computed_at);
+""")
+# A nightly batch job: at midnight it computes, for each station, the share of the previous
+# 24 hours the station was empty, and writes it with the time it became available.
+db.executemany("INSERT INTO features VALUES (?, ?, ?)",
+               [(s, 24 * d, float(empty[s, 24 * (d - 1):24 * d].mean()))
+                for s in range(stations) for d in range(1, days + 1)])
+# Training examples: at four times a day, will the station be empty in the next hour?
+db.executemany("INSERT INTO labels VALUES (?, ?, ?)",
+               [(s, int(h), int(empty[s, h])) for s in range(stations) for d in range(1, days)
+                for h in 24 * d + np.array([7, 11, 16, 20])])
+
+JOINS = {
+    # Point in time: the latest value that had been computed when the prediction would be made.
+    "point-in-time (as of)": """SELECT l.empty_next_hour,
+        (SELECT f.empty_share_24h FROM features f WHERE f.station = l.station AND f.computed_at <= l.at
+         ORDER BY f.computed_at DESC LIMIT 1) FROM labels l ORDER BY l.rowid""",
+    # Joined on the calendar day: uses the value computed at the END of the label's day.
+    "same calendar day": """SELECT l.empty_next_hour, f.empty_share_24h FROM labels l
+        JOIN features f ON f.station = l.station AND f.computed_at = (l.at / 24 + 1) * 24 ORDER BY l.rowid""",
+}
+
+def auc(y, score):
+    """Probability that a random positive example scores above a random negative one (ties count half)."""
+    neg, pos = np.sort(score[y == 0]), score[y == 1]
+    below, upto = np.searchsorted(neg, pos, "left"), np.searchsorted(neg, pos, "right")
+    return (below + 0.5 * (upto - below)).sum() / (len(pos) * len(neg))
+
+print(f"{db.execute('SELECT COUNT(*) FROM labels').fetchone()[0]:,} training examples, "
+      f"{db.execute('SELECT AVG(empty_next_hour) FROM labels').fetchone()[0]:.1%} positive\n")
+results = {}
+for name, sql in JOINS.items():
+    y, x = map(np.array, zip(*db.execute(sql)))
+    results[name] = (y, x)
+    print(f"{name:22s} AUC of the single feature: {auc(y, x):.3f}")
+
+# A threshold tuned offline on leaky features, then used online, where only as-of values exist.
+y, leak = results["same calendar day"]
+_, online = results["point-in-time (as of)"]
+best = max(np.unique(leak), key=lambda t: np.mean((leak >= t) == y))
+print(f"\nthreshold tuned on same-day features: {best:.3f}")
+print(f"  accuracy offline (leaky features): {np.mean((leak >= best) == y):.1%}")
+print(f"  accuracy online (as-of features):  {np.mean((online >= best) == y):.1%}")
+print(f"  always predicting 'not empty':     {np.mean(y == 0):.1%}")
+```
+
+The same-day join looks far better offline — an AUC of 0.841 against 0.644 — because its value was computed at midnight *after* the prediction, from hours including the very hour being predicted. A rule tuned on it scores 79.6% offline; in production, where only the as-of value exists, it scores 70.2%, *worse* than always predicting "not empty" (71.8%). Nothing crashes, and the offline evaluation says the opposite of the truth. This is **leakage**, one of the commonest ways a model that looked good fails in production.
+
+<Narrator who="gideon">
+
+"As of" must use the time a value *became available*, not the time it describes. A feature computed at midnight about the previous day is not knowable at 18:00 that day; a value restated by a backfill three weeks later was not knowable before the backfill. Feature tables therefore need both timestamps — event time and availability time — and point-in-time joins must use the second.
+
+</Narrator>
+
+pandas has `merge_asof`, several SQL engines (DuckDB and ClickHouse among them) have an `ASOF JOIN`, and feature stores generate these joins from feature definitions. Many teams need no feature-store product at all: a history table in the warehouse, one feature definition shared by training and serving, and an online key–value cache cover most needs. The product earns its keep when many teams share hundreds of features.
+
+</Section>
+
+<Section id="vectors" kind="computation" title="Vectors: approximate nearest neighbours">
+
+Retrieval-augmented generation, semantic search and recommendation reduce to one query: given a vector $q$, find the $k$ stored vectors most similar to it, usually by cosine similarity. Lumenary CS's [reasoning and agents](/en/cs/reasoning-and-agents/) lesson builds a retrieval pipeline with exact search, which costs $O(nd)$ per query — for 100 million vectors of 768 dimensions, about $8 \times 10^{10}$ multiply–adds — so large systems accept answers that are *almost* right.
+
+<Definition term="Recall at k">
+
+For a query, let $T$ be the true $k$ nearest neighbours (from exact search) and $R$ the $k$ results an approximate index returns. The **recall@k** is $|R \cap T| / k$, averaged over a set of test queries. An approximate index is described by its recall against its speed, memory and build time — never by speed alone.
+
+</Definition>
+
+The **inverted file** (IVF) index is the simplest serious design: cluster the vectors with $k$-means into `nlist` cells, keep the list of vectors in each, and answer a query by scanning exactly only the `nprobe` lists whose centroids are closest. A true neighbour just across a cell boundary is missed unless its cell is probed too.
+
+<Figure caption="An inverted-file index in two dimensions. The query falls in the shaded cell, but its true nearest neighbour lies just across the boundary in the next cell: probing one list misses it, probing the two nearest lists finds it.">
+
+<svg viewBox="0 0 640 260" role="img" aria-label="A rectangle divided into seven irregular cells, each with a centroid drawn as a small cross and a few data points drawn as dots. A query point, drawn as a ring, lies in the central lower cell, which is shaded. Its nearest neighbour, a dot ringed in gold, lies just across the boundary in the upper right neighbouring cell, which is lightly shaded as the second cell probed. A legend explains: cross, centroid; dot, stored vector; ring, query; nprobe 1 scans one cell and misses the neighbour, nprobe 2 scans two and finds it.">
+  <g transform="translate(10,10)">
+    <polygon points="158,117 254,88 299,145 255,240 189,240" fill="var(--gold-soft)" stroke="none" />
+    <polygon points="276,0 410,0 341,138 299,145 254,88" fill="var(--sky-soft)" stroke="none" />
+    <g fill="none" stroke="currentColor" strokeWidth="1" strokeOpacity="0.6">
+      <polygon points="0,0 130,0 148,110 0,151" />
+      <polygon points="130,0 276,0 254,88 158,117 148,110" />
+      <polygon points="276,0 410,0 341,138 299,145 254,88" />
+      <polygon points="189,240 0,240 0,151 148,110 158,117" />
+      <polygon points="255,240 189,240 158,117 254,88 299,145" />
+      <polygon points="440,212 440,240 255,240 299,145 341,138" />
+      <polygon points="410,0 440,0 440,212 341,138" />
+    </g>
+    <g stroke="currentColor" strokeWidth="1.8">
+      <path d="M75,65 l10,10 M85,65 l-10,10" />
+      <path d="M195,45 l10,10 M205,45 l-10,10" />
+      <path d="M315,75 l10,10 M325,75 l-10,10" />
+      <path d="M105,175 l10,10 M115,175 l-10,10" />
+      <path d="M225,145 l10,10 M235,145 l-10,10" />
+      <path d="M335,195 l10,10 M345,195 l-10,10" />
+      <path d="M395,115 l10,10 M405,115 l-10,10" />
+    </g>
+    <g fill="currentColor">
+      <circle cx="50" cy="40" r="3" />
+      <circle cx="100" cy="95" r="3" />
+      <circle cx="60" cy="110" r="3" />
+      <circle cx="175" cy="30" r="3" />
+      <circle cx="225" cy="75" r="3" />
+      <circle cx="180" cy="90" r="3" />
+      <circle cx="300" cy="40" r="3" />
+      <circle cx="355" cy="60" r="3" />
+      <circle cx="305" cy="118" r="3" />
+      <circle cx="90" cy="160" r="3" />
+      <circle cx="140" cy="205" r="3" />
+      <circle cx="60" cy="210" r="3" />
+      <circle cx="205" cy="185" r="3" />
+      <circle cx="250" cy="200" r="3" />
+      <circle cx="215" cy="125" r="3" />
+      <circle cx="250" cy="165" r="3" />
+      <circle cx="330" cy="175" r="3" />
+      <circle cx="380" cy="215" r="3" />
+      <circle cx="300" cy="215" r="3" />
+      <circle cx="415" cy="80" r="3" />
+      <circle cx="405" cy="160" r="3" />
+      <circle cx="425" cy="120" r="3" />
+    </g>
+    <circle cx="305" cy="118" r="8" fill="none" stroke="var(--gold)" strokeWidth="2" />
+    <circle cx="270" cy="125" r="6" fill="none" stroke="currentColor" strokeWidth="2.2" />
+    <line x1="270" y1="125" x2="297" y2="119" stroke="currentColor" strokeWidth="1" strokeDasharray="3 2" />
+  </g>
+  <g fill="currentColor" fontSize="11.5">
+    <path d="M466,32 l8,8 M474,32 l-8,8" stroke="currentColor" strokeWidth="1.8" />
+    <text x="486" y="40">centroid of a cell</text>
+    <circle cx="470" cy="60" r="3" />
+    <text x="486" y="64">stored vector</text>
+    <circle cx="470" cy="84" r="6" fill="none" stroke="currentColor" strokeWidth="2" />
+    <text x="486" y="88">query</text>
+    <circle cx="470" cy="108" r="7" fill="none" stroke="var(--gold)" strokeWidth="2" />
+    <text x="486" y="112">its true nearest neighbour</text>
+    <rect x="463" y="128" width="14" height="12" fill="var(--gold-soft)" />
+    <text x="486" y="138">nprobe = 1: this cell only,</text>
+    <text x="486" y="152">the neighbour is missed</text>
+    <rect x="463" y="166" width="14" height="12" fill="var(--sky-soft)" />
+    <text x="486" y="176">nprobe = 2 adds this cell,</text>
+    <text x="486" y="190">and the neighbour is found</text>
+  </g>
+</svg>
+
+</Figure>
+
+The block builds an IVF index with 128 lists over 20,000 unit vectors of 48 dimensions, measures recall@10 for 200 fresh queries at several values of `nprobe`, and repeats everything for vectors with no cluster structure at all.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(2)
+N, Q, D, K = 20_000, 200, 48, 10
+
+def unit(x):
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+def clustered(n):
+    """Stand-in embeddings: 1,000 topics, each a direction in space with its own spread."""
+    topic = rng.integers(0, 1000, n)
+    return unit(centres[topic] + spread[topic, None] * rng.normal(size=(n, D)))
+centres = rng.normal(size=(1000, D))
+spread = rng.uniform(0.4, 1.0, 1000)
+
+def build_ivf(X, nlist, iters=8):
+    """Inverted file index: k-means on the unit sphere, then one list of vector ids per centroid."""
+    C = X[rng.choice(len(X), nlist, replace=False)]
+    for _ in range(iters):
+        assign = np.argmax(X @ C.T, axis=1)
+        for c in range(nlist):
+            members = X[assign == c]
+            if len(members):
+                C[c] = members.sum(axis=0)
+        C = unit(C)
+    assign = np.argmax(X @ C.T, axis=1)
+    return C, [np.flatnonzero(assign == c) for c in range(nlist)]
+
+def search_ivf(q, X, C, lists, nprobe):
+    """Scan only the nprobe lists whose centroids are most similar to the query."""
+    probe = np.argsort(-(C @ q))[:nprobe]
+    ids = np.concatenate([lists[c] for c in probe])
+    best = ids[np.argsort(-(X[ids] @ q))[:K]]
+    return best, len(ids)
+
+for name, X, queries in [("clustered (like real embeddings)", clustered(N), clustered(Q)),
+                         ("uniform random directions", unit(rng.normal(size=(N, D))), unit(rng.normal(size=(Q, D))))]:
+    exact = np.argsort(-(queries @ X.T), axis=1)[:, :K]          # brute force: the ground truth
+    C, lists = build_ivf(X, nlist=128)
+    sizes = np.array([len(l) for l in lists])
+    print(f"{name}: {N:,} vectors of {D} dims; 128 lists of {sizes.min()} to {sizes.max()} vectors")
+    print("   nprobe   recall@10   vectors scanned per query")
+    for nprobe in [1, 2, 4, 8, 16, 32]:
+        hits = scanned = 0
+        for q, truth in zip(queries, exact):
+            found, n = search_ivf(q, X, C, lists, nprobe)
+            hits += len(set(found.tolist()) & set(truth.tolist()))
+            scanned += n
+        print(f"   {nprobe:6d}   {hits / (Q * K):9.3f}   {scanned / Q:8,.0f}  ({scanned / Q / N:5.1%} of the data)")
+    print()
+```
+
+On clustered data, scanning 6.3% of the vectors (`nprobe` = 8) gives a recall@10 of 0.870, and 12.6% gives 0.924: the last few per cent of recall cost the most. On structureless vectors the same index is nearly useless — 0.424 at 6.2% scanned — because in high dimensions random points are all almost equally far apart. Real embeddings are clustered, which is why approximate search works at all; how well depends on *your* data, so measure recall on your own vectors and queries.
+
+The other main family is **graph-based**. **HNSW** ([Malkov and Yashunin](https://arxiv.org/abs/1603.09320)) links each vector to a few dozen near neighbours, in layers of decreasing sparsity, and answers a query by greedy walks downwards from a top-layer entry point: excellent recall at low latency, with inserts, but the full vectors plus links live in memory. **Product quantisation** (Jégou, Douze and Schmid, 2011) attacks memory: it splits each vector into sub-vectors and replaces each by the index of its nearest entry in a small codebook, so 3,072 bytes become perhaps 64, and distances are approximated from lookup tables. Production systems combine these — IVF with product quantisation, graphs over compressed vectors, disk-resident graphs such as DiskANN — and re-rank the best few hundred candidates at full precision.
+
+<Narrator who="margaret">
+
+Memory decides the architecture. One hundred million vectors of 768 dimensions in 32-bit floats take $10^8 \times 768 \times 4 \approx 307$ GB, before any graph links — several large machines. Product-quantised to 64 bytes each, they take 6.4 GB and fit on one. That factor of about 48, paid for in recall, is why billion-scale search compresses.
+
+</Narrator>
+
+</Section>
+
+<Section id="evaluation" kind="human" title="Evaluation data">
+
+An evaluation set is a measuring instrument, and data engineering keeps it calibrated. The practices that matter:
+
+- **Version it immutably.** Identify each version by a content hash, store it read-only, and record with every score which version produced it.
+- **Keep it out of training.** Remove documents that overlap evaluation items — commonly long word $n$-grams, after normalisation — from training data (one exercise builds this), and embed **canary strings** in published benchmarks so pipelines can filter them and leaks can be detected. Lumenary CS's [evaluation](/en/cs/evaluation/) lesson explains contamination and its detection in depth.
+- **Hold some back.** Keep a private split that is never published and used rarely, and add fresh items over time, so that scores are not slowly fitted to a public set.
+- **Record slices.** Tag each item with its language, domain, difficulty and source so that results can be reported per slice; an average over 40 languages can hide failure in five of them.
+- **Measure label quality.** Have a sample labelled twice, measure agreement, and fix or drop ambiguous items; 5% wrong labels blur any difference between models smaller than that.
+- **Trace lineage** from each model version to the exact training data, evaluation data and code behind it, as <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink> asks of every pipeline.
+
+The statistics of comparing models on such sets, including error bars and multiple comparisons, are in Lumenary Statistics' [evaluating AI systems](/en/statistics/evaluating-ai-systems/).
+
+</Section>
+
+<Section id="practice" kind="human" title="The professional view">
+
+As of late 2026, roughly — names change quickly, so treat these as examples, not a ranking:
+
+**Corpus building.** Open tools such as Hugging Face's datatrove (used for FineWeb), Ai2's Dolma toolkit, NVIDIA's NeMo Curator and Alibaba's Data-Juicer run on Spark, Ray, Dask or plain batch schedulers; large labs build their own on the same ideas. **Synthetic data** from earlier models is now a large part of later training stages. Studies of "model collapse" ([Shumailov et al.](https://arxiv.org/abs/2305.17493)) showed that models trained recursively on their own outputs lose the tails of the distribution, while later work suggests that keeping real data alongside avoids most of the damage; how much synthetic data helps, and where, is an open question.
+
+**Vector search** has converged with general databases. Dedicated vector databases (Milvus, Qdrant, Weaviate, Pinecone, Chroma, Vespa and others) compete with indexes inside existing systems — PostgreSQL's [pgvector](https://github.com/pgvector/pgvector), Elasticsearch and OpenSearch, Redis, MongoDB, several warehouses — and with libraries such as [FAISS](https://github.com/facebookresearch/faiss), hnswlib, ScaNN and DiskANN, compared openly by [ANN-Benchmarks](https://ann-benchmarks.com/). Up to tens of millions of vectors, an index in a database you already run is often enough; dedicated systems earn their place at larger scale, with heavy filtering or tight latency targets. The hard engineering is often elsewhere: keeping embeddings in sync with changing sources, re-embedding everything when the model changes, and combining similarity with filters ("only documents this user may see") without losing recall.
+
+**Feature platforms** have moved towards the lakehouse: offline features as open-format tables, materialised to an online store.
+
+What is overstated: that more data always helps (filtering and deduplication usually beat volume), that any one database is "the AI database", and that synthetic data removes the need for real data. What is understated: provenance, documentation and consent, cheap to build in at the start and very expensive to reconstruct later.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"An approximate index returns the nearest neighbours, only faster."** It returns *some* near neighbours, and recall depends on the data, the parameters and any filters. Without measuring recall against exact search on your own queries, you do not know how approximate it is.
+
+</Misconception>
+
+<Misconception>
+
+**"If the offline metric is good, the features are fine."** A leaking feature makes the offline metric *better*, as the bike-share example showed. Only point-in-time joins, shared feature code and a comparison of offline and online feature values catch it.
+
+</Misconception>
+
+<Misconception>
+
+**"Removing a person's data from the dataset removes it from the model."** It removes it from future training runs. A trained model's weights are not a database; making a trained model forget specific data ("machine unlearning") is an open research problem. That is one more reason to minimise personal data before training.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -1,0 +1,606 @@
+---
+title: Pipelines and orchestration
+subtitle: Turning a pile of scripts into a pipeline that runs in the right order, recovers from failure, rebuilds the past on demand and tells you when it is late.
+minutes: 80
+objectives:
+  - Model a pipeline as a directed acyclic graph of tasks, and find an execution order or a cycle with Kahn's algorithm
+  - Implement a small orchestrator with dependency handling, retries with exponential backoff, and skipping on upstream failure
+  - Write tasks that are idempotent per date partition, and run backfills and catch-up runs safely
+  - Explain logical dates and data intervals, schedules, sensors and data-aware triggers
+  - Find a pipeline's critical path and estimate how often it will miss a freshness target
+  - Compare Airflow, Dagster, Prefect and dbt fairly, and test pipelines at several levels
+prerequisites: [what-data-engineers-do, distributed-processing]
+related: [math.discrete.graph-theory, math.found.order-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: Apache Airflow documentation
+    url: https://airflow.apache.org/docs/
+    note: Core concepts (DAGs, tasks, runs, data intervals, assets) and the scheduler.
+  - title: Dagster documentation
+    url: https://docs.dagster.io/
+    note: Asset-based orchestration, partitions, backfills and asset checks.
+  - title: Prefect documentation
+    url: https://docs.prefect.io/
+  - title: dbt documentation
+    url: https://docs.getdbt.com/
+    note: Models, ref(), incremental materialisations, data tests and unit tests.
+  - title: SQLMesh documentation
+    url: https://sqlmesh.readthedocs.io/
+  - title: Argo Workflows
+    url: https://argoproj.github.io/workflows/
+    note: A container-native workflow engine for Kubernetes.
+  - title: "Topological sorting of large networks"
+    author: A. B. Kahn
+    year: 1962
+    note: Communications of the ACM 5(11); the algorithm used in this lesson.
+  - title: "Python standard library: graphlib"
+    url: https://docs.python.org/3/library/graphlib.html
+  - title: "Functional Data Engineering — a modern paradigm for batch data processing"
+    author: Maxime Beauchemin
+    year: 2018
+    note: An essay by Airflow's creator on idempotent, partition-replacing tasks; widely republished.
+---
+
+<Section id="motivation" kind="motivation" title="Three cron jobs and a hope">
+
+A pharmacy chain in East Africa runs its reporting on one server. At 01:30 a cron job pulls yesterday's orders from the shops' database. At 02:30 another fetches exchange rates for Kenyan shillings, Ugandan shillings and Tanzanian shillings. At 03:00 a third computes revenue by region in US dollars, and at 04:00 a fourth emails the dashboard link to managers.
+
+It works most nights. On the night the orders export takes ninety minutes, the 03:00 job runs on half a day of orders and the managers receive a confident, wrong number. On the night the exchange-rate service times out, revenue is computed with no rates and comes out as zero for Uganda. When an analyst finds a bug in the revenue query from three weeks ago, someone spends a day re-running jobs by hand, in the right order, for each of twenty-one days, and gets two of them wrong.
+
+The cron jobs encode *times*, but what the pipeline actually needs is *dependencies*: revenue runs when orders and rates are both ready, for the same day, and not before. An **orchestrator** is the program that knows those dependencies and acts on them — runs tasks in order, retries the ones that fail for passing reasons, refuses to run tasks whose inputs are missing, records what happened, and re-runs any slice of the past on request. This lesson builds one in Python, then looks at the real ones.
+
+</Section>
+
+<Section id="dags" kind="definitions" title="Pipelines as graphs">
+
+<Definition term="DAG, task and run">
+
+A pipeline is a **directed acyclic graph** (DAG): its nodes are **tasks** (extract the orders, compute revenue, publish the dashboard), and an edge from task $u$ to task $v$ means $v$ needs $u$'s output, so $u$ must finish successfully first. A **run** (or DAG run) executes the graph once for a particular slice of data, usually identified by a date: the **logical date** or **partition**.
+
+</Definition>
+
+"Acyclic" is essential. If computing revenue needs the published dashboard, and publishing needs revenue, nothing can ever start. Lumenary Math's <TopicLink id="math.discrete.graph-theory">graph theory</TopicLink> supplies the tool that finds an order or proves there is none.
+
+<Theorem name="Topological order">
+
+A finite directed graph has a **topological order** — a list of all its nodes in which every edge goes from an earlier node to a later one — if and only if it has no directed cycle. Kahn's algorithm finds such an order, or detects a cycle, in time $O(V + E)$ for $V$ nodes and $E$ edges.
+
+</Theorem>
+
+<Proof>
+
+If there is a cycle $v_1 \to v_2 \to \dots \to v_k \to v_1$, then in any order the earliest of these nodes has an incoming edge from a node of the cycle that comes later, so no topological order exists.
+
+Conversely, suppose there is no cycle. Then some node has no incoming edge: otherwise, starting anywhere and repeatedly stepping backwards along an incoming edge, after more than $V$ steps we would revisit a node and so have found a cycle. Kahn's algorithm places such a node first, deletes it and its outgoing edges, and repeats. Deleting nodes cannot create a cycle, so every step finds a node with no remaining incoming edges, and all $V$ nodes are placed, each after all its predecessors. If at some step no node is free, the remaining nodes each have an incoming edge from another remaining node, and the backward walk above finds a cycle among them. Each node and each edge is handled a constant number of times, so the time is $O(V + E)$. ∎
+
+</Proof>
+
+<Narrator who="chloe">
+
+A DAG is a partial order: it says which tasks must come before which, and is silent about the rest. A topological order is one way of extending it to a total order, and there are usually many. The orchestrator's freedom lives in that silence — independent tasks, like fetching orders and fetching rates, can run in either order, or at the same time on different workers.
+
+</Narrator>
+
+<Figure caption="The pharmacy chain's pipeline as a DAG, with median durations. The highlighted chain is the critical path: on a median night the dashboard is published 116 minutes after the trigger, and making any task off this path faster changes nothing. The ml_features task depends on staged orders but nothing in the dashboard waits for it.">
+
+<svg viewBox="0 0 680 255" role="img" aria-label="Nine boxes connected by arrows. A dashed box, wait for export, 25 minutes, leads to extract_orders, 30 minutes. extract_orders and extract_fx, 3 minutes, both lead to stage_orders, 35 minutes. stage_orders leads to ml_features, 70 minutes, and to daily_revenue, 20 minutes, which also needs extract_stores, 2 minutes. daily_revenue leads to check_revenue, 4 minutes, which leads to publish, 2 minutes. The path export, extract_orders, stage_orders, daily_revenue, check_revenue, publish is highlighted as the critical path.">
+  <defs>
+    <marker id="po-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+    <marker id="po-arrow-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--gold)" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="1.6">
+    <rect x="10" y="30" width="100" height="34" rx="5" stroke="var(--gold)" strokeDasharray="5 3" />
+    <rect x="140" y="30" width="120" height="34" rx="5" stroke="var(--gold)" />
+    <rect x="140" y="100" width="120" height="34" rx="5" stroke="currentColor" />
+    <rect x="140" y="190" width="120" height="34" rx="5" stroke="currentColor" />
+    <rect x="290" y="65" width="110" height="34" rx="5" stroke="var(--gold)" />
+    <rect x="430" y="10" width="110" height="34" rx="5" stroke="currentColor" />
+    <rect x="430" y="120" width="110" height="34" rx="5" stroke="var(--gold)" />
+    <rect x="560" y="120" width="110" height="34" rx="5" stroke="var(--gold)" />
+    <rect x="560" y="190" width="110" height="34" rx="5" stroke="var(--gold)" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="60" y="44">wait for export</text>
+    <text x="60" y="57">25 min</text>
+    <text x="200" y="44">extract_orders</text>
+    <text x="200" y="57">30 min</text>
+    <text x="200" y="114">extract_fx</text>
+    <text x="200" y="127">3 min</text>
+    <text x="200" y="204">extract_stores</text>
+    <text x="200" y="217">2 min</text>
+    <text x="345" y="79">stage_orders</text>
+    <text x="345" y="92">35 min</text>
+    <text x="485" y="24">ml_features</text>
+    <text x="485" y="37">70 min</text>
+    <text x="485" y="134">daily_revenue</text>
+    <text x="485" y="147">20 min</text>
+    <text x="615" y="134">check_revenue</text>
+    <text x="615" y="147">4 min</text>
+    <text x="615" y="204">publish</text>
+    <text x="615" y="217">2 min</text>
+    <text x="340" y="247">highlighted: the critical path, 25 + 30 + 35 + 20 + 4 + 2 = 116 min</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.2" markerEnd="url(#po-arrow)">
+    <line x1="260" y1="117" x2="288" y2="86" />
+    <line x1="400" y1="82" x2="428" y2="30" />
+    <line x1="260" y1="207" x2="428" y2="141" />
+  </g>
+  <g stroke="var(--gold)" strokeWidth="2" markerEnd="url(#po-arrow-gold)">
+    <line x1="110" y1="47" x2="138" y2="47" />
+    <line x1="260" y1="47" x2="288" y2="78" />
+    <line x1="400" y1="82" x2="428" y2="133" />
+    <line x1="540" y1="137" x2="558" y2="137" />
+    <line x1="615" y1="154" x2="615" y2="188" />
+  </g>
+</svg>
+
+</Figure>
+
+</Section>
+
+<Section id="orchestrator" kind="computation" title="An orchestrator in sixty lines">
+
+The block below is a complete, if tiny, orchestrator. `topological_order` is Kahn's algorithm. `run_dag` walks the order for one day and applies three rules that every real orchestrator has in some form:
+
+1. **Never run a task whose inputs are missing.** If an upstream task did not succeed, the task is marked `upstream_failed` and skipped, and so, in turn, is everything downstream of it.
+2. **Retry transient failures with exponential backoff.** A timeout or a busy service often succeeds a minute later; waiting 60 s, then 120 s, then 240 s gives it room without hammering it.
+3. **Do not retry permanent failures.** A missing column or a bug fails the same way every time; retrying only delays the alert.
+
+Two failures are planted: the exchange-rate service times out twice on 14 March, and on 13 March the store export arrives without a column the pipeline needs. To keep the output readable the tasks only report how long they took, and run one at a time.
+
+```python run
+from collections import deque
+
+def topological_order(deps):
+    """deps maps each task to the set of tasks it depends on. Kahn's algorithm:
+    repeatedly take a task whose upstream tasks are all placed. Raises ValueError on a cycle."""
+    waiting = {t: len(up) for t, up in deps.items()}
+    downstream = {t: [] for t in deps}
+    for t, ups in deps.items():
+        for u in ups:
+            downstream[u].append(t)
+    ready = deque(sorted(t for t, n in waiting.items() if n == 0))
+    order = []
+    while ready:
+        t = ready.popleft()
+        order.append(t)
+        for d in sorted(downstream[t]):
+            waiting[d] -= 1
+            if waiting[d] == 0:
+                ready.append(d)
+    if len(order) < len(deps):
+        raise ValueError(f"cycle among {sorted(t for t in deps if t not in order)}")
+    return order
+
+class Transient(Exception):
+    """A failure worth retrying: a timeout, a dropped connection, a busy service."""
+
+def run_dag(deps, tasks, day, retries=3, base_delay=60):
+    """Run every task once for `day`, in dependency order, with retries and exponential backoff.
+    The clock is simulated, so nothing actually sleeps."""
+    clock, status = 0, {}
+    for name in topological_order(deps):
+        if any(status[u] != "success" for u in deps[name]):
+            status[name] = "upstream_failed"                  # never run on missing inputs
+            print(f"  {clock:5d}s  {name:15s} skipped: an upstream task did not succeed")
+            continue
+        for attempt in range(1, retries + 2):
+            try:
+                clock += tasks[name](day)                     # a task returns its duration in seconds
+                status[name] = "success"
+                print(f"  {clock:5d}s  {name:15s} success on try {attempt}")
+                break
+            except Transient as err:
+                if attempt > retries:
+                    status[name] = "failed"
+                    print(f"  {clock:5d}s  {name:15s} failed after {attempt} tries: {err}")
+                    break
+                wait = base_delay * 2 ** (attempt - 1)        # 60 s, 120 s, 240 s, ...
+                print(f"  {clock:5d}s  {name:15s} try {attempt}: {err}; retry in {wait} s")
+                clock += wait
+            except Exception as err:                          # a bug or bad data: retrying won't help
+                status[name] = "failed"
+                print(f"  {clock:5d}s  {name:15s} failed, not retried: {err}")
+                break
+    return status
+
+# A daily revenue pipeline for a chain of pharmacies. Each task only reports a duration here;
+# the next block gives tasks real work. Two failures are planted.
+fx_tries = {}
+def extract_fx(day):
+    fx_tries[day] = fx_tries.get(day, 0) + 1
+    if day == "2026-03-14" and fx_tries[day] <= 2:
+        raise Transient("timeout calling the exchange-rate service")
+    return 30
+
+def extract_stores(day):
+    if day == "2026-03-13":
+        raise ValueError("store export has no column 'region'")
+    return 20
+
+tasks = {
+    "extract_orders": lambda day: 300,
+    "extract_fx": extract_fx,
+    "extract_stores": extract_stores,
+    "stage_orders": lambda day: 240,
+    "daily_revenue": lambda day: 180,
+    "check_revenue": lambda day: 20,
+    "publish": lambda day: 10,
+}
+deps = {
+    "extract_orders": set(), "extract_fx": set(), "extract_stores": set(),
+    "stage_orders": {"extract_orders", "extract_fx"},
+    "daily_revenue": {"stage_orders", "extract_stores"},
+    "check_revenue": {"daily_revenue"},
+    "publish": {"check_revenue"},
+}
+print("order:", topological_order(deps))
+for day in ["2026-03-13", "2026-03-14"]:
+    print(f"\nrun for {day} (clock: seconds after the run starts)")
+    run_dag(deps, tasks, day)
+
+deps["extract_orders"] = {"publish"}          # a mistaken edit: extraction waits for publishing
+try:
+    topological_order(deps)
+except ValueError as err:
+    print("\nrejected before running anything:", err)
+```
+
+On 13 March the store extract fails at once and is not retried; `stage_orders` still runs, because it does not need the stores, but `daily_revenue`, `check_revenue` and `publish` are skipped — the managers get no dashboard rather than a wrong one, and the run's record says exactly why. On 14 March the exchange-rate fetch fails twice, waits 60 and then 120 seconds, succeeds on the third try, and the rest of the run proceeds: the whole night finishes 980 simulated seconds after it started. Finally, a mistaken edit that makes extraction wait for publishing creates a cycle, and the orchestrator rejects the DAG before running anything, naming the five tasks involved.
+
+<Narrator who="margaret">
+
+Backoff numbers are worth a sum. Three retries at 60, 120 and 240 seconds wait 7 minutes in total, enough to ride out a service restart; at a fixed 10 seconds the same three retries would give up after 30 seconds. Real orchestrators also add random **jitter** to each wait, so that a hundred tasks that failed together do not all retry in the same second — the thundering-herd problem from Lumenary CS's [reliability engineering](/en/cs/reliability-engineering/) lesson.
+
+</Narrator>
+
+A real orchestrator adds what the toy lacks: it runs independent tasks in parallel on a pool of workers, persists every task's state in a database so a crash of the orchestrator itself loses nothing, enforces timeouts, sends alerts, keeps logs per attempt, limits how many runs are active at once, and offers a web interface to inspect and re-run tasks.
+
+</Section>
+
+<Section id="backfills" kind="computation" title="Partitions, idempotence and backfills">
+
+<LessonLink slug="what-data-engineers-do">What data engineers do</LessonLink> showed why a task must be **idempotent**: it will run twice — on retry, on re-run, on backfill — and appending would duplicate data. The orchestrator makes that requirement concrete: if every task for logical date $D$ *replaces* the partition for $D$, in one transaction, then any run for $D$ can be repeated safely, and the state of the warehouse depends only on which days have run, not on how many times.
+
+<Definition term="Backfill and catch-up">
+
+A **backfill** runs a pipeline for a range of past logical dates: to fill history when a pipeline is new, or to recompute it after a bug fix or a late correction in a source. **Catch-up** is the orchestrator scheduling the runs it missed — while it was paused or down, or since the pipeline's start date — one per interval.
+
+</Definition>
+
+The block gives the pipeline real work against SQLite: three extracts that each replace their day's partition, a revenue query that joins them, and a check that every raw order was counted. It keeps a **state store** — the status of each (task, day) pair, as Airflow's metadata database and Dagster's event log do — so that re-running a backfill does only what has not yet succeeded. The store export is broken for 13 March until someone repairs it.
+
+```python run
+import graphlib
+import random
+import sqlite3
+import zlib
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE raw_orders (day TEXT, order_id TEXT, store TEXT, amount INTEGER, currency TEXT);
+CREATE TABLE fx (day TEXT, currency TEXT, usd_per_unit REAL);
+CREATE TABLE stores (day TEXT, store TEXT, region TEXT);
+CREATE TABLE daily_revenue (day TEXT, region TEXT, orders INTEGER, usd_cents INTEGER);
+""")
+STORES = {"NBO-1": ("Nairobi", "KES"), "NBO-2": ("Nairobi", "KES"), "MBA-1": ("Mombasa", "KES"),
+          "KLA-1": ("Kampala", "UGX"), "DAR-1": ("Dar es Salaam", "TZS")}
+RATES = {"KES": 0.0077, "UGX": 0.00027, "TZS": 0.00038}       # illustrative USD per unit
+outage = {"2026-03-13"}                      # the store export is broken for this day
+
+def source(day, what):
+    """Sources are deterministic per day, so a re-run sees the same data."""
+    return random.Random(zlib.crc32(f"{day}/{what}".encode()))
+
+def replace_partition(table, day, rows):
+    """Idempotent write: delete the day's slice and insert it again, in one transaction."""
+    with db:
+        db.execute(f"DELETE FROM {table} WHERE day = ?", (day,))
+        db.executemany(f"INSERT INTO {table} VALUES ({', '.join('?' * len(rows[0]))})", rows)
+
+def extract_orders(day):
+    rng = source(day, "orders")
+    rows = []
+    for i in range(rng.randint(150, 250)):
+        store = rng.choice(sorted(STORES))
+        currency = STORES[store][1]
+        rows.append((day, f"{day}-{i}", store, round(rng.uniform(2, 60) / RATES[currency]), currency))
+    replace_partition("raw_orders", day, rows)
+
+def extract_fx(day):
+    rng = source(day, "fx")
+    replace_partition("fx", day, [(day, c, r * rng.uniform(0.98, 1.02)) for c, r in RATES.items()])
+
+def extract_stores(day):
+    if day in outage:
+        raise RuntimeError("store export missing")
+    replace_partition("stores", day, [(day, s, region) for s, (region, _) in STORES.items()])
+
+def daily_revenue(day):
+    with db:
+        db.execute("DELETE FROM daily_revenue WHERE day = ?", (day,))
+        db.execute("""INSERT INTO daily_revenue
+            SELECT o.day, s.region, COUNT(*), CAST(ROUND(SUM(o.amount * f.usd_per_unit) * 100) AS INTEGER)
+            FROM raw_orders o
+            JOIN fx f ON f.day = o.day AND f.currency = o.currency
+            JOIN stores s ON s.day = o.day AND s.store = o.store
+            WHERE o.day = ? GROUP BY s.region""", (day,))
+
+def check_revenue(day):
+    raw, = db.execute("SELECT COUNT(*) FROM raw_orders WHERE day = ?", (day,)).fetchone()
+    out, = db.execute("SELECT SUM(orders) FROM daily_revenue WHERE day = ?", (day,)).fetchone()
+    if raw != out:
+        raise AssertionError(f"{raw} raw orders but {out} counted")
+
+TASKS = {f.__name__: f for f in (extract_orders, extract_fx, extract_stores, daily_revenue, check_revenue)}
+DEPS = {"daily_revenue": {"extract_orders", "extract_fx", "extract_stores"}, "check_revenue": {"daily_revenue"}}
+ORDER = list(graphlib.TopologicalSorter(DEPS).static_order())     # the standard library's topological sort
+state = {}                                    # (task, day) -> "success" | "failed" | "upstream_failed"
+
+def run(day, force=False):
+    """Run the DAG for one day's partition, skipping tasks already done unless forced."""
+    ran = 0
+    for task in ORDER:
+        if state.get((task, day)) == "success" and not force:
+            continue
+        if any(state.get((up, day)) != "success" for up in DEPS.get(task, ())):
+            state[(task, day)] = "upstream_failed"
+            continue
+        ran += 1
+        try:
+            TASKS[task](day)
+            state[(task, day)] = "success"
+        except Exception:
+            state[(task, day)] = "failed"
+    return ran
+
+days = [f"2026-03-{d:02d}" for d in range(10, 17)]
+print("backfill 10-16 March:", sum(run(d) for d in days), "task runs")
+for d in days:
+    if state[("check_revenue", d)] != "success":
+        print(f"  {d}:", {t: s for (t, dd), s in state.items() if dd == d and s != "success"})
+
+outage.clear()                                 # the source team repairs the export
+print("after the fix, the same backfill:", sum(run(d) for d in days), "task runs")
+
+before = db.execute("SELECT * FROM daily_revenue ORDER BY day, region").fetchall()
+print("forced re-run of every day:", sum(run(d, force=True) for d in days), "task runs; table unchanged:",
+      before == db.execute("SELECT * FROM daily_revenue ORDER BY day, region").fetchall())
+
+print("\nregion          orders   revenue (USD)")
+for region, orders, cents in db.execute("""SELECT region, SUM(orders), SUM(usd_cents) FROM daily_revenue
+                                           GROUP BY region ORDER BY SUM(usd_cents) DESC"""):
+    print(f"{region:15s} {orders:6d} {cents / 100:13,.2f}")
+```
+
+The first backfill of seven days makes 33 task runs: 35 tasks, less the two that were skipped on 13 March because the store extract failed. Once the export is repaired, running the *same* backfill command does just 3 task runs — the failed extract and the two tasks it had blocked — because the state store knows the rest succeeded. A forced re-run of all 35 tasks leaves `daily_revenue` exactly as it was. That is idempotence doing its job: the operator does not need to work out which days are safe to re-run, because all of them are.
+
+<Narrator who="gideon">
+
+The forced re-run left the table unchanged only because the *sources* returned the same data. Idempotence is a property of a task given its inputs; if yesterday's orders have since been corrected, re-running yesterday rightly gives a different answer. If you need to reproduce exactly what a report said on the day — for an audit, say — you must also keep the inputs as they were, which is what the snapshots and time travel of <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink> provide.
+
+</Narrator>
+
+Backfills have their own hazards. Launching 365 daily runs at once can overload the source systems and the warehouse, so orchestrators cap the number of active runs and let you backfill in batches. Some tasks are not independent across days — a running balance, or a table that records each customer's state as of yesterday — and must run in date order, one day after another (Airflow calls this `depends_on_past`). And a backfill costs real money: recomputing a year of a large table on a scan-priced warehouse is a bill worth estimating before pressing the button.
+
+</Section>
+
+<Section id="scheduling" kind="intuition" title="Schedules, triggers and freshness targets">
+
+When should a run start? Orchestrators offer three kinds of trigger, and most pipelines use a mixture.
+
+- **Time-based schedules**, written as cron expressions or presets such as `@daily`. A daily run is usually labelled by the **data interval** it covers — 14 March 00:00 to 15 March 00:00 — and starts *after* that interval ends, since only then is the data complete. This is why a run labelled 14 March executes in the early hours of 15 March, a perennial source of confusion for people new to Airflow.
+- **Sensors**, tasks that wait for a condition: a file appearing in object storage, a partition landing in a table, an upstream system's "done" marker. Waiting on the data itself, rather than on a time when it usually arrives, is what fixes the cron chain of the motivation. Modern orchestrators make waiting cheap (Airflow's *deferrable* operators release their worker slot while they wait).
+- **Data-aware triggers**: run when an upstream dataset has been updated. Dagster is built around **assets** — the tables, files and models a pipeline produces — and schedules work to keep them fresh; Airflow added data-aware scheduling in version 2.4 and, in version 3 (2025), calls the updated objects assets as well.
+
+<Narrator who="gideon">
+
+Schedules in local time hide a trap. In the Central European time zone clocks jump from 02:00 to 03:00 on the last Sunday of March, so a job scheduled for 02:30 local time has no 02:30 that day, and on the last Sunday of October 02:30 happens twice. Schedule in UTC where you can; where business rules need local time, use the orchestrator's time-zone-aware schedules and test the two transition days.
+
+</Narrator>
+
+A pipeline's consumers care about one thing above all: is the data there, and current, when they need it? That is a **freshness target**, a service-level objective (SLO) in the sense of Lumenary CS's [reliability engineering](/en/cs/reliability-engineering/) lesson: "`daily_revenue` for day $D$ is published by 04:00 East Africa Time on day $D + 1$, on at least 98% of days". (An SLA is the same promise written into an agreement, with consequences when it is broken.) Most orchestrators can alert when a run has not finished by a deadline, and asset-based tools can express freshness directly: this table must never be more than 26 hours old.
+
+Whether a pipeline meets its target is decided by its **critical path**: the longest chain of dependent tasks, which sets the earliest possible finish however many workers you have. The block computes it for the DAG in the figure, then simulates 1,000 nights in which task durations vary from night to night, and the source export, outside the team's control, varies most of all.
+
+```python run
+import math
+import random
+from graphlib import TopologicalSorter
+
+# Median minutes per task, from (synthetic) run history; "export" is the wait for the source system.
+MEDIAN = {"export": 25, "extract_orders": 30, "extract_fx": 3, "extract_stores": 2,
+          "stage_orders": 35, "daily_revenue": 20, "ml_features": 70, "check_revenue": 4, "publish": 2}
+DEPS = {"extract_orders": {"export"}, "extract_fx": set(), "extract_stores": set(),
+        "stage_orders": {"extract_orders", "extract_fx"},
+        "daily_revenue": {"stage_orders", "extract_stores"},
+        "ml_features": {"stage_orders"},
+        "check_revenue": {"daily_revenue"}, "publish": {"check_revenue"}}
+ORDER = list(TopologicalSorter(DEPS).static_order())
+
+def schedule(duration):
+    """Earliest finish of every task if each starts as soon as its inputs are ready (unlimited workers)."""
+    finish = {}
+    for t in ORDER:
+        finish[t] = max((finish[u] for u in DEPS.get(t, ())), default=0) + duration[t]
+    return finish
+
+def critical_path(finish, end="publish"):
+    path = [end]
+    while DEPS.get(path[-1]):
+        path.append(max(DEPS[path[-1]], key=lambda u: finish[u]))   # the input that arrived last
+    return path[::-1]
+
+finish = schedule(MEDIAN)
+print("median night: publish at", finish["publish"], "min after 01:00")
+print("critical path:", " -> ".join(critical_path(finish)))
+print("ml_features finishes at", finish["ml_features"], "min, but nothing in the dashboard waits for it")
+
+# 1,000 simulated nights. Durations vary (lognormal, about 35% spread), and the source export
+# varies much more. The dashboard is due at 04:00: 180 minutes after the 01:00 trigger.
+def miss_rate(faster=None, export_spread=0.8, n=1_000, seed=11):
+    rng = random.Random(seed)
+    late = 0
+    for _ in range(n):
+        d = {t: rng.lognormvariate(math.log(m), 0.35) for t, m in MEDIAN.items()}
+        d["export"] = rng.lognormvariate(math.log(MEDIAN["export"]), export_spread)
+        if faster:
+            d[faster] *= 0.6                                    # 40% faster
+        late += schedule(d)["publish"] > 180
+    return late / n
+
+print(f"\nSLA (publish by 04:00) missed on {miss_rate():.1%} of nights")
+for label, change in [("stage_orders 40% faster", dict(faster="stage_orders")),
+                      ("extract_fx 40% faster", dict(faster="extract_fx")),
+                      ("ml_features 40% faster", dict(faster="ml_features")),
+                      ("a steadier source export", dict(export_spread=0.3))]:
+    print(f"  {label:25s} -> missed on {miss_rate(**change):.1%}")
+```
+
+On a median night the dashboard is ready 116 minutes after the trigger, well inside the 180 allowed, yet the target is missed on 7.1% of nights — the tail, not the median, breaks promises. Making `stage_orders` 40% faster helps (4.2%) because it is on the critical path; speeding up `extract_fx` or `ml_features` changes nothing, because neither is. The biggest improvement, to 1.1%, comes from a steadier source export — a conversation with the team that owns the source, not a code change. That is the argument for the data contracts of <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink>.
+
+</Section>
+
+<Section id="tools" kind="human" title="The tools, fairly">
+
+Every orchestrator does what the toy does — dependencies, retries, state, backfills — and they differ in what they treat as the unit of work, how pipelines are written, and how they are run. As of 2026 the most widely used open-source options are these, each also sold as a managed service by its company or by the clouds.
+
+**Apache Airflow**, created at Airbnb in 2014 by Maxime Beauchemin and an Apache top-level project since 2019, is the most widely deployed. Pipelines are Python files defining DAGs of tasks; a large library of **providers** connects to databases, clouds and services. Airflow 3, released in 2025, added DAG versioning, a new interface and a task-execution interface that lets tasks run remotely. Managed Airflow is offered by Astronomer, Google (Cloud Composer), AWS (Amazon MWAA) and others. Airflow's strengths are maturity, breadth of integrations and a large community; its costs are a scheduler, a metadata database, workers and a web server to run and upgrade, and a task-centred model in which the *data* a task produces is not, by default, a first-class object.
+
+```python
+# Not run here: Apache Airflow 3 (TaskFlow API); details vary by version, see the documentation.
+from datetime import datetime, timedelta
+from airflow.sdk import dag, task
+
+@dag(schedule="@daily", start_date=datetime(2026, 3, 1), catchup=True, max_active_runs=3,
+     default_args={"retries": 3, "retry_delay": timedelta(minutes=1), "retry_exponential_backoff": True})
+def daily_revenue_pipeline():
+    @task
+    def extract_orders(ds=None):              # ds: the run's logical date, e.g. "2026-03-14"
+        replace_partition("raw_orders", ds, fetch_orders(ds))
+
+    @task
+    def extract_fx(ds=None):
+        replace_partition("fx", ds, fetch_rates(ds))
+
+    @task
+    def daily_revenue(ds=None):
+        run_sql("sql/daily_revenue.sql", day=ds)     # DELETE + INSERT for the day, in one transaction
+
+    [extract_orders(), extract_fx()] >> daily_revenue()
+
+daily_revenue_pipeline()
+```
+
+**Dagster**, begun in 2018 by Nick Schrock and developed by Dagster Labs, is **asset-centred**: you declare the tables and files you want to exist and how each is computed from others, and the DAG follows from those declarations. Partitions, backfills, lineage and **asset checks** (data-quality tests attached to an asset) are built in, and the same definitions run locally in tests.
+
+```python
+# Not run here: Dagster; see its documentation for current APIs.
+import dagster as dg
+
+daily = dg.DailyPartitionsDefinition(start_date="2026-03-01")
+
+@dg.asset(partitions_def=daily)
+def raw_orders(context: dg.AssetExecutionContext) -> None:
+    replace_partition("raw_orders", context.partition_key, fetch_orders(context.partition_key))
+
+@dg.asset(partitions_def=daily, deps=[raw_orders])
+def daily_revenue(context: dg.AssetExecutionContext) -> None:
+    run_sql("sql/daily_revenue.sql", day=context.partition_key)
+```
+
+**Prefect** turns ordinary Python functions into tasks and flows with decorators (`@task(retries=3)`, `@flow`), and builds the graph as the code runs, which suits dynamic workflows whose shape depends on data — one task per file that happens to arrive, say. Other orchestrators are worth knowing too: **Luigi** (from Spotify, 2012, one of the first open-source orchestrators), **Argo Workflows** and **Flyte** (Kubernetes-native, popular for machine learning), **Kestra** (declarative YAML), **Temporal** (durable execution for general application workflows, sometimes used for data), and the clouds' own services such as AWS Step Functions, Azure Data Factory and Google Cloud Workflows. For one script on one machine, cron or a systemd timer is still a fine answer.
+
+**dbt** is not an orchestrator but a framework for the **transformation** step of ELT, run *by* an orchestrator or on its own schedule. Each model is a `SELECT` statement in a file; `ref()` names the models it reads, from which dbt builds the DAG and runs the models in order inside the warehouse. Models can be materialised as views, tables or **incremental** tables that process only new partitions; tests and documentation live beside them in YAML.
+
+```sql
+-- Not run here: a dbt model, models/marts/daily_revenue.sql. Jinja fills in table names.
+{{ config(materialized="incremental", unique_key=["day", "region"],
+          incremental_strategy="delete+insert") }}
+
+select o.day, s.region, count(*) as orders,
+       cast(round(sum(o.amount * f.usd_per_unit) * 100) as integer) as usd_cents
+from {{ ref("stg_orders") }} o
+join {{ ref("stg_fx") }} f on f.day = o.day and f.currency = o.currency
+join {{ ref("stg_stores") }} s on s.day = o.day and s.store = o.store
+{% if is_incremental() %}
+where o.day >= (select max(day) from {{ this }})        -- reprocess the latest day and anything newer
+{% endif %}
+group by o.day, s.region
+```
+
+```yaml
+# Not run here: models/marts/schema.yml, declaring tests that dbt runs as SQL queries.
+version: 2
+models:
+  - name: daily_revenue
+    description: Revenue in US cents, one row per day and region.
+    columns:
+      - name: day
+        data_tests: [not_null]
+      - name: region
+        data_tests: [not_null]
+      - name: usd_cents
+        data_tests: [not_null]
+```
+
+dbt Core is open source under the Apache 2.0 licence; dbt Labs sells a hosted platform and in 2025 introduced a rewritten engine, Fusion, under different licence terms. **SQLMesh** is an open-source alternative with its own approach to environments and change planning. Both make SQL transformations versioned, tested and reviewable like any other code — which is most of the point.
+
+How to choose? Start from the work: a few SQL transformations in one warehouse may need only dbt and a scheduler; a platform team running hundreds of pipelines across systems needs a full orchestrator, and should weigh the cost of operating it themselves against a managed service's bill. Asset-based tools fit teams who think in tables; task-based tools fit teams orchestrating actions across many systems. Above all, prefer what your team can run, monitor and debug at 03:00.
+
+</Section>
+
+<Section id="testing" kind="examples" title="Testing pipelines">
+
+Pipelines fail in two ways: they crash, or they succeed and produce wrong data. The second is worse, and it is what most testing of pipelines is for. Lumenary CS's [testing](/en/cs/testing/) lesson gives the general principles; for pipelines, tests come in layers.
+
+1. **Unit tests of transformations.** Keep business logic in plain functions or SQL models that can run on a handful of rows, and test them with tiny hand-made inputs whose right answer you know — including the awkward cases: an empty day, a currency with no rate, a duplicated order. dbt (since version 1.8) supports unit tests of a model on mocked input rows.
+2. **DAG integrity tests.** In continuous integration, load every pipeline definition and check that it parses, has no cycles, and follows the team's rules (every task has retries and an owner; no credentials in code).
+3. **Integration tests.** Run the whole pipeline end to end on a small synthetic dataset, against a disposable database — an embedded engine such as DuckDB or SQLite, or a container — and compare the outputs with expected results.
+4. **Data tests in production.** Checks that run as tasks *inside* the pipeline, on real data, before results are published: the `check_revenue` task above, dbt's tests, Dagster's asset checks. They catch what no pre-deployment test can — a source that changed overnight. <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink> builds a small framework for them.
+
+<Example title="Write, audit, publish">
+
+The pharmacy chain's revenue query is being rewritten. Rather than deploy it and hope, the team runs the new version for the last 30 days into a separate staging schema (write), compares its output with the current production table — row counts per day, revenue per region, and every row where the two differ by more than a cent (audit) — and only when the differences are understood switches the dashboard to the new table (publish). The same three steps work for every run in production: write to a staging location, run the data tests, and make the result visible only if they pass. Table formats make the final step an atomic metadata switch, as <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink> shows.
+
+</Example>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The orchestrator should do the heavy lifting."** An orchestrator coordinates; it should *start* work in engines built for it — a warehouse, Spark, a container — and wait. Loading gigabytes into pandas on an Airflow worker ties up the worker, competes with other tasks and fails mysteriously when memory runs out.
+
+</Misconception>
+
+<Misconception>
+
+**"Retries make a pipeline reliable."** Retries help only with transient failures, and only if the task is idempotent; retrying a task that appends, sends an email or charges money multiplies the damage. Retrying a permanent failure just delays the alert.
+
+</Misconception>
+
+<Misconception>
+
+**"The run labelled 14 March runs on 14 March."** For a daily schedule, the run for the 14 March data interval normally starts after the interval ends, on 15 March. Use the run's logical date or data interval inside tasks, never the wall-clock date, or a backfill of last month will process today's data thirty times.
+
+</Misconception>
+
+<Misconception>
+
+**"All green means the data is right."** A green run means every task exited without an error. It says nothing about whether a source sent half its rows, or a join silently dropped a region, unless data tests check for exactly that.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

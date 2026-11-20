@@ -1,0 +1,472 @@
+---
+title: Experiments in products
+subtitle: A/B testing as companies practise it — choosing what to measure, randomising, computing power, checking the plumbing, reducing variance, resisting the urge to peek, and experimenting on people responsibly.
+minutes: 85
+objectives:
+  - Design an online controlled experiment with an overall evaluation criterion, guardrail metrics and trust checks
+  - Choose a randomisation unit, assign units deterministically by hashing, and recognise when units interfere with each other
+  - Compute the sample size and duration an experiment needs, and check the calculation by simulation
+  - Detect a sample ratio mismatch and explain why it invalidates the comparison
+  - Implement CUPED and explain why it reduces variance without introducing bias
+  - Explain why repeatedly checking a running test inflates false positives, and how sequential designs fix it
+  - Recognise novelty effects and interference, and weigh the ethics of experimenting on people
+narrators: [chloe, margaret, gideon]
+prerequisites: [the-data-science-workflow, exploratory-data-analysis]
+related: [math.prob.statistical-inference-intro, math.prob.statistics, math.prob.probability-theory]
+references:
+  - title: Trustworthy online controlled experiments
+    author: Ron Kohavi, Diane Tang and Ya Xu
+    year: 2020
+    url: https://doi.org/10.1017/9781108653985
+    note: The standard practitioners' book, by people who ran experimentation at large technology companies.
+  - title: "Controlled experiments on the web: survey and practical guide"
+    author: Ron Kohavi, Roger Longbotham, Dan Sommerfield and Randal M. Henne
+    year: 2009
+    url: https://doi.org/10.1007/s10618-008-0114-1
+  - title: Improving the sensitivity of online controlled experiments by utilizing pre-experiment data
+    author: Alex Deng, Ya Xu, Ron Kohavi and Toby Walker
+    year: 2013
+    url: https://doi.org/10.1145/2433396.2433413
+    note: The CUPED paper.
+  - title: Diagnosing sample ratio mismatch in online controlled experiments
+    author: Aleksander Fabijan and colleagues
+    year: 2019
+    url: https://doi.org/10.1145/3292500.3330722
+  - title: "Always valid inference: bringing sequential analysis to A/B testing"
+    author: Ramesh Johari, Leonid Pekelis and David Walsh
+    year: 2015
+    url: https://arxiv.org/abs/1512.04922
+  - title: Experimental evidence of massive-scale emotional contagion through social networks
+    author: Adam D. I. Kramer, Jamie E. Guillory and Jeffrey T. Hancock
+    year: 2014
+    url: https://doi.org/10.1073/pnas.1320040111
+    note: Read it together with the journal's editorial expression of concern about consent, published with it online.
+  - title: The Belmont Report
+    url: https://www.hhs.gov/ohrp/regulations-and-policy/belmont-report/index.html
+    note: The 1979 statement of ethical principles for research with human participants.
+  - title: "Focusing on the long-term: it's good for users and business"
+    author: Henning Hohnhold, Deirdre O'Brien and Diane Tang
+    year: 2015
+    note: KDD 2015. How long-running holdouts revealed effects that short experiments missed.
+---
+
+<Section id="motivation" kind="motivation" title="Did the new checkout work?">
+
+An online grocery service redesigns its checkout: fewer steps, delivery slots shown earlier, a clearer total. It launches on a Monday. The next week, the share of baskets that become orders is up from 4.0% to 4.3%, and the product team celebrates.
+
+The data scientist is less sure. That week also had a public holiday, a competitor's outage, and the first payday of the month. A marketing email went out on Wednesday. Any of these could move conversion by a few tenths of a percentage point, in either direction. Comparing *before* with *after* mixes the effect of the redesign with the effect of everything else that changed. This is the central problem of [causal inference](/en/statistics/causal-inference/): we want to compare what happened with what *would* have happened without the change, and we never observe the second.
+
+A **randomised controlled experiment** solves it by creating the missing comparison. For two weeks, each visitor is assigned at random to the old checkout (A, the control) or the new one (B, the treatment). Holidays, outages, paydays and emails now hit both groups equally, because chance, not anything about the visitors, decided who saw what. Any difference larger than chance alone would produce can be attributed to the redesign. This is the same logic as a clinical trial, and the statistical tools (hypothesis tests, confidence intervals, power) are taught in [hypothesis testing](/en/statistics/hypothesis-testing/), [comparing groups](/en/statistics/comparing-groups/) and [experimental design and ANOVA](/en/statistics/experimental-design-and-anova/) in Lumenary Statistics.
+
+Online experiments add their own difficulties: millions of units but tiny effects, metrics that can be gamed, software bugs that silently break randomisation, managers who check results every morning, and users who influence each other. This lesson is about those difficulties, which is where most real experiments go wrong.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="The vocabulary of an experiment">
+
+<Definition term="online controlled experiment (A/B test)">
+
+An experiment in which **units** (usually users) are randomly assigned to two or more **variants** of a product, and **metrics** are compared between the variants. The **randomisation unit** is what is assigned (user, device, session, city, hour); the **analysis unit** is what a metric is averaged over (users, orders, page views). The **average treatment effect** is the difference between the mean outcome under treatment and under control.
+
+</Definition>
+
+<Definition term="overall evaluation criterion, guardrails, trust checks">
+
+The **overall evaluation criterion** (OEC) is the metric, or small agreed combination of metrics, that decides whether a change is an improvement, chosen *before* the experiment. **Guardrail metrics** must not get worse even if the OEC improves: page speed, crash rate, unsubscribes, complaints, refunds. **Trust checks** (also called invariant or diagnostic metrics) test the experiment itself: the split between arms, metrics that the change cannot possibly affect, and A/A tests in which both arms get the same product.
+
+</Definition>
+
+<Definition term="power and minimum detectable effect">
+
+The **power** of an experiment is the probability that it detects an effect of a given size (rejects "no difference" at significance level $\alpha$) when that effect is real. The **minimum detectable effect** (MDE) is the smallest effect it has, typically, 80% power to detect. Power grows with the number of units and the size of the effect, and shrinks with the variance of the metric.
+
+</Definition>
+
+<Figure caption="The anatomy of an online experiment. Units are assigned deterministically by hashing; exposure is logged when a unit actually meets the change; the analysis computes the OEC, the guardrails and the trust checks; and only an experiment that passes its trust checks feeds a decision.">
+<svg viewBox="0 0 680 250" role="img" aria-label="Flow diagram. Users go into a box labelled hash of experiment and user id gives bucket 0 to 99. It splits into two boxes: A, control, buckets 50 to 99, and B, treatment, buckets 0 to 49. Both lead to an exposure log. The exposure log feeds three boxes: OEC, decides; guardrails, must not get worse; trust checks, sample ratio and A/A. These three lead to a final box: decision, ship, iterate or stop.">
+  <defs>
+    <marker id="exp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="10" y="100" width="70" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="45" y="125" textAnchor="middle" fill="currentColor" fontSize="12">users</text>
+  <rect x="100" y="90" width="130" height="60" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="165" y="114" textAnchor="middle" fill="currentColor" fontSize="11">hash(experiment,</text>
+  <text x="165" y="128" textAnchor="middle" fill="currentColor" fontSize="11">user id) gives</text>
+  <text x="165" y="142" textAnchor="middle" fill="currentColor" fontSize="11">bucket 0–99</text>
+  <rect x="260" y="40" width="120" height="44" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="320" y="58" textAnchor="middle" fill="currentColor" fontSize="11">A: control</text>
+  <text x="320" y="74" textAnchor="middle" fill="currentColor" fontSize="11">buckets 50–99</text>
+  <rect x="260" y="156" width="120" height="44" rx="6" fill="var(--gold)" fillOpacity="0.35" stroke="currentColor" />
+  <text x="320" y="174" textAnchor="middle" fill="currentColor" fontSize="11">B: treatment</text>
+  <text x="320" y="190" textAnchor="middle" fill="currentColor" fontSize="11">buckets 0–49</text>
+  <rect x="405" y="100" width="80" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="445" y="118" textAnchor="middle" fill="currentColor" fontSize="11">exposure</text>
+  <text x="445" y="132" textAnchor="middle" fill="currentColor" fontSize="11">log</text>
+  <rect x="510" y="20" width="160" height="36" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="590" y="42" textAnchor="middle" fill="currentColor" fontSize="11">OEC: decides</text>
+  <rect x="510" y="70" width="160" height="36" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="590" y="92" textAnchor="middle" fill="currentColor" fontSize="11">guardrails: must not worsen</text>
+  <rect x="510" y="120" width="160" height="36" rx="6" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="590" y="142" textAnchor="middle" fill="currentColor" fontSize="11">trust checks: SRM, A/A</text>
+  <rect x="510" y="196" width="160" height="40" rx="6" fill="var(--gold)" fillOpacity="0.35" stroke="currentColor" />
+  <text x="590" y="221" textAnchor="middle" fill="currentColor" fontSize="11">decision: ship, iterate, stop</text>
+  <line x1="80" y1="120" x2="98" y2="120" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="230" y1="110" x2="258" y2="66" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="230" y1="130" x2="258" y2="174" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="380" y1="66" x2="404" y2="110" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="380" y1="174" x2="404" y2="132" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="485" y1="112" x2="508" y2="40" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="485" y1="118" x2="508" y2="88" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="485" y1="124" x2="508" y2="136" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+  <line x1="590" y1="156" x2="590" y2="194" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#exp-arrow)" />
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="metrics" kind="human" title="What to measure: the OEC and its guardrails">
+
+Choosing the OEC is the most consequential decision in an experiment, and it is a judgement about what the organisation values, not a statistical one. A good OEC has three properties. It is **aligned with long-term value**: an increase should really mean that users and the organisation are better off. It is **sensitive**: it moves enough, within a two-week experiment, to be detected. And it is **hard to game**: a change cannot raise it while making the product worse.
+
+These pull against each other. Revenue per user is aligned but noisy. Clicks are sensitive but easy to inflate with a misleading button. For the grocery checkout, "orders completed per visitor" is a reasonable OEC; "clicks on the checkout button" is not, because a confusing design could produce more clicks and fewer orders. Many companies end up with an OEC that combines a few metrics with agreed weights, and spend years refining it.
+
+<Narrator who="chloe">
+
+What question are we really asking? "Did conversion go up?" is a question about the next two weeks. The question the business cares about is whether customers will be better served over the next two years, and the OEC is our best short-term stand-in for it. Every experiment is only as good as that stand-in, which is why the best teams test their OEC against long-running holdouts.
+
+</Narrator>
+
+Guardrails protect against the change winning on the OEC by doing harm elsewhere: a faster checkout that also hides the returns policy, a feed that raises engagement and also complaints. Typical guardrails are page-load time, errors and crashes, unsubscribes and account deletions, customer-support contacts, and revenue (for a change not meant to affect it). Agree in advance how much deterioration counts as a failure.
+
+**Ratio metrics need care.** If users are randomised but the metric is per order (average basket value) or per page view (click-through rate), the observations are not independent: one enthusiastic user contributes many orders. Treating orders as independent understates the variance and produces false positives. Compute the variance at the level of the randomisation unit, using the delta method or a bootstrap over users ([resampling and simulation](/en/statistics/resampling-and-simulation/)).
+
+</Section>
+
+<Section id="randomisation" kind="computation" title="Randomisation units, hashing and sample ratio mismatch">
+
+The randomisation unit should be the unit at which the change is experienced and at which units do not affect one another. **Users** (when logged in) are the usual choice: each person sees a consistent product. **Devices or cookies** are used for visitors who are not logged in, at the cost of one person on two devices being counted twice. **Sessions or page views** give more units, but a user who sees the new checkout on Monday and the old one on Tuesday has a confusing experience. **Clusters** (a city, a school, a warehouse) and **time slots** are used when units interfere, discussed below.
+
+Assignment in production is not done by drawing random numbers and storing them. It is done by **hashing**: a hash of the experiment's name and the unit's id gives a number from 0 to 99, and buckets 0–49 get the treatment. The same user always gets the same variant, without any lookup, on any server. Including the experiment's name in the hash makes assignments in different experiments independent, so that thousands of experiments can run at once on overlapping users.
+
+The first thing to check when results arrive is that the plumbing worked. A **sample ratio mismatch** (SRM) means that the number of units in each arm differs from the designed split by more than chance allows. It is a symptom, not a cause, but the causes are always serious: the treatment crashes for some users before they are logged, a redirect loses some visitors, bots are filtered differently in the two arms. In each case the users who remain in the treatment are no longer comparable with the control, and no amount of statistics afterwards can repair the comparison. An analysis of experiments at one large company found SRM in a few per cent of them ([Fabijan and colleagues, 2019](https://doi.org/10.1145/3292500.3330722)).
+
+```python run
+import hashlib
+import math
+from collections import Counter
+
+def bucket(unit_id, experiment, buckets=100):
+    """Deterministic assignment: the same user always lands in the same bucket of an experiment."""
+    digest = hashlib.sha256(f"{experiment}:{unit_id}".encode()).hexdigest()
+    return int(digest[:15], 16) % buckets
+
+def arm(unit_id, experiment):
+    return "B" if bucket(unit_id, experiment) < 50 else "A"     # a 50/50 split
+
+def srm_p_value(n_a, n_b, share_a=0.5):
+    """Chi-square test (1 degree of freedom) that the counts match the designed split."""
+    n = n_a + n_b
+    z = (n_a - n * share_a) / math.sqrt(n * share_a * (1 - share_a))
+    return math.erfc(abs(z) / math.sqrt(2))
+
+users = [f"user-{i:06d}" for i in range(100_000)]
+counts = Counter(arm(u, "checkout-2026-11") for u in users)
+print("assigned:", dict(sorted(counts.items())), f"SRM p = {srm_p_value(counts['A'], counts['B']):.3f}")
+
+# Assignment in one experiment should be independent of assignment in another.
+pairs = Counter((arm(u, "checkout-2026-11"), arm(u, "search-ranking-v7")) for u in users)
+print("joint with another experiment:", dict(sorted(pairs.items())))
+
+# A bug: the new checkout page fails to load on an old browser used by about 3% of people,
+# so those users in B never send the event that marks them as "exposed".
+logged = Counter()
+for i, u in enumerate(users):
+    a = arm(u, "checkout-2026-11")
+    old_browser = i % 33 == 0
+    if not (a == "B" and old_browser):
+        logged[a] += 1
+print("logged as exposed:", dict(sorted(logged.items())), f"SRM p = {srm_p_value(logged['A'], logged['B']):.2g}")
+```
+
+The hash split 100,000 users 49,944 to 50,056, a difference well within chance (p = 0.723). Crossed with a second experiment, the four combinations each hold close to a quarter of the users, so the two experiments do not confound each other. Then the bug: a treatment page that fails for 3% of visitors removed 1,528 users from B's logs. The split of 49,944 to 48,528 looks harmless to the eye, a difference of under 3%, but its p-value is $6.4 \times 10^{-6}$. The missing users are the ones on old browsers, who probably convert differently from everyone else, so B's conversion rate is now measured on a different population from A's. The right response to an SRM is to stop, find the cause, and fix it; not to analyse the results anyway.
+
+</Section>
+
+<Section id="power" kind="computation" title="Power, sample size and duration">
+
+Online experiments look for small effects. A redesign that lifts conversion from 4.0% to 4.2% (a 5% relative lift) may be worth a great deal to a large business, and detecting it reliably needs a surprisingly large number of users. For comparing two proportions $p_1$ and $p_2$ with a two-sided test at level $\alpha$ and power $1 - \beta$, the normal approximation gives, per arm,
+
+$$n = \frac{(z_{1-\alpha/2} + z_{1-\beta})^2 \, \big(p_1(1-p_1) + p_2(1-p_2)\big)}{(p_2 - p_1)^2},$$
+
+where $z_q$ is the $q$ quantile of the standard normal distribution. For a mean with standard deviation $\sigma$ and an absolute effect $\delta$, the numerator's variance term becomes $2\sigma^2$. The derivation is in [hypothesis testing](/en/statistics/hypothesis-testing/); here we use it, and check it by simulation.
+
+```python run
+import math
+from statistics import NormalDist
+import numpy as np
+
+z = NormalDist().inv_cdf
+
+def n_per_arm(p_base, rel_lift, alpha=0.05, power=0.80):
+    """Users per arm for a two-sided test of two proportions (normal approximation)."""
+    p1, p2 = p_base, p_base * (1 + rel_lift)
+    var = p1 * (1 - p1) + p2 * (1 - p2)
+    return math.ceil((z(1 - alpha / 2) + z(power)) ** 2 * var / (p2 - p1) ** 2)
+
+print("baseline conversion 4.0%, two-sided alpha 0.05, power 80%")
+print(" relative lift   absolute     users per arm   days at 20,000 users a day")
+for lift in (0.20, 0.10, 0.05, 0.02):
+    n = n_per_arm(0.04, lift)
+    print(f"{lift:13.0%} {0.04 * lift:10.2%} {n:15,d} {math.ceil(2 * n / 20_000):10d}")
+
+# Check the formula by simulation: 4,000 experiments with a true 5% lift.
+rng = np.random.default_rng(1)
+n = n_per_arm(0.04, 0.05)
+conv_a = rng.binomial(n, 0.040, 4000) / n
+conv_b = rng.binomial(n, 0.042, 4000) / n
+pooled = (conv_a + conv_b) / 2
+zstat = (conv_b - conv_a) / np.sqrt(pooled * (1 - pooled) * 2 / n)
+print(f"\nsimulated power at n = {n:,} per arm: {np.mean(np.abs(zstat) > z(0.975)):.3f}")
+# ... and the false-positive rate when there is no effect at all.
+conv_b0 = rng.binomial(n, 0.040, 4000) / n
+pooled0 = (conv_a + conv_b0) / 2
+z0 = (conv_b0 - conv_a) / np.sqrt(pooled0 * (1 - pooled0) * 2 / n)
+print(f"simulated false-positive rate with no effect: {np.mean(np.abs(z0) > z(0.975)):.3f}")
+```
+
+The table is the most useful thing a data scientist can show a product team *before* an experiment starts. A 20% lift needs about 10,000 users per arm, two days of traffic; a 5% lift needs 154,302 per arm, 16 days; a 2% lift needs nearly a million per arm, more than three months. Halving the effect quadruples the sample, because $n$ grows as $1/\delta^2$. The simulation confirms the formula: 80.3% of simulated experiments detected the true 5% lift, and 4.7% of experiments with no effect produced a false positive, as designed.
+
+Three practical adjustments follow. **Duration** is not just $n$ divided by daily traffic: returning users mean that unique users accumulate more slowly than visits, so estimate from historical data how many distinct users a given number of days brings. **Run whole weeks**, at least one and usually two, because behaviour differs between weekdays and weekends, and a test that runs Monday to Thursday measures a different population. And **if the required duration is absurd**, say so before the experiment, not after: either the change must be bigger, the metric less noisy (next section), or the question must be answered some other way. An underpowered experiment that finds "no significant difference" has usually learned nothing.
+
+<Narrator who="gideon">
+
+The formula assumes the conversions of different users are independent and the sample is large enough for the normal approximation. Both are fine here; neither is fine for a metric such as revenue per user with a few huge spenders, whose variance can be dominated by a handful of outliers. Cap (winsorise) such metrics at a high percentile chosen before the experiment, or the variance will be far larger than any planning calculation assumed.
+
+</Narrator>
+
+</Section>
+
+<Section id="cuped" kind="computation" title="Variance reduction with CUPED">
+
+Much of the variance in a metric like weekly spend has nothing to do with the experiment: large households spend more than single students in both arms. If we could subtract the part of each user's spend that we could have predicted before the experiment started, the remaining variance, and so the sample size needed, would shrink. That is **CUPED** (controlled-experiment using pre-experiment data), introduced at Microsoft by [Deng, Xu, Kohavi and Walker (2013)](https://doi.org/10.1145/2433396.2433413) and now standard on many experimentation platforms.
+
+<Definition term="CUPED">
+
+For each unit, let $Y$ be the metric during the experiment and $X$ a covariate measured **before** assignment (often the same metric in a pre-period). The adjusted metric is
+
+$$Y' = Y - \theta\,(X - \bar X), \qquad \theta = \frac{\operatorname{Cov}(X, Y)}{\operatorname{Var}(X)}.$$
+
+Because $X$ was fixed before randomisation, its mean is the same in both arms in expectation, so the difference in means of $Y'$ estimates the same treatment effect as that of $Y$. Its variance is smaller by a factor of $1 - \rho^2$, where $\rho$ is the correlation between $X$ and $Y$.
+
+</Definition>
+
+Statisticians will recognise this as regression adjustment (analysis of covariance): CUPED is equivalent, in large samples, to regressing $Y$ on the treatment indicator and $X$ ([multiple regression and diagnostics](/en/statistics/multiple-regression-and-diagnostics/)). The block implements it on a synthetic grocery app where each household's weekly spend during the experiment is correlated with its spend in the four weeks before.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(8)
+
+def make_experiment(n_per_arm, effect, rng):
+    """Synthetic grocery app: weekly spend before (x) and during (y) the experiment."""
+    habit = rng.gamma(2.0, 15.0, 2 * n_per_arm)                 # each household's typical spend
+    x = habit * rng.lognormal(0, 0.35, 2 * n_per_arm)           # the four weeks before
+    y = habit * rng.lognormal(0, 0.35, 2 * n_per_arm)           # the four weeks during
+    treated = np.repeat([0, 1], n_per_arm)
+    y = y + effect * treated
+    return x, y, treated
+
+def diff_and_se(y, treated):
+    a, b = y[treated == 0], y[treated == 1]
+    return b.mean() - a.mean(), np.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))
+
+def cuped(y, x):
+    """Subtract the part of y that pre-experiment data predicts. theta is estimated on both arms pooled."""
+    theta = np.cov(x, y)[0, 1] / x.var(ddof=1)
+    return y - theta * (x - x.mean()), theta
+
+x, y, t = make_experiment(10_000, effect=0.75, rng=rng)
+d, se = diff_and_se(y, t)
+y_adj, theta = cuped(y, x)
+d2, se2 = diff_and_se(y_adj, t)
+rho = np.corrcoef(x, y)[0, 1]
+print(f"mean weekly spend {y.mean():.2f}; true effect +0.75; correlation(before, during) = {rho:.2f}")
+print(f"plain difference : {d:+.2f}  95% CI [{d - 1.96 * se:+.2f}, {d + 1.96 * se:+.2f}]")
+print(f"CUPED (theta={theta:.2f}): {d2:+.2f}  95% CI [{d2 - 1.96 * se2:+.2f}, {d2 + 1.96 * se2:+.2f}]")
+print(f"variance reduced by {1 - (se2 / se) ** 2:.0%}; rho squared = {rho ** 2:.0%}")
+
+# Repeat the experiment 400 times: is CUPED unbiased, and how often does each method detect the effect?
+plain, adj = [], []
+for _ in range(400):
+    x, y, t = make_experiment(10_000, 0.75, rng)
+    plain.append(diff_and_se(y, t))
+    adj.append(diff_and_se(cuped(y, x)[0], t))
+plain, adj = np.array(plain), np.array(adj)
+for name, r in [("plain", plain), ("CUPED", adj)]:
+    print(f"{name:6s} mean estimate {r[:, 0].mean():.3f}, sd of estimates {r[:, 0].std():.3f}, "
+          f"detected (|z| > 1.96) in {np.mean(np.abs(r[:, 0] / r[:, 1]) > 1.96):.0%} of runs")
+```
+
+In this run, the plain comparison found a lift of 0.67 with a confidence interval from −0.07 to +1.42: not significant. CUPED, on the same users, estimated 0.76 with an interval from +0.23 to +1.28. The correlation of 0.71 between spend before and during the experiment removed 51% of the variance, exactly $\rho^2$. Over 400 repetitions, both methods averaged close to the true effect of 0.75 (CUPED is not biased), the spread of CUPED's estimates was 0.281 against 0.387, and CUPED detected the effect in 80% of experiments against 55%. Halving the variance is worth the same as doubling the traffic.
+
+<Narrator who="gideon">
+
+The covariate must be measured *before* assignment. Adjusting for something the treatment can change, such as the number of sessions during the experiment, silently subtracts part of the effect you are trying to measure, and can even reverse its sign. "Pre-experiment" is a condition, not a suggestion.
+
+</Narrator>
+
+</Section>
+
+<Section id="peeking" kind="computation" title="Peeking and sequential testing">
+
+A fixed-horizon test promises a 5% false-positive rate if you look at the result **once**, at the planned end. Dashboards show the p-value every day, and it is very tempting to stop as soon as it dips below 0.05. When there is no effect, the running p-value wanders, and the more often you look, the more likely it is to cross 0.05 at some point. The block simulates 20,000 A/A tests (no effect at all) that are checked every day for two weeks.
+
+```python run
+import numpy as np
+
+rng = np.random.default_rng(2026)
+SIMS, DAYS, PER_DAY, P = 20_000, 14, 2_000, 0.05     # users per arm per day; 5% conversion
+day = np.arange(1, DAYS + 1)
+
+def z_paths(p_a, p_b):
+    """Cumulative z-statistic after each day, for SIMS independent experiments."""
+    conv_a = rng.binomial(PER_DAY, p_a, (SIMS, DAYS)).cumsum(axis=1)
+    conv_b = rng.binomial(PER_DAY, p_b, (SIMS, DAYS)).cumsum(axis=1)
+    n = PER_DAY * day
+    pa, pb = conv_a / n, conv_b / n
+    pooled = (pa + pb) / 2
+    return (pb - pa) / np.sqrt(pooled * (1 - pooled) * 2 / n)
+
+aa = z_paths(P, P)                                    # A/A tests: no effect at all
+print(f"A/A tests, false-positive rate: one look at day {DAYS}: {np.mean(np.abs(aa[:, -1]) > 1.96):.3f}; "
+      f"daily looks, stopping at the first p < 0.05: {np.mean((np.abs(aa) > 1.96).any(axis=1)):.3f}")
+
+# Two boundaries for daily looks, each calibrated on the A/A runs to a 5% overall false-positive rate:
+# constant (Pocock-style), and strict early but close to 1.96 at the end (O'Brien-Fleming-style).
+shape = {"constant": np.ones(DAYS), "strict early": np.sqrt(DAYS / day)}
+bounds = {k: s * np.quantile((np.abs(aa) / s).max(axis=1), 0.95) for k, s in shape.items()}
+for k, b in bounds.items():
+    print(f"  {k:12s} boundary: |z| > {b[0]:.2f} on day 1, {b[6]:.2f} on day 7, {b[-1]:.2f} on day 14")
+
+ab = z_paths(P, P * 1.10)                             # a real 10% relative lift
+print(f"\nwith a real 10% lift: one look at day {DAYS}: power {np.mean(np.abs(ab[:, -1]) > 1.96):.3f}")
+for k, b in bounds.items():
+    crossed = np.abs(ab) > b
+    stopped = crossed.any(axis=1)
+    days_run = np.where(stopped, crossed.argmax(axis=1) + 1, DAYS)
+    print(f"  daily looks, {k:12s}: power {stopped.mean():.3f}, average length {days_run.mean():.1f} days")
+```
+
+Looking once gives the promised 5.0%. Looking daily and stopping at the first p below 0.05 gives 21.9%: more than one "winning" change in five is noise. This is not a reason never to look; it is a reason to look with a boundary designed for looking. Both boundaries in the block keep the overall false-positive rate at 5% across 14 looks. A constant boundary ($|z| > 2.62$ every day, in the spirit of Pocock's design) stops early often but loses power: 61.2% against 74.9% for a single look at day 14. A boundary that is very strict early and relaxes to 2.12 by the end (in the spirit of O'Brien and Fleming's design) keeps almost all the power, 72.9%, while still stopping on average after 11.1 days instead of 14.
+
+<Figure caption="One simulated A/A test (no real difference) from the block, checked daily. Its z-statistic crosses the usual 1.96 line on day 3, so a team that stops at the first significant result would ship a change that does nothing. Neither sequential boundary is crossed, and by day 14 the statistic has drifted back to 0.65. The negative boundaries, mirror images of these, are not shown.">
+<svg viewBox="0 0 580 270" role="img" aria-label="Line chart over days 1 to 14 of a z statistic. A horizontal line at z equals 1.96, a higher horizontal line at 2.62 labelled constant boundary, and a curve that starts very high and falls to 2.12 by day 14 labelled strict-early boundary. The z statistic path starts at 1.92, rises to 2.42 on day 3, above the 1.96 line, then hovers between 1.4 and 1.9 until day 9 and falls to about 0.65 by day 14.">
+  <line x1="60" y1="230" x2="540" y2="230" stroke="currentColor" strokeWidth="1" />
+  <line x1="60" y1="230" x2="60" y2="20" stroke="currentColor" strokeWidth="1" />
+  <line x1="60" y1="210" x2="540" y2="210" stroke="currentColor" strokeWidth="0.6" strokeDasharray="2 3" />
+  <text x="54" y="214" textAnchor="end" fill="currentColor" fontSize="10">0</text>
+  <text x="54" y="174" textAnchor="end" fill="currentColor" fontSize="10">1</text>
+  <text x="54" y="134" textAnchor="end" fill="currentColor" fontSize="10">2</text>
+  <text x="54" y="94" textAnchor="end" fill="currentColor" fontSize="10">3</text>
+  <text x="54" y="54" textAnchor="end" fill="currentColor" fontSize="10">4</text>
+  <text x="18" y="125" textAnchor="middle" fill="currentColor" fontSize="12" transform="rotate(-90 18 125)">z statistic</text>
+  <text x="60" y="246" textAnchor="middle" fill="currentColor" fontSize="10">1</text>
+  <text x="276" y="246" textAnchor="middle" fill="currentColor" fontSize="10">7</text>
+  <text x="528" y="246" textAnchor="middle" fill="currentColor" fontSize="10">14</text>
+  <text x="300" y="264" textAnchor="middle" fill="currentColor" fontSize="12">day of the experiment</text>
+  <line x1="60" y1="131.6" x2="540" y2="131.6" stroke="currentColor" strokeWidth="1.2" strokeDasharray="6 4" />
+  <text x="536" y="146" textAnchor="end" fill="currentColor" fontSize="10">1.96: the fixed-horizon line</text>
+  <line x1="60" y1="105.2" x2="540" y2="105.2" stroke="var(--human)" strokeWidth="1.5" />
+  <text x="536" y="100" textAnchor="end" fill="currentColor" fontSize="10">constant boundary, 2.62</text>
+  <polyline points="132,27.0 168,51.6 204,68.3 240,80.6 276,90.2 312,98.0 348,104.4 384,109.8 420,114.4 456,118.5 492,122.1 528,125.3" fill="none" stroke="var(--compute)" strokeWidth="1.8" />
+  <text x="215" y="56" fill="currentColor" fontSize="10">strict-early boundary</text>
+  <polyline points="60,133.2 96,139.2 132,113.2 168,138.4 204,135.2 240,132.4 276,152.4 312,143.2 348,137.6 384,170.4 420,179.6 456,177.6 492,181.2 528,184.0" fill="none" stroke="var(--sky)" strokeWidth="2.2" />
+  <circle cx="132" cy="113.2" r="5" fill="var(--gold)" stroke="currentColor" strokeWidth="1" />
+  <text x="140" y="190" fill="currentColor" fontSize="10">a daily peeker stops here, day 3</text>
+  <line x1="150" y1="180" x2="134" y2="119" stroke="currentColor" strokeWidth="0.8" />
+</svg>
+</Figure>
+
+Professional platforms offer several principled ways to look early. **Group sequential designs** fix the number and timing of looks in advance and spend the 5% across them (the Pocock and O'Brien–Fleming boundaries, and the more flexible alpha-spending functions of Lan and DeMets). **Always-valid p-values and confidence sequences** let you look as often as you like, at a modest cost in power ([Johari, Pekelis and Walsh](https://arxiv.org/abs/1512.04922)). Bayesian analyses are popular and report intuitive probabilities, but a Bayesian stopping rule does not automatically control the frequency of false launches; whatever the framework, check its error rates by simulating A/A tests, as above ([Bayesian inference](/en/statistics/bayesian-inference/)). A related trap is testing twenty metrics and celebrating the one that moved: decide the OEC in advance, and treat everything else as exploratory ([multiple testing and reproducibility](/en/statistics/multiple-testing-and-reproducibility/)).
+
+<Narrator who="margaret">
+
+I counted when the A/A runs first crossed 1.96. Of the 21.9% of null experiments that a daily peeker would have stopped, 36% crossed on the first or second day, when only 2,000 to 4,000 users per arm had arrived. The early days are when chance is loudest, which is exactly where the strict-early boundary is strictest.
+
+</Narrator>
+
+</Section>
+
+<Section id="novelty-interference" kind="human" title="Novelty, interference and other ways experiments mislead">
+
+**Novelty and primacy effects.** Users react to change itself. A new layout may attract clicks for a week because it is new (novelty), or lose them for a week because regular users are disoriented (primacy, or change aversion). Either way, the first days' effect is not the long-run effect. Plot the treatment effect by day, and by how many days each user has been in the experiment; if it is still trending at the end, run longer or analyse only users' later exposures. For changes expected to have slow effects (pricing, recommendations, notification frequency), large companies keep a small **long-term holdout** that does not get the change for months; one well-known study at Google found that the long-run effect of showing more ads differed from the short-run effect because users gradually learned to ignore them (Hohnhold, O'Brien and Tang, 2015).
+
+**Interference.** The simple analysis assumes that one unit's outcome depends only on its own assignment (statisticians call this the *stable unit treatment value assumption*; see [causal inference](/en/statistics/causal-inference/)). It fails in many products:
+
+- **Marketplaces.** If a ride-hailing app shows lower prices to treatment riders, they book more rides, leaving fewer drivers for control riders. Treatment looks better *and* control looks worse than either would at full rollout, so the experiment overstates the effect.
+- **Social and communication products.** A feature that makes it easier to send messages changes the experience of the (possibly control) recipients.
+- **Shared budgets and inventories.** Advertisers' budgets, delivery slots and hotel rooms are shared between arms.
+
+The remedies change the randomisation unit to one that contains the interference: whole **clusters** (cities, schools, communities in a social graph), or **switchback** designs that alternate the whole market between treatment and control in time slots (an hour on, an hour off), at the cost of far fewer effective units and so wider intervals. Some companies split the marketplace itself, giving each arm its own share of supply. Every one of these trades statistical power for a more honest estimate.
+
+**Heterogeneous effects.** An average effect of zero can hide a benefit for new users and a harm for experienced ones. Segmenting results is useful for learning and dangerous for deciding: with twenty segments, one will show a "significant" effect by chance. Decide in advance which segments matter (for example, low-bandwidth users, screen-reader users, each country), and treat the rest as hypotheses for the next experiment.
+
+</Section>
+
+<Section id="ethics" kind="human" title="Experimenting on people">
+
+Every product change is an experiment on its users; an A/B test just measures it. That argument, often made in industry, is partly right: shipping an untested change to everyone is not more ethical than testing it on half. But it is not the whole story, and the field learned this publicly. In 2014 researchers published an experiment in which the news feeds of nearly 700,000 users of a social network were altered for a week to show fewer positive or fewer negative posts, to study whether emotions spread ([Kramer, Guillory and Hancock](https://doi.org/10.1073/pnas.1320040111)). The effects measured were tiny; the reaction was not. The journal published an editorial expression of concern about whether the users had given informed consent, and the episode prompted many companies to set up internal review.
+
+The principles of research ethics, set out for medicine and behavioural science in the [Belmont Report](https://www.hhs.gov/ohrp/regulations-and-policy/belmont-report/index.html), translate directly: **respect for persons** (people should be able to understand, and where it matters choose, how they are studied), **beneficence** (the expected benefit should justify the risk, and the risk should be minimised), and **justice** (the burdens of experimentation should not fall on the vulnerable). In practice:
+
+- Do not test a variant you would not be willing to ship. Experiments that deliberately worsen the product for some users (slower pages, to measure the value of speed) need a strong reason, a small exposure and a short duration.
+- Be especially careful with changes that touch money, health, safety, children, or people in distress, and with experiments on prices, where two customers paying different amounts for the same thing raises fairness and, in some jurisdictions, legal questions.
+- Never use experiments to optimise **dark patterns**, designs that trick people into choices against their interest. They often win on short-term metrics, which is exactly why guardrails and the OEC matter.
+- Have a review process proportionate to the risk, written down before it is needed. Many companies route sensitive experiments to a review group that includes people outside the product team.
+- Protect the data. Experiment logs describe what individuals did; access, retention and anonymisation rules apply to them as to any personal data (<LessonLink slug="responsible-data-science">responsible data science</LessonLink>).
+
+</Section>
+
+<Section id="professional" kind="human" title="The professional view">
+
+At large technology companies, experimentation is infrastructure: an in-house platform assigns units, logs exposures, computes hundreds of metrics with correct variances, runs SRM checks automatically, and refuses to show results for an experiment that fails them. Thousands of experiments run concurrently. Smaller organisations use commercial or open-source experimentation platforms, or the experiment features of their analytics tools; whichever they choose, it is worth checking that it computes variances at the randomisation unit, detects SRM, and offers a principled answer to peeking. The practitioners' reference is [Kohavi, Tang and Xu (2020)](https://doi.org/10.1017/9781108653985), and the earlier survey by [Kohavi and colleagues (2009)](https://doi.org/10.1007/s10618-008-0114-1) is still a good short introduction.
+
+Two honest observations from practice. First, most ideas do not work: companies that publish their experience report that only a minority of experiments (often a third or fewer) improve the OEC, which is a strong argument for testing rather than trusting intuition. Second, the hardest problems are rarely statistical. They are agreeing an OEC, building trustworthy logging, and persuading a team to accept a negative result for the idea it spent a quarter building. A data scientist who can explain *why* an experiment is not yet trustworthy, before anyone has seen the result, is worth more than one who knows every test.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Not significant means no effect."** It means the experiment could not distinguish the effect from zero. If it was underpowered, a large effect could easily have been missed; report the confidence interval, which says how large an effect is still consistent with the data.
+
+</Misconception>
+
+<Misconception>
+
+**"A small sample ratio mismatch is just noise."** A split of 49,944 to 48,528 looks like noise and has a p-value of $6.4 \times 10^{-6}$. With large samples, the SRM test is sensitive to exactly the kind of bug that makes results untrustworthy. Investigate before reading any metric.
+
+</Misconception>
+
+<Misconception>
+
+**"We can stop as soon as the result is significant."** Only with a sequential design. Stopping at the first p below 0.05 on daily looks raised the false-positive rate from 5% to 21.9% in the simulation.
+
+</Misconception>
+
+<Misconception>
+
+**"Variance reduction is a statistical trick that biases the estimate."** CUPED with a pre-experiment covariate is unbiased: over 400 simulated experiments its average estimate matched the true effect. What it changes is the noise, which fell by half.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

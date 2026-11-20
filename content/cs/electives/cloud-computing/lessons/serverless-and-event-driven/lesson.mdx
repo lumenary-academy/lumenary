@@ -1,0 +1,459 @@
+---
+title: Serverless and event-driven design
+subtitle: Code that runs when something happens — cold starts, queues and fan-out, at-least-once delivery and idempotency, workflows and sagas, and what it really costs.
+minutes: 90
+objectives:
+  - Explain functions as a service, what an instance is, and what the provider manages for you
+  - Model cold starts with a Poisson arrival process, and choose among the ways to reduce them
+  - Design with event sources, queues, topics and dead-letter queues, including fan-out to several consumers
+  - Implement a consumer that is correct under at-least-once delivery, and say exactly where idempotency checks must commit
+  - Structure a multi-step process as a saga with compensations, orchestrated or choreographed
+  - Compute when functions cost less than a fleet of virtual machines, and judge the limits and lock-in of serverless platforms
+prerequisites: [what-is-the-cloud, virtualisation-and-containers, kubernetes]
+related: [math.prob.stochastic-processes, math.prob.probability-theory, math.applied.optimisation]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Cloud Programming Simplified: A Berkeley View on Serverless Computing"
+    author: Eric Jonas, Johann Schleier-Smith, Vikram Sreekanti and colleagues
+    year: 2019
+    url: https://arxiv.org/abs/1902.03383
+    note: What serverless is, what it is good for, and its open problems, from the group behind the 2009 Berkeley view of cloud computing.
+  - title: "Serverless in the Wild: Characterizing and Optimizing the Serverless Workload at a Large Cloud Provider"
+    author: Mohammad Shahrad, Rodrigo Fonseca, Íñigo Goiri and colleagues
+    year: 2020
+    url: https://www.usenix.org/conference/atc20/presentation/shahrad
+    note: Measurements of real function traffic on Azure, and keep-alive policies that cut cold starts.
+  - title: "Firecracker: Lightweight Virtualization for Serverless Applications"
+    author: Alexandru Agache and colleagues
+    year: 2020
+    url: https://www.usenix.org/conference/nsdi20/presentation/agache
+  - title: Sagas
+    author: Hector Garcia-Molina and Kenneth Salem
+    year: 1987
+    url: https://doi.org/10.1145/38713.38742
+    note: The SIGMOD paper that introduced long-lived transactions built from compensable steps.
+  - title: CloudEvents
+    url: https://cloudevents.io/
+    note: A CNCF specification for describing events in a common way across platforms.
+  - title: AWS Lambda documentation
+    url: https://docs.aws.amazon.com/lambda/
+  - title: Azure Functions documentation
+    url: https://learn.microsoft.com/en-us/azure/azure-functions/
+  - title: Cloud Run functions documentation (Google Cloud)
+    url: https://cloud.google.com/run/docs/functions/comparison
+  - title: Alibaba Cloud Function Compute documentation
+    url: https://www.alibabacloud.com/help/en/functioncompute/
+  - title: Knative
+    url: https://knative.dev/docs/
+    note: An open-source, Kubernetes-based platform for serverless containers and eventing.
+  - title: Temporal documentation
+    url: https://docs.temporal.io/
+    note: An open-source durable-execution engine for workflows.
+---
+
+<Section id="motivation" kind="motivation" title="Quiet all week, then everyone at once">
+
+A football club in Rosario sells match tickets online. For six days a week the shop sees a few requests a minute. When tickets for a big match go on sale at noon, fifty thousand fans arrive in the same quarter of an hour. Each purchase then sets off a chain of work: hold a seat, take the payment, issue the ticket, email a receipt, credit loyalty points, update the stadium's seat map.
+
+Sizing servers for the noon rush means paying all week for machines that sit idle; sizing them for the quiet days means falling over at noon. **Serverless** platforms offer a third way. You upload a function; the provider runs as many copies as the moment requires, from none to thousands, and bills only for the time they run. You never choose a machine, patch an operating system or configure an autoscaler.
+
+AWS Lambda introduced the model to a wide audience in 2014, and within a few years every large provider had its own: Azure Functions, Google Cloud Functions (renamed Cloud Run functions in 2024), Alibaba Cloud Function Compute, and edge platforms such as Cloudflare Workers. Open-source projects such as Knative and OpenFaaS offer the same model on your own Kubernetes cluster. This lesson looks at what happens underneath, simulates the two things that surprise every newcomer — cold starts and duplicate messages — and computes when the model saves money and when it costs more.
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="What serverless means">
+
+"Serverless" does not mean there are no servers. It means the servers are entirely the provider's concern.
+
+<Definition term="function as a service (FaaS)">
+
+A **function as a service** is a piece of code, with a single entry point (the *handler*), that the platform runs in response to **events** — an HTTP request, a message on a queue, a file arriving in object storage, a timer. The platform starts and stops copies automatically, scales to zero when there are no events, and bills per invocation and per unit of running time and memory.
+
+</Definition>
+
+<Definition term="instance and cold start">
+
+An **instance** (also called an execution environment) is one isolated copy of the function's runtime — typically a microVM, a container or a language-level isolate — that handles invocations. Creating a new instance and running the function's start-up code before the first invocation is a **cold start**; an invocation that reuses an existing instance is **warm**.
+
+</Definition>
+
+The wider family is sometimes called **serverless computing**: any managed service billed by use and scaled by the provider, including object storage, queues, event routers, some databases, and serverless *container* platforms that run a whole container image this way (Google Cloud Run, Azure Container Apps, Alibaba Cloud Serverless App Engine, Knative on Kubernetes).
+
+An instance's life has three phases. **Init**: the platform creates the sandbox (often a Firecracker-style microVM, as in <LessonLink slug="virtualisation-and-containers">Virtualisation and containers</LessonLink>), loads your code, starts the language runtime and runs your module-level code — imports, configuration, database connections. **Invoke**: the handler runs for each event; work done in init is reused by every warm invocation. **Shutdown**: after a period without work, the platform reclaims the instance, without promising exactly when. Platforms differ in how many requests one instance handles at once: in AWS Lambda's standard model each instance serves one request at a time, while Cloud Run, Azure Functions and Alibaba Function Compute can be configured to let one instance serve several concurrently, which matters for both cost and cold starts.
+
+</Section>
+
+<Section id="cold-starts" kind="computation" title="Cold starts, modelled">
+
+A cold start costs whatever init takes: tens of milliseconds for a small function in a light runtime, a second or more for a large package with heavy imports, a VM-based runtime or connections to set up. How often does it happen? That depends on traffic and on how long the platform keeps idle instances warm. A clean model gives a first answer.
+
+<Theorem name="Cold-start probability under a keep-alive policy">
+
+Suppose requests arrive as a Poisson process of rate $\lambda$, each request is handled in negligible time, and the platform keeps an instance warm for exactly $T$ seconds after its last request. Then each request after the first is a cold start with probability $e^{-\lambda T}$, independently of the others.
+
+</Theorem>
+
+<Proof>
+
+In a Poisson process the gaps between consecutive arrivals are independent and exponentially distributed with rate $\lambda$ (see <TopicLink id="math.prob.stochastic-processes">stochastic processes</TopicLink>). Because handling takes negligible time, the single instance becomes idle the moment it receives a request, so a request finds it warm exactly when the gap since the previous request is at most $T$. The probability of a longer gap is $\Pr[G > T] = e^{-\lambda T}$, and independence of the gaps gives independence of the events.
+
+</Proof>
+
+The formula says that cold starts are a problem of **low and irregular** traffic. With a ten-minute keep-alive, a function called once an hour is cold $e^{-1/6} \approx 85\%$ of the time, once every ten minutes $e^{-1} \approx 37\%$, and once a minute almost never. The simulation below relaxes the model's assumptions: each request takes 0.2 s of work, a cold start adds 1 s of init, and an instance serves one request at a time, so overlapping requests need extra instances.
+
+```python run
+import heapq, math, random
+
+def simulate(rate, keep_alive=600.0, work=0.2, init=1.0, n=20000, min_instances=0, seed=1):
+    """Poisson arrivals at `rate` per second; one request per instance at a time; a new instance
+    spends `init` seconds starting up; idle instances are reclaimed after `keep_alive` seconds,
+    except `min_instances` that are kept warm for good."""
+    rng = random.Random(seed)
+    idle = [(-math.inf, True)] * min_instances        # (idle since, kept forever?)
+    busy = []                                         # heap of (finish time, kept forever?)
+    t, cold, latencies = 0.0, 0, []
+    for _ in range(n):
+        t += rng.expovariate(rate)
+        while busy and busy[0][0] <= t:
+            idle.append(heapq.heappop(busy))
+        idle = [(s, keep) for s, keep in idle if keep or t - s <= keep_alive]   # reclaim
+        if idle:
+            idle.sort()
+            _, keep = idle.pop()                      # reuse the most recently idle instance
+            latency = work
+        else:
+            cold, keep, latency = cold + 1, False, init + work
+        heapq.heappush(busy, (t + latency, keep))
+        latencies.append(latency)
+    latencies.sort()
+    return cold / n, latencies[len(latencies) // 2], latencies[int(0.99 * len(latencies))]
+
+T = 600.0   # a keep-alive of 10 minutes: an example; providers do not promise a figure
+print(f"{'traffic':>14} {'cold (sim)':>11} {'exp(-rate*T)':>13} {'p50 s':>6} {'p99 s':>6}")
+for label, rate in [("1 per hour", 1 / 3600), ("1 per 10 min", 1 / 600), ("1 per minute", 1 / 60),
+                    ("1 per second", 1.0), ("100 per second", 100.0)]:
+    frac, p50, p99 = simulate(rate, T)
+    print(f"{label:>14} {frac:11.3%} {math.exp(-rate * T):13.3%} {p50:6.1f} {p99:6.1f}")
+
+frac, _, p99 = simulate(1 / 600, T, min_instances=1)
+print(f"\n1 per 10 min with one instance kept warm: cold {frac:.2%}, p99 {p99:.1f} s")
+
+# A burst: an idle function suddenly receives 500 requests per second for 10 seconds.
+rng = random.Random(3)
+t, busy, idle, cold = 0.0, [], [], 0
+for _ in range(5000):
+    t += rng.expovariate(500.0)
+    while busy and busy[0] <= t:
+        idle.append(heapq.heappop(busy))
+    if idle:
+        idle.pop()
+        heapq.heappush(busy, t + 0.2)
+    else:
+        cold += 1
+        heapq.heappush(busy, t + 1.2)
+print(f"burst from idle to 500/s: {cold} cold starts; instances at the end: {len(busy) + len(idle)}")
+```
+
+At low rates the simulation agrees with $e^{-\lambda T}$ to within sampling error. At higher rates the formula predicts essentially no cold starts, but the simulation still finds up to a few tenths of a per cent: these come from *concurrency*, when a request arrives while every warm instance is busy, and at 100 per second from the initial ramp. At once an hour, even the median request pays the full 1.2 s. Keeping one instance warm removes almost all cold starts at low traffic, at the price of paying for that instance all the time.
+
+<Narrator who="margaret">
+
+The burst is the case to remember. At 500 requests per second and 0.2 s each, Little's law ($L = \lambda W$) says about 100 requests are in flight in steady state, so about 100 instances should suffice. But while the first instances spend 1.2 s starting, requests keep arriving and each needs yet another new instance: the run created 656. Slow init does not just add latency; it multiplies the number of cold starts during a spike, and real platforms also limit how fast they will add instances.
+
+</Narrator>
+
+The ways to reduce cold starts follow from the model. Make init **cheaper**: smaller packages, fewer and lazier imports, lighter runtimes. **Restore instead of initialising**: snapshot an initialised instance and resume copies of it, as Lambda SnapStart does for Java, Python and .NET, built on microVM snapshots. **Keep instances warm**: provisioned concurrency (Lambda), always-ready instances (Azure Functions), minimum instances (Cloud Run, Function Compute), all billed whether used or not. **Use isolates**: platforms that run code in language-level sandboxes, such as V8 isolates, start in milliseconds, at the cost of restricting what code may do. And smarter keep-alive policies help providers themselves: the *Serverless in the Wild* study linked below found that most functions are called rarely, with invocation rates spanning about eight orders of magnitude, and proposed predicting each function's idle times rather than using one fixed keep-alive for all. Cold starts also cost money where init time is billed — AWS, for example, began billing the init phase for all Lambda functions in August 2025.
+
+</Section>
+
+<Section id="events" kind="intuition" title="Event sources, queues and fan-out">
+
+A function does nothing until an event arrives, so designing a serverless system means designing its events. The common sources are HTTP requests through an API gateway, messages on a **queue**, notifications on a **topic** (publish–subscribe), changes in object storage or a database, entries in a log or stream, and schedules.
+
+The crucial distinction is between **synchronous** and **asynchronous** invocation. An HTTP request waits for the function's answer; if the function is slow or failing, the caller feels it immediately. A message on a queue decouples the two sides: the producer writes and moves on, the queue holds the message durably, and consumers take messages at whatever rate they can sustain. A queue turns a burst of noon traffic into a backlog that drains over the next minutes, instead of a wall of errors.
+
+<Narrator who="chloe">
+
+The idea that makes event-driven systems work is to decouple in *time*. The ticket API only has to record "order 7310 placed" and answer the fan; everything else may happen a second or a minute later, by services that can be down, slow or redeployed without the fan ever noticing. The cost is that the system is now only *eventually* consistent: for a moment the ticket exists but the loyalty points do not.
+
+</Narrator>
+
+**Fan-out** sends one event to several independent consumers. The producer publishes to a topic, and each consumer subscribes with its own queue, so the receipt sender, the seat map and the loyalty service each get a copy, each at their own pace, and a failure in one does not hold up the others. Each queue retries failed messages and, after a set number of attempts, moves a message that keeps failing to a **dead-letter queue** for a human or a separate process to inspect, instead of retrying it for ever.
+
+<Figure caption="Fan-out with queues. The ticket API publishes one event to a topic; each consumer has its own queue, so each gets every event and fails or slows down independently. A message that keeps failing is moved to a dead-letter queue after a fixed number of attempts.">
+<svg viewBox="0 0 560 280" role="img" aria-label="Architecture diagram. A box labelled ticket API sends an arrow to a topic labelled order placed. From the topic three arrows go to three queues. Each queue sends an arrow to a function: send receipt, update seat map, and credit loyalty points. A dashed arrow goes from the third queue down to a box labelled dead-letter queue, with the note after 5 failed attempts.">
+  <defs>
+    <marker id="sls-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="98" width="100" height="44" rx="4" />
+    <rect x="410" y="18" width="140" height="40" rx="4" />
+    <rect x="410" y="100" width="140" height="40" rx="4" />
+    <rect x="410" y="182" width="140" height="40" rx="4" />
+    <rect x="280" y="238" width="104" height="30" rx="4" strokeDasharray="4 3" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1.5">
+    <rect x="140" y="98" width="100" height="44" rx="22" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="280" y="22" width="90" height="32" rx="3" />
+    <rect x="280" y="104" width="90" height="32" rx="3" />
+    <rect x="280" y="186" width="90" height="32" rx="3" />
+    <path d="M 340 22 V 54 M 350 22 V 54 M 360 22 V 54" />
+    <path d="M 340 104 V 136 M 350 104 V 136 M 360 104 V 136" />
+    <path d="M 340 186 V 218 M 350 186 V 218 M 360 186 V 218" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="60" y="117">ticket API</text>
+    <text x="60" y="133" fontSize="10">function</text>
+    <text x="190" y="117">topic</text>
+    <text x="190" y="133" fontSize="10">order-placed</text>
+    <text x="310" y="42" fontSize="10">queue</text>
+    <text x="310" y="124" fontSize="10">queue</text>
+    <text x="310" y="206" fontSize="10">queue</text>
+    <text x="480" y="42">send receipt</text>
+    <text x="480" y="124">update seat map</text>
+    <text x="480" y="206">credit loyalty points</text>
+    <text x="332" y="257" fontSize="10">dead-letter queue</text>
+    <text x="460" y="257" fontSize="10">after 5 failed attempts</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#sls-arrow)">
+    <path d="M 110 120 L 138 120" />
+    <path d="M 240 112 L 278 40" />
+    <path d="M 240 120 L 278 120" />
+    <path d="M 240 128 L 278 200" />
+    <path d="M 370 38 L 408 38" />
+    <path d="M 370 120 L 408 120" />
+    <path d="M 370 202 L 408 202" />
+    <path d="M 332 218 L 332 236" strokeDasharray="4 3" />
+  </g>
+</svg>
+</Figure>
+
+Every provider offers these building blocks, under different names and with different guarantees, and open-source systems provide them for your own infrastructure:
+
+| Building block | AWS | Microsoft Azure | Google Cloud | Alibaba Cloud | Open source |
+| --- | --- | --- | --- | --- | --- |
+| Queue | [SQS](https://docs.aws.amazon.com/sqs/) | [Queue Storage](https://learn.microsoft.com/en-us/azure/storage/queues/), [Service Bus](https://learn.microsoft.com/en-us/azure/service-bus-messaging/) | [Pub/Sub](https://cloud.google.com/pubsub/docs) subscriptions | [Simple Message Queue](https://www.alibabacloud.com/help/en/mns/) (formerly MNS) | [RabbitMQ](https://www.rabbitmq.com/), [NATS](https://nats.io/) |
+| Topics and event routing | [SNS](https://docs.aws.amazon.com/sns/), [EventBridge](https://docs.aws.amazon.com/eventbridge/) | Service Bus topics, [Event Grid](https://learn.microsoft.com/en-us/azure/event-grid/) | Pub/Sub topics, [Eventarc](https://cloud.google.com/eventarc/docs) | [EventBridge](https://www.alibabacloud.com/help/en/eventbridge/) | [Apache Kafka](https://kafka.apache.org/), NATS, [Knative Eventing](https://knative.dev/docs/) |
+
+Ordered, replayable logs of events — streams — are the subject of the Data Engineering elective's [stream processing](/en/cs/electives/data-engineering/stream-processing/) lesson; here we need only queues and topics, and one property they nearly all share.
+
+</Section>
+
+<Section id="at-least-once" kind="computation" title="At-least-once delivery and idempotency">
+
+A queue hands a message to a consumer and hides it for a **visibility timeout** (or *acknowledgement deadline*). If the consumer acknowledges in time, the message is deleted; if the consumer crashes, times out, or the acknowledgement is lost, the message becomes visible again and is delivered once more. Most queues may also occasionally deliver a duplicate on their own. The guarantee is **at-least-once delivery**: nothing is lost, but anything may arrive twice. Lumenary CS's [distributed systems](/en/cs/distributed-systems/) lesson explains why no network can promise exactly once; this section shows what that means for a function.
+
+The consequence is a rule: **every consumer of an at-least-once source must be idempotent** — processing a message twice must have the same effect as processing it once. Some effects are naturally idempotent ("set seat A14 to sold"); others are not ("add 10 points"). For those, record each message's id and skip ids already processed. *Where* that record is written turns out to matter. The simulation delivers 2,000 loyalty-point messages, worth 10 points each, with a 5% chance that the consumer crashes before acknowledging and a 1% chance that the queue sends a duplicate; one malformed message ("ten" points) fails every time.
+
+```python run
+import random
+
+def run(consumer, n=2000, p_crash=0.05, p_duplicate=0.01, visibility=30, max_receives=5, seed=7):
+    """Deliver n messages, each worth 10 loyalty points, at least once, plus one malformed message."""
+    rng = random.Random(seed)
+    visible = [(i, {"customer": f"c{i % 50}", "points": "10"}) for i in range(n)]
+    visible.append((n, {"customer": "c0", "points": "ten"}))       # a poison message
+    hidden, receives, dead_letters = [], {}, []
+    db = {"points": {}, "processed": set()}                        # the consumer's database
+    now = 0
+    while visible or hidden:
+        now += 1
+        visible += [m for t, m in hidden if t <= now]             # visibility timeout expired
+        hidden = [(t, m) for t, m in hidden if t > now]
+        if not visible:
+            continue
+        msg = visible.pop(0)
+        receives[msg[0]] = receives.get(msg[0], 0) + 1
+        if receives[msg[0]] > max_receives:                         # give up: dead-letter queue
+            dead_letters.append(msg[0])
+            continue
+        if rng.random() < p_duplicate:                              # the queue delivers a copy too
+            visible.append(msg)
+        try:
+            acknowledged = consumer(msg[0], msg[1], db, rng.random() < p_crash)
+        except ValueError:
+            acknowledged = False                                    # handler error: retry later
+        if not acknowledged:
+            hidden.append((now + visibility, msg))
+    extra = sum(db["points"].values()) - 10 * n
+    return extra, dead_letters
+
+def credit(db, body):
+    db["points"][body["customer"]] = db["points"].get(body["customer"], 0) + int(body["points"])
+
+def naive(msg_id, body, db, crash):
+    credit(db, body)                       # the effect
+    return not crash                       # a crash here means no acknowledgement
+
+def check_then_record(msg_id, body, db, crash):
+    if msg_id in db["processed"]:
+        return True
+    credit(db, body)                       # the effect ...
+    if crash:
+        return False                       # ... a crash before the record is written
+    db["processed"].add(msg_id)            # ... and the record, as a separate write
+    return True
+
+def atomic(msg_id, body, db, crash):
+    points = int(body["points"])           # validate before touching the database
+    if msg_id not in db["processed"]:      # one transaction: both writes commit, or neither
+        db["points"][body["customer"]] = db["points"].get(body["customer"], 0) + points
+        db["processed"].add(msg_id)
+    return not crash                       # a crash after commit only causes a harmless redelivery
+
+for name, consumer in [("naive", naive), ("check, then record", check_then_record),
+                       ("effect + record in one transaction", atomic)]:
+    extra, dlq = run(consumer)
+    print(f"{name:36} extra points credited: {extra:5}   dead letters: {dlq}")
+```
+
+The naive consumer credits 1,460 points too many. Checking for the id helps against the queue's own duplicates but still over-credits 1,120 points, because a crash between the effect and the record leaves no trace that the work was done. Only the consumer that commits the effect and the record together is exact. In every version the malformed message ends in the dead-letter queue after five attempts, instead of blocking the queue or retrying for ever.
+
+<Narrator who="gideon">
+
+The precise condition is that the effect and the "already done" record must commit **atomically**, in the same transaction of the same database — for example a conditional insert of the message id and the balance update in one transaction, or a single write that does both. When the effect lives in another system (a payment provider, an email service), you cannot share a transaction with it, so pass your message id to that system as its **idempotency key** and let it deduplicate. A crash *after* the commit is harmless: the redelivered message finds its id and is acknowledged without doing anything.
+
+</Narrator>
+
+Two practical details. Idempotency records cannot be kept for ever, so they get an expiry longer than the longest plausible redelivery delay. And queues that offer ordering and deduplication (FIFO queues on several platforms, exactly-once options on others) deduplicate only within a time window or a scope they control; they reduce duplicates but do not remove the need for idempotent effects.
+
+</Section>
+
+<Section id="sagas" kind="human" title="Workflows and sagas">
+
+Buying a ticket takes four steps in four services: hold the seat, charge the card, issue the ticket, send the receipt. In a single database these would be one transaction, committed or rolled back as a whole. Across services there is no shared transaction: a distributed commit protocol would make every purchase wait for every service, and fail when any one is down.
+
+A **saga** trades isolation for availability. It is a sequence of local transactions, each committed on its own, and for each step a **compensating action** that semantically undoes it: release the seat, refund the card, cancel the ticket. If step $k$ fails, the saga runs the compensations of steps $k-1, \ldots, 1$ in reverse order. The idea comes from a 1987 database paper by Hector Garcia-Molina and Kenneth Salem, written for long-lived transactions that would otherwise hold locks for hours.
+
+Compensation is not the same as rollback. Other customers could see the seat as held while the payment was being tried; a refund is a new transaction, visible on the fan's statement, not an erasure; and some actions cannot be undone at all (an email that was sent can only be followed by an apology). So order steps to put the irreversible ones last, and make every action and compensation idempotent and retryable, since they too run on at-least-once machinery.
+
+There are two ways to coordinate the steps. In **choreography**, each service reacts to events from the others ("payment taken" makes the ticket service issue the ticket): no central component, but the overall process is visible nowhere. In **orchestration**, a workflow engine runs the saga as an explicit program, persisting its progress after every step so that it can resume after a crash, retrying with back-off, waiting on timers for hours or days, and running compensations on failure. Each cloud has one — [AWS Step Functions](https://docs.aws.amazon.com/step-functions/), [Azure Durable Functions](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-overview), [Google Cloud Workflows](https://cloud.google.com/workflows/docs) and [Alibaba Cloud CloudFlow](https://www.alibabacloud.com/help/en/serverless-workflow/latest/what-is-cloudflow) — and open-source engines such as [Temporal](https://docs.temporal.io/) run anywhere. Most teams use orchestration once a process has more than three or four steps, because the question "where is order 7310 stuck?" then has an answer. The exercises ask you to write a small saga orchestrator.
+
+</Section>
+
+<Section id="cost" kind="computation" title="What it costs: functions or machines">
+
+Function pricing has two parts: a fee per invocation, and a fee per **GB-second** — the memory you allocate multiplied by the wall-clock time each invocation runs. A virtual machine or container costs a fixed amount per hour, however busy it is, but serves many requests at once. Which is cheaper depends on traffic, and on a detail that is easy to miss: a function is billed for the time it spends *waiting* — for a database, another service, a model — while a machine can serve other requests during that wait.
+
+The model below uses example prices of the size several providers listed in 2026 (check each provider's pricing page: [Lambda](https://aws.amazon.com/lambda/pricing/), [Azure Functions](https://azure.microsoft.com/en-us/pricing/details/functions/), [Cloud Run](https://cloud.google.com/run/pricing), [Function Compute](https://www.alibabacloud.com/help/en/functioncompute/fc-3-0/product-overview/billing-overview)) and ignores free tiers. Each request needs 20 ms of CPU and 80 ms of waiting. The machines are 2-vCPU VMs, run at 60% CPU at most, never fewer than two; they are either a fixed fleet sized for the daily peak, or a fleet that autoscales hour by hour.
+
+```python run
+import math
+
+DAYS = 30
+# Example prices, of the size several providers listed in 2026 (check current pricing pages):
+FN_PER_MILLION_REQUESTS = 0.20        # USD per million invocations
+FN_PER_GB_SECOND = 0.0000166667       # USD, billed for the whole wall-clock duration
+VM_PER_HOUR = 0.08                    # USD, an on-demand VM with 2 vCPUs and 4 GiB
+
+# One request: 20 ms of CPU work plus 80 ms waiting for the database = 100 ms wall clock.
+CPU_S, WALL_S, FN_MEMORY_GB = 0.020, 0.100, 0.5
+PER_VM = 2 / CPU_S * 0.6              # a VM interleaves requests: 60 req/s at 60% CPU
+MIN_VMS = 2                           # two, so that one can fail
+
+# Traffic through the day, relative to the daily average (quiet nights, lunch and evening peaks).
+shape = [0.2, 0.15, 0.1, 0.1, 0.1, 0.2, 0.4, 0.8, 1.2, 1.3, 1.4, 1.6,
+         2.2, 2.0, 1.4, 1.2, 1.2, 1.4, 1.8, 2.4, 2.4, 1.6, 0.9, 0.4]
+mean = sum(shape) / 24
+shape = [s / mean for s in shape]
+
+def function_cost(avg, wall=WALL_S):
+    requests = avg * 86400 * DAYS
+    return requests * (FN_PER_MILLION_REQUESTS / 1e6 + wall * FN_MEMORY_GB * FN_PER_GB_SECOND)
+
+def fixed_fleet_cost(avg):            # enough VMs for the daily peak, all day
+    return max(MIN_VMS, math.ceil(avg * max(shape) / PER_VM)) * VM_PER_HOUR * 24 * DAYS
+
+def autoscaled_cost(avg):             # VM count follows the traffic hour by hour
+    return sum(max(MIN_VMS, math.ceil(avg * s / PER_VM)) for s in shape) * VM_PER_HOUR * DAYS
+
+print(f"peak hour = {max(shape):.2f} x the daily average")
+print(f"{'avg req/s':>9} {'functions':>10} {'fixed VMs':>10} {'autoscaled':>11}   (USD per month)")
+for avg in [0.1, 1, 10, 30, 100, 300, 1000]:
+    print(f"{avg:9} {function_cost(avg):10.2f} {fixed_fleet_cost(avg):10.2f} {autoscaled_cost(avg):11.2f}")
+
+def crossover(other, wall=WALL_S):
+    avg = 0.5
+    while function_cost(avg, wall) < other(avg) and avg < 5000:
+        avg += 0.5
+    return avg
+
+for wall in (0.05, 0.1, 0.5):
+    print(f"handler takes {wall * 1000:3.0f} ms wall clock: functions are cheaper than the autoscaled"
+          f" fleet below about {crossover(autoscaled_cost, wall):.0f} req/s on average")
+```
+
+Below a few tens of requests per second the functions cost a fraction of the two-machine minimum: USD 2.68 a month at one request per second, against USD 115.20. Above roughly 44 requests per second the machines win, and by 1,000 requests per second the autoscaled fleet costs well under half as much, because it pays for CPU while the functions pay for waiting. The last lines show how sensitive the crossover is to that waiting: at 50 ms per request functions stay cheaper up to about 80 requests per second; at 500 ms, only up to about 10.
+
+The model leaves out costs that often decide the matter. An HTTP front door (an API gateway) usually charges per request too, often several times the function's own request fee. Logs are billed per gigabyte ingested and stored. Network egress and NAT gateways cost the same either way. On the other side of the ledger, the machines need patching, monitoring and an on-call rota that the function does not; for a small team that time may cost more than either bill. <LessonLink slug="cost-and-finops">Cost and FinOps</LessonLink> returns to all of these.
+
+</Section>
+
+<Section id="limits" kind="human" title="Limits and lock-in">
+
+Serverless platforms trade control for convenience, and the limits are part of the trade. Every platform caps how long one invocation may run (AWS Lambda's cap is 15 minutes; others range from minutes to hours depending on plan and trigger), how much memory and local disk it may have, how large its request and response may be, and how many instances an account may run at once in a region. Instances are short-lived, so nothing kept in memory or on local disk survives; state belongs in a database, object store or cache. Each instance opens its own connections, so a burst of a thousand instances can open a thousand database connections and exhaust the database; connection-pooling proxies or HTTP-based data APIs exist for this reason. And debugging moves from one process to a trail of events across services, which makes tracing (the subject of <LessonLink slug="observability-and-autoscaling">Observability and autoscaling</LessonLink>) essential rather than optional.
+
+**Lock-in** is subtler than it looks. The function's code is usually ordinary Python or JavaScript and moves easily; what does not move is everything around it — the event formats, the trigger configuration, the permissions model, the workflow definitions, the provider's SDK calls. Several practices keep the switching cost down: keep business logic in plain functions that take ordinary arguments, with a thin adapter per platform; describe events with the vendor-neutral [CloudEvents](https://cloudevents.io/) format where the platforms support it; and where portability matters most, deploy containers to a serverless container platform rather than code to a function runtime. Knative, for example, describes a scale-to-zero service in a few lines of Kubernetes YAML that run on any conformant cluster (shown, not run here):
+
+```yaml
+# Not run here: a Knative Service (serving.knative.dev/v1) on any Kubernetes cluster with Knative installed
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: receipt-sender
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/min-scale: "0"     # scale to zero when idle
+        autoscaling.knative.dev/max-scale: "50"
+    spec:
+      containerConcurrency: 10                     # requests one instance may serve at once
+      containers:
+        - image: registry.example.org/receipt-sender:1.3.0
+          env:
+            - name: SMTP_HOST
+              value: smtp.example.org
+```
+
+Portability has its own price: running Knative means running Kubernetes, and avoiding every provider-specific service means rebuilding what they offer. Lock-in is a cost to weigh against the work it saves, not a sin to avoid at any price.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Serverless is always cheaper."** It is cheapest for low, spiky or unpredictable traffic. For steady, high traffic — especially when each request spends most of its time waiting on other systems — machines or containers that interleave many requests cost less, as the model shows. Compute the crossover for your own workload.
+
+</Misconception>
+
+<Misconception>
+
+**"The queue delivers each message once, so my handler can just do the work."** Almost every queue and event source delivers at least once. Duplicates come from crashes, timeouts, lost acknowledgements and the queue itself, so every handler with a non-idempotent effect needs an idempotency check committed together with the effect.
+
+</Misconception>
+
+<Misconception>
+
+**"A FIFO queue with deduplication makes my consumer exactly-once."** Deduplication applies to messages *sent* within a time window. If your consumer crashes after doing the work but before acknowledging, the message is delivered again and the effect repeats. Ordering and deduplication help; they do not replace idempotent processing.
+
+</Misconception>
+
+<Misconception>
+
+**"A saga is a distributed transaction."** A saga has no isolation: other users can see its intermediate states, and its compensations are new actions, not erasures. Design the steps so that intermediate states are acceptable and irreversible steps come last.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

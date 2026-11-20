@@ -1,0 +1,451 @@
+---
+title: What data engineers do
+subtitle: From the place data is born to the place it is useful — the lifecycle, the trade-offs and the people.
+minutes: 60
+objectives:
+  - Trace a number on a dashboard back through serving, transformation, storage and ingestion to its sources
+  - Distinguish batch from streaming pipelines, and choose between them by the latency a decision really needs
+  - Explain ETL and ELT, and when transforming before loading is still the right call
+  - Build a small pipeline in Python that extracts log lines, cleans them, loads them into SQLite and answers questions with SQL
+  - Make a load idempotent, so that a retried or re-run job never double-counts
+  - Describe what data engineers, analytics engineers and data platform engineers each own
+narrators: [chloe, margaret, gideon]
+related: [math.comp.computational-reproducibility]
+references:
+  - title: "Designing Data-Intensive Applications"
+    author: Martin Kleppmann
+    year: 2017
+    url: https://dataintensive.net/
+    note: The standard book on the systems underneath data engineering; a second edition was in preparation as of 2026.
+  - title: "Fundamentals of Data Engineering"
+    author: Joe Reis and Matt Housley
+    year: 2022
+    url: https://www.oreilly.com/library/view/fundamentals-of-data-engineering/9781098108298/
+    note: A practitioner's overview of the lifecycle and the roles around it.
+  - title: "Python: sqlite3 — DB-API 2.0 interface for SQLite databases"
+    url: https://docs.python.org/3/library/sqlite3.html
+  - title: "SQLite: JSON functions and operators"
+    url: https://www.sqlite.org/json1.html
+    note: The json_extract function used in the ELT example.
+  - title: "Regulation (EU) 2016/679 (General Data Protection Regulation)"
+    url: https://eur-lex.europa.eu/eli/reg/2016/679/oj
+    note: The EU's data-protection law; its principles of purpose limitation and data minimisation shape how pipelines treat personal data.
+  - title: Apache Airflow
+    url: https://airflow.apache.org/
+    note: One widely used open-source orchestrator, met again in the lesson on pipelines and orchestration.
+---
+
+<Section id="motivation" kind="motivation" title="A number on a screen">
+
+Every morning the owner of a small online shop that sells handwoven textiles opens a dashboard. It says **Orders yesterday: 43**, broken down by country, with a chart of which pages lead people to buy. She uses it to decide what to restock and where to spend her small advertising budget.
+
+Follow that number backwards and it unravels into a long chain. Forty-three times, someone in Lagos or Pune or Belo Horizonte tapped "pay" on a phone. The shop's web servers wrote a line to a log file for each page they served — over a thousand lines that day, mixed with requests from search-engine crawlers and a few half-written lines from a server whose disk filled up. A small program shipped those files to cheap storage. Overnight a job read them, threw away the junk, removed the crawlers and the duplicates, worked out which visit each page belonged to, and wrote tidy rows into a database. A query turned the rows into the chart.
+
+If any link of that chain is wrong, the dashboard is wrong, and nobody may notice. Count the crawlers as visitors and the conversion rate looks worse than it is. Run the overnight job twice after a timeout and yesterday's orders double. Change the app so that it calls the country field something new, and a quarter of the orders silently lose their country.
+
+**Data engineering** is the craft of building and running that chain: getting data from where it is produced to where it is useful — correct, on time, at a sensible cost, and with care for the people the data describes. This elective is about how it is done at every scale, from one laptop to thousands of machines. This first lesson draws the map and builds a whole pipeline, small enough to read in one sitting.
+
+</Section>
+
+<Section id="lifecycle" kind="intuition" title="The data lifecycle">
+
+Almost every data system, however large, has the same five stages.
+
+<Figure caption="The data lifecycle. Data flows from sources to the people and programs that use it; underneath every stage run concerns that no single stage owns.">
+
+<svg viewBox="0 0 680 220" role="img" aria-label="Five boxes from left to right joined by arrows: Sources (apps, databases, devices, files and APIs), Ingestion (batch loads, change data capture, event streams), Storage (object stores, warehouses, lakehouses), Transformation (clean, join, aggregate, model) and Serving (dashboards, machine-learning features, apps and APIs). A band underneath all five reads: security and privacy, data quality, orchestration, metadata and lineage.">
+  <defs>
+    <marker id="de-life-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="2">
+    <rect x="10" y="30" width="112" height="44" rx="6" stroke="var(--sky)" />
+    <rect x="146" y="30" width="112" height="44" rx="6" stroke="var(--gold)" />
+    <rect x="282" y="30" width="112" height="44" rx="6" stroke="var(--gold)" />
+    <rect x="418" y="30" width="112" height="44" rx="6" stroke="var(--gold)" />
+    <rect x="554" y="30" width="112" height="44" rx="6" stroke="var(--sky)" />
+  </g>
+  <g fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">
+    <text x="66" y="57">Sources</text>
+    <text x="202" y="57">Ingestion</text>
+    <text x="338" y="57">Storage</text>
+    <text x="474" y="57">Transformation</text>
+    <text x="610" y="57">Serving</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.5" markerEnd="url(#de-life-arrow)">
+    <line x1="122" y1="52" x2="143" y2="52" />
+    <line x1="258" y1="52" x2="279" y2="52" />
+    <line x1="394" y1="52" x2="415" y2="52" />
+    <line x1="530" y1="52" x2="551" y2="52" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="66" y="96">apps, databases,</text>
+    <text x="66" y="111">devices, files,</text>
+    <text x="66" y="126">other APIs</text>
+    <text x="202" y="96">batch loads,</text>
+    <text x="202" y="111">change data capture,</text>
+    <text x="202" y="126">event streams</text>
+    <text x="338" y="96">object stores,</text>
+    <text x="338" y="111">warehouses,</text>
+    <text x="338" y="126">lakehouses</text>
+    <text x="474" y="96">clean, join,</text>
+    <text x="474" y="111">aggregate,</text>
+    <text x="474" y="126">model</text>
+    <text x="610" y="96">dashboards, ML</text>
+    <text x="610" y="111">features, apps</text>
+    <text x="610" y="126">and APIs</text>
+  </g>
+  <rect x="10" y="158" width="656" height="40" rx="6" fill="none" stroke="currentColor" strokeWidth="1.2" strokeDasharray="5 4" />
+  <text x="338" y="183" fill="currentColor" fontSize="12" textAnchor="middle">underneath every stage: security and privacy · data quality · orchestration · metadata and lineage</text>
+</svg>
+
+</Figure>
+
+1. **Sources** are where data is born: the shop's application database, its web-server logs, a payment provider's API, sensors on a water network, spreadsheets that a partner emails every Monday. The data engineer rarely controls them. They change shape without warning, go down, and send the same record twice.
+2. **Ingestion** moves data out of the sources. It may copy a whole table every night (a **batch load**), follow a database's own change log and copy each insert, update and delete as it happens (**change data capture**, CDC), or receive a continuous **event stream** from apps and devices.
+3. **Storage** keeps data durably and cheaply enough to keep a lot of it. Raw files usually land in an **object store** (Amazon S3, Google Cloud Storage, Azure Blob Storage, or a self-hosted one such as Ceph); modelled tables live in an analytical database or **warehouse**, or in open table formats over object storage, a **lakehouse**. Lumenary CS's [storage at scale](/en/cs/storage-at-scale/) lesson explains the machinery.
+4. **Transformation** turns raw records into trustworthy, useful tables: parse, validate, deduplicate, convert units and time zones, join with reference data, aggregate, and shape the result into models that answer a family of questions.
+5. **Serving** delivers the result to whoever needs it: a dashboard, an analyst's notebook, a machine-learning model's training set or live features, a nightly file for a partner, or an operational system (sending modelled data *back* into a sales or support tool is sometimes called **reverse ETL**).
+
+Underneath every stage run concerns that belong to none of them: **security and privacy** (who may see what, and what we should not collect at all), **data quality** (is it complete, fresh, plausible?), **orchestration** (what runs when, in which order, and what happens on failure), and **metadata and lineage** (what does this column mean, and which sources fed it?). Most of a data engineer's working week is spent on these undercurrents rather than on the arrows.
+
+<Narrator who="chloe">
+
+The useful way to see each box is as a *promise* to the next one. Ingestion promises "every record the source produced, at least once"; transformation promises "one row per order, no duplicates, country never empty"; serving promises "fresh by 07:00". A pipeline is reliable exactly when every promise is written down and checked, and most data incidents are a promise that one team assumed and the other never made.
+
+</Narrator>
+
+</Section>
+
+<Section id="definitions" kind="definitions" title="Batch and streaming, ETL and ELT">
+
+Two choices shape every pipeline: *when* it processes data, and *where* the transformation happens.
+
+<Definition term="Batch and streaming">
+
+A **batch** pipeline processes a bounded chunk of data — yesterday's logs, this month's invoices — on a schedule or on demand, reading it to the end and then producing a result. A **streaming** pipeline processes an unbounded flow of events continuously, updating its results within seconds or less of each event's arrival. **Micro-batching** sits in between: a stream processed as a sequence of very small batches, every few seconds or minutes.
+
+</Definition>
+
+Batch is simpler to build, test, re-run and reason about, and usually cheaper; its cost is **latency**, since a nightly job's answer is up to a day old. Streaming gives fresh answers but must cope with events that arrive late, out of order or twice, and it runs (and pages someone) around the clock. The right question is never "which is more modern?" but "how fresh must this answer be for the decision it feeds?" A card-fraud check must answer before the payment is approved, in well under a second: streaming. The shop owner's restocking decision is made once a day: batch is plenty. Lumenary CS's [batch and stream processing](/en/cs/data-processing/) lesson introduces both; this elective treats batch in <LessonLink slug="batch-processing-and-mapreduce">Batch processing and MapReduce</LessonLink> and streaming in <LessonLink slug="stream-processing">Stream processing</LessonLink>.
+
+<Definition term="ETL and ELT">
+
+In **ETL** (extract, transform, load) data is transformed on its way between source and destination, and only the cleaned result is stored. In **ELT** (extract, load, transform) the raw data is loaded first, as it came, into the analytical store, and transformed there — usually in SQL — into modelled tables.
+
+</Definition>
+
+ETL dominated when warehouse storage and compute were expensive: you did not load anything you had not already cleaned and shrunk. ELT became the common default in the 2010s, as cloud warehouses made storage cheap and compute elastic. Its great advantage is that **the raw data is kept**: when you discover a bug in a transformation, you fix the SQL and re-run it over history, instead of asking every source to send its data again. Its costs are that you store more, and that raw data — including anything sensitive in it — now sits in the warehouse.
+
+Which is why ETL never went away. If a hospital's records contain national identity numbers, they should be removed or pseudonymised *before* the data leaves the hospital's network, not after it lands in a shared warehouse. Many real pipelines are a mixture, sometimes written "EtLT": a light transformation on the way in (drop or mask sensitive fields, fix encodings), then the heavy modelling in the warehouse.
+
+<Note>
+
+The words are used loosely. Vendors call almost any data movement "ETL", and "pipeline" can mean anything from a ten-line script to a platform. When someone uses these terms, ask the concrete questions: where does the raw data live, where does the transformation code run, and what happens if it runs twice?
+
+</Note>
+
+That last question has a name.
+
+<Definition term="Idempotent job">
+
+A pipeline step is **idempotent** if running it twice (or ten times) on the same input leaves the destination exactly as running it once would.
+
+</Definition>
+
+Jobs *will* run twice. A scheduler retries a step that timed out — though it may have finished after all; an engineer re-runs last week after fixing a bug (a **backfill**); a machine restarts in the middle. A step that **appends** its output is not idempotent: each run adds another copy. The usual remedy is to make every run *replace* a well-defined slice of the destination — "all rows for 14 March" — inside one transaction, or to **upsert** rows by a unique key, so that a re-run rewrites the same rows instead of adding new ones.
+
+<Narrator who="gideon">
+
+"All rows for 14 March" hides an assumption: 14 March *where*? The logs below are stamped in UTC, so an order placed at 22:30 UTC on the 14th belongs to the 15th in Nairobi (UTC+3) and in Tokyo (UTC+9). Store timestamps in UTC, convert at the edge, and write down which time zone defines each daily slice — or two honest teams will publish two different numbers for the same day.
+
+</Narrator>
+
+</Section>
+
+<Section id="pipeline" kind="computation" title="A whole pipeline in one page">
+
+Here is the shop's pipeline, start to finish, small enough to read. The source is a day of web-server log lines, generated with a fixed seed so you see the same data every time. Each line records one page view: a timestamp, an event id, the visit (session) it belongs to, a country code, the page, and whether the client was a browser or a bot. Notice what the logs do *not* contain: no names, no email addresses, no IP addresses. A session is an opaque random token. A pipeline can only leak what it collects, so the first privacy decision is made at the source.
+
+Real logs are messy, so three faults are planted at the end: a line that the log shipper sent twice, a line cut off halfway, and a line of junk.
+
+```python run
+import random
+import re
+import sqlite3
+
+# --- A source: one day of web-server log lines from a small online shop (synthetic) -------------
+rng = random.Random(2026)
+countries = ["KE", "IN", "BR", "DE", "JP", "MX", "NG", "VN"]
+landings = ["/", "/product/", "/blog/", "/search?q="]
+lines = []
+for s in range(400):                                   # 400 visits ("sessions")
+    session = f"s{s:04d}"
+    country = rng.choice(countries)
+    agent = "bot" if rng.random() < 0.08 else "browser"
+    t = rng.randrange(0, 86400 - 600)                  # seconds after midnight, UTC
+    landing = rng.choice(landings)
+    pages = [landing + (str(rng.randrange(1, 60)) if landing != "/" else "")]
+    pages += [f"/product/{rng.randrange(1, 60)}" for _ in range(rng.randrange(0, 4))]
+    if agent == "browser" and rng.random() < (0.25 if landing == "/product/" else 0.08):
+        pages += ["/cart", "/checkout/complete"]
+    for p in pages:
+        t += rng.randrange(5, 90)
+        hh, mm, ss = t // 3600, t % 3600 // 60, t % 60
+        lines.append(f"2026-03-14T{hh:02d}:{mm:02d}:{ss:02d}Z ev={len(lines):05d} s={session} "
+                     f"country={country} path={p} status=200 ms={rng.randrange(20, 400)} agent={agent}")
+lines.append(lines[17])                                # the log shipper retried: a duplicate line
+lines.append(lines[230][:41])                          # a line cut off when a disk filled up
+lines.append("GET /favicon.ico ???")                   # junk from a misconfigured proxy
+
+# --- Extract: parse each line; keep what we can, count what we cannot -------------------------
+PATTERN = re.compile(r"(\S+T(\d\d):\S+Z) ev=(\d+) s=(\S+) country=([A-Z]{2}) path=(\S+) "
+                     r"status=(\d{3}) ms=(\d+) agent=(\w+)$")
+parsed, rejected = [], 0
+for line in lines:
+    m = PATTERN.match(line)
+    if m is None:
+        rejected += 1
+        continue
+    ts, hour, ev, session, country, path, status, ms, agent = m.groups()
+    parsed.append(dict(ts=ts, hour=int(hour), ev=int(ev), session=session, country=country,
+                       path=path, status=int(status), ms=int(ms), agent=agent))
+
+# --- Transform: drop bots, remove duplicates, derive the page type ----------------------------
+def page_type(path):
+    if path == "/":
+        return "home"
+    return path.strip("/").split("/")[0].split("?")[0]   # product, blog, search, cart, checkout
+
+seen, views, bots, duplicates = set(), [], 0, 0
+for r in parsed:
+    if r["agent"] == "bot":
+        bots += 1
+        continue
+    if r["ev"] in seen:
+        duplicates += 1
+        continue
+    seen.add(r["ev"])
+    views.append((r["ev"], r["ts"], r["hour"], r["session"], r["country"], page_type(r["path"]), r["ms"]))
+
+# --- Load: into a database table (here SQLite in memory; in production, a warehouse) -----------
+db = sqlite3.connect(":memory:")
+db.execute("""CREATE TABLE page_views (event_id INTEGER PRIMARY KEY, ts TEXT, hour INTEGER,
+              session TEXT, country TEXT, page_type TEXT, ms INTEGER)""")
+db.executemany("INSERT INTO page_views VALUES (?, ?, ?, ?, ?, ?, ?)", views)
+
+print(f"lines read: {len(lines)}; malformed: {rejected}; from bots: {bots}; "
+      f"duplicates: {duplicates}; rows loaded: {len(views)}")
+
+# --- Serve: answer questions with SQL ------------------------------------------------------------
+print("\norders by country")
+for row in db.execute("""SELECT country, COUNT(*) FROM page_views WHERE page_type = 'checkout'
+                         GROUP BY country ORDER BY COUNT(*) DESC, country"""):
+    print(f"  {row[0]}  {row[1]:3d}")
+
+print("\nvisits and conversion by landing page")
+query = """
+WITH firsts AS (SELECT session, MIN(event_id) AS first_ev FROM page_views GROUP BY session),
+     visits AS (
+       SELECT f.session, v.page_type AS landing,
+              EXISTS (SELECT 1 FROM page_views c
+                      WHERE c.session = f.session AND c.page_type = 'checkout') AS bought
+       FROM firsts f JOIN page_views v ON v.event_id = f.first_ev)
+SELECT landing, COUNT(*) AS visits, SUM(bought) AS orders,
+       ROUND(100.0 * SUM(bought) / COUNT(*), 1) AS conversion_pct
+FROM visits GROUP BY landing ORDER BY conversion_pct DESC"""
+print(f"  {'landing':8s} {'visits':>6s} {'orders':>6s} {'conv. %':>8s}")
+for landing, visits, orders, pct in db.execute(query):
+    print(f"  {landing:8s} {visits:6d} {orders:6d} {pct:8.1f}")
+```
+
+Of 1,124 lines, 2 are malformed, 80 come from bots and 1 is a duplicate, leaving 1,041 page views. The shop took 43 orders, most from Nigeria and India, and visitors who land directly on a product page buy far more often (23.5%) than those who arrive through the blog (6.5%).
+
+Look at the shape of the code rather than the details, because every production pipeline has it:
+
+- **Extract** never trusts its input. It parses with an explicit pattern and *counts* what it rejects instead of crashing or silently skipping. A rejected count that jumps from 2 to 2,000 one morning is how you learn a source changed.
+- **Transform** encodes business rules — what counts as a bot, what counts as a duplicate, what a "landing page" is. Each rule is a decision someone should be able to find and question.
+- **Load** gives the table a schema and a key. The `PRIMARY KEY` on `event_id` would reject a duplicate even if the transformation missed one: the database enforces a promise instead of hoping for it.
+- **Serve** is just SQL — a common table expression and an `EXISTS` subquery, the kind of query Lumenary CS's [databases](/en/cs/databases/) lesson teaches.
+
+<Narrator who="margaret">
+
+The bot filter is worth a number. 33 of the 400 visits came from bots, and none of them bought anything, so leaving them in would report 43 orders from 400 visits — a conversion rate of 10.8% — instead of 43 from 367 visits, 11.7%. A marketing team could easily act on that difference, and it would come from a filter nobody wrote down.
+
+</Narrator>
+
+</Section>
+
+<Section id="elt" kind="computation" title="ELT, retries and re-runs">
+
+Now the same shop, a year later. It has a phone app that sends events as JSON, and the team has switched to ELT: payloads are loaded into a `raw_events` table *exactly as received*, and SQL inside the database turns them into a modelled table, `daily_orders`. The block below runs three scenarios over two days of synthetic events.
+
+1. The transformation **appends** its output, and the scheduler retries the second day after a timeout.
+2. The transformation **overwrites** the day's slice in one transaction, with the same retry.
+3. Someone discovers that version 2 of the app renamed the field `country` to `country_code`. The SQL is fixed — `COALESCE` takes whichever field is present — and re-run over the raw data that ELT kept.
+
+```python run
+import json
+import random
+import sqlite3
+
+rng = random.Random(7)
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE raw_events (load_day TEXT, payload TEXT)")     # landing zone: raw JSON
+db.execute("CREATE TABLE daily_orders (day TEXT, country TEXT, orders INTEGER, revenue_cents INTEGER)")
+
+def app_events(day, n=300):
+    """Synthetic events from the shop's phone app. Version 2 of the app renamed 'country'."""
+    for i in range(n):
+        e = {"event_id": f"{day}-{i}", "type": rng.choice(["view", "view", "view", "order"])}
+        e["country" if rng.random() < 0.7 else "country_code"] = rng.choice(["KE", "IN", "BR", "DE"])
+        if e["type"] == "order":
+            e["amount_cents"] = rng.randrange(800, 9000)      # money as integer cents, never floats
+        yield json.dumps(e)
+
+def extract_load(day):                                        # E + L: store payloads untouched
+    db.executemany("INSERT INTO raw_events VALUES (?, ?)", [(day, p) for p in app_events(day)])
+
+V1 = """SELECT ?, json_extract(payload, '$.country'), COUNT(*), SUM(json_extract(payload, '$.amount_cents'))
+        FROM raw_events WHERE load_day = ? AND json_extract(payload, '$.type') = 'order' GROUP BY 2"""
+V2 = V1.replace("json_extract(payload, '$.country')",
+                "COALESCE(json_extract(payload, '$.country'), json_extract(payload, '$.country_code'))")
+
+def transform_append(day, sql):                               # T, the naive way
+    db.execute("INSERT INTO daily_orders " + sql, (day, day))
+
+def transform_overwrite(day, sql):                            # T, idempotent: replace the day's rows
+    with db:                                                  # one transaction, so no half-written day
+        db.execute("DELETE FROM daily_orders WHERE day = ?", (day,))
+        db.execute("INSERT INTO daily_orders " + sql, (day, day))
+
+def report(title):
+    print(title)
+    for day, orders, unknown in db.execute(
+            """SELECT day, SUM(orders), SUM(CASE WHEN country IS NULL THEN orders ELSE 0 END)
+               FROM daily_orders GROUP BY day ORDER BY day"""):
+        print(f"  {day}: {orders} orders, {unknown} with no country")
+
+for day in ["2026-03-14", "2026-03-15"]:
+    extract_load(day)
+truth = db.execute("SELECT COUNT(*) FROM raw_events WHERE json_extract(payload, '$.type') = 'order'"
+                   " GROUP BY load_day ORDER BY load_day").fetchall()
+print("orders actually in the raw data:", [n for (n,) in truth])
+
+transform_append("2026-03-14", V1)
+transform_append("2026-03-15", V1)
+transform_append("2026-03-15", V1)        # the scheduler retried after a timeout
+report("\nappend, transform v1, one retry:")
+
+db.execute("DELETE FROM daily_orders")
+for day in ["2026-03-14", "2026-03-15", "2026-03-15"]:
+    transform_overwrite(day, V1)
+report("\noverwrite, transform v1, same retry:")
+
+for day in ["2026-03-14", "2026-03-15"]:   # fix the transform, re-run it over the raw data we kept
+    transform_overwrite(day, V2)
+report("\noverwrite, transform v2 re-run over history:")
+for row in db.execute("SELECT country, SUM(orders), SUM(revenue_cents) FROM daily_orders "
+                      "GROUP BY country ORDER BY country"):
+    print(f"  {row[0]}: {row[1]} orders, USD {row[2] / 100:,.2f}")
+```
+
+The raw data holds 75 and 76 orders. With appends, one retry turns 76 into 152 — a number that would sit on the dashboard looking perfectly plausible. With overwrites, the retry is harmless. And because the raw payloads were kept, fixing the transformation repaired history: the 21 and 22 orders with no country got their countries back without anyone asking the app to resend anything. Under ETL, with only the cleaned output stored, those countries would have been lost for good.
+
+<Example title="Reading the scenarios as promises">
+
+Scenario 1 broke the promise "one row per day and country" without any error message. Scenario 2 kept it because the destination slice is *defined* by the run's input (the day), so a re-run can only rewrite the same slice. Scenario 3 shows the other promise ELT makes: "we can always recompute from raw". That promise has a cost — storage, and the duty to protect raw data that may contain more than the models expose — and a team should decide deliberately how long raw data is kept.
+
+</Example>
+
+Two details in the code are habits worth copying. Money is stored as **integer cents**, because binary floating point cannot represent most decimal fractions exactly, and sums of prices drift. And the overwrite runs in a **transaction** (`with db:`), so a reader never sees the day half-deleted.
+
+</Section>
+
+<Section id="roles" kind="human" title="Who does what">
+
+Titles vary wildly between organisations, and in a company of twenty people one person does all of the following. In larger organisations the work usually divides roughly like this.
+
+| Role | Mainly owns | Typical tools |
+| --- | --- | --- |
+| **Data engineer** | Ingestion and the pipelines that move and transform data at scale; reliability, freshness and cost of those pipelines | Python, SQL, Spark, Kafka, an orchestrator, cloud storage |
+| **Analytics engineer** | The modelled tables analysts and dashboards use: clean, tested, documented SQL models with agreed definitions ("what is an active customer?") | SQL, dbt or a similar SQL-modelling tool, the warehouse, version control |
+| **Data platform engineer** | The shared platform the others build on: storage, compute clusters, access control, catalogues, orchestration services, cost controls | Infrastructure as code, Kubernetes, cloud services, observability |
+| Data analyst / data scientist | Asking and answering questions with the data; experiments; models | SQL, notebooks, statistics, BI tools |
+| ML engineer | Training and serving models, including the feature pipelines feeding them | Python, ML frameworks, feature stores |
+| Data steward / governance | Definitions, ownership, quality rules, access policy, legal and ethical obligations | Catalogues, policies, people |
+
+The **analytics engineer** title spread in the late 2010s, when SQL-based modelling tools let people who knew the business write tested, version-controlled transformations without building infrastructure. The **platform** role grew as companies found that every team was reinventing the same clusters and permissions. The boundaries are blurry and shift with each company's size and tools.
+
+What all of them share is a habit of mind: treating data as a product with users, an owner, a definition and a quality bar, and treating pipelines as software — version-controlled, reviewed, tested and monitored. The data-science side of that partnership is the subject of the [data-science workflow](/en/cs/electives/data-science/the-data-science-workflow/) lesson in the Data Science elective.
+
+</Section>
+
+<Section id="practice" kind="human" title="The professional view">
+
+Every stage of the lifecycle has a crowded market of tools, open source and commercial, and the market changes every year. A sketch of the landscape as of 2026, named fairly rather than exhaustively:
+
+- **Ingestion:** managed connectors such as [Fivetran](https://www.fivetran.com/) and the open-source [Airbyte](https://airbyte.com/) and [dlt](https://dlthub.com/); change data capture with [Debezium](https://debezium.io/) or the clouds' own services (AWS Database Migration Service, Google Cloud Datastream, Azure Data Factory); event streams through [Apache Kafka](https://kafka.apache.org/), Apache Pulsar, Redpanda or managed equivalents.
+- **Storage and analytical engines:** object stores on every cloud and on premises; cloud warehouses such as Google BigQuery, Snowflake, Amazon Redshift, Databricks SQL, Microsoft Fabric and Alibaba Cloud MaxCompute; open-source engines such as [ClickHouse](https://clickhouse.com/), [DuckDB](https://duckdb.org/), Apache Doris and Trino. <LessonLink slug="analytical-databases">Analytical databases</LessonLink> compares them.
+- **Transformation:** SQL models managed with [dbt](https://www.getdbt.com/) or SQLMesh; Apache Spark for large or complex jobs; pandas, Polars or DuckDB for data that fits on one machine.
+- **Orchestration:** [Apache Airflow](https://airflow.apache.org/), [Dagster](https://dagster.io/), Prefect, or the clouds' managed workflow services. <LessonLink slug="pipelines-and-orchestration">Pipelines and orchestration</LessonLink> covers them.
+- **Serving:** BI tools such as Apache Superset, Metabase, Power BI, Looker and Tableau; feature stores and training-data pipelines for machine learning (<LessonLink slug="data-for-ai">Data for AI</LessonLink>).
+
+Three honest observations from practice.
+
+**Most data is not big.** Many organisations' entire analytical data fits comfortably on one modern machine, and a single well-run PostgreSQL or DuckDB instance with a scheduled script will serve them better than a cluster. Distributed systems earn their complexity at tens of terabytes and beyond, or when data arrives faster than one machine can absorb. Choose the smallest tool that meets the need with headroom.
+
+**Every choice has a running cost.** Managed services bill per row synced, per byte scanned or per second of compute, and those bills grow quietly with data volume; a careless query, or a nightly full reload that should have been incremental, can add a large line to the monthly bill before anyone notices. Self-hosted open source has no licence fee but costs people's time: upgrades, security patches, capacity planning and being woken at 03:00. The [cost and FinOps](/en/cs/electives/cloud-computing/cost-and-finops/) lesson of the Cloud Computing elective goes into the numbers.
+
+**Data about people is a responsibility, not just a resource.** Collect only what a stated purpose needs (data minimisation), keep it only as long as it is needed, pseudonymise identifiers early, restrict who can see raw data, and log who did. Laws make much of this mandatory: the EU's GDPR, Brazil's LGPD, India's Digital Personal Data Protection Act 2023, Kenya's Data Protection Act 2019, California's CCPA, and many others — but the habit should come from respect for the people behind the rows, not only from fear of fines. Security basics from Lumenary CS's [security](/en/cs/security/) lesson apply in full: pipelines hold credentials to many systems and are a tempting target. <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink> returns to all of this in depth.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Data engineering is just plumbing: copy data from A to B."** Copying is the easy part. The work is in the definitions (what is an order? a visitor? a day?), the failure handling (late, duplicated, malformed, missing data), the cost, and the trust: knowing, and being able to show, that the numbers are right.
+
+</Misconception>
+
+<Misconception>
+
+**"Streaming is the modern way; batch is legacy."** Streaming is the right tool when a decision needs fresh data in seconds. For a daily report it adds round-the-clock operation, harder testing and harder reprocessing, for no benefit. Most organisations run mostly batch, with streaming where latency truly matters.
+
+</Misconception>
+
+<Misconception>
+
+**"The job succeeded, so the data is correct."** A green tick means the code did not crash. The append-and-retry scenario above "succeeded" twice and doubled the revenue. Correctness needs checks on the data itself — row counts, uniqueness, freshness, ranges — not only on the job's exit status.
+
+</Misconception>
+
+<Misconception>
+
+**"ELT means you never transform before loading."** Sensitive fields should be masked or dropped before data leaves the system that is entitled to hold them, and malformed records often need a quarantine on the way in. ELT moves the *heavy* modelling into the warehouse; it does not forbid every transformation on the way.
+
+</Misconception>
+
+<Misconception>
+
+**"You need a cluster to do real data engineering."** The concepts — sources, idempotent loads, models, quality checks, lineage — are the same on one laptop as on a thousand machines. Scale changes the tools and the failure modes, not the craft.
+
+</Misconception>
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Businesses were copying data out of their operational systems for reporting long before the term "data engineering". In the 1980s and 1990s, **data warehousing** took shape around two schools: Bill Inmon's enterprise-wide, normalised warehouse feeding departmental marts, and Ralph Kimball's dimensional models built around business processes, which the next lesson, <LessonLink slug="data-models-and-file-formats">Data models and file formats</LessonLink>, explains. Moving data meant ETL tools running nightly batches.
+
+In the 2000s the web produced data faster than any warehouse could absorb. Google described its distributed file system (2003) and **MapReduce** (2004); Hadoop, an open-source implementation, followed in 2006 and spread through the industry. The 2010s brought Apache Spark, Apache Kafka, and fully managed cloud warehouses that separated storage from compute and made ELT practical. The job title "data engineer" became common in that decade, as companies found they needed specialists to build and run the pipelines that their analysts and data scientists depended on. The 2020s added open table formats and lakehouses, a rich open-source ecosystem around Apache Arrow and engines such as DuckDB, and the enormous data pipelines behind large AI models — the subjects of the later levels of this elective, ending with <LessonLink slug="the-modern-data-stack">The modern data stack</LessonLink>.
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

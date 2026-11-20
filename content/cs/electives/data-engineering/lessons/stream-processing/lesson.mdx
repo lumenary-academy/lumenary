@@ -1,0 +1,572 @@
+---
+title: Stream processing
+subtitle: Computing over data that never stops arriving — logs and consumer groups, event time and watermarks, results that are exactly right after crashes, and capturing every change a database makes.
+minutes: 85
+objectives:
+  - Explain Kafka's log model — topics, partitions, keys, offsets and consumer groups — and reason about ordering, rebalancing and lag
+  - Distinguish event time from processing time, and use tumbling, hopping and session windows
+  - Explain how watermarks are combined across partitions, why an idle partition stalls them, and how allowed lateness and side outputs handle late events
+  - Compare at-most-once, at-least-once and effectively-once processing, and make results exact with idempotent or transactional sinks
+  - Describe Apache Flink, Kafka Streams and Spark Structured Streaming fairly, with their costs
+  - Capture changes from a database with log-based change data capture, and explain what polling misses
+prerequisites: [what-data-engineers-do, pipelines-and-orchestration]
+related: [math.found.order-theory, math.prob.stochastic-processes]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "The Log: What every software engineer should know about real-time data's unifying abstraction"
+    author: Jay Kreps
+    year: 2013
+    note: An essay on LinkedIn's engineering blog, by one of Kafka's creators, explaining why a log can sit at the centre of a data platform.
+  - title: Apache Kafka documentation
+    url: https://kafka.apache.org/documentation/
+    note: The design section covers partitions, replication, consumer groups and delivery semantics.
+  - title: "The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing"
+    author: Tyler Akidau et al.
+    year: 2015
+    url: https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/
+    note: Windows, watermarks, triggers and accumulation, from Google; the model behind Apache Beam.
+  - title: "Lightweight Asynchronous Snapshots for Distributed Dataflows"
+    author: Paris Carbone, Gyula Fóra, Stephan Ewen, Seif Haridi and Kostas Tzoumas
+    year: 2015
+    url: https://arxiv.org/abs/1506.08603
+    note: The checkpointing algorithm behind Apache Flink's exactly-once state.
+  - title: "Apache Flink: timely stream processing"
+    url: https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/
+    note: Event time, watermarks, idleness and lateness in Flink.
+  - title: Kafka Streams documentation
+    url: https://kafka.apache.org/documentation/streams/
+  - title: Spark Structured Streaming programming guide
+    url: https://spark.apache.org/docs/latest/streaming/index.html
+  - title: Debezium documentation
+    url: https://debezium.io/documentation/
+    note: Open-source log-based change data capture for PostgreSQL, MySQL, SQL Server, Oracle, MongoDB and others.
+  - title: Apache Pulsar
+    url: https://pulsar.apache.org/
+---
+
+<Section id="motivation" kind="motivation" title="Bikes for the morning rush">
+
+A city bike-share system has a few hundred docking stations. Between 07:30 and 09:00 commuters empty the stations near residential districts and fill those near offices, and a small fleet of vans moves bikes back. To dispatch the vans well, the operations team wants rentals and returns per station, per minute, *now* — and an alert within seconds when a station is about to run dry.
+
+A nightly batch job, the subject of <LessonLink slug="pipelines-and-orchestration">Pipelines and orchestration</LessonLink>, would tell them tomorrow what went wrong this morning. They need **stream processing**: computing continuously over **unbounded** data, events that keep arriving with no end to wait for. Lumenary CS's [batch and stream processing](/en/cs/data-processing/) lesson introduced the main ideas — event time, windows, watermarks, Kafka, exactly-once. This lesson takes each one apart: a log and its consumer groups simulated in Python, watermarks across partitions with late events, four delivery strategies crashed on purpose, and change data capture from a database.
+
+Streaming is also expensive in ways batch is not. A stream job runs around the clock, holds state that must survive crashes, and pages someone at 03:00. The first question is always whether the decision being fed really needs answers in seconds; a micro-batch every five minutes, or an hourly batch, is often enough and much cheaper.
+
+<Narrator who="margaret">
+
+A small stream job on three machines running all month uses $3 \times 730 = 2{,}190$ machine-hours. A batch job that does the same daily computation in ten minutes uses $30 \times 10 = 300$ minutes, five machine-hours. The stream job may still be the right choice — vans cannot be dispatched from yesterday's data — but it should be chosen for its freshness, knowing that it costs hundreds of times more compute.
+
+</Narrator>
+
+</Section>
+
+<Section id="logs" kind="computation" title="The log, partitions and consumer groups">
+
+At the centre of most streaming systems is a **log**: an append-only, ordered sequence of records, retained whether or not anyone has read them. Apache Kafka, created at LinkedIn and open-sourced in 2011, made the log shared infrastructure, and its model has become the common vocabulary.
+
+<Definition term="Topic, partition, offset, consumer group">
+
+A **topic** is a named stream, split into **partitions**, each an independent append-only log stored and replicated on brokers. A producer appends a **record** (key, value, timestamp) to one partition, usually chosen by hashing the key, and the record gets the next **offset** in that partition. Consumers read sequentially from an offset. A **consumer group** is a set of consumers that share the work of reading a topic: each partition is read by exactly one member of the group at a time, and the group stores a **committed offset** per partition — the point up to which it has finished processing. Different groups read the same topic independently.
+
+</Definition>
+
+Three consequences follow, and the block below shows each. **Ordering** is guaranteed only within a partition, so all events for one key (one station) are in order, but events for different keys in different partitions are not ordered relative to each other. **Parallelism** in a group is capped by the number of partitions: a group of eight consumers on a six-partition topic leaves two idle. And when a consumer fails, the group **rebalances**: its partitions are reassigned, and the new owner resumes from the *committed* offset, so anything processed but not committed is processed again.
+
+<Figure caption="A topic of three partitions, as in the block below. Producers append records at the tail of each partition, choosing the partition by key. The dashboard group's two consumers divide the partitions between them; the billing group reads all three independently, at its own pace. Each group keeps its own committed offset per partition.">
+
+<svg viewBox="0 0 640 240" role="img" aria-label="On the left a box labelled producers with lines to three horizontal rows of numbered cells, labelled partition 0 with offsets 0 to 4, partition 1 with offsets 0 to 8, and partition 2 with offsets 0 to 3; a dashed empty cell at the end of each row marks where the next record is appended. On the right, a dashed box labelled group dashboard holds consumers c1 and c2: c1 is connected to partitions 0 and 2, c2 to partition 1. Below it, a dashed box labelled group billing holds consumer b1, connected to all three partitions.">
+  <g fill="none" strokeWidth="1.4">
+    <rect x="5" y="95" width="80" height="50" rx="6" stroke="currentColor" />
+    <rect x="470" y="25" width="160" height="80" rx="8" stroke="var(--gold)" strokeDasharray="5 3" />
+    <rect x="470" y="150" width="160" height="70" rx="8" stroke="var(--sky)" strokeDasharray="5 3" />
+    <rect x="485" y="55" width="60" height="30" rx="4" stroke="var(--gold)" />
+    <rect x="560" y="55" width="60" height="30" rx="4" stroke="var(--gold)" />
+    <rect x="485" y="178" width="60" height="30" rx="4" stroke="var(--sky)" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="125" y="45" width="26" height="26" /><rect x="153" y="45" width="26" height="26" /><rect x="181" y="45" width="26" height="26" /><rect x="209" y="45" width="26" height="26" /><rect x="237" y="45" width="26" height="26" />
+    <rect x="125" y="105" width="26" height="26" /><rect x="153" y="105" width="26" height="26" /><rect x="181" y="105" width="26" height="26" /><rect x="209" y="105" width="26" height="26" /><rect x="237" y="105" width="26" height="26" /><rect x="265" y="105" width="26" height="26" /><rect x="293" y="105" width="26" height="26" /><rect x="321" y="105" width="26" height="26" /><rect x="349" y="105" width="26" height="26" />
+    <rect x="125" y="165" width="26" height="26" /><rect x="153" y="165" width="26" height="26" /><rect x="181" y="165" width="26" height="26" /><rect x="209" y="165" width="26" height="26" />
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3">
+    <rect x="265" y="45" width="26" height="26" />
+    <rect x="377" y="105" width="26" height="26" />
+    <rect x="237" y="165" width="26" height="26" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="45" y="116">producers</text>
+    <text x="45" y="131">(docks)</text>
+    <text x="138" y="62">0</text><text x="166" y="62">1</text><text x="194" y="62">2</text><text x="222" y="62">3</text><text x="250" y="62">4</text>
+    <text x="138" y="122">0</text><text x="166" y="122">1</text><text x="194" y="122">2</text><text x="222" y="122">3</text><text x="250" y="122">4</text><text x="278" y="122">5</text><text x="306" y="122">6</text><text x="334" y="122">7</text><text x="362" y="122">8</text>
+    <text x="138" y="182">0</text><text x="166" y="182">1</text><text x="194" y="182">2</text><text x="222" y="182">3</text>
+    <text x="160" y="38">partition 0</text>
+    <text x="160" y="98">partition 1</text>
+    <text x="160" y="158">partition 2</text>
+    <text x="320" y="225">offsets: oldest on the left, appends on the right</text>
+    <text x="550" y="43">group: dashboard</text>
+    <text x="515" y="74">c1</text>
+    <text x="590" y="74">c2</text>
+    <text x="550" y="168">group: billing</text>
+    <text x="515" y="197">b1</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1">
+    <line x1="85" y1="112" x2="123" y2="58" />
+    <line x1="85" y1="120" x2="123" y2="118" />
+    <line x1="85" y1="128" x2="123" y2="178" />
+  </g>
+  <g stroke="var(--gold)" strokeWidth="1.2">
+    <line x1="485" y1="68" x2="295" y2="58" />
+    <line x1="485" y1="78" x2="267" y2="178" />
+    <line x1="590" y1="85" x2="407" y2="118" />
+  </g>
+  <g stroke="var(--sky)" strokeWidth="1.2" strokeDasharray="4 3">
+    <line x1="485" y1="186" x2="295" y2="64" />
+    <line x1="485" y1="192" x2="407" y2="124" />
+    <line x1="485" y1="200" x2="267" y2="184" />
+  </g>
+</svg>
+
+</Figure>
+
+```python run
+import zlib
+
+class Topic:
+    """A topic is a set of append-only logs (partitions). A record's key chooses its partition,
+    so all records with one key stay in order. Nothing is removed when a record is read."""
+    def __init__(self, partitions):
+        self.logs = [[] for _ in range(partitions)]
+
+    def produce(self, key, value):
+        p = zlib.crc32(key.encode()) % len(self.logs)    # Kafka's default uses murmur2; same idea
+        self.logs[p].append((key, value))
+        return p, len(self.logs[p]) - 1                    # (partition, offset)
+
+class Group:
+    """A consumer group: its members share the partitions, and the group stores, per partition,
+    the committed offset, the next record it has promised to have processed up to."""
+    def __init__(self, topic, members):
+        self.topic, self.committed = topic, [0] * len(topic.logs)
+        self.rebalance(members)
+
+    def rebalance(self, members):
+        """Share the partitions out again; every member restarts from the committed offsets."""
+        self.owner = {p: members[p % len(members)] for p in range(len(self.topic.logs))}
+        self.position = list(self.committed)               # uncommitted progress is forgotten
+
+    def poll(self, member, n=3):
+        batch = []
+        for p, m in self.owner.items():
+            if m == member:
+                log = self.topic.logs[p]
+                batch += [(p, off, *log[off]) for off in range(self.position[p], min(len(log), self.position[p] + n))]
+                self.position[p] = min(len(log), self.position[p] + n)
+        return batch
+
+    def commit(self, member):
+        for p, m in self.owner.items():
+            if m == member:
+                self.committed[p] = self.position[p]
+
+    def lag(self):
+        return [len(log) - c for log, c in zip(self.topic.logs, self.committed)]
+
+# Dock events from a bike-share system, keyed by station: ("CDMX-014", "bike out"), ...
+rides = Topic(partitions=3)
+stations = ["CDMX-014", "CDMX-102", "CDMX-230", "CDMX-301"]
+for i in range(18):
+    p, off = rides.produce(stations[i % 4], f"event {i}")
+for p, log in enumerate(rides.logs):
+    print(f"partition {p}: {len(log)} records, keys {sorted({k for k, _ in log})}")
+
+dashboard = Group(rides, ["c1", "c2"])        # two consumers share three partitions
+billing = Group(rides, ["b1"])                # a second group reads everything, independently
+print("dashboard owners:", dashboard.owner)
+
+processed = []
+processed += dashboard.poll("c1"); dashboard.commit("c1")     # c1 processes a batch and commits
+processed += dashboard.poll("c2"); dashboard.commit("c2")
+processed += dashboard.poll("c1")                              # c1 processes another batch...
+print("lag before the crash:", dashboard.lag())
+dashboard.rebalance(["c2"])                                    # ...and crashes before committing
+print("after rebalancing, owners:", dashboard.owner)
+processed += dashboard.poll("c2", n=100); dashboard.commit("c2")
+seen = [(p, off) for p, off, _, _ in processed]
+print(f"records processed: {len(seen)}, distinct: {len(set(seen))}, "
+      f"processed twice: {len(seen) - len(set(seen))}")
+print("dashboard lag:", dashboard.lag(), "  billing lag:", billing.lag(), "(billing has read nothing yet)")
+```
+
+The keys hashed unevenly — partition 1 holds two stations and nine records, partition 2 one station and four — a small version of the skew of <LessonLink slug="distributed-processing">Distributed processing</LessonLink>; with hundreds of keys per partition it evens out, but one very busy key always lands in one partition. Consumer `c1` processed a second batch and died before committing it, so after the rebalance `c2` read those three records again: at-least-once delivery, by construction. The billing group, meanwhile, has read nothing, and its **lag** — records written but not yet processed — is the whole topic. Consumer lag, per partition, is the first number to watch on any streaming system: steadily rising lag means the consumers cannot keep up.
+
+Kafka adds what the toy leaves out. Each partition is replicated to several brokers, and a producer that waits for all in-sync replicas to acknowledge a write (`acks=all`) does not lose it when one broker fails. Records are kept for a configured time or size, or — with **log compaction** — until a newer record with the same key replaces them, which turns a topic into a durable table of latest values. Since Kafka 4.0 (2025) the cluster manages its own metadata with a built-in consensus protocol, KRaft, instead of a separate ZooKeeper ensemble. And **tiered storage** moves older segments to object storage, so retention can be long without large broker disks.
+
+As of 2026 the log is offered in many forms: open-source Kafka, run yourself or as a managed service from Confluent, AWS (Amazon MSK), Aiven and others; Kafka-compatible implementations such as Redpanda; Apache Pulsar, which separates serving from storage; and cloud services with their own APIs — Amazon Kinesis Data Streams, Google Cloud Pub/Sub, Azure Event Hubs (which also accepts Kafka clients). Several newer systems write the log directly to object storage, accepting higher latency for much lower storage and cross-zone network costs. Running Kafka yourself is real work — capacity, partition counts, broker upgrades, rebalancing, monitoring lag — and managed services charge for taking it on, often with costs that grow with data volume and retention.
+
+</Section>
+
+<Section id="time" kind="definitions" title="Event time, windows and watermarks">
+
+The bike-share question — rentals per station per minute — is about when rentals **happened** (event time), not when the processor heard about them (processing time). The two differ by network delay, and sometimes by much more: a dock that lost its mobile connection uploads a backlog when it reconnects.
+
+<Definition term="Windows">
+
+A **window** assigns each event to one or more finite groups by its event time. **Tumbling** windows have a fixed size and do not overlap (each minute). **Hopping** (or sliding) windows have a fixed size and a smaller slide, so they overlap and each event belongs to size ÷ slide windows (ten-minute windows every minute: each rental is in ten). **Session** windows are per key and data-driven: a session continues while events arrive less than a set gap apart, and closes after a gap of inactivity.
+
+</Definition>
+
+<Definition term="Watermark">
+
+A **watermark** $W$ is a processor's assertion that it expects no more events with event time earlier than $W$. When the watermark passes a window's end, the window's result can be emitted. Watermarks are generated at the sources, commonly as "the latest event time seen, minus a bound on out-of-orderness", and must never move backwards.
+
+</Definition>
+
+The definitions leave three practical questions, which separate toy stream processors from real ones.
+
+**Many partitions, one watermark.** An operator reading several partitions (or several upstream tasks) takes the **minimum** of their watermarks, since it cannot claim progress that a slower input has not made. So one **idle** partition — a district where nobody rents bikes at night, a topic partition with no traffic — holds back every window downstream. Flink, for example, lets sources be declared idle after a timeout and excluded from the minimum until they produce again.
+
+**Late events.** An event that arrives after the watermark has passed its window is **late**. A processor can drop it; keep window state for an **allowed lateness** and emit a corrected result; or send it to a **side output** for separate handling — a correction job, an audit table.
+
+**When to emit.** **Triggers** decide when results are emitted: at the watermark, early and repeatedly (a speculative count every ten seconds), and again on each late event. Downstream systems must then accept **updates** to results they have already seen, which is why stream outputs are usually written by key, as upserts, rather than appended.
+
+The block counts rentals per minute from three districts. Each partition's watermark is its latest event time minus 5 seconds; the stream's watermark is the minimum over partitions. District 2 falls silent between event times 150 and 420 seconds. About 3% of events come from docks that synced late, by 20 to 120 seconds. It runs twice: once with every partition always counted in the minimum, and once declaring a partition idle after 30 seconds without events. Allowed lateness is 60 seconds.
+
+```python run
+import random
+from collections import Counter
+
+def dock_events(seed=3):
+    """A stream of bike rentals from three partitions (city districts), as a generator of
+    (arrival_time, partition, event_time), in arrival order. Times are seconds."""
+    rng = random.Random(seed)
+    events = []
+    for p in range(3):
+        t = 0.0
+        while True:
+            t += rng.expovariate(0.5)                        # about one rental every 2 s
+            if t >= 600:
+                break
+            if p == 2 and 150 < t < 420:
+                continue                                     # district 2 goes quiet for a while
+            delay = rng.uniform(0.2, 3.0)
+            if rng.random() < 0.03:
+                delay += rng.uniform(20, 120)                # a dock that synced late
+            events.append((t + delay, p, t))
+    yield from sorted(events)
+
+WINDOW, BOUND, LATENESS, IDLE = 60, 5, 60, 30
+
+def run(idle_timeout=None):
+    """Count rentals per 60 s event-time window. Each partition's watermark is its latest event
+    time minus BOUND; the stream's watermark is the minimum over partitions that are not idle.
+    A window is emitted when the watermark passes its end, and re-emitted with a correction for
+    late events up to LATENESS seconds after that; anything later goes to a side output."""
+    latest, last_arrival, watermark = {}, {}, float("-inf")
+    counts, emitted, first_emit, updates, side = Counter(), set(), {}, Counter(), []
+    for now, p, et in dock_events():
+        latest[p] = max(latest.get(p, et), et)
+        last_arrival[p] = now
+        active = [q for q in latest if idle_timeout is None or now - last_arrival[q] <= idle_timeout]
+        if len(latest) == 3:                                 # every partition has been heard from
+            watermark = max(watermark, min(latest[q] for q in active) - BOUND)   # never moves back
+        w = int(et // WINDOW) * WINDOW
+        if w in emitted and w + WINDOW + LATENESS <= watermark:
+            side.append((p, et))                             # too late even for a correction
+            continue
+        counts[w] += 1
+        if w in emitted:
+            updates[w] += 1                                  # emit a corrected result
+        for start in sorted(counts):
+            if start not in emitted and start + WINDOW <= watermark:
+                emitted.add(start)
+                first_emit[start] = now
+    return counts, first_emit, updates, side
+
+truth = Counter(int(et // WINDOW) * WINDOW for _, _, et in dock_events())
+stall, idle = run(), run(idle_timeout=IDLE)
+when = lambda t: "at end" if t is None else f"{t:.0f}"         # never emitted before the input ended
+print("window    true   first result at (s)        late    final")
+print("                 no idleness   idle 30 s  updates   count")
+for w in sorted(truth):
+    print(f"{w:3d}-{w + WINDOW:<4d} {truth[w]:5d}   {when(stall[1].get(w)):>9}   "
+          f"{when(idle[1].get(w)):>9}   {idle[2][w]:6d}   {idle[0][w]:5d}")
+print(f"\nside output (beyond allowed lateness): {len(idle[3])} events, "
+      f"event times {[round(et) for _, et in idle[3]]}")
+```
+
+Without idleness handling, the windows from 120 to 360 seconds all wait until 422 seconds — when district 2 speaks again — although the other districts finished them minutes earlier: four minutes of results held back by a district with nothing to say. With a 30-second idleness timeout, each window comes out a few seconds to a minute after it closes. Every window received one to three late corrections, and three events arrived so late — more than 60 seconds after their window had been emitted — that they went to the side output instead; the final counts are therefore a little below the truth for three windows, by exactly those events. The windows from 540 seconds are never closed by a watermark because the input ends; a real stream never ends, and a final window simply waits for later data.
+
+<Narrator who="gideon">
+
+Idleness is a trade with correctness. Excluding a quiet partition lets the watermark advance past events that partition has not yet sent: when district 2 wakes up with a backlog, its events are late, and some may be dropped. Declare a source idle only when silence really means "no events", not "events delayed", and keep a side output for what slips through.
+
+</Narrator>
+
+</Section>
+
+<Section id="exactly-once" kind="computation" title="Exactly-once results, tested by crashing">
+
+A stream processor crashes, restarts and resumes. What it resumes from decides whether its results are right. Lumenary CS's [distributed systems](/en/cs/distributed-systems/) lesson explains why no network can deliver a message *exactly* once; what systems promise as **exactly-once** is that each record **affects the result** exactly once, even though it may be delivered more than once.
+
+The block consumes a partition of 1,000 payment events in batches of 50 and crashes once in each of four batches, at the worst moment for each strategy. It tries four designs:
+
+- **At-most-once:** commit the offset, then process. A crash between the two loses the batch.
+- **At-least-once:** process, then commit. A crash between the two processes the batch again — and the sink *increments* totals, so the second pass double-counts.
+- **Idempotent sink:** process, then commit, but write each payment by its unique id with `INSERT OR IGNORE`, so a second write of the same payment changes nothing; totals are computed from the stored payments.
+- **Transactional:** store the increment *and the offset* in the same database transaction, so after a crash either both happened or neither did.
+
+```python run
+import random
+import sqlite3
+
+rng = random.Random(8)
+# A partition of a "payments" topic: (event_id, country, amount in whole shillings or francs).
+log = [(f"tx{i:04d}", rng.choice(["KE", "RW", "TZ", "UG"]), rng.randint(1, 500)) for i in range(1_000)]
+BATCH = 50
+CRASH_IN = set(rng.sample(range(len(log) // BATCH), 4))     # batches during which the consumer dies once
+truth = sum(a for _, _, a in log)
+
+class Crash(Exception):
+    pass
+
+def consume(strategy):
+    db = sqlite3.connect(":memory:")
+    db.executescript("""CREATE TABLE totals (country TEXT PRIMARY KEY, amount INTEGER);
+                        CREATE TABLE payments (event_id TEXT PRIMARY KEY, country TEXT, amount INTEGER);
+                        CREATE TABLE progress (next_offset INTEGER); INSERT INTO progress VALUES (0);""")
+    broker_offset, crashed = 0, set()          # the offset committed to the log, Kafka-style
+
+    def add_to_totals(batch):                  # NOT idempotent: an increment
+        for _, country, amount in batch:
+            db.execute("""INSERT INTO totals VALUES (?, ?) ON CONFLICT(country)
+                          DO UPDATE SET amount = amount + excluded.amount""", (country, amount))
+
+    while True:
+        if strategy == "transactional":
+            start = db.execute("SELECT next_offset FROM progress").fetchone()[0]
+        else:
+            start = broker_offset
+        if start >= len(log):
+            break
+        batch = log[start:start + BATCH]
+        crash = start // BATCH in CRASH_IN and start // BATCH not in crashed
+        crashed.add(start // BATCH)
+        try:
+            if strategy == "at-most-once":         # commit first, then process
+                broker_offset = start + len(batch)
+                if crash:
+                    raise Crash
+                add_to_totals(batch); db.commit()
+            elif strategy == "at-least-once":      # process first, then commit
+                add_to_totals(batch); db.commit()
+                if crash:
+                    raise Crash
+                broker_offset = start + len(batch)
+            elif strategy == "idempotent sink":    # process first, but writes are keyed by event id
+                db.executemany("INSERT OR IGNORE INTO payments VALUES (?, ?, ?)", batch); db.commit()
+                if crash:
+                    raise Crash
+                broker_offset = start + len(batch)
+            elif strategy == "transactional":      # results and offset in ONE transaction
+                with db:
+                    add_to_totals(batch)
+                    db.execute("UPDATE progress SET next_offset = ?", (start + len(batch),))
+                    if crash:
+                        raise Crash                # the transaction rolls back: neither is stored
+        except Crash:
+            pass                                   # the consumer restarts from the stored offset
+    if strategy == "idempotent sink":
+        return db.execute("SELECT SUM(amount) FROM payments").fetchone()[0]
+    return db.execute("SELECT SUM(amount) FROM totals").fetchone()[0]
+
+print(f"{len(log)} payments, true total {truth:,}; the consumer crashes during batches {sorted(CRASH_IN)}")
+for strategy in ["at-most-once", "at-least-once", "idempotent sink", "transactional"]:
+    total = consume(strategy)
+    print(f"{strategy:16s} total {total:7,}  error {total - truth:+6,}")
+```
+
+At-most-once lost four batches, 51,381 shillings and francs of payments; at-least-once counted the same four batches twice. The idempotent sink and the transactional design are both exact, by different routes. The first makes duplicates harmless: it needs a unique id on every event, created once at the source, and a sink that can upsert by it. The second makes the processing and the bookkeeping one atomic step: it needs the sink to be the place where offsets are stored, as it is here.
+
+<Theorem name="Effectively-once from at-least-once">
+
+Suppose every record is delivered at least once, and the sink's state after processing a sequence of records depends only on the *set* of distinct records applied (that is, applying a record is idempotent and the order of distinct records does not matter for the result). Then the sink's final state equals the state after applying each record exactly once.
+
+</Theorem>
+
+<Proof>
+
+Delivery at least once means the sequence of applied records contains every record, possibly with repetitions. By assumption the state depends only on the set of records in that sequence. The set of records in the repeated sequence is the same as the set in a sequence containing each record exactly once. So the two states are equal. ∎
+
+</Proof>
+
+The theorem's assumptions are the engineering: unique ids, and a sink whose writes are keyed upserts rather than increments. Real systems combine both routes. **Kafka transactions** let a stream application write its output records and its consumer offsets in one atomic commit, so Kafka-to-Kafka pipelines (Kafka Streams with `processing.guarantee=exactly_once_v2`, for instance) are exactly-once inside Kafka. **Flink** takes periodic **checkpoints** — consistent snapshots of all operator state and source offsets, using barriers that flow through the dataflow graph (the Carbone et al. paper in the references) — and restores the last checkpoint after a failure; with sinks that support a **two-phase commit**, output becomes visible only when the checkpoint that produced it completes. Either way the guarantee ends at the system's boundary: an email, a payment request or a call to another service needs its own idempotency key.
+
+</Section>
+
+<Section id="engines" kind="human" title="The engines, fairly">
+
+Three open-source engines dominate stateful stream processing as of 2026, and they make different trades.
+
+**Apache Flink**, which grew out of the Stratosphere research project at TU Berlin and became an Apache top-level project in 2014, processes each event as it arrives, with keyed state (often in an embedded RocksDB store on local disk), event-time windows, watermarks with idleness, and checkpointed exactly-once state. It has Java and Python APIs and a SQL layer. It is the usual choice for large, stateful, low-latency jobs — fraud scoring, real-time features, streaming joins. Its cost is operational: a cluster to run (often on Kubernetes), checkpoint storage, state that can grow to terabytes, and upgrades that must carry state across versions. Managed Flink is offered by AWS, Alibaba Cloud (whose engineers contribute heavily to Flink), Confluent, Ververica and others.
+
+```sql
+-- Not run here: Flink SQL. A table over a Kafka topic, with a watermark, and a one-minute tumbling count.
+CREATE TABLE rentals (
+  station_id STRING,
+  district   STRING,
+  rented_at  TIMESTAMP(3),
+  WATERMARK FOR rented_at AS rented_at - INTERVAL '5' SECOND
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'rentals',
+  'properties.bootstrap.servers' = 'broker:9092',
+  'properties.group.id' = 'rentals-per-minute',
+  'scan.startup.mode' = 'group-offsets',
+  'format' = 'json'
+);
+
+SELECT window_start, window_end, district, COUNT(*) AS rentals
+FROM TABLE(TUMBLE(TABLE rentals, DESCRIPTOR(rented_at), INTERVAL '1' MINUTE))
+GROUP BY window_start, window_end, district;
+```
+
+**Kafka Streams** is a Java library, not a cluster: your application embeds it, reads from and writes to Kafka, keeps local state stores backed by changelog topics, and scales by running more instances, which share partitions like any consumer group. It is attractive when everything already flows through Kafka and the team would rather deploy ordinary services than run a processing cluster; it is tied to Kafka and to the JVM.
+
+**Spark Structured Streaming** treats a stream as a table that keeps growing and runs the same DataFrame and SQL operations on it, by default as a sequence of small **micro-batches** with checkpointed progress. Latency is typically seconds rather than milliseconds, and in return a team that already uses Spark for batch writes streaming jobs with the same API and engine (not run here):
+
+```python
+# Not run here: PySpark Structured Streaming.
+rentals = (spark.readStream.format("kafka")
+           .option("kafka.bootstrap.servers", "broker:9092")
+           .option("subscribe", "rentals").load()
+           .select(F.from_json(F.col("value").cast("string"), rental_schema).alias("r"))
+           .select("r.*"))
+per_minute = (rentals.withWatermark("rented_at", "5 seconds")
+              .groupBy(F.window("rented_at", "1 minute"), "district")
+              .count())
+query = (per_minute.writeStream.outputMode("update")      # emit changed windows as they change
+         .format("console")                                # in production: a table, a topic or a database
+         .option("checkpointLocation", "s3://example-bucket/checkpoints/rentals-per-minute/")
+         .start())
+```
+
+Others are worth knowing. **Apache Beam** describes pipelines once and runs them on Google Cloud Dataflow, Flink or Spark. **Streaming databases** such as RisingWave and Materialize let you write a SQL view over streams and keep it incrementally up to date, hiding watermarks and state behind SQL. The clouds offer their own managed services. As with batch, the right engine is the one whose latency, state size and operational demands match the problem and the team.
+
+</Section>
+
+<Section id="cdc" kind="computation" title="Change data capture">
+
+Many streams start in a database. The orders, accounts and stations of an application live in PostgreSQL or MySQL, and analytics, search indexes and caches all want to follow them. **Change data capture** (CDC) turns a database's changes into a stream.
+
+There are two ways to do it. **Query-based** CDC polls: every few minutes, `SELECT * FROM stations WHERE updated_at > :last_seen`. **Log-based** CDC reads the database's own replication log — PostgreSQL's write-ahead log through logical decoding, MySQL's binlog, SQL Server's change tables — which records every committed insert, update and delete in order. The block simulates both against SQLite, using triggers to stand in for the database's log.
+
+```python run
+import sqlite3
+
+src = sqlite3.connect(":memory:")
+src.executescript("""
+CREATE TABLE stations (id TEXT PRIMARY KEY, docks INTEGER, status TEXT, updated_at INTEGER);
+-- Stand-in for the database's own change log (PostgreSQL's WAL, MySQL's binlog): every change, in order.
+CREATE TABLE changelog (seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, id TEXT, docks INTEGER, status TEXT);
+CREATE TRIGGER ins AFTER INSERT ON stations BEGIN
+  INSERT INTO changelog (op, id, docks, status) VALUES ('insert', NEW.id, NEW.docks, NEW.status); END;
+CREATE TRIGGER upd AFTER UPDATE ON stations BEGIN
+  INSERT INTO changelog (op, id, docks, status) VALUES ('update', NEW.id, NEW.docks, NEW.status); END;
+CREATE TRIGGER del AFTER DELETE ON stations BEGIN
+  INSERT INTO changelog (op, id, docks, status) VALUES ('delete', OLD.id, NULL, NULL); END;
+""")
+clock = 0
+def write(sql, *args):
+    global clock
+    clock += 1
+    with src:
+        src.execute(sql.replace("NOW", str(clock)), args)
+
+poll_replica, poll_seen, polled, log_replica, log_seen, log_events = {}, 0, 0, {}, 0, []
+
+def poll():
+    """Query-based capture: fetch rows whose updated_at is newer than the last poll."""
+    global poll_seen, polled
+    for id_, docks, status, ts in src.execute("SELECT * FROM stations WHERE updated_at > ?", (poll_seen,)):
+        poll_replica[id_] = (docks, status)
+        polled += 1
+        poll_seen = max(poll_seen, ts)
+
+def read_log():
+    """Log-based capture: read every change after the last sequence number, in order."""
+    global log_seen
+    for seq, op, id_, docks, status in src.execute("SELECT * FROM changelog WHERE seq > ?", (log_seen,)):
+        log_events.append((op, id_, docks, status))
+        if op == "delete":
+            log_replica.pop(id_, None)
+        else:
+            log_replica[id_] = (docks, status)
+        log_seen = seq
+
+write("INSERT INTO stations VALUES ('LIS-01', 20, 'open', NOW)")
+write("INSERT INTO stations VALUES ('LIS-02', 16, 'open', NOW)")
+poll(); read_log()
+write("UPDATE stations SET status = 'maintenance', updated_at = NOW WHERE id = 'LIS-02'")
+write("UPDATE stations SET status = 'open', docks = 18, updated_at = NOW WHERE id = 'LIS-02'")
+write("DELETE FROM stations WHERE id = 'LIS-01'")
+write("INSERT INTO stations VALUES ('LIS-03', 24, 'open', NOW)")
+poll(); read_log()
+write("UPDATE stations SET docks = 12 WHERE id = 'LIS-03'")      # a writer forgot to set updated_at
+poll(); read_log()
+
+source = {i: (d, s) for i, d, s, _ in src.execute("SELECT * FROM stations")}
+print("source:         ", source)
+print("polling replica:", poll_replica, "| matches:", poll_replica == source)
+print("log replica:    ", log_replica, "| matches:", log_replica == source)
+print(f"changes made: {clock}; rows fetched by polling: {polled}; changes read from the log: {len(log_events)}")
+for e in log_events:
+    print("  ", e)
+```
+
+The polling replica is wrong in three ways. It still holds `LIS-01`, because a deleted row has no `updated_at` to find. It never saw `LIS-02`'s spell in maintenance, because two updates between polls collapse into one. And it thinks `LIS-03` has 24 docks, because one writer forgot to set `updated_at`, an easy mistake in a large codebase. The log reader saw all seven changes, in order, and its replica matches the source exactly. Polling still has its place — it needs no special database access and works on any table with a reliable timestamp — but log-based CDC is the standard for keeping systems in step.
+
+In practice, log-based CDC is usually run with [Debezium](https://debezium.io/documentation/) (open source, typically on Kafka Connect), with managed services from the clouds and data-integration vendors, or with tools built into databases and warehouses. A CDC pipeline starts with a consistent **snapshot** of each table and then streams changes from the log position at which the snapshot was taken, so nothing is missed or doubled at the seam. Changes for one row are keyed by its primary key, so they stay in order within a partition. And the **outbox pattern** solves a related problem: an application that must update its database *and* publish an event writes the event into an outbox table in the same transaction, and CDC publishes it — no change can be committed without its event, or the reverse.
+
+<Narrator who="chloe">
+
+The idea under all of this is the duality of tables and streams. A table is the current state; a log of changes is its history; replaying the log rebuilds the table, and every table can be turned back into a log. Databases have always worked this way internally — the write-ahead log *is* the truth, and the tables are a cache of it — and CDC simply lets the rest of the organisation read that truth.
+
+</Narrator>
+
+CDC copies *everything* the source holds, including personal data that downstream consumers may have no business seeing. Filter or mask columns as the changes leave the source, and remember that deletions in the source — including deletions requested under privacy law — must be propagated to every replica, which log-based CDC can do and polling cannot. <LessonLink slug="data-quality-and-governance">Data quality and governance</LessonLink> returns to this.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Adding consumers always speeds up a consumer group."** At most one consumer per partition reads at a time; consumers beyond the number of partitions sit idle. To scale further you need more partitions — and changing the partition count changes which partition each key maps to, which can break per-key ordering during the change.
+
+</Misconception>
+
+<Misconception>
+
+**"A watermark guarantees no late data."** It is an estimate. Late events still arrive; the system needs a policy — drop, correct within an allowed lateness, or send to a side output — and that policy should be chosen for the use, not left at the default.
+
+</Misconception>
+
+<Misconception>
+
+**"Exactly-once is a setting you turn on."** Engine settings make the engine's own state and output exactly-once under specific conditions. The guarantee holds end to end only if every sink is idempotent or transactional and every external side effect carries an idempotency key.
+
+</Misconception>
+
+<Misconception>
+
+**"Streaming is the modern replacement for batch."** They answer different needs. Streaming buys freshness at the cost of always-on compute, state and operational complexity; batch is simpler to build, test and re-run. Many platforms use both, and many "real-time" requirements turn out to be satisfied by a batch every few minutes.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

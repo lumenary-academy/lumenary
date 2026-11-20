@@ -1,0 +1,475 @@
+---
+title: Analytical databases
+subtitle: Why the engines that answer questions over billions of rows look so different from the database behind a shop's checkout — and what their answers cost.
+minutes: 80
+objectives:
+  - Distinguish OLTP from OLAP workloads, and say why one system rarely serves both well
+  - Explain how columnar engines execute queries, and why vectorised execution beats tuple-at-a-time iteration
+  - Use partitioning, clustering and zone maps to prune data, and measure what each layout saves
+  - Implement hash and sort-merge joins, and decide between shuffle and broadcast joins with a cost argument
+  - Describe the main kinds of analytical engine — cloud warehouses, open-source distributed engines and embedded engines — fairly, with their costs
+  - Estimate the cost of a query under scan-based and capacity-based pricing, and name the levers that reduce it
+prerequisites: [data-models-and-file-formats]
+related: [math.comp.algorithm-design, math.comp.algorithms-and-efficiency]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "MonetDB/X100: Hyper-Pipelining Query Execution"
+    author: Peter Boncz, Marcin Zukowski and Niels Nes
+    year: 2005
+    url: https://www.cidrdb.org/cidr2005/papers/P19.pdf
+    note: The CIDR paper that introduced vectorised execution, the design behind many modern engines.
+  - title: "Efficiently Compiling Efficient Query Plans for Modern Hardware"
+    author: Thomas Neumann
+    year: 2011
+    url: https://www.vldb.org/pvldb/vol4/p539-neumann.pdf
+    note: The compiled (data-centric) alternative to vectorisation, from the HyPer system.
+  - title: "Volcano — An Extensible and Parallel Query Evaluation System"
+    author: Goetz Graefe
+    year: 1994
+    note: IEEE Transactions on Knowledge and Data Engineering; the classic iterator model of query execution.
+  - title: "The Design and Implementation of Modern Column-Oriented Database Systems"
+    author: Daniel Abadi, Peter Boncz, Stavros Harizopoulos, Stratos Idreos and Samuel Madden
+    year: 2013
+    note: A survey (Foundations and Trends in Databases) of columnar storage, compression, late materialisation and vectorisation.
+  - title: DuckDB documentation
+    url: https://duckdb.org/docs/
+  - title: ClickHouse documentation
+    url: https://clickhouse.com/docs
+  - title: "BigQuery: introduction to clustered tables"
+    url: https://cloud.google.com/bigquery/docs/clustered-tables
+  - title: Snowflake documentation
+    url: https://docs.snowflake.com/
+  - title: Amazon Redshift documentation
+    url: https://docs.aws.amazon.com/redshift/
+  - title: "Spark SQL performance tuning"
+    url: https://spark.apache.org/docs/latest/sql-performance-tuning.html
+    note: Broadcast thresholds, adaptive query execution and skew-join handling in Spark.
+  - title: Transaction Processing Performance Council (TPC)
+    url: https://www.tpc.org/
+    note: The TPC-H and TPC-DS decision-support benchmarks.
+  - title: ClickBench
+    url: https://benchmark.clickhouse.com/
+    note: An open benchmark of analytical engines, maintained by ClickHouse; read its methodology notes alongside the results.
+---
+
+<Section id="motivation" kind="motivation" title="The query that slowed the checkout">
+
+A growing online grocer in Jakarta runs on PostgreSQL. At lunchtime the database handles a few thousand small transactions a second — add to basket, reserve a delivery slot, take payment — each touching a handful of rows by primary key, each finishing in a millisecond or two.
+
+One Monday an analyst runs, against the same database, "revenue by product category, by week, for the last three years, compared with the year before". It reads every order line ever written. It runs for eleven minutes, fills the database's memory with pages nobody else needs, and checkout latency triples until it finishes.
+
+Nothing was wrong with PostgreSQL or with the query. They were simply built for different jobs. This lesson is about the second job — scanning and aggregating huge amounts of data to answer questions — and the engines designed for it: how they lay out and execute queries, how to organise tables so they read little, how they join, which ones exist, and what a query costs when you pay by the byte.
+
+</Section>
+
+<Section id="oltp-olap" kind="definitions" title="Two workloads">
+
+<Definition term="OLTP and OLAP">
+
+**Online transaction processing** (OLTP) serves an application: many concurrent, short transactions, each reading or writing a few rows found by key, which must be fast, isolated and durable. **Online analytical processing** (OLAP) serves analysis: fewer, larger queries, each scanning, filtering, joining and aggregating many rows but few columns, mostly over data that is appended rather than updated.
+
+</Definition>
+
+| | OLTP | OLAP |
+| --- | --- | --- |
+| Typical query | fetch or update one order | revenue by category by week, three years |
+| Rows touched per query | a few | millions to billions |
+| Columns touched | most of a row | a few of many |
+| Latency target | milliseconds | seconds to minutes |
+| Concurrency | thousands of clients | tens to hundreds of queries |
+| Writes | small, constant, in place | bulk loads, appends |
+| Storage layout | rows, B-tree indexes | columns, compression, zone maps |
+| Examples | PostgreSQL, MySQL, Oracle, SQL Server, SQLite | warehouses and the engines below |
+
+Every row of that table pulls the design in a different direction, which is why most organisations copy data from OLTP systems into a separate analytical system — the pipelines of <LessonLink slug="what-data-engineers-do">What data engineers do</LessonLink>. **HTAP** systems (hybrid transactional/analytical processing) try to serve both, usually by keeping a row store and a columnar replica of the same data in sync — TiDB with TiFlash and SingleStore are examples, and PostgreSQL has columnar and DuckDB-based extensions. They are useful when analytics must be seconds fresh, but the two workloads still compete for the same hardware.
+
+</Section>
+
+<Section id="execution" kind="intuition" title="How a columnar engine runs a query">
+
+<LessonLink slug="data-models-and-file-formats">Data models and file formats</LessonLink> showed the storage side: columns, encodings, compression, statistics. The execution side matters as much. A query plan is a tree of **operators** — scan, filter, project, join, aggregate — and the question is how data flows between them.
+
+The classic answer, the **iterator** or **Volcano model** (after the Volcano system Goetz Graefe described in 1994), has every operator offer one method, "give me the next row", and pull rows one at a time from the operator below. It is elegant and composes any plan, but it pays a function call, a branch and some bookkeeping *per row per operator*, and processes rows in a way that keeps the processor's pipelines and vector units mostly idle.
+
+**Vectorised execution**, introduced by the MonetDB/X100 project in 2005, keeps the operator tree but passes **batches** of perhaps a thousand to a few thousand values per column at a time. Each operator runs a tight loop over a batch — compare 2,048 integers, gather 2,048 values — that the compiler and processor execute with SIMD instructions and good cache behaviour, and the per-call overhead is paid once per batch instead of once per row. Filters produce a **selection vector** (which positions survived) rather than copying rows. A third approach, **query compilation**, generates machine code specialised to each query, fusing operators into a few loops; HyPer and its successor Umbra are known for it, and several engines combine the two ideas.
+
+Columnar engines add further habits: **late materialisation** (carry column positions through the plan and assemble full rows only at the end, if at all) and **operating on compressed data** (grouping by dictionary codes, as the block below does, instead of by strings).
+
+The block runs one aggregation both ways over 300,000 rows of synthetic sales. The tuple-at-a-time version is a pipeline of Python generators, one call per row per operator; the vectorised one processes batches of 2,048 with NumPy, and groups by the dictionary code of the country.
+
+```python run
+import time
+import numpy as np
+
+# A sales table of 300,000 rows, stored by column. Country is dictionary-encoded: small integer codes.
+rng = np.random.default_rng(8)
+n = 300_000
+countries = np.array(["BR", "DE", "EG", "IN", "JP", "MX", "NG", "VN"])
+year = rng.integers(2023, 2026, n)
+country = rng.integers(0, len(countries), n)                     # codes into `countries`
+amount = rng.integers(1, 500, n)                                  # whole currency units
+
+# Query: SELECT country, SUM(amount) FROM sales WHERE year = 2025 AND amount > 100 GROUP BY country
+
+# 1. Tuple at a time (the "Volcano" iterator model): each operator pulls one row from the one below.
+calls = 0
+def scan():
+    global calls
+    for row in zip(year.tolist(), country.tolist(), amount.tolist()):
+        calls += 1
+        yield row
+def select(rows):
+    global calls
+    for y, c, a in rows:
+        calls += 1
+        if y == 2025 and a > 100:
+            yield c, a
+def aggregate(rows):
+    global calls
+    totals = {}
+    for c, a in rows:
+        calls += 1
+        totals[c] = totals.get(c, 0) + a
+    return totals
+
+t0 = time.perf_counter()
+by_row = aggregate(select(scan()))
+t_row = time.perf_counter() - t0
+
+# 2. Vectorised: each operator processes a batch of 2,048 values per call, in tight compiled loops.
+BATCH = 2048
+t0 = time.perf_counter()
+totals, batch_calls = np.zeros(len(countries), dtype=np.int64), 0
+for start in range(0, n, BATCH):
+    y, c, a = year[start:start + BATCH], country[start:start + BATCH], amount[start:start + BATCH]
+    keep = (y == 2025) & (a > 100)                               # selection vector for this batch
+    totals += np.bincount(c[keep], weights=a[keep], minlength=len(countries)).astype(np.int64)
+    batch_calls += 3                                             # scan, select, aggregate: one call each
+t_vec = time.perf_counter() - t0
+
+assert all(by_row.get(i, 0) == totals[i] for i in range(len(countries)))
+for i in np.argsort(-totals)[:3]:
+    print(f"{countries[i]}  {totals[i]:,}")
+print(f"\ntuple at a time: {calls:,} operator calls")
+print(f"vectorised:      {batch_calls:,} operator calls")
+print(f"time on this machine: {t_row * 1000:.0f} ms against {t_vec * 1000:.1f} ms, "
+      f"about {t_row / t_vec:.0f} times faster")
+```
+
+Both compute the same totals. The tuple-at-a-time pipeline made 679,849 operator calls; the vectorised one 441. In a dozen runs on the machine that checked this lesson, the vectorised version was between 13 and 27 times faster; the ratio varies from run to run and machine to machine, and your browser will differ again, but the gap stays large.
+
+<Narrator who="gideon">
+
+This demonstration flatters vectorisation. In Python each call costs on the order of a hundred nanoseconds of interpretation; in a C++ engine a virtual call costs a few nanoseconds. The gap there comes from branches, cache misses and idle vector units rather than from the interpreter, and it is smaller, though still large on analytical queries — which is why almost every modern analytical engine is vectorised, compiled or both.
+
+</Narrator>
+
+</Section>
+
+<Section id="pruning" kind="computation" title="Partitioning, clustering and pruning">
+
+The cheapest byte is the one you never read. Analytical engines avoid reading data in three nested ways.
+
+<Definition term="Partitioning, clustering and zone maps">
+
+**Partitioning** splits a table into separate parts by the value of one column, typically a date (one partition per day or month), so a filter on that column skips whole partitions without reading them: **partition pruning**. **Clustering** (or sorting) orders rows *within* partitions by one or more columns, so that similar values sit together. **Zone maps** — the minimum and maximum of each column in each block of rows, like Parquet's row-group statistics — let the engine skip blocks whose range cannot match a filter.
+
+</Definition>
+
+Names differ between products — BigQuery has partitioned and clustered tables, Snowflake divides tables into **micro-partitions** with metadata and optional clustering keys, ClickHouse's MergeTree tables have a partition key and a sorting key with a sparse primary index, Iceberg and Hive tables partition by directory — but the mechanism is the same.
+
+The block builds a year of synthetic orders, 1.2 million rows, partitioned by month and cut into blocks of 8,192 rows with zone maps, in two layouts: rows in arrival order (so, by time, within each month), and rows clustered by customer within each month. It runs two queries against each: one week of March, and one customer's orders.
+
+```python run
+import numpy as np
+
+# A year of orders: 1,200,000 rows, arriving in time order. day = 0 is 1 January 2025.
+rng = np.random.default_rng(21)
+n = 1_200_000
+day = np.sort(rng.integers(0, 365, n))
+customer = rng.integers(0, 200_000, n)
+amount = rng.integers(1, 500, n)
+LENGTHS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+MONTH_END = np.cumsum(LENGTHS) - 1                    # last day of each month
+MONTH_START = MONTH_END - np.array(LENGTHS) + 1
+month = np.searchsorted(MONTH_END, day)
+BLOCK = 8_192                                       # rows per block, each with a min/max zone map
+
+def build(cluster_by):
+    """Partition by month; inside each partition, order rows by `cluster_by` and cut into blocks."""
+    table = []
+    for m in range(12):
+        rows = np.flatnonzero(month == m)
+        if cluster_by is not None:
+            rows = rows[np.argsort(cluster_by[rows], kind="stable")]
+        blocks = [rows[i:i + BLOCK] for i in range(0, len(rows), BLOCK)]
+        table.append([(b, day[b].min(), day[b].max(), customer[b].min(), customer[b].max()) for b in blocks])
+    return table
+
+def query(table, day_range=None, cust=None):
+    """Count partitions and blocks read, using partition pruning and then zone maps."""
+    parts = blocks = total = 0
+    for m, part in enumerate(table):
+        if day_range and (MONTH_START[m] > day_range[1] or MONTH_END[m] < day_range[0]):
+            continue                               # partition pruning: this month cannot match
+        parts += 1
+        for rows, dmin, dmax, cmin, cmax in part:
+            if day_range and (dmax < day_range[0] or dmin > day_range[1]):
+                continue                           # zone map rules the block out
+            if cust is not None and not (cmin <= cust <= cmax):
+                continue
+            blocks += 1
+            ok = np.ones(len(rows), bool)
+            if day_range:
+                ok &= (day[rows] >= day_range[0]) & (day[rows] <= day_range[1])
+            if cust is not None:
+                ok &= customer[rows] == cust
+            total += int(amount[rows][ok].sum())
+    return parts, blocks, total
+
+layouts = {"arrival order": build(None), "clustered by customer": build(customer)}
+all_blocks = sum(len(p) for p in layouts["arrival order"])
+week = (61, 67)                                     # 3 to 9 March
+someone = int(customer[123_456])
+print(f"{n:,} rows, 12 monthly partitions, {all_blocks} blocks of {BLOCK:,} rows")
+print(f"{'layout':22s} {'query':24s} {'partitions':>10s} {'blocks':>7s} {'read':>6s}  result")
+for name, table in layouts.items():
+    for label, kw in [("one week in March", dict(day_range=week)),
+                      (f"customer {someone}", dict(cust=someone))]:
+        p, b, total = query(table, **kw)
+        print(f"{name:22s} {label:24s} {p:10d} {b:7d} {b / all_blocks:6.1%}  {total:,}")
+```
+
+Each layout makes one query cheap and leaves the other expensive. In arrival order the week of March reads 4 blocks of 154 (2.6%) — partition pruning finds March and the zone maps on date find the week — but a single customer's orders mean reading every block, because every block contains a broad spread of customer ids. Clustered by customer, the customer query reads one block per month (7.8%), while the week query must read all of March (8.4%): partition pruning still works, but within March the dates are scattered. The answers never change; only the bytes read.
+
+<Narrator who="chloe">
+
+The idea underneath is that a zone map is a summary, and a summary helps only when the data it summarises is *narrow*. Sorting by a column makes each block's range of that column narrow and every other column's range wide. That is why you choose a layout for your most common, most expensive filters, and why techniques such as Z-ordering and Hilbert curves, which interleave several columns' sort orders, exist: they make several ranges moderately narrow at once.
+
+</Narrator>
+
+Partitioning has a failure mode in the other direction. Partition a modest table by a high-cardinality column — by customer, or by hour for ten years — and you get tens or hundreds of thousands of tiny files. Each must be listed, opened and planned, the metadata overwhelms the data, and queries slow down. A common rule of thumb is to partition only by a low-cardinality column used in most filters (usually a date), keep partitions large (hundreds of megabytes or more), and leave the finer organisation to clustering. Compacting small files is a regular maintenance task in <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink>.
+
+</Section>
+
+<Section id="joins" kind="computation" title="Join strategies">
+
+Joins are where analytical queries spend much of their time. On one machine there are two main algorithms; across machines, there is the further question of moving the data.
+
+- **Hash join.** Build a hash table on the smaller input, keyed by the join key; then stream the larger input and probe the table for each row. Time $O(|R| + |S|)$ on average, memory proportional to the smaller side. It needs an equality condition, and if the build side does not fit in memory, engines partition both inputs to disk and join partition by partition (a *grace* or *hybrid* hash join).
+- **Sort-merge join.** Sort both inputs by the key, then walk them together like the merge step of merge sort, emitting every pair of rows with equal keys. Time $O(|R| \log |R| + |S| \log |S|)$ for the sorts and linear for the merge — less if the inputs are already sorted, as a clustered table may be. It handles inputs larger than memory gracefully with external sorting.
+- **Nested loops** (compare every pair) is $O(|R| \cdot |S|)$, used only for tiny inputs or conditions that are not equalities.
+
+In a distributed engine, rows with the same key must meet on one worker. A **shuffle join** repartitions *both* inputs by a hash of the key; a **broadcast join** copies the whole of the smaller input to every worker and leaves the larger one where it is. Lumenary CS's [batch and stream processing](/en/cs/data-processing/) lesson simulates both and the salting trick for skewed keys; here is the argument for choosing between them.
+
+<Theorem name="When broadcasting moves less data">
+
+Let a big input of $B$ rows and a small input of $S$ rows start spread evenly over $N \ge 2$ workers, and let a hash partitioning send each row to a uniformly random worker. Then, in expectation, a broadcast join sends fewer rows over the network than a shuffle join if and only if $S < B/(N-1)$.
+
+</Theorem>
+
+<Proof>
+
+In a shuffle, a row stays put only if its target is the worker it is already on, which happens with probability $1/N$; so the expected number of rows sent is $(B + S)(N-1)/N$. In a broadcast, each of the $N$ workers already holds $S/N$ rows of the small input and must receive the other $S(N-1)/N$, so $N \cdot S(N-1)/N = S(N-1)$ rows are sent, and the big input does not move. Broadcasting sends less exactly when $S(N-1) < (B+S)(N-1)/N$. Dividing by $(N-1)/N > 0$ gives $SN < B + S$, that is $S(N-1) < B$. ∎
+
+</Proof>
+
+The block implements both local algorithms, checks that they agree, and then counts the rows each distributed strategy actually sends for 60,000 orders and 2,000 products on 4, 16 and 64 workers.
+
+```python run
+import random
+from collections import defaultdict
+
+rng = random.Random(12)
+# orders(order_id, product_id, qty) is big; products(product_id, category) is small.
+products = [(p, rng.choice(["books", "tea", "tools", "toys"])) for p in range(2_000)]
+orders = [(o, rng.randrange(2_100), rng.randrange(1, 5)) for o in range(60_000)]  # ids >= 2,000: unknown
+
+def hash_join(small, big):
+    """Build a hash table on the smaller input, then probe it once per row of the larger."""
+    table = defaultdict(list)
+    for pid, cat in small:
+        table[pid].append(cat)
+    return [(o, pid, q, cat) for o, pid, q in big for cat in table.get(pid, ())]
+
+def sort_merge_join(small, big):
+    """Sort both inputs by key, then walk them together; equal keys meet in step."""
+    s, b = sorted(small), sorted(big, key=lambda r: r[1])
+    out, i, j = [], 0, 0
+    while i < len(s) and j < len(b):
+        if s[i][0] < b[j][1]:
+            i += 1
+        elif s[i][0] > b[j][1]:
+            j += 1
+        else:                                       # emit every pair with this key (duplicates too)
+            key, i2 = s[i][0], i
+            while i2 < len(s) and s[i2][0] == key:
+                i2 += 1
+            while j < len(b) and b[j][1] == key:
+                out += [(b[j][0], key, b[j][2], s[k][1]) for k in range(i, i2)]
+                j += 1
+            i = i2
+    return out
+
+h = sorted(hash_join(products, orders))
+assert h == sorted(sort_merge_join(products, orders))      # same answer, different algorithm
+print(f"{len(orders):,} orders join {len(products):,} products: {len(h):,} matches; "
+      f"{len(orders) - len(h):,} orders name an unknown product and drop out of the inner join\n")
+
+# Distributed: rows start spread evenly over N workers. Count rows sent over the network.
+def shuffle_cost(small, big, N):
+    """Repartition both sides by hash(key) mod N: a row moves unless it is already on its target."""
+    sent = 0
+    for side, key in ((small, 0), (big, 1)):
+        for i, row in enumerate(side):
+            sent += (i % N) != (hash(row[key]) % N)    # row i starts on worker i mod N
+    return sent
+
+def broadcast_cost(small, N):
+    """Every worker needs a full copy of the small side; it already holds 1/N of it."""
+    return len(small) * (N - 1)
+
+for N in (4, 16, 64):
+    s, b = shuffle_cost(products, orders, N), broadcast_cost(products, N)
+    print(f"N = {N:2d} workers: shuffle sends {s:6,} rows, broadcast sends {b:7,} rows "
+          f"-> {'broadcast' if b < s else 'shuffle'} (break-even small side: {len(orders) / (N - 1):,.0f} rows)")
+```
+
+The counts follow the theorem: with 2,000 products, broadcasting wins below the break-even point (20,000 rows on 4 workers, 4,000 on 16) and loses on 64 workers, where the threshold falls to 952 rows. The more workers, the more copies a broadcast makes — the threshold shrinks as the cluster grows.
+
+<Narrator who="margaret">
+
+Real engines compare bytes, not rows, and they add a memory condition the theorem ignores: every worker must hold the whole small side. That is why Spark's default rule is simply "broadcast if the small side is estimated below 10 MB" (the `spark.sql.autoBroadcastJoinThreshold` setting), with adaptive execution re-deciding at run time once real sizes are known. A 2 GB "small" table broadcast to 200 workers would send 400 GB and might not fit in their memory at all.
+
+</Narrator>
+
+</Section>
+
+<Section id="engines" kind="human" title="The engines, fairly">
+
+Analytical engines differ less in their core techniques — almost all are columnar, compressed, vectorised or compiled, and parallel — than in where they run, who operates them and how they are paid for. As of 2026, the main families are these.
+
+<Figure caption="Two architectures. In shared-nothing designs each node owns its slice of the data; in separated designs, stateless compute clusters read shared object storage, so compute can grow, shrink or be duplicated independently of the data.">
+
+<svg viewBox="0 0 640 230" role="img" aria-label="Left, labelled shared-nothing: three nodes side by side, each a box containing compute above its own disk holding one slice of the data. Right, labelled storage and compute separated: two compute clusters of different sizes at the top, a metadata and catalogue service in the middle, and one wide object storage box at the bottom that both clusters read.">
+  <g fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">
+    <text x="150" y="20">shared-nothing</text>
+    <text x="480" y="20">storage and compute separated</text>
+  </g>
+  <g fill="none" strokeWidth="1.8">
+    <rect x="20" y="40" width="80" height="150" rx="6" stroke="currentColor" />
+    <rect x="110" y="40" width="80" height="150" rx="6" stroke="currentColor" />
+    <rect x="200" y="40" width="80" height="150" rx="6" stroke="currentColor" />
+    <rect x="30" y="55" width="60" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="120" y="55" width="60" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="210" y="55" width="60" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="30" y="120" width="60" height="55" rx="4" stroke="var(--sky)" />
+    <rect x="120" y="120" width="60" height="55" rx="4" stroke="var(--sky)" />
+    <rect x="210" y="120" width="60" height="55" rx="4" stroke="var(--sky)" />
+    <rect x="340" y="40" width="120" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="480" y="40" width="140" height="50" rx="4" stroke="var(--gold)" />
+    <rect x="370" y="110" width="220" height="30" rx="4" stroke="currentColor" strokeDasharray="4 3" />
+    <rect x="340" y="160" width="280" height="40" rx="4" stroke="var(--sky)" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="60" y="84">compute</text>
+    <text x="150" y="84">compute</text>
+    <text x="240" y="84">compute</text>
+    <text x="60" y="144">disk:</text>
+    <text x="60" y="159">slice 1</text>
+    <text x="150" y="144">disk:</text>
+    <text x="150" y="159">slice 2</text>
+    <text x="240" y="144">disk:</text>
+    <text x="240" y="159">slice 3</text>
+    <text x="400" y="62">compute cluster</text>
+    <text x="400" y="77">for dashboards</text>
+    <text x="550" y="62">larger cluster</text>
+    <text x="550" y="77">for nightly jobs</text>
+    <text x="480" y="129">metadata and catalogue</text>
+    <text x="480" y="184">object storage: all the data, columnar files</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="400" y1="90" x2="440" y2="160" />
+    <line x1="550" y1="90" x2="520" y2="160" />
+  </g>
+</svg>
+
+</Figure>
+
+**Cloud data warehouses** are fully managed: you load data or point them at it and pay for storage and for compute. [Google BigQuery](https://cloud.google.com/bigquery/docs) descends from Google's Dremel and is serverless — you do not size a cluster. [Snowflake](https://docs.snowflake.com/), which runs on several clouds, separates storage from **virtual warehouses**, compute clusters started, resized and suspended on demand. [Amazon Redshift](https://docs.aws.amazon.com/redshift/) began as a shared-nothing cluster and now also offers managed storage and a serverless mode. Microsoft Fabric's warehouse, Databricks SQL (on its lakehouse) and Alibaba Cloud's MaxCompute are other widely used options. Their strengths are elasticity and having nothing to operate; their costs are bills that grow with use, and some lock-in of data, SQL dialect and tooling, mitigated where they read open table formats.
+
+**Open-source distributed engines** you can run yourself or buy as a service. [ClickHouse](https://clickhouse.com/docs), first developed at Yandex and now also run by ClickHouse Inc., is known for very fast scans and aggregations on large event tables. [Apache Doris](https://doris.apache.org/) and [StarRocks](https://www.starrocks.io/), whose lineages go back to an analytics system at Baidu, target fast interactive analytics with MySQL-compatible interfaces. [Apache Druid](https://druid.apache.org/) and [Apache Pinot](https://pinot.apache.org/) (from Metamarkets and LinkedIn) specialise in low-latency queries over streaming data, for user-facing dashboards. [Trino](https://trino.io/) (from the Presto project begun at Facebook) and Spark SQL are query engines without their own storage, reading files and tables from object stores and other databases. Self-hosting them means no licence fee and full control, paid for in operations: capacity planning, upgrades, tuning and on-call.
+
+**Embedded engines** run inside your process, like SQLite does for transactions. [DuckDB](https://duckdb.org/docs/), from CWI in Amsterdam (where MonetDB was also built), is a vectorised analytical database in a library: `pip install` it and query Parquet files, CSV or pandas data frames with SQL, on a laptop, in a notebook or in a serverless function. Polars and Apache DataFusion play a similar role as libraries, and chDB embeds ClickHouse. For data up to hundreds of gigabytes on one machine, they are often the simplest and cheapest answer of all.
+
+**Benchmarks** need care. TPC-H and TPC-DS, from the Transaction Processing Performance Council, are the standard decision-support workloads; ClickBench is an open, frequently updated comparison maintained by ClickHouse. Every engine can be tuned to win some benchmark, vendors' own results are chosen by vendors, and your workload — your data's shape, your concurrency, your budget — is the only benchmark that settles anything. Run your own queries on two or three candidates before committing.
+
+</Section>
+
+<Section id="cost" kind="examples" title="What a query costs">
+
+Analytical systems are paid for in one of three main ways, and each rewards different habits.
+
+1. **Scan-based (on demand):** pay per byte a query reads — BigQuery's on-demand mode and Amazon Athena work this way. Cost is proportional to bytes scanned after pruning.
+2. **Capacity-based:** pay for compute capacity per unit of time — Snowflake credits per second a virtual warehouse runs, BigQuery's reserved slots, Redshift node-hours or serverless capacity units. Cost is proportional to how long and how big the compute runs, whatever it reads.
+3. **Self-hosted:** pay for machines (rented or owned) and the people who run them. The marginal query is nearly free; the fixed costs are not.
+
+Prices differ by provider, region, edition and contract, and change over time, so always read the current pricing page. The example below uses a deliberately round, hypothetical price.
+
+<Example title="The dashboard that refreshed itself">
+
+A team builds a dashboard over a 4 TB orders table and sets it to refresh every 5 minutes. Each refresh runs six queries, and each query, written as `SELECT *` and filtered in the dashboard tool, scans the full table. At a hypothetical USD 5 per terabyte scanned, one refresh costs $6 \times 4 \times 5 =$ USD 120, and there are $24 \times 60 / 5 = 288$ refreshes a day: USD 34,560 a day.
+
+Selecting the 4 columns the charts use, out of 40 of similar size, divides the bytes by 10. Filtering on the date partition column to the last 90 days of a 3-year table divides them by about 12. Refreshing every hour instead of every 5 minutes divides the number of runs by 12. Together: $120 / (10 \times 12) =$ USD 1 per refresh, 24 refreshes a day, USD 24 a day — over a thousand times less, for the same charts.
+
+</Example>
+
+The levers, in roughly the order they pay off:
+
+- **Read fewer columns.** In a columnar store, `SELECT *` reads every column; naming columns reads only those.
+- **Prune.** Filter on partition and clustering columns, and design those columns around the filters people actually use.
+- **Pre-aggregate.** A daily summary table or a materialised view that dashboards query instead of the raw facts can cut scans by orders of magnitude.
+- **Cache and schedule sensibly.** Refresh as often as decisions need, not as often as the tool allows; most engines cache identical repeated queries.
+- **Set guard rails.** Per-query byte limits, budgets and alerts, and automatic suspension of idle capacity, catch mistakes before the invoice does. The [cost and FinOps](/en/cs/electives/cloud-computing/cost-and-finops/) lesson of the Cloud Computing elective goes further.
+
+<Narrator who="gideon">
+
+`LIMIT 10` is not a cost lever in most scan-priced engines: the engine may read the whole table to find ten rows, and in BigQuery's on-demand mode, for example, a `LIMIT` on an unclustered table does not reduce the bytes billed. Check the bytes an engine reports for a query — most show an estimate before running — rather than assuming.
+
+</Narrator>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"An analytical database can replace the application's database."** Analytical engines are poor at many small concurrent writes and point updates, and many have weaker transactional guarantees. Run the application on an OLTP database and copy its data out.
+
+</Misconception>
+
+<Misconception>
+
+**"Partition by everything you filter on."** Over-partitioning creates huge numbers of tiny files and slows planning and scanning. Partition coarsely by one low-cardinality column (usually a date) and cluster or sort within partitions for the rest.
+
+</Misconception>
+
+<Misconception>
+
+**"Columnar engines are bad at joins."** Modern columnar engines have excellent hash and merge joins and cost-based optimisers; star-schema joins against small dimensions are their everyday work. What they dislike is joining two enormous tables on a skewed key — which is hard for every engine.
+
+</Misconception>
+
+<Misconception>
+
+**"The fastest engine in the benchmark will be fastest for us."** Benchmarks measure particular queries, data and tuning. Your data's distribution, your concurrency and your budget decide; test on your own workload.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

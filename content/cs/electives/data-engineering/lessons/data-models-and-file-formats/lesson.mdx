@@ -1,0 +1,656 @@
+---
+title: Data models and file formats
+subtitle: How to shape data for the questions people ask, and how to lay it out on disk and in memory so that answering them is cheap.
+minutes: 80
+objectives:
+  - Contrast normalised and dimensional models, and design a star schema by first declaring its grain
+  - Keep the history of a changing dimension with slowly changing dimension types 1, 2 and 3
+  - Explain why columnar layouts suit analytical queries, and when row layouts are better
+  - Compare CSV, JSON, Avro, Parquet and ORC by layout, schema, compression and typical use
+  - Describe a Parquet file's row groups, column chunks, pages and footer, and measure its encodings and codecs with pyarrow
+  - Use Parquet's column statistics to skip row groups, and outline how repetition and definition levels store nested data
+  - Describe Arrow's columnar memory format and why it allows zero-copy interchange between tools
+  - Classify schema changes as backward or forward compatible
+prerequisites: [what-data-engineers-do]
+related: [math.found.functions, math.found.equivalence-relations]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: The Kimball Group
+    url: https://www.kimballgroup.com/
+    note: Articles on dimensional modelling from the practitioners who popularised it, including slowly changing dimensions.
+  - title: Apache Parquet documentation
+    url: https://parquet.apache.org/docs/
+  - title: Parquet format specification
+    url: https://github.com/apache/parquet-format
+    note: The file layout, the metadata (Thrift) definitions, and the Encodings.md document describing every encoding.
+  - title: "Dremel: Interactive Analysis of Web-Scale Datasets"
+    author: Sergey Melnik, Andrey Gubarev, Jing Jing Long, Geoffrey Romer, Shiva Shivakumar, Matt Tolton and Theo Vassilakis
+    year: 2010
+    note: The Google paper (VLDB 2010) that introduced repetition and definition levels for columnar storage of nested records; Parquet adopted the idea.
+  - title: Apache Arrow columnar format
+    url: https://arrow.apache.org/docs/format/Columnar.html
+    note: The specification of arrays, buffers, validity bitmaps, offsets, record batches and IPC.
+  - title: "pyarrow: reading and writing the Apache Parquet format"
+    url: https://arrow.apache.org/docs/python/parquet.html
+  - title: Apache Avro specification
+    url: https://avro.apache.org/docs/
+    note: Includes the rules of schema resolution between a writer's and a reader's schema.
+  - title: Apache ORC
+    url: https://orc.apache.org/
+  - title: "RFC 4180: Common Format and MIME Type for Comma-Separated Values (CSV) Files"
+    url: https://www.rfc-editor.org/rfc/rfc4180
+  - title: "Gene name errors are widespread in the scientific literature"
+    author: Mark Ziemann, Yotam Eren and Assam El-Osta
+    year: 2016
+    url: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-1044-7
+    note: How spreadsheet software silently turned gene names in CSV files into dates.
+---
+
+<Section id="motivation" kind="motivation" title="Shape and layout">
+
+A city's library network runs its lending on a well-normalised relational database — members, books, copies, branches, loans — exactly as Lumenary CS's [databases](/en/cs/databases/) lesson recommends. It checks out a book in milliseconds and never lends one copy twice.
+
+Then the questions change. Which genres are borrowed most in each district, month by month? Did late returns fall after fines were cut? Such questions touch every loan of the year but only a few attributes of each, and they group by things that sit several joins away from the loan.
+
+Two decisions make them cheap. The **shape** of the data — which tables, at what level of detail, with which keys — is the data model. The **layout** — how those tables become bytes on disk and in memory — is the file format. Either one, done badly, can make the same query a thousand times slower.
+
+</Section>
+
+<Section id="models" kind="definitions" title="Normalised and dimensional models">
+
+A **normalised** model stores each fact once, in many narrow tables linked by keys, so that an update touches one row and the data cannot contradict itself: the right model for systems that *write*. For analysis it costs many joins, and its tables mirror the application rather than the business.
+
+**Dimensional modelling**, developed and popularised by Ralph Kimball and colleagues from the 1990s, reshapes the same data for reading. It divides the world into **facts** — measurements of a business process, such as a loan or a sale — and **dimensions** — the context by which people filter and group those measurements: when, where, what, who.
+
+<Definition term="Fact table, grain and measures">
+
+A **fact table** has one row per event or measurement of one business process. Its **grain** states precisely what one row represents ("one loan of one copy to one member"). Its columns are keys to dimensions plus **measures**, which are **additive** if they can be summed over every dimension (days borrowed, fees paid), **semi-additive** if over some but not over time (stock on hand), and **non-additive** if not at all (a ratio such as the late-return rate, recomputed from its additive parts).
+
+</Definition>
+
+<Definition term="Dimension table and star schema">
+
+A **dimension table** has one row per member of a dimension (a branch, a book, a date), with descriptive attributes and a **surrogate key** — a meaningless integer assigned by the warehouse, distinct from the source's **natural key**. A **star schema** joins a fact table directly to its dimensions; normalising dimensions into sub-dimensions (book → genre → section) gives a **snowflake schema**.
+
+</Definition>
+
+<Figure caption="A star schema for library loans. The fact table holds keys and measures at the grain of one loan; each dimension holds the descriptive attributes used to filter and group.">
+
+<svg viewBox="0 0 600 300" role="img" aria-label="A central box labelled fact_loans with columns date_key, branch_key, book_key, member_key, days_borrowed and late_fee, joined by lines to four dimension boxes at the corners: dim_date with date, month, weekday and holiday; dim_branch with name, district, valid_from and valid_to; dim_book with title, genre and language; dim_member with age band and home district.">
+  <g stroke="currentColor" strokeWidth="1.2">
+    <line x1="170" y1="70" x2="222" y2="110" />
+    <line x1="430" y1="70" x2="378" y2="110" />
+    <line x1="170" y1="235" x2="222" y2="200" />
+    <line x1="430" y1="235" x2="378" y2="200" />
+  </g>
+  <g fill="none" strokeWidth="2">
+    <rect x="220" y="95" width="160" height="120" rx="6" stroke="var(--gold)" />
+    <rect x="20" y="20" width="150" height="86" rx="6" stroke="var(--sky)" />
+    <rect x="430" y="20" width="150" height="86" rx="6" stroke="var(--sky)" />
+    <rect x="20" y="195" width="150" height="86" rx="6" stroke="var(--sky)" />
+    <rect x="430" y="195" width="150" height="86" rx="6" stroke="var(--sky)" />
+  </g>
+  <g fill="currentColor" fontSize="13" fontWeight="600" textAnchor="middle">
+    <text x="300" y="115">fact_loans</text>
+    <text x="95" y="40">dim_date</text>
+    <text x="505" y="40">dim_branch</text>
+    <text x="95" y="215">dim_book</text>
+    <text x="505" y="215">dim_member</text>
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="300" y="135">date_key, branch_key,</text>
+    <text x="300" y="150">book_key, member_key</text>
+    <text x="300" y="175">days_borrowed</text>
+    <text x="300" y="190">late_fee</text>
+    <text x="95" y="60">date, month,</text>
+    <text x="95" y="76">weekday, holiday</text>
+    <text x="505" y="60">name, district,</text>
+    <text x="505" y="76">valid_from, valid_to</text>
+    <text x="95" y="235">title, genre,</text>
+    <text x="95" y="251">language</text>
+    <text x="505" y="235">age band,</text>
+    <text x="505" y="251">home district</text>
+  </g>
+</svg>
+
+</Figure>
+
+Note what `dim_member` lacks: no name, address or date of birth. An age band and a district answer the library's planning questions, and a warehouse that never holds the rest cannot leak it.
+
+<Narrator who="chloe">
+
+Everything in a dimensional model follows from the grain. Declare "one row per loan" and you know which dimensions apply (each loan has one date, one branch, one book), which measures make sense, and what a `COUNT(*)` means. Mix grains in one table — some rows per loan, some per day — and every sum silently counts some things twice.
+
+</Narrator>
+
+Kimball's is not the only school. Bill Inmon's approach builds a normalised enterprise warehouse first and derives dimensional **data marts** from it; **Data Vault** separates business keys (hubs), relationships (links) and changing attributes (satellites), making full history systematic at the price of more tables, and is common in large enterprises with audit requirements; and many teams simply serve **one big table**, the star pre-joined, trading storage for join-free queries. The core ideas — a declared grain, facts versus context, history kept deliberately — carry across all of them.
+
+</Section>
+
+<Section id="scd" kind="computation" title="History in a dimension">
+
+Dimensions change: a book is reclassified, a branch moves to another district. What should last year's reports say afterwards?
+
+<Definition term="Slowly changing dimensions">
+
+**Type 1**: overwrite the attribute, restating history as if it had always had the new value. **Type 2**: close the current row (set its `valid_to`) and add a new row with a new surrogate key, so earlier facts keep pointing to the old version. **Type 3**: keep a `previous_…` column beside the current one, recording only the latest change.
+
+</Definition>
+
+The block builds a small star schema in SQLite with a year of synthetic loans, and on 1 July moves the Riverside branch from Old Town to Harbour as a type 2 change. For each loan the loader looks up the branch version valid on the loan's date — the **surrogate-key lookup** that makes type 2 work — and the queries report loans by district both ways.
+
+```python run
+import random
+import sqlite3
+from datetime import date, timedelta
+
+rng = random.Random(42)
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE dim_branch (branch_key INTEGER PRIMARY KEY,   -- surrogate key: one per VERSION
+                         branch_id TEXT, name TEXT, district TEXT,   -- branch_id: the natural key
+                         valid_from TEXT, valid_to TEXT, is_current INTEGER);
+CREATE TABLE dim_book   (book_key INTEGER PRIMARY KEY, genre TEXT, language TEXT);
+CREATE TABLE fact_loans (loan_date TEXT, branch_key INTEGER, book_key INTEGER,   -- grain: one loan
+                         days_borrowed INTEGER, late_fee_cents INTEGER);
+""")
+branches = [("B01", "Central", "Old Town"), ("B02", "Riverside", "Old Town"),
+            ("B03", "Campus", "University"), ("B04", "Harbour Road", "Harbour")]
+for i, (bid, name, district) in enumerate(branches, start=1):
+    db.execute("INSERT INTO dim_branch VALUES (?, ?, ?, ?, '2000-01-01', '9999-12-31', 1)",
+               (i, bid, name, district))
+genres = ["fiction", "children", "science", "history", "comics"]
+languages = ["English", "Swahili", "Spanish", "Hindi"]
+db.executemany("INSERT INTO dim_book VALUES (?, ?, ?)",
+               [(k, rng.choice(genres), rng.choice(languages)) for k in range(1, 301)])
+
+def scd2_change(branch_id, new_district, when):
+    """Slowly changing dimension, type 2: close the current version and open a new one."""
+    with db:
+        old = db.execute("SELECT branch_key, name FROM dim_branch WHERE branch_id = ? AND is_current = 1",
+                         (branch_id,)).fetchone()
+        db.execute("UPDATE dim_branch SET valid_to = ?, is_current = 0 WHERE branch_key = ?", (when, old[0]))
+        db.execute("INSERT INTO dim_branch VALUES (NULL, ?, ?, ?, ?, '9999-12-31', 1)",
+                   (branch_id, old[1], new_district, when))
+
+def key_for(branch_id, day):
+    """The surrogate-key lookup a loader does for each fact: the version valid on that day."""
+    return db.execute("SELECT branch_key FROM dim_branch WHERE branch_id = ? AND valid_from <= ? "
+                      "AND ? < valid_to", (branch_id, day, day)).fetchone()[0]
+
+def load_loans(start, days):
+    rows = []
+    for d in range(days):
+        day = (start + timedelta(days=d)).isoformat()
+        for _ in range(rng.randrange(20, 40)):
+            bid = rng.choice(["B01", "B02", "B02", "B03", "B04"])      # Riverside is busy
+            late = rng.random() < 0.1
+            rows.append((day, key_for(bid, day), rng.randrange(1, 301),
+                         rng.randrange(22, 40) if late else rng.randrange(3, 22), 50 * rng.randrange(1, 9) if late else 0))
+    db.executemany("INSERT INTO fact_loans VALUES (?, ?, ?, ?, ?)", rows)
+
+load_loans(date(2025, 1, 1), 181)                  # January to June
+scd2_change("B02", "Harbour", "2025-07-01")         # Riverside branch moves to a new building
+load_loans(date(2025, 7, 1), 184)                  # July to December
+
+print("dim_branch after the move:")
+for row in db.execute("SELECT * FROM dim_branch ORDER BY branch_id, valid_from"):
+    print("  ", row)
+
+TYPE2 = """SELECT b.district, SUM(f.loan_date < '2025-07-01'), SUM(f.loan_date >= '2025-07-01')
+           FROM fact_loans f JOIN dim_branch b ON b.branch_key = f.branch_key
+           GROUP BY b.district ORDER BY b.district"""
+TYPE1 = """SELECT cur.district, SUM(f.loan_date < '2025-07-01'), SUM(f.loan_date >= '2025-07-01')
+           FROM fact_loans f JOIN dim_branch b ON b.branch_key = f.branch_key
+           JOIN dim_branch cur ON cur.branch_id = b.branch_id AND cur.is_current = 1
+           GROUP BY cur.district ORDER BY cur.district"""
+for title, sql in [("as it was (type 2: history kept)", TYPE2), ("as it is now (type 1: overwritten)", TYPE1)]:
+    print(f"\nloans by district, {title}")
+    print(f"  {'district':11s} {'Jan-Jun':>8s} {'Jul-Dec':>8s}")
+    for district, h1, h2 in db.execute(sql):
+        print(f"  {district:11s} {h1:8d} {h2:8d}")
+
+print("\nlate fees by genre and language, whole year (a typical star-schema query):")
+for row in db.execute("""SELECT k.genre, k.language, COUNT(*), SUM(f.late_fee_cents) / 100.0
+                         FROM fact_loans f JOIN dim_book k ON k.book_key = f.book_key
+                         GROUP BY k.genre, k.language ORDER BY 4 DESC LIMIT 3"""):
+    print(f"  {row[0]:9s} {row[1]:8s} {row[2]:5d} loans  {row[3]:8.2f} in fees")
+```
+
+The two tables answer different questions. Type 2 tells *where loans were made at the time*: Harbour's lending roughly tripled in the second half, because a busy branch moved in. Type 1 restates history into today's districts — right for "how have the branches now in Harbour performed?" — and Harbour looks flat. Type 2 is the usual choice because it can answer both (the second query recovers type 1 from it); what is never acceptable is a dashboard whose readers cannot tell which one they see.
+
+<Note>
+
+Type 2 has a privacy side. A type 2 member dimension that records every change of home district is a location history. Keep history only where a stated purpose needs it, and remember that deleting a person's data on request means deleting every version.
+
+</Note>
+
+</Section>
+
+<Section id="layout" kind="intuition" title="Rows or columns">
+
+Now the layout. A table is two-dimensional; files and memory are one-dimensional sequences of bytes. There are two natural ways to flatten it.
+
+<Figure caption="The same three loans in row layout and in column layout. A query for the average of days needs the shaded values: scattered through the row layout, contiguous in the column layout.">
+
+<svg viewBox="0 0 620 200" role="img" aria-label="Top: a row layout, a strip of nine cells reading Central, fiction, 3, Campus, poetry, 14, Central, comics, 9, with the three day values highlighted and scattered. Bottom: a column layout, a strip reading Central, Campus, Central, fiction, poetry, comics, 3, 14, 9, with the three day values highlighted and adjacent at the end.">
+  <text x="10" y="30" fill="currentColor" fontSize="13" fontWeight="600">row layout</text>
+  <text x="10" y="120" fill="currentColor" fontSize="13" fontWeight="600">column layout</text>
+  <g fill="none" strokeWidth="1.5">
+    <rect x="10" y="40" width="64" height="30" stroke="var(--sky)" />
+    <rect x="74" y="40" width="64" height="30" stroke="var(--human)" />
+    <rect x="138" y="40" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+    <rect x="202" y="40" width="64" height="30" stroke="var(--sky)" />
+    <rect x="266" y="40" width="64" height="30" stroke="var(--human)" />
+    <rect x="330" y="40" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+    <rect x="394" y="40" width="64" height="30" stroke="var(--sky)" />
+    <rect x="458" y="40" width="64" height="30" stroke="var(--human)" />
+    <rect x="522" y="40" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+    <rect x="10" y="130" width="64" height="30" stroke="var(--sky)" />
+    <rect x="74" y="130" width="64" height="30" stroke="var(--sky)" />
+    <rect x="138" y="130" width="64" height="30" stroke="var(--sky)" />
+    <rect x="202" y="130" width="64" height="30" stroke="var(--human)" />
+    <rect x="266" y="130" width="64" height="30" stroke="var(--human)" />
+    <rect x="330" y="130" width="64" height="30" stroke="var(--human)" />
+    <rect x="394" y="130" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+    <rect x="458" y="130" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+    <rect x="522" y="130" width="64" height="30" stroke="var(--gold)" fill="var(--gold-soft)" />
+  </g>
+  <g fill="currentColor" fontSize="12" textAnchor="middle">
+    <text x="42" y="60">Central</text>
+    <text x="106" y="60">fiction</text>
+    <text x="170" y="60">3</text>
+    <text x="234" y="60">Campus</text>
+    <text x="298" y="60">poetry</text>
+    <text x="362" y="60">14</text>
+    <text x="426" y="60">Central</text>
+    <text x="490" y="60">comics</text>
+    <text x="554" y="60">9</text>
+    <text x="42" y="150">Central</text>
+    <text x="106" y="150">Campus</text>
+    <text x="170" y="150">Central</text>
+    <text x="234" y="150">fiction</text>
+    <text x="298" y="150">poetry</text>
+    <text x="362" y="150">comics</text>
+    <text x="426" y="150">3</text>
+    <text x="490" y="150">14</text>
+    <text x="554" y="150">9</text>
+  </g>
+  <g fill="currentColor" fontSize="11">
+    <text x="10" y="88">loan 1 · loan 2 · loan 3, each complete: good for reading or writing one whole loan</text>
+    <text x="10" y="178">branch · genre · days, each contiguous: good for scanning one attribute of every loan</text>
+  </g>
+</svg>
+
+</Figure>
+
+An analytical query such as "average days borrowed, by genre" touches two columns of every row. On a row layout it reads every byte, because the bytes it needs are interleaved with those it does not; on a column layout it reads two columns. Values in one column share a type and are often similar, so they also **compress** far better, and a processor can sweep one operation along them using its vector instructions and caches — see <LessonLink slug="analytical-databases">Analytical databases</LessonLink>, and Lumenary CS's [memory hierarchy](/en/cs/memory-hierarchy/) for why contiguous reads win.
+
+The costs are the mirror image: fetching or inserting *one whole record* touches every column, and updating a value inside a compressed column is awkward. So transactional databases store rows, analytical systems store columns, and columnar data is written in large batches and rarely modified in place.
+
+</Section>
+
+<Section id="formats" kind="human" title="Five file formats">
+
+| | CSV | JSON (lines) | Avro | Parquet | ORC |
+| --- | --- | --- | --- | --- | --- |
+| Layout | rows, text | rows, text | rows, binary | columns, binary | columns, binary |
+| Schema | none (a header line, perhaps) | none; each record self-describing | required, stored in the file header | required, stored in the footer | required, stored in the footer |
+| Types | everything is text | strings, numbers, booleans, null, nesting | rich, including nesting | rich, including nesting | rich, including nesting |
+| Compression | whole-file only | whole-file only | per block | per column chunk, plus encodings | per stream, plus encodings |
+| Typical use | exchange with people and spreadsheets | APIs, logs, semi-structured events | messages in streams; row-at-a-time pipelines | analytics at rest; data lakes and lakehouses | analytics in the Hive and Hadoop lineage |
+
+**CSV** is universal and readable, and has no types, so every reader guesses whether `03-04` is a date (and which), whether `007` is a number, what `NA` means. RFC 4180 describes a common form, but real files vary in delimiter (semicolons where the decimal separator is a comma), quoting and character encoding; spreadsheet software that turns gene names such as SEPT2 into dates affected the supplementary gene lists of about one in five genomics papers examined in a 2016 study. Use CSV at the edges, for people, and convert it at once to something typed.
+
+**JSON**, usually one object per line, is the natural format of web APIs and application events. It nests and needs no schema, so producers add fields freely — which is also its weakness, as the renamed field in <LessonLink slug="what-data-engineers-do">What data engineers do</LessonLink> showed. It repeats every field name in every record, parses slowly, and many parsers read numbers as 64-bit floats, which cannot hold every integer above $2^{53}$; large ids travel as strings.
+
+**Avro** (Apache, 2009) is a compact binary *row* format whose schema, written in JSON, travels in the file header or, for streaming messages, is referenced by id in a **schema registry**, so records carry no field names. Its defining feature is **schema resolution**: the library reconciles the writer's schema with the schema the reader expects, field by field, filling defaults. That makes it, with Protocol Buffers, a common choice for messages in Kafka and other streams, where producers and consumers upgrade at different times.
+
+**ORC** (Optimized Row Columnar) was created in 2013 within Apache Hive to speed up Hive on Hadoop: columnar, in **stripes** with lightweight indexes and statistics, and the basis of Hive's transactional tables. Hive, Spark and Trino read it, and it remains common on platforms that grew from Hadoop.
+
+**Parquet**, created in 2013 by engineers at Twitter and Cloudera on the ideas of Google's Dremel paper, is the de facto standard for analytical data at rest as of 2026: data lakes are mostly Parquet files, and the open table formats of <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink> mostly store their data in it. That role earns it the next two sections.
+
+</Section>
+
+<Section id="parquet" kind="computation" title="Inside a Parquet file">
+
+A Parquet file is organised in three nested levels, with the metadata at the end.
+
+<Figure caption="The layout of a Parquet file. Each row group holds one column chunk per column; each chunk is a sequence of pages. The footer, read first, holds the schema and the location and statistics of every chunk.">
+
+<svg viewBox="0 0 600 270" role="img" aria-label="A tall box representing a Parquet file. At the top the magic bytes PAR1. Then row group 0, containing column chunks for loan_date, branch and days, each drawn as a row of small page boxes, with the branch chunk starting with a dictionary page. Then row group 1, the same. Then the footer, listing the schema, row-group locations and column statistics min, max and null count, followed by the footer length and PAR1 again.">
+  <rect x="20" y="10" width="560" height="250" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <g fill="currentColor" fontSize="11" fontFamily="var(--font-mono)">
+    <text x="32" y="28">PAR1</text>
+    <text x="32" y="250">footer length · PAR1</text>
+  </g>
+  <g fill="none" strokeWidth="1.5">
+    <rect x="32" y="36" width="536" height="76" rx="4" stroke="var(--sky)" />
+    <rect x="32" y="120" width="536" height="76" rx="4" stroke="var(--sky)" />
+    <rect x="32" y="204" width="536" height="32" rx="4" stroke="var(--gold)" />
+  </g>
+  <g fill="currentColor" fontSize="12" fontWeight="600">
+    <text x="42" y="52">row group 0</text>
+    <text x="42" y="136">row group 1</text>
+    <text x="42" y="225">footer</text>
+  </g>
+  <g fill="currentColor" fontSize="11">
+    <text x="42" y="72">loan_date</text>
+    <text x="42" y="88">branch</text>
+    <text x="42" y="104">days</text>
+    <text x="42" y="156">loan_date</text>
+    <text x="42" y="172">branch</text>
+    <text x="42" y="188">days</text>
+    <text x="100" y="225">schema · row-group and column-chunk locations · statistics: min, max, null count</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <rect x="120" y="62" width="60" height="12" />
+    <rect x="182" y="62" width="60" height="12" />
+    <rect x="120" y="78" width="40" height="12" strokeDasharray="3 2" />
+    <rect x="162" y="78" width="60" height="12" />
+    <rect x="224" y="78" width="60" height="12" />
+    <rect x="120" y="94" width="60" height="12" />
+    <rect x="182" y="94" width="60" height="12" />
+    <rect x="244" y="94" width="60" height="12" />
+    <rect x="120" y="146" width="60" height="12" />
+    <rect x="182" y="146" width="60" height="12" />
+    <rect x="120" y="162" width="40" height="12" strokeDasharray="3 2" />
+    <rect x="162" y="162" width="60" height="12" />
+    <rect x="120" y="178" width="60" height="12" />
+    <rect x="182" y="178" width="60" height="12" />
+  </g>
+  <g fill="currentColor" fontSize="10">
+    <text x="320" y="72">pages: each encoded, then compressed</text>
+    <text x="320" y="88">dashed: the dictionary page</text>
+    <text x="320" y="104">one column chunk per column per row group</text>
+  </g>
+</svg>
+
+</Figure>
+
+- A **row group** is a horizontal slice of the table, commonly a few hundred megabytes; different readers can process different row groups in parallel.
+- Within a row group each column is one contiguous **column chunk**, so a reader needing three columns of fifty reads three chunks and skips the rest.
+- Each chunk is a sequence of **pages** (typically about 1 MB), the unit of encoding and compression; a dictionary-encoded chunk starts with a **dictionary page**.
+- The **footer** holds the schema and, for every column chunk, its position, sizes, encodings and **statistics**: minimum, maximum and null count. A reader fetches it first — from object storage, one small ranged request — and plans every other read from it. Writing it last lets a writer stream row groups out without knowing how many there will be.
+
+Inside each page, values pass through two stages. First an **encoding**, which exploits the structure of the values: **PLAIN** writes them one after another; **dictionary** encoding stores each distinct value once in the dictionary page and replaces values by small integer indices; those indices, and the definition levels described below, are written with a hybrid of **run-length encoding** (RLE — "the value 4, 3,000 times") and **bit-packing** (each index in just as many bits as the dictionary size needs); **DELTA_BINARY_PACKED** stores the differences between successive integers, bit-packed, which is ideal for sorted or sequential numbers. Then an optional general-purpose **compression codec** — Snappy and LZ4 (fast, moderate ratio), Zstandard (a good balance of speed and ratio, and increasingly popular), gzip (slower) — squeezes the encoded bytes.
+
+The block writes 100,000 synthetic loans in several formats and prints the sizes, then every column chunk of the smallest file.
+
+```python run
+import io
+import json
+import numpy as np
+import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
+
+# 100,000 synthetic library loans, in the order a loader appends them: by loan id, so by date.
+rng = np.random.default_rng(1)
+n = 100_000
+branches = np.array(["Central", "Riverside", "Campus", "Harbour Road", "Hillside", "Market Square"])
+genres = np.array(["fiction", "children", "science", "history", "comics", "poetry", "travel"])
+late = rng.random(n) < 0.1
+loans = pa.table({
+    "loan_id": np.arange(5_000_000, 5_000_000 + n),
+    "loan_date": pa.array(np.sort(rng.integers(20089, 20454, n)).astype("int32"), pa.date32()),
+    "branch": branches[rng.choice(6, n, p=[0.3, 0.25, 0.15, 0.1, 0.1, 0.1])],
+    "genre": genres[rng.integers(0, 7, n)],
+    "book_id": rng.integers(1, 40_000, n),
+    "days_borrowed": np.where(late, rng.integers(22, 60, n), rng.integers(3, 22, n)),
+    "late_fee_cents": np.where(late, 50 * rng.integers(1, 9, n), 0),
+})
+
+def parquet(**options):
+    buf = io.BytesIO()
+    pq.write_table(loans, buf, **options)
+    return buf
+
+codecs = [c for c in ["snappy", "gzip", "zstd"] if pa.Codec.is_available(c)]  # browser builds may lack some
+best = "zstd" if "zstd" in codecs else "none"
+others = [c for c in loans.column_names if c != "loan_id"]
+files = {
+    "CSV": io.BytesIO(),
+    "JSON lines": io.BytesIO("".join(json.dumps(r, default=str) + "\n" for r in loans.to_pylist()).encode()),
+    "Parquet: PLAIN encoding, no compression": parquet(use_dictionary=False, compression="none"),
+    "Parquet: dictionary + RLE, no compression": parquet(compression="none"),
+    **{f"Parquet: dictionary + RLE, {c}": parquet(compression=c) for c in codecs},
+    f"Parquet: + DELTA for loan_id, {best}": parquet(compression=best, use_dictionary=others,
+                                                     column_encoding={"loan_id": "DELTA_BINARY_PACKED"}),
+}
+pacsv.write_csv(loans, files["CSV"])
+csv_size = files["CSV"].getbuffer().nbytes
+for name, f in files.items():
+    size = f.getbuffer().nbytes
+    print(f"{name:42s} {size / 1e6:6.2f} MB  {size / csv_size:6.1%} of CSV")
+
+meta = pq.ParquetFile(f).metadata             # the last file written
+print(f"\nlast file: {meta.num_rows} rows, {meta.num_row_groups} row group, column chunks:")
+print(f"  {'column':15s} {'type':10s} {'encoded':>9s} {'compressed':>11s}  encodings")
+rg = meta.row_group(0)
+for i in range(rg.num_columns):
+    c = rg.column(i)
+    print(f"  {c.path_in_schema:15s} {c.physical_type:10s} {c.total_uncompressed_size / 1e3:7.1f} kB "
+          f"{c.total_compressed_size / 1e3:8.1f} kB  {', '.join(c.encodings)}")
+```
+
+Columnar layout alone is not the win: PLAIN Parquet (5.93 MB) is *larger* than the CSV (5.08 MB), since every integer takes 8 bytes and every string a 4-byte length, and JSON lines is nearly three times the CSV. The gains come from **encoding** (dictionary and RLE: a third of the CSV), then **compression** (Zstandard: 14.6%), then the right encoding per column (delta for the ids: 8.5%).
+
+<Narrator who="margaret">
+
+The column chunks profile the data. 100,000 consecutive loan ids take 2.0 kB with delta encoding (every difference is 1), against about 1 MB with the default dictionary, which stores all 100,000 ids *and* a 17-bit index per row. Branch and genre, with 6 and 7 distinct values, cost 3 bits a value, about 37.5 kB each. And `book_id`, nearly random, is over half the file: high-cardinality, high-entropy columns are where the bytes go.
+
+</Narrator>
+
+</Section>
+
+<Section id="statistics" kind="computation" title="Statistics, skipping and nesting">
+
+To answer "loans between 10 and 16 March", a reader can compare that range with each row group's minimum and maximum `loan_date` in the footer and read only the row groups that *could* contain matches. This is **predicate pushdown** — the filter is applied to metadata before any data is touched — and with **projection pushdown** (reading only the needed columns) it lets a narrow question read a tiny part of the bytes, provided the data is laid out to allow it. The block writes the same 100,000 loans twice, in 10 row groups: sorted by date, and shuffled.
+
+```python run
+import io
+from datetime import date
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+rng = np.random.default_rng(3)
+n = 100_000
+loans = pa.table({
+    "loan_date": pa.array(np.sort(rng.integers(20089, 20454, n)).astype("int32"), pa.date32()),  # 2025
+    "branch": rng.choice(["Central", "Riverside", "Campus", "Harbour Road"], n),
+    "book_id": rng.integers(1, 40_000, n),
+    "days_borrowed": rng.integers(3, 40, n),
+})
+files = {}
+for name, table in [("sorted by date", loans), ("shuffled", loans.take(rng.permutation(n)))]:
+    files[name] = io.BytesIO()
+    pq.write_table(table, files[name], row_group_size=10_000, compression="none")
+
+def scan(buf, lo, hi, columns):
+    """Read only the row groups whose loan_date [min, max] overlaps [lo, hi], and only `columns`."""
+    pf = pq.ParquetFile(buf)
+    meta, col = pf.metadata, pf.schema_arrow.get_field_index("loan_date")
+    stats = [meta.row_group(g).column(col).statistics for g in range(meta.num_row_groups)]
+    keep = [g for g, s in enumerate(stats) if s.max >= lo and s.min <= hi]
+    idx = [pf.schema_arrow.get_field_index(c) for c in columns]
+    nbytes = sum(meta.row_group(g).column(i).total_compressed_size for g in keep for i in idx)
+    t = pf.read_row_groups(keep, columns=columns)
+    return keep, nbytes, t.filter((pc.field("loan_date") >= lo) & (pc.field("loan_date") <= hi))
+
+meta = pq.ParquetFile(files["sorted by date"]).metadata
+print(f"{meta.num_rows} rows in {meta.num_row_groups} row groups; footer {meta.serialized_size} bytes")
+print("footer statistics for loan_date in the sorted file:")
+for g in range(3):
+    s = meta.row_group(g).column(0).statistics
+    print(f"  row group {g}: min {s.min}  max {s.max}  nulls {s.null_count}")
+whole = sum(meta.row_group(g).total_byte_size for g in range(meta.num_row_groups))
+
+lo, hi = date(2025, 3, 10), date(2025, 3, 16)
+for name, buf in files.items():
+    keep, nbytes, t = scan(buf, lo, hi, ["loan_date", "days_borrowed"])
+    print(f"\n{name}: row groups read {keep}; {nbytes / 1e3:.0f} kB read of {whole / 1e3:.0f} kB")
+    print(f"  {t.num_rows} loans from {lo} to {hi}, mean {pc.mean(t['days_borrowed']).as_py():.2f} days")
+
+# The library does the same skipping for you when you pass a filter:
+t = pq.read_table(files["shuffled"], filters=[("loan_date", ">=", lo), ("loan_date", "<=", hi)],
+                  use_threads=False)
+print(f"\npq.read_table with filters agrees: {t.num_rows} rows")
+```
+
+Both files give the same answer — 1,917 loans, a mean of 20.75 days — but the sorted file needs 2 of 10 row groups and 16 kB of 992 kB, while in the shuffled file every row group spans nearly the whole year and nothing can be skipped. pyarrow, DuckDB, Spark, Trino and the cloud warehouses prune like this automatically, and Parquet adds page-level indexes and optional Bloom filters for finer skipping. <LessonLink slug="analytical-databases">Analytical databases</LessonLink> turns this into a design method: partitioning and clustering tables so that common filters prune well.
+
+<Narrator who="gideon">
+
+Statistics can only *exclude* a row group: one whose [min, max] overlaps the query may still hold no matches, so the reader must still filter its rows. And they are an optimisation, not data to report: some older writers got string and floating-point statistics wrong (sort order, NaN), which is why readers check how statistics were computed before trusting them.
+
+</Narrator>
+
+#### Nested data, in outline
+
+Parquet stores nested and repeated data — a book with a *list* of keywords, an order with a list of items — as flat columns, using an idea from the Dremel paper. Each leaf field becomes a column of values plus two small integers per value. The **repetition level** says at which level of nesting the value repeats (0: a new record starts). The **definition level** says how many optional or repeated fields on the path are actually present, so empty lists and missing values cost no stored value. For a repeated string field `keywords`, the records `["sea", "maps"]`, `[]` and `["poems"]` become:
+
+| value | repetition level | definition level | meaning |
+| --- | --- | --- | --- |
+| sea | 0 | 1 | first record starts; a keyword is present |
+| maps | 1 | 1 | same record, the list continues |
+| (none) | 0 | 0 | second record starts; its list is empty |
+| poems | 0 | 1 | third record starts |
+
+The levels are tiny integers in long runs, which RLE stores almost for free, and the records can be rebuilt exactly from the columns. (Parquet's standard list encoding adds one more level so that a missing list, an empty list and a null element can all be told apart.)
+
+</Section>
+
+<Section id="arrow" kind="computation" title="Arrow: columns in memory">
+
+Parquet is a format for **storage**: encoded, compressed, decoded when read. Engines compute on a decoded in-memory form, and for decades every tool had its own — pandas, R, each database, each JVM engine — so moving a table between two tools meant converting it value by value, often costing more than the computation.
+
+**Apache Arrow**, started in 2016 by developers from many of those projects, specifies one **columnar memory format** for every language. An Arrow **array** is a column: a type, a length and a few **buffers**, contiguous memory aligned for vector instructions. A **validity bitmap** holds one bit per value (0 = null), so nulls need no sentinel values. Fixed-width types have one buffer of values; strings have an **offsets** buffer — value $i$ is bytes `offsets[i]` to `offsets[i+1]` — and one **data** buffer of all the bytes end to end. Equal-length arrays with a schema form a **record batch**; batches sharing a schema form a **table**.
+
+```python run
+import io
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# One Arrow string array: three buffers, exactly as any Arrow implementation lays them out.
+city = pa.array(["Nairobi", None, "Lima", "Kraków", "Osaka"])
+validity, offsets, data = city.buffers()
+print(f"{city.type}, length {len(city)}, nulls {city.null_count}")
+print("  validity bitmap:", [(validity.to_pybytes()[0] >> i) & 1 for i in range(len(city))])
+ends = np.frombuffer(offsets, dtype=np.int32)[: len(city) + 1]
+print("  offsets (int32):", ends.tolist())
+print("  data (UTF-8):   ", data.to_pybytes()[: ends[-1]])
+
+# A fixed-width column with no nulls: just one values buffer, which NumPy can view without copying.
+days = pa.array([3, 14, 9, 21, 7], type=pa.int32())
+view = days.to_numpy(zero_copy_only=True)
+print("\nint32 buffers:", [None if b is None else b.size for b in days.buffers()],
+      "| NumPy view shares the Arrow buffer:", view.ctypes.data == days.buffers()[1].address)
+
+# Columns of equal length form a record batch; batches with one schema form a table.
+batch = pa.RecordBatch.from_arrays([city, days], names=["city", "days"])
+print("\nschema:", batch.schema.to_string().replace("\n", "; "))
+
+# Arrow IPC file (Feather v2): the in-memory layout written as is, readable without decoding.
+sink = pa.BufferOutputStream()
+with pa.ipc.new_file(sink, batch.schema) as writer:
+    writer.write_batch(batch)
+ipc = sink.getvalue()
+back = pa.ipc.open_file(ipc).read_all()
+inner = back.column("days").chunk(0).buffers()[1]
+print(f"IPC file: {ipc.size} bytes; equal after reading: {back.equals(pa.Table.from_batches([batch]))};",
+      "column read in place:", ipc.address <= inner.address < ipc.address + ipc.size)
+
+# Parquet round trip: encoded and compressed for storage, decoded back into Arrow memory on read.
+pbuf = io.BytesIO()
+pq.write_table(pa.Table.from_batches([batch]), pbuf)
+again = pq.read_table(pbuf)
+print(f"Parquet file: {pbuf.getbuffer().nbytes} bytes; equal after reading: {again.equals(back)}")
+
+# At scale the trade-off shows: 100,000 rows of the same two columns.
+rng = np.random.default_rng(0)
+big = pa.table({"city": rng.choice(["Nairobi", "Lima", "Kraków", "Osaka"], 100_000),
+                "days": rng.integers(1, 43, 100_000).astype("int32")})
+sink = pa.BufferOutputStream()
+with pa.ipc.new_file(sink, big.schema) as writer:
+    writer.write_table(big)
+pbuf = io.BytesIO()
+pq.write_table(big, pbuf)
+print(f"\n100,000 rows: in memory {big.nbytes / 1e3:.0f} kB, Arrow IPC {sink.getvalue().size / 1e3:.0f} kB,"
+      f" Parquet {pbuf.getbuffer().nbytes / 1e3:.0f} kB")
+```
+
+The bitmap marks the second value null, which takes zero bytes of data; the offsets count bytes, not characters (Kraków is 7 bytes). The integer array, having no nulls, has no bitmap at all, and NumPy views its values buffer **without copying** a byte.
+
+Because the layout is specified to the bit, programs that speak Arrow can hand each other a table by passing pointers to buffers, in one process or through shared memory: **zero-copy interchange**. The **Arrow IPC** format writes the buffers nearly as they are in memory (an IPC file is also called a **Feather** version 2 file, optionally compressed with LZ4 or Zstandard), so reading it means pointing at the bytes — the "read in place" check — rather than decoding them. Parquet must decode on every read, and in return is an order of magnitude smaller: 101 kB against 1,376 kB for 100,000 rows.
+
+As of 2026 Arrow is the common in-memory currency of much of the ecosystem: pandas offers Arrow-backed column types (`pd.ArrowDtype`); Polars and Apache DataFusion are built on Arrow memory; DuckDB hands results to Python as Arrow without copying; Spark uses it between the JVM and Python; ADBC and Arrow Flight carry Arrow batches between databases and clients; and there are native implementations in C++, Java, Rust, Go, R, Julia and more. The two formats are complements: **Parquet on disk, Arrow in memory and on the wire**. <LessonLink slug="the-modern-data-stack">The modern data stack</LessonLink> returns to Arrow as the shared format that lets separate tools compose.
+
+</Section>
+
+<Section id="evolution" kind="definitions" title="Schema evolution">
+
+Schemas change, old data stays, and readers and writers upgrade at different times, so every change must be judged by who can still read what.
+
+<Definition term="Backward and forward compatibility">
+
+A schema change is **backward compatible** if readers using the *new* schema can read data written with the *old* one, and **forward compatible** if readers still using the *old* schema can read data written with the *new* one. A change that is both is **fully compatible**.
+
+</Definition>
+
+The usual rules, which Avro's resolution makes precise and schema registries enforce automatically:
+
+- **Adding a field with a default** is backward compatible (new readers fill the default into old records) and, in Avro, also forward compatible (old readers ignore the unknown field).
+- **Adding a required field with no default** is not backward compatible: new readers have nothing to put in it for old data.
+- **Removing a field** is backward compatible (new readers ignore it in old data) but forward compatible only if old readers have a default for it.
+- **Widening a type** (a 32-bit integer to a 64-bit one) is usually backward compatible; narrowing never is.
+- **Renaming** is the dangerous one: matching by *name* sees a rename as a removal plus an addition, and old data seems to lose the column. Avro needs an explicit **alias**; Protocol Buffers identifies fields by **number** on the wire; Iceberg gives every column a permanent **id**, so a rename is a metadata change.
+
+<Narrator who="gideon">
+
+"Backward compatible" protects you only if the *meaning* is unchanged. Changing a `price` column from euros to cents, or a timestamp from local time to UTC, passes every compatibility check a registry can run and breaks every report downstream. Semantic changes need a new field name, not just a passing schema check.
+
+</Narrator>
+
+Each Parquet file carries its own schema, so a folder written over three years may hold several versions. Readers can merge compatible ones, filling nulls for missing columns, but the folder records nothing about which change happened when, and renames are invisible: keeping that history is a main job of the table formats in <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink>.
+
+</Section>
+
+<Section id="practice" kind="human" title="The professional view">
+
+As of 2026 the formats are converging more than competing. At rest, Parquet is the analytical default nearly everywhere, usually managed by an open table format; ORC remains where Hive-era platforms do (Iceberg tables can hold Parquet, ORC or Avro files). In memory, Arrow is increasingly shared by engines, dataframe libraries and drivers. In motion, Avro and Protocol Buffers with a schema registry (the Confluent Schema Registry, Apicurio Registry, AWS Glue Schema Registry) are the common choices, and JSON remains everywhere at the edges.
+
+Competition is real at the margins. Parquet was designed for large sequential scans; fast random access to single rows, very wide machine-learning tables and decoding on GPUs have prompted newer formats such as [Lance](https://github.com/lancedb/lance) and Vortex, while the Parquet community adds encodings and page indexes. It is too early to say how much ground they will take; for most work, Parquet with sensible row groups and Zstandard is the sound default — with the grain declared, raw data kept, history kept deliberately, and no personal data that no stated purpose needs.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Parquet is a database."** It is a file format. It has no transactions, no updates in place, no indexes in the database sense, and no record of how a folder of files changed over time. Databases and table formats add those on top.
+
+</Misconception>
+
+<Misconception>
+
+**"CSV is simple, so it is safe."** Its simplicity is the absence of a type system. Leading zeros, dates, decimal commas, encodings and embedded newlines all depend on the reader's guesses, and the guesses differ between tools.
+
+</Misconception>
+
+<Misconception>
+
+**"Compression is the main reason Parquet is small."** In the measurement above, encoding did most of the work (5.93 MB to 1.70 MB) before any codec ran, and sorting the data so that runs form helps both. The general-purpose codec comes last.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

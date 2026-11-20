@@ -1,0 +1,567 @@
+---
+title: Infrastructure for AI in the cloud
+subtitle: Renting accelerators by the thousand — the instances, the networks that bind them, schedulers that start a job all at once or not at all, serving that scales on tokens, and what a token costs.
+minutes: 80
+objectives:
+  - Describe what an accelerator instance contains, and how the main accelerator families are offered by cloud providers as of 2026
+  - Explain scale-up and scale-out networks, rail-optimised fabrics and oversubscription, and estimate what network placement costs a training run
+  - Explain why distributed jobs need gang scheduling, simulate the deadlock it prevents, and implement the EASY backfilling rule
+  - Choose signals for autoscaling a model-serving deployment, and measure the effect of cold starts and utilisation targets
+  - Compare on-demand, spot, short-term reservations and long-term commitments for scarce accelerator capacity
+  - Compute the cost per million tokens of a deployment from its price, throughput and utilisation
+prerequisites: [virtualisation-and-containers, cloud-networking, kubernetes, observability-and-autoscaling, cost-and-finops]
+related: [math.applied.optimisation, math.prob.stochastic-processes]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Large-scale cluster management at Google with Borg"
+    author: Abhishek Verma, Luis Pedrosa, Madhukar Korupolu, David Oppenheimer, Eric Tune and John Wilkes
+    year: 2015
+    url: https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/
+    note: The cluster manager behind Kubernetes' ideas, including priorities, quotas and preemption.
+  - title: "MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs"
+    author: Ziheng Jiang et al. (ByteDance)
+    year: 2024
+    url: https://arxiv.org/abs/2402.15627
+    note: Networking, fault tolerance and diagnosis for a production training system.
+  - title: "The Llama 3 Herd of Models"
+    author: Llama Team, Meta
+    year: 2024
+    url: https://arxiv.org/abs/2407.21783
+    note: Section 3.3 describes the training clusters, their network and their failures.
+  - title: "TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning with Hardware Support for Embeddings"
+    author: Norman P. Jouppi et al.
+    year: 2023
+    url: https://arxiv.org/abs/2304.01433
+    note: How Google wires thousands of TPUs into reconfigurable slices.
+  - title: "DiLoCo: Distributed Low-Communication Training of Language Models"
+    author: Arthur Douillard et al.
+    year: 2023
+    url: https://arxiv.org/abs/2311.08105
+    note: Training across poorly connected sites by synchronising rarely.
+  - title: "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving"
+    author: Yinmin Zhong et al.
+    year: 2024
+    url: https://arxiv.org/abs/2401.09670
+  - title: "Splitwise: Efficient generative LLM inference using phase splitting"
+    author: Pratyush Patel et al.
+    year: 2023
+    url: https://arxiv.org/abs/2311.18677
+  - title: Kubernetes documentation — gang scheduling
+    url: https://kubernetes.io/docs/concepts/scheduling-eviction/gang-scheduling/
+    note: Upstream gang scheduling, alpha since Kubernetes 1.35 (December 2025).
+  - title: Kubernetes documentation — dynamic resource allocation
+    url: https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/
+  - title: Kueue
+    url: https://kueue.sigs.k8s.io/
+    note: Kubernetes job queueing, quotas and topology-aware admission.
+  - title: Volcano
+    url: https://volcano.sh/
+    note: A CNCF batch system for Kubernetes with gang scheduling.
+  - title: Slurm workload manager
+    url: https://slurm.schedmd.com/
+  - title: JobSet
+    url: https://github.com/kubernetes-sigs/jobset
+  - title: Gateway API Inference Extension
+    url: https://github.com/kubernetes-sigs/gateway-api-inference-extension
+    note: Model-aware routing for Kubernetes gateways.
+  - title: KServe
+    url: https://github.com/kserve/kserve
+  - title: llm-d
+    url: https://github.com/llm-d/llm-d
+  - title: NVIDIA Dynamo
+    url: https://github.com/ai-dynamo/dynamo
+  - title: Ray documentation
+    url: https://docs.ray.io/
+  - title: Ultra Ethernet Consortium
+    url: https://ultraethernet.org/
+    note: Published its 1.0 specification for Ethernet in AI and HPC clusters in June 2025.
+  - title: MLCommons (MLPerf benchmarks)
+    url: https://mlcommons.org/
+    note: Audited training and inference results across many systems and vendors.
+  - title: Amazon EC2 instance types
+    url: https://aws.amazon.com/ec2/instance-types/
+  - title: Azure virtual machine sizes
+    url: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/overview
+  - title: Google Cloud — GPU machine types
+    url: https://docs.cloud.google.com/compute/docs/gpus
+  - title: Google Cloud TPU documentation
+    url: https://docs.cloud.google.com/tpu/docs
+  - title: Alibaba Cloud — heterogeneous computing
+    url: https://www.alibabacloud.com/product/gpu
+  - title: Oracle Cloud Infrastructure — GPU compute
+    url: https://www.oracle.com/cloud/compute/gpu/
+  - title: Amazon EC2 Capacity Blocks for ML
+    url: https://aws.amazon.com/ec2/capacityblocks/
+  - title: Introducing Dynamic Workload Scheduler (Google Cloud)
+    url: https://cloud.google.com/blog/products/compute/introducing-dynamic-workload-scheduler
+  - title: Azure on-demand capacity reservation
+    url: https://learn.microsoft.com/en-us/azure/virtual-machines/capacity-reservation-overview
+---
+
+<Section id="motivation" kind="motivation" title="A cluster you rent by the hour">
+
+A research group in Seoul wants to adapt an open-weight language model to Korean legal documents. A start-up in Nairobi wants to serve a speech model to farmers' phones across East Africa. A university in São Paulo has a month of training on 256 GPUs. All of them will rent, not build — and soon discover that renting accelerators is not like renting the web servers of the earlier lessons.
+
+Four things are different. **The hardware is scarce and expensive**: a single 8-GPU server can cost more per hour than dozens of ordinary virtual machines, and the newest generation is often unavailable without a reservation. **The machines must work as one**: a training job on 256 GPUs is a single program that stops if any one of them stops, so it needs all of them at once, close together on a fast network. **Serving is measured in tokens**, not requests, and its load and its costs follow tokens. And **power and cooling** set the limits of where and how fast capacity can grow.
+
+The chips themselves, the ways of splitting a model across them, and the inner workings of a serving engine are taught in Lumenary CS: [accelerators and distributed training](/en/cs/accelerators-and-parallelism/) and [serving models](/en/cs/inference-at-scale/). How a data centre is supplied with tens or hundreds of megawatts is in Lumenary EE's [powering data centres](/en/ee/powering-data-centres/). This lesson is about the layer between: what you rent, how it is wired, how jobs are scheduled onto it, how serving scales, and what it all costs. It builds on <LessonLink slug="kubernetes">Kubernetes</LessonLink>, <LessonLink slug="observability-and-autoscaling">observability and autoscaling</LessonLink> and <LessonLink slug="cost-and-finops">cost and FinOps</LessonLink>.
+
+</Section>
+
+<Section id="instances" kind="definitions" title="What an accelerator instance is">
+
+<Definition term="Accelerator instance">
+
+A virtual machine or bare-metal server rented with one or more **accelerators** attached — GPUs or purpose-built chips for matrix arithmetic — together with the host CPUs, memory, local NVMe storage and network adapters needed to keep them fed. The largest instances expose a whole server of 8 accelerators; **rack-scale** offerings expose dozens of accelerators joined by one high-bandwidth fabric as a single unit of rental.
+
+</Definition>
+
+Look inside a typical training-class instance of 2024–26 and you find eight GPUs, each with 80 to almost 300 GB of high-bandwidth memory; a switch chip or mesh joining them at hundreds of gigabytes per second each (NVLink and NVSwitch in NVIDIA's designs, Infinity Fabric in AMD's); two host CPUs with a terabyte or two of RAM; several terabytes of local NVMe; and — the part most easily overlooked — around eight network adapters of 200 or 400 Gb/s, roughly one per GPU, for talking to other servers. Ordinary instances have one network adapter. The network is a large part of what you are paying for.
+
+What is on offer, as of late 2026, falls into a few families, each described by its provider's own documentation (see the references):
+
+- **NVIDIA GPUs** (the Hopper and Blackwell generations, with Rubin announced for 2026) are offered by every large provider — Amazon Web Services, Microsoft Azure, Google Cloud, Oracle, Alibaba Cloud and others — and by a wave of specialised GPU clouds. Rack-scale systems put 72 GPUs in one NVLink domain.
+- **AMD Instinct GPUs** (the MI300 and MI350 series, with a rack-scale MI400 series announced for 2026) are offered by several providers, including Azure and Oracle, and by specialised clouds.
+- **Providers' own chips.** Google rents **TPUs** in slices of a pod, from a few chips to thousands, joined by a dedicated inter-chip interconnect; Ironwood, the seventh generation, was announced in 2025. Amazon offers **Trainium** for training and inference and the older **Inferentia** for inference. Microsoft has its **Maia** accelerators, used mainly for its own services. In China, where export controls restrict the most advanced foreign chips, clouds increasingly offer domestic accelerators such as Huawei's **Ascend** series and chips designed by Alibaba's T-Head and by Baidu's Kunlunxin.
+
+Which to choose is an engineering question, not a loyalty one: what your software stack supports (CUDA is the most widely supported; ROCm, the JAX/XLA stack for TPUs and AWS's Neuron SDK each have their own coverage), what is actually available in the region and quantity you need, and the measured price per unit of *your* workload. Vendor peak-FLOP figures say little about that. Audited benchmarks such as [MLPerf](https://mlcommons.org/) are a better start, and a day of benchmarking your own model is better still.
+
+<Note>
+
+GPUs can also be shared. A GPU can be split into hardware-isolated slices (NVIDIA's multi-instance GPU), time-sliced between containers, or rented fractionally. That suits small models and notebooks; large training and serving use whole devices, usually whole servers.
+
+</Note>
+
+</Section>
+
+<Section id="networks" kind="intuition" title="The networks that make thousands of chips one machine">
+
+A training cluster has two networks inside it, and a third beside it.
+
+- The **scale-up** network joins the accelerators of one server or rack: NVLink domains of 8 or 72 GPUs, a TPU slice's inter-chip links, Trainium's NeuronLink. Bandwidths are hundreds of gigabytes per second per chip, so this is where the most communication-hungry parallelism (tensor and expert parallelism) lives. UALink, an open consortium specification first published in 2025, aims to offer the same kind of fabric across vendors.
+- The **scale-out** (or *back-end*) network joins servers: InfiniBand, Ethernet with RDMA (RoCE), or a provider's own transport, such as AWS's Elastic Fabric Adapter with its SRD protocol. Roughly 50 GB/s per GPU in 2024–26 designs — an order of magnitude below scale-up.
+- The **front-end** network, beside them, carries everything else: datasets and checkpoints from storage, logs, the internet. Keeping it separate stops a checkpoint write from slowing the gradients.
+
+<Figure caption="A rail-optimised training fabric (four of each server's eight GPUs drawn). Inside a server, GPUs share a scale-up switch. Each GPU also has its own network adapter, wired to the leaf switch for its 'rail', so GPU 2 of every server is one hop from GPU 2 of every other. Leaf switches connect through spine switches; if the leaves have less uplink capacity than downlink, the spine is oversubscribed.">
+
+<svg viewBox="0 0 640 330" role="img" aria-label="Diagram of two servers, each with four GPUs joined by an internal NVSwitch bar; each GPU connects upward to one of four rail leaf switches, GPU i of both servers to rail i; the four leaf switches each connect to two spine switches at the top." xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12" fill="none" stroke="currentColor">
+  <rect x="200" y="16" width="100" height="28" rx="4"/>
+  <rect x="380" y="16" width="100" height="28" rx="4"/>
+  <text x="250" y="35" text-anchor="middle" fill="currentColor" stroke="none">spine</text>
+  <text x="430" y="35" text-anchor="middle" fill="currentColor" stroke="none">spine</text>
+  <g stroke-opacity="0.5">
+    <line x1="110" y1="110" x2="250" y2="44"/><line x1="110" y1="110" x2="430" y2="44"/>
+    <line x1="250" y1="110" x2="250" y2="44"/><line x1="250" y1="110" x2="430" y2="44"/>
+    <line x1="390" y1="110" x2="250" y2="44"/><line x1="390" y1="110" x2="430" y2="44"/>
+    <line x1="530" y1="110" x2="250" y2="44"/><line x1="530" y1="110" x2="430" y2="44"/>
+  </g>
+  <rect x="60" y="110" width="100" height="28" rx="4"/>
+  <rect x="200" y="110" width="100" height="28" rx="4"/>
+  <rect x="340" y="110" width="100" height="28" rx="4"/>
+  <rect x="480" y="110" width="100" height="28" rx="4"/>
+  <text x="110" y="129" text-anchor="middle" fill="currentColor" stroke="none">rail 0 leaf</text>
+  <text x="250" y="129" text-anchor="middle" fill="currentColor" stroke="none">rail 1 leaf</text>
+  <text x="390" y="129" text-anchor="middle" fill="currentColor" stroke="none">rail 2 leaf</text>
+  <text x="530" y="129" text-anchor="middle" fill="currentColor" stroke="none">rail 3 leaf</text>
+  <line x1="75" y1="212" x2="110" y2="138"/><line x1="375" y1="212" x2="110" y2="138"/>
+  <line x1="140" y1="212" x2="250" y2="138"/><line x1="440" y1="212" x2="250" y2="138"/>
+  <line x1="205" y1="212" x2="390" y2="138"/><line x1="505" y1="212" x2="390" y2="138"/>
+  <line x1="270" y1="212" x2="530" y2="138"/><line x1="570" y1="212" x2="530" y2="138"/>
+  <rect x="30" y="196" width="280" height="110" rx="8" stroke-dasharray="5 3"/>
+  <rect x="330" y="196" width="280" height="110" rx="8" stroke-dasharray="5 3"/>
+  <text x="170" y="322" text-anchor="middle" fill="currentColor" stroke="none">server A</text>
+  <text x="470" y="322" text-anchor="middle" fill="currentColor" stroke="none">server B</text>
+  <g>
+    <rect x="50" y="212" width="50" height="34" rx="3"/><rect x="115" y="212" width="50" height="34" rx="3"/>
+    <rect x="180" y="212" width="50" height="34" rx="3"/><rect x="245" y="212" width="50" height="34" rx="3"/>
+    <rect x="350" y="212" width="50" height="34" rx="3"/><rect x="415" y="212" width="50" height="34" rx="3"/>
+    <rect x="480" y="212" width="50" height="34" rx="3"/><rect x="545" y="212" width="50" height="34" rx="3"/>
+  </g>
+  <g fill="currentColor" stroke="none" text-anchor="middle" font-size="11">
+    <text x="75" y="233">GPU 0</text><text x="140" y="233">GPU 1</text><text x="205" y="233">GPU 2</text><text x="270" y="233">GPU 3</text>
+    <text x="375" y="233">GPU 0</text><text x="440" y="233">GPU 1</text><text x="505" y="233">GPU 2</text><text x="570" y="233">GPU 3</text>
+  </g>
+  <line x1="75" y1="246" x2="75" y2="268"/><line x1="140" y1="246" x2="140" y2="268"/><line x1="205" y1="246" x2="205" y2="268"/><line x1="270" y1="246" x2="270" y2="268"/>
+  <line x1="375" y1="246" x2="375" y2="268"/><line x1="440" y1="246" x2="440" y2="268"/><line x1="505" y1="246" x2="505" y2="268"/><line x1="570" y1="246" x2="570" y2="268"/>
+  <rect x="50" y="268" width="245" height="22" rx="3"/>
+  <rect x="350" y="268" width="245" height="22" rx="3"/>
+  <text x="172" y="283" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">scale-up switch (NVLink / NVSwitch)</text>
+  <text x="472" y="283" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">scale-up switch (NVLink / NVSwitch)</text>
+</svg>
+
+</Figure>
+
+Large fabrics are built as **Clos** or **fat-tree** networks of leaf and spine switches, like the networks of ordinary cloud data centres but for a very different traffic pattern. Two design choices matter most to you as a tenant.
+
+**Rails.** In a *rail-optimised* design, GPU $i$ of every server plugs into leaf switch $i$. The libraries that implement collectives, such as NCCL, exploit this: they first combine data among the eight GPUs of a server over the fast scale-up switch, so that each GPU is left responsible for one-eighth of it, then run eight independent rings or trees across servers, one per rail, each staying within its own leaf switch where possible.
+
+**Oversubscription.** A leaf switch with 32 ports down to GPUs and 16 up to the spine is *2:1 oversubscribed*: if every GPU sends across the spine at once, each gets half its bandwidth. Training traffic does exactly that — every GPU communicating at the same moment, in lockstep — so AI back-end networks are built non-blocking (1:1) wherever possible, and a job placed across several such blocks pays for any oversubscription between them. That is why providers offer **placement groups**, **compact placement policies** or *topology blocks*, and why schedulers increasingly read topology labels.
+
+The block below estimates what this means for one data-parallel training step: the gradients of an 8-billion-parameter model, all-reduced across 32 servers. It uses the *alpha-beta* cost model: each message costs a fixed latency $\alpha$ plus its size divided by the bandwidth. The ring algorithm itself is derived in [accelerators and distributed training](/en/cs/accelerators-and-parallelism/).
+
+```python run
+# How much does the network cost a training run? A data-parallel step: compute, then all-reduce the gradients.
+# Alpha-beta model: each step of a ring costs a latency (alpha) plus bytes / bandwidth. Figures are illustrative.
+GB = 1e9
+params = 8e9                         # an 8-billion-parameter model
+grad_bytes = 2 * params              # BF16 gradients: 16 GB
+nodes, g = 32, 8                     # 32 servers of 8 GPUs = 256 GPUs
+nvlink = 450 * GB                    # per GPU, each direction, inside a server
+nic = 50 * GB                        # per GPU: one 400 Gb/s network adapter per GPU
+
+def ring(n, size, bw, alpha):
+    """Ring all-reduce of `size` bytes over n members: 2(n-1) steps, each moving size/n."""
+    return 0.0 if n == 1 else 2 * (n - 1) * (alpha + size / n / bw)
+
+def hierarchical(size, inter_bw, inter_alpha):
+    """Reduce inside each server over NVLink, then one ring per rail across servers, then share inside."""
+    return ring(g, size, nvlink, 5e-6) + ring(nodes, size / g, inter_bw, inter_alpha)
+
+# Compute per step: 6 x params x tokens FLOPs, at 45% of an H100-class GPU's dense BF16 peak.
+tokens_per_step = 4e6
+compute = 6 * params * tokens_per_step / (nodes * g * 989e12 * 0.45)
+
+placements = {
+    "one non-blocking fabric":      hierarchical(grad_bytes, nic, 15e-6),
+    "spine oversubscribed 2:1":     hierarchical(grad_bytes, nic / 2, 15e-6),
+    "spine oversubscribed 4:1":     hierarchical(grad_bytes, nic / 4, 15e-6),
+    "one ring through all 256":     ring(nodes * g, grad_bytes, nic, 15e-6),
+    "two regions 1,000 km apart":   ring(g, grad_bytes, nvlink, 5e-6)
+                                    + ring(nodes, grad_bytes / g, 100 * GB / 16, 5e-3),
+}
+
+price = 3.00                         # USD per GPU-hour: an example 2026 on-demand price, not a quote
+base_cost = nodes * g * 30 * 24 * price
+print(f"compute per step: {compute:.2f} s   (256 GPUs, {tokens_per_step / 1e6:.0f}M tokens per step)\n")
+print(f"{'placement':28s} {'all-reduce':>10s} {'slowdown':>9s} {'extra cost of a 30-day run':>27s}")
+for name, comm in placements.items():
+    slow = comm / compute                     # if none of the communication overlaps computation
+    print(f"{name:28s} {comm * 1000:7.0f} ms {slow:9.1%}       USD {base_cost * slow:12,.0f}")
+```
+
+Read the rows as upper bounds — real frameworks overlap much of the gradient exchange with the backward pass — but the ranking is robust. On one non-blocking fabric the exchange takes 141 ms against 1.69 s of compute. A 4:1 oversubscribed spine makes it 373 ms; on a month-long run that difference is worth more than USD 75,000 of idle accelerators at the example price. A single ring threaded through all 256 GPUs is slow for a less obvious reason: it crosses each server boundary only once, so it uses one of the server's eight network adapters and leaves seven idle — which is why collective libraries build one ring or tree per rail. And spreading one job across two regions, with 800 Gb/s between them and 5 ms of one-way latency, makes the exchange take more than half as long as the computation itself.
+
+<Narrator who="margaret">
+
+Those numbers move a lot with the parallelism. Data parallelism exchanges gradients once per step and can hide them behind computation; tensor parallelism exchanges activations inside every layer, forward and backward, which is why it is kept within one scale-up domain. Before blaming the network, measure the exposed communication time in a profiler: 10% of exposed communication on 256 GPUs is the cost of about 25 GPUs doing nothing; before buying a bigger network, check whether a different split of the model would need less of it.
+
+</Narrator>
+
+Training across sites is not impossible — Google's [Gemini report](https://arxiv.org/abs/2312.11805) describes training across multiple data centres, and methods such as [DiLoCo](https://arxiv.org/abs/2311.08105) synchronise rarely so that slow links matter less — but it is a deliberate design, not something a scheduler should stumble into. Production systems such as ByteDance's [MegaScale](https://arxiv.org/abs/2402.15627) and the clusters in Meta's [Llama 3 report](https://arxiv.org/abs/2407.21783) give a candid picture of what running such fabrics involves. On the standards side, the [Ultra Ethernet Consortium](https://ultraethernet.org/) published its 1.0 specification in June 2025, an attempt to give Ethernet the transport features that AI and HPC clusters need.
+
+</Section>
+
+<Section id="scheduling" kind="computation" title="Scheduling a job that needs everything at once">
+
+A web service with 40 replicas is happy to start with 30 and get the rest later. A training job on 64 GPUs is not. Its processes meet at a barrier when they start, set up their collective communication, and only then begin; until the last one arrives, the others sit holding their GPUs and doing nothing. Kubernetes' default scheduler places **pods one at a time** (<LessonLink slug="kubernetes">Kubernetes</LessonLink>), which is exactly wrong for such a job.
+
+<Definition term="Gang scheduling">
+
+A scheduling policy in which all the tasks of a job (its **gang**) are started together or not at all: resources are committed only when every task can be placed. The idea, also called **coscheduling**, comes from parallel computers of the early 1980s (John Ousterhout's 1982 work on scheduling concurrent systems) and has been standard in supercomputer batch systems ever since.
+
+</Definition>
+
+Without it, two jobs can each grab half of a cluster and wait forever for the other half. Gang scheduling removes that deadlock but creates a new inefficiency: if the job at the head of the queue needs 48 GPUs and only 40 are free, strict first-in-first-out leaves 40 GPUs idle until enough others finish.
+
+<Definition term="Backfilling (EASY)">
+
+A rule that lets a later, smaller job jump ahead of a blocked job without delaying it. When the job at the head of the queue cannot start, the scheduler computes its **shadow time** — the earliest moment enough resources will be free, from the running jobs' declared time limits — and reserves resources for it then. A later job may start now if it fits in the free resources and **either** finishes before the shadow time **or** uses only resources the head job will not need at the shadow time. This version, from the EASY scheduler at Argonne National Laboratory in the mid-1990s, guarantees the head job is never delayed.
+
+</Definition>
+
+The simulation runs a small cluster of 8 servers (64 GPUs) and 24 jobs, each needing between one and eight whole servers, under three policies.
+
+```python run
+import numpy as np
+
+NODES = 8                                  # a small cluster: 8 servers of 8 GPUs; one pod = one whole server
+rng = np.random.default_rng(3)
+jobs = []                                  # (name, arrival hour, servers needed, hours to run)
+for j in range(24):
+    jobs.append((f"J{j:02d}", int(rng.integers(0, 30)), int(rng.choice([1, 2, 2, 4, 4, 6, 8])), int(rng.integers(2, 10))))
+jobs.sort(key=lambda job: job[1])
+
+def simulate(policy, horizon=400):
+    held = {}                              # job -> servers bound to it (running, or waiting at its barrier)
+    started, finished = {}, {}
+    for t in range(horizon):
+        for name, arr, need, dur in jobs:  # jobs that finish now release their servers
+            if name in started and started[name] + dur == t:
+                finished[name] = t
+                held.pop(name)
+        free = NODES - sum(held.values())
+        waiting = [jb for jb in jobs if jb[1] <= t and jb[0] not in started]
+        if policy == "pod-by-pod":
+            # Each pod is placed on its own; pending jobs take turns, one pod each, while servers last.
+            progress = True
+            while free > 0 and progress:
+                progress = False
+                for name, arr, need, dur in waiting:
+                    if free > 0 and held.get(name, 0) < need:
+                        held[name] = held.get(name, 0) + 1
+                        free -= 1
+                        progress = True
+            for name, arr, need, dur in waiting:
+                if held.get(name, 0) == need:
+                    started[name] = t      # all pods present: the job passes its start-up barrier
+        else:
+            # Gang scheduling: a job gets all its servers at once or none.
+            for i, (name, arr, need, dur) in enumerate(waiting):
+                if need <= free:
+                    held[name], started[name] = need, t
+                    free -= need
+                elif policy == "gang, FIFO":
+                    break                  # strict order: nobody may overtake the job at the head
+                else:
+                    # EASY backfill: when can the head job surely start (its shadow time)?
+                    ends = sorted((started[n] + d, k) for n, a, k, d in jobs if n in started and n not in finished)
+                    avail, shadow = free, t
+                    for end, servers in ends:
+                        avail += servers
+                        if avail >= need:
+                            shadow = end
+                            break
+                    spare = avail - need   # servers still free at the shadow time once the head starts
+                    for name2, arr2, need2, dur2 in waiting[i + 1:]:
+                        if name2 in started or need2 > free:
+                            continue
+                        if t + dur2 <= shadow or need2 <= spare:
+                            held[name2], started[name2] = need2, t
+                            free -= need2
+                            if t + dur2 > shadow:
+                                spare -= need2
+                    break
+        busy = sum(held[n] for n in held if n in started)
+        if len(finished) == len(jobs):
+            break
+        if busy == 0 and free == 0:
+            return f"DEADLOCK at hour {t}: all {NODES * 8} GPUs held by {len(held)} half-started jobs, none computing"
+    makespan = max(finished.values())
+    waits = [started[n] - a for n, a, need, d in jobs]
+    used = sum(need * d for n, a, need, d in jobs)
+    return (f"finished at hour {makespan:3d}   utilisation {used / (NODES * makespan):5.1%}   "
+            f"mean wait {np.mean(waits):5.1f} h   longest wait {max(waits):3d} h")
+
+print("first jobs:", ", ".join(f"{n} ({need}x8 GPUs, {d} h)" for n, a, need, d in jobs[:4]), "...")
+for policy in ["pod-by-pod", "gang, FIFO", "gang + backfill"]:
+    print(f"{policy:16s} {simulate(policy)}")
+```
+
+Placing pods independently deadlocks at hour 7: an eight-server job has seven of its servers, a two-server job has the eighth, each waits at its barrier for a server the other holds, and no GPU computes again until a human or a timeout intervenes. Gang scheduling with strict FIFO finishes everything, at 78.8% utilisation; adding EASY backfilling raises that to 90.7%, finishes 13 hours sooner and cuts the mean wait by almost eleven hours, without delaying any job at the head of the queue. On a cluster that costs thousands of dollars an hour, those twelve points of utilisation are the scheduler's whole reason to exist.
+
+<Narrator who="chloe">
+
+The idea underneath is the one behind database transactions and the dining philosophers: deadlock needs processes that *hold* some resources while *waiting* for others. Gang scheduling breaks it by making allocation atomic — all or nothing — just as acquiring every lock at once does. Backfilling then recovers the efficiency that atomicity costs, by using what users tell the scheduler about the future: their time limits.
+
+</Narrator>
+
+### The tools, side by side
+
+- **Slurm**, the most widely used batch scheduler on supercomputers, allocates whole gangs by design, with backfilling, fair-share and topology-aware placement; the large providers each offer tooling to deploy it on their instances.
+- **Kubernetes add-ons.** [Kueue](https://kueue.sigs.k8s.io/) queues jobs and admits a whole job only when its team's quota covers every pod, optionally within one topology block; [Volcano](https://volcano.sh/) replaces the scheduler with one that does gang scheduling; [JobSet](https://github.com/kubernetes-sigs/jobset) describes multi-part jobs such as a leader with workers.
+- **Upstream Kubernetes** added a Workload API and [gang scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/gang-scheduling/) as alpha features, off by default, in version 1.35 (December 2025) and revised them in 1.36 (2026); [dynamic resource allocation](https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/), a richer way to request devices than a GPU count, became stable in 1.34.
+- **Ray** reserves groups of resources together through *placement groups*.
+
+Here is how a team asks for a 4-server gang under Slurm, and under Kubernetes with Kueue (not run here; the topology label is a placeholder for the one your provider sets on its nodes):
+
+```bash
+#!/bin/bash
+# Not run here: a Slurm batch script. Slurm starts it only when all 4 servers are allocated.
+#SBATCH --job-name=finetune-ko-legal
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-node=8
+#SBATCH --time=12:00:00          # the time limit is what backfilling relies on
+srun python train.py --config ko-legal.yaml
+```
+
+```yaml
+# Not run here: a Kubernetes Job admitted by Kueue as a whole, from the team's queue.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: finetune-ko-legal-
+  namespace: research
+  labels:
+    kueue.x-k8s.io/queue-name: research-gpus
+spec:
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-required-topology: "example.com/topology-block"
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: registry.example.com/trainer:2026.11
+        command: ["python", "train.py", "--config", "ko-legal.yaml"]
+        resources:
+          limits:
+            nvidia.com/gpu: 8
+```
+
+</Section>
+
+<Section id="serving" kind="computation" title="Serving at scale: autoscaling on tokens">
+
+Inside one replica, a serving engine batches requests, manages the KV cache and streams tokens ([serving models](/en/cs/inference-at-scale/) shows how). The cloud problem is everything around the replicas: how many to run, where, and how to route requests among them.
+
+**Routing.** Round-robin works badly for language models: requests differ in cost by orders of magnitude, and a replica that already holds a conversation's prefix in its KV cache answers it far more cheaply. Model-aware gateways route on queue length, KV-cache occupancy and prefix affinity; examples include the Kubernetes [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension), and serving stacks such as [KServe](https://github.com/kserve/kserve), [llm-d](https://github.com/llm-d/llm-d), [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) and Ray Serve, several of which also run **disaggregated** pools for the prefill and decode phases ([DistServe](https://arxiv.org/abs/2401.09670), [Splitwise](https://arxiv.org/abs/2311.18677)).
+
+**Scaling signals.** The CPU utilisation that drives an ordinary autoscaler (<LessonLink slug="observability-and-autoscaling">observability and autoscaling</LessonLink>) says nothing here. What tracks load is **tokens**: tokens per second generated, requests and tokens waiting in the queue, the fraction of KV-cache memory in use, and the latency targets themselves — time to first token and time per output token.
+
+**Cold starts.** A new replica must get a machine, start a container image that is often over 10 GB, load the weights — 140 GB for a 70-billion-parameter model in BF16 — and warm up the engine. From object storage at 1 GB/s the weights alone take over two minutes; from a cold start with no cached image, ten minutes is not unusual. Teams shorten this with weights cached on local NVMe, parallel streaming from object storage, pre-pulled images, warm standby replicas and, increasingly, snapshots of an initialised process.
+
+<Narrator who="gideon">
+
+Beware the GPU "utilisation" figure that monitoring tools show by default. It reports the fraction of time *some* kernel was running on the GPU, not how much of the chip was busy, so a memory-bound decode loop serving a handful of users can show close to 100%. It is a fine alarm for a stalled GPU and a poor signal for scaling; use queue depth, KV-cache occupancy and latency instead.
+
+</Narrator>
+
+The simulation serves one synthetic day of traffic for a chat model, minute by minute, including a 90-minute spike in the afternoon. Each replica is an 8-GPU server that sustains 6,000 output tokens per second within its latency target (an illustrative figure for a mid-sized model). The autoscaler asks for enough replicas to run at a target fraction of capacity; new replicas serve only after a cold start, and idle ones are released only after 15 quiet minutes.
+
+```python run
+import math
+import numpy as np
+
+# One synthetic day of demand for a chat model, in output tokens per second, minute by minute:
+# a daily cycle, noise, and a spike at 14:00 when a news story sends users to the app.
+minutes = np.arange(24 * 60)
+rng = np.random.default_rng(7)
+demand = 40_000 + 30_000 * np.sin((minutes / 60 - 9) / 24 * 2 * np.pi)       # peak mid-afternoon
+demand *= rng.normal(1.0, 0.04, minutes.size)
+demand[14 * 60:14 * 60 + 90] *= 1.6                                           # a 90-minute spike
+
+CAPACITY = 6_000         # output tokens/s one replica (an 8-GPU server) sustains within its latency target
+PRICE = 8 * 3.00         # USD per replica-hour: 8 GPUs at an example USD 3.00 per GPU-hour
+
+def run(target, cold_start, scale_down_after=15):
+    """Each minute, ask for enough replicas to run at `target` of capacity. New replicas serve only after
+    `cold_start` minutes; surplus ones are removed after a quiet spell."""
+    ready, booting, quiet = 4, [], 0          # replicas serving; start times of replicas booting
+    replica_minutes, short_minutes, unserved = 0, 0, 0.0
+    for m in minutes:
+        ready += sum(1 for s in booting if s + cold_start == m)
+        booting = [s for s in booting if s + cold_start > m]
+        want = math.ceil(demand[m] / (CAPACITY * target))
+        if want > ready + len(booting):
+            booting += [m] * (want - ready - len(booting))
+            quiet = 0
+        elif want < ready:
+            quiet += 1
+            if quiet >= scale_down_after:     # stabilisation window: don't remove capacity on a blip
+                ready, quiet = max(want, 1), 0
+        replica_minutes += ready + len(booting)   # booting replicas are billed too
+        served = min(demand[m], ready * CAPACITY)
+        if served < demand[m]:
+            short_minutes += 1
+            unserved += (demand[m] - served) * 60
+    tokens = demand.sum() * 60 - unserved
+    cost = replica_minutes / 60 * PRICE
+    return replica_minutes / 60, short_minutes, unserved / (demand.sum() * 60), cost / tokens * 1e6
+
+peak = math.ceil(demand.max() / CAPACITY)
+static_cost = peak * 24 * PRICE / (demand.sum() * 60) * 1e6
+print(f"tokens in the day: {demand.sum() * 60 / 1e9:.2f} billion; the peak needs {peak} replicas\n")
+print(f"{'policy':40s} {'replica-h':>9s} {'short min':>9s} {'unserved':>9s} {'USD / M tokens':>15s}")
+print(f"{'static, sized for the peak':40s} {peak * 24:9d} {0:9d} {0:9.2%} {static_cost:15.3f}")
+for target, cold in [(0.7, 10), (0.9, 10), (0.7, 2), (0.9, 2)]:
+    hours, short, lost, usd = run(target, cold)
+    print(f"{f'autoscale: target {target:.0%}, cold start {cold:2d} min':40s} {hours:9.0f} {short:9d} {lost:9.2%} {usd:15.3f}")
+```
+
+Provisioning for the peak all day costs USD 3.29 per million output tokens at these example prices; autoscaling at a 70% target cuts that to about USD 1.78, and at 90% to about USD 1.41, because the fleet shrinks in the night trough. The price is paid in the spike: with a ten-minute cold start the fleet is short of capacity for ten minutes, and at the 90% target 0.41% of the day's tokens wait beyond the latency target (in a real system they queue, and users see slow responses). Cutting the cold start to two minutes removes most of that harm at almost no cost — usually a better investment than a lower target. A busy service keeps a floor of warm replicas; a rarely used model may scale to zero and accept a slow first request.
+
+The night trough has a second use. Many model APIs sell **batch** processing — results within hours rather than seconds — at a large discount, which lets the provider fill the troughs of its daily curve with work that can wait.
+
+</Section>
+
+<Section id="capacity" kind="human" title="Capacity: scarcity, reservations and spot">
+
+Since 2023 the newest accelerators have been, at times, simply unavailable on demand in the quantities teams want. Prices for older generations fell steeply in 2024–25 as supply caught up, but each new generation has repeated the pattern, and a request for hundreds of GPUs in one region, on one fabric, at short notice still often fails. Providers ration with quotas and sell certainty in several forms:
+
+| Option | What you get | Fits |
+| --- | --- | --- |
+| On demand | Pay by the second or hour, if capacity exists; quotas apply | Experiments, small serving fleets |
+| Spot or preemptible | Deep discounts; the provider can reclaim the machine with seconds to minutes of warning | Checkpointed training, batch inference, evaluation |
+| Short-term reservation | A cluster for days or weeks, booked ahead or queued until capacity frees (e.g. AWS [Capacity Blocks for ML](https://aws.amazon.com/ec2/capacityblocks/), Google Cloud's [Dynamic Workload Scheduler](https://cloud.google.com/blog/products/compute/introducing-dynamic-workload-scheduler), Azure [capacity reservations](https://learn.microsoft.com/en-us/azure/virtual-machines/capacity-reservation-overview)) | A training run with a deadline |
+| Commitment of one to three years | The lowest hourly price, paid whether used or not | The steady base of a serving fleet; labs with continuous training |
+
+The arithmetic of commitment is the break-even rule from <LessonLink slug="cost-and-finops">cost and FinOps</LessonLink>: a commitment at a fraction $c$ of the on-demand price pays off for capacity that would be busy more than a fraction $c$ of the time. The serving simulation above is a typical shape: a base of replicas busy around the clock (commit), a daily swell (on demand), and spikes (on demand, plus whatever the cold start allows).
+
+<Example title="Spot for a fine-tuning run">
+
+A fine-tuning run needs 400 GPU-hours. On demand, at an example USD 3.00 per GPU-hour, that is USD 1,200. On spot at USD 1.20, suppose the run is interrupted on average once every 10 hours and each interruption loses 20 minutes of work since the last checkpoint plus 10 minutes to restart: about 5% extra time, so 420 GPU-hours, USD 504. The saving is real only because the job checkpoints often and restarts automatically. Without checkpoints, a run longer than the typical time between interruptions might never finish at all.
+
+</Example>
+
+Capacity is ultimately limited by power. New AI data-centre campuses are measured in hundreds of megawatts, racks of rack-scale GPU systems draw over 100 kW each and need liquid cooling, and in several regions the wait for a grid connection now sets the pace of construction. Lumenary EE's [powering data centres](/en/ee/powering-data-centres/) explains why, and the <LessonLink slug="sustainable-and-confidential-cloud">sustainable cloud</LessonLink> lesson counts the energy and carbon.
+
+</Section>
+
+<Section id="cost-per-token" kind="examples" title="What a token costs">
+
+Everything in this lesson ends in one number. For a deployment that rents $G$ accelerators at price $p$ per accelerator-hour and generates $r$ tokens per second when busy, at average utilisation $u$ (the fraction of paid time the capacity is doing useful work),
+
+$$
+\text{cost per million tokens} = \frac{G \, p}{3600 \, r \, u} \times 10^6 .
+$$
+
+<Example title="One server, three ways">
+
+An 8-GPU server at an example USD 3.00 per GPU-hour costs USD 24 an hour. At 6,000 tokens per second it could make 21.6 million tokens an hour, so at full utilisation the hardware costs about USD 1.11 per million tokens. At 70% average utilisation it is USD 1.59; at the 34% of the simulation's fleet sized for its peak, USD 3.29. A one-year commitment at 60% of the on-demand price brings the full-utilisation figure to USD 0.67 — but only for capacity that really is used.
+
+</Example>
+
+The formula hides the levers that move $r$: batch size, quantisation, speculative decoding and prefix caching, all from [serving models](/en/cs/inference-at-scale/), and the routing and disaggregation above. Real prices also cover input tokens (cheaper, because prefill is compute-efficient), networking, storage, redundancy across zones, staff and margin. The discipline is the same as for any cloud cost: measure tokens served per accelerator-hour as a first-class metric, alongside latency.
+
+</Section>
+
+<Section id="practice" kind="human" title="The professional view">
+
+Teams that run AI infrastructure well tend to share a few habits.
+
+- **Benchmark before committing.** Measure tokens per dollar, or time per training step, for your own model on each candidate instance type, including accelerators from different vendors; peak figures rarely predict it.
+- **Treat topology as a resource.** Ask for placement groups or topology blocks, and check with a short communication benchmark that the job got the fabric it asked for.
+- **Make jobs interruptible.** Frequent asynchronous checkpoints and automatic restarts turn spot capacity and hardware failures from disasters into delays.
+- **Queue, don't hoard.** A shared queue with quotas and backfilling gets far more out of a fixed reservation than teams holding machines "just in case".
+- **Plan capacity like a supply chain**: reservations for the base, on demand and spot for the rest, and more than one region — often more than one accelerator family — so that one shortage does not stop the work.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A GPU instance is just a VM with a GPU."** For training, the network adapters and the fabric they connect to matter as much as the GPUs; the same eight GPUs on an oversubscribed or cross-zone network can be a fifth slower or worse.
+
+</Misconception>
+
+<Misconception>
+
+**"Kubernetes will schedule my distributed training job."** The default scheduler places pods independently, which can leave half-started jobs holding GPUs indefinitely. Distributed jobs need gang semantics, from Slurm, Kueue, Volcano or upstream Kubernetes' newer gang-scheduling features.
+
+</Misconception>
+
+<Misconception>
+
+**"Higher GPU utilisation always means a cheaper service."** Pushing the autoscaling target from 70% to 90% saved about a fifth of the cost in the simulation, but more than doubled the tokens that missed their latency target in the spike. Cost per token and latency must be read together.
+
+</Misconception>
+
+<Misconception>
+
+**"The fastest chip gives the cheapest tokens."** What matters is tokens per dollar on your model with your software, and availability where you need it. A previous-generation accelerator that is plentiful and cheap often wins.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

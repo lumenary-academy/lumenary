@@ -57,6 +57,10 @@ for part in source.split(SEPARATOR):
 RUN_BLOCK = re.compile(r"^```python[ \t]+run[ \t]*\n(.*?)^```\s*$", re.M | re.S)
 CHECK_BLOCK = re.compile(r"^```([\w#+-]+)[ \t]+check[ \t]*\n(.*?)^```\s*$", re.M | re.S)
 
+# Lessons run in parallel (--jobs, one per CPU by default); without a cap, each NumPy/SciPy process
+# would also start one BLAS thread per CPU, and on a busy machine blocks that take a second alone
+# time out. The learner's browser runs them single-threaded too.
+SINGLE_THREADED = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")}
 TOOLCHAINS = pathlib.Path(os.environ.get("LUMENARY_TOOLCHAINS", pathlib.Path.home() / ".cache" / "lumenary-toolchains"))
 T = str(TOOLCHAINS)
 TSC = ROOT / "node_modules" / "typescript" / "bin" / "tsc"
@@ -218,7 +222,7 @@ def run(source, timeout):
             proc = subprocess.run(
                 [sys.executable, "-I", "-X", "utf8", "-c", RUNNER],
                 input=source, text=True, capture_output=True, timeout=timeout, cwd=tmp,
-                env={**os.environ, "PYTHONHASHSEED": "0", "MPLBACKEND": "Agg"},
+                env={**os.environ, "PYTHONHASHSEED": "0", "MPLBACKEND": "Agg", **SINGLE_THREADED},
             )
         except subprocess.TimeoutExpired:
             return False, f"timed out after {timeout}s"

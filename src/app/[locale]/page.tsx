@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowRight, ArrowUpRight, Atom, Bot, Braces, Cog, Cpu, FlaskConical, Gem, GraduationCap, Languages, Sigma, Zap } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Atom, BarChart3, Bot, Braces, Cog, Cpu, FlaskConical, Gem, GraduationCap, Languages, Sigma, Zap } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { getT, resolveLocale } from "@/i18n/server";
 import { href } from "@/lib/href";
@@ -10,6 +10,7 @@ import { scientiaSubjects } from "@/lib/subjects";
 /** Each Scientia subject's icon and accent. */
 const SUBJECT_LOOK: Record<string, { Icon: LucideIcon; accent: string }> = {
   mathematics: { Icon: Sigma, accent: "bg-gold" },
+  statistics: { Icon: BarChart3, accent: "bg-gold" },
   computerScience: { Icon: Cpu, accent: "bg-compute" },
   programmingLanguages: { Icon: Braces, accent: "bg-compute" },
   electricalEngineering: { Icon: Zap, accent: "bg-sky" },

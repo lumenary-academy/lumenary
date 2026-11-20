@@ -1,0 +1,590 @@
+---
+title: Kubernetes
+subtitle: Declare what should be running and let control loops make it so — pods, services, scheduling, rollouts and operators, and when a cluster is more than you need.
+minutes: 90
+objectives:
+  - Describe a cluster's control plane and nodes, and the objects you declare — pods, deployments, services, ingress and routes
+  - Explain desired state and the control loop, and implement a small level-triggered reconciler
+  - Simulate the scheduler's filter-and-score cycle, and explain requests, limits, taints and why spreading can strand capacity
+  - Configure an application with ConfigMaps and Secrets, and say what actually protects a Secret
+  - Predict a rolling update's capacity from maxSurge and maxUnavailable
+  - Explain the operator pattern, compare managed Kubernetes on several clouds, and decide when Kubernetes is overkill
+prerequisites: [virtualisation-and-containers, cloud-networking]
+related: [math.analysis.dynamical-systems, math.applied.optimisation, math.comp.complexity-theory]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: "Kubernetes documentation: concepts"
+    url: https://kubernetes.io/docs/concepts/
+    note: The project's own explanations of every object in this lesson.
+  - title: "Kubernetes documentation: controllers"
+    url: https://kubernetes.io/docs/concepts/architecture/controller/
+  - title: "Kubernetes documentation: scheduling framework"
+    url: https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
+    note: The extension points (filter, score and others) that kube-scheduler's plugins implement.
+  - title: "Kubernetes documentation: resource bin packing"
+    url: https://kubernetes.io/docs/concepts/scheduling-eviction/resource-bin-packing/
+  - title: "Kubernetes documentation: Deployments"
+    url: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+  - title: "Kubernetes documentation: good practices for Secrets"
+    url: https://kubernetes.io/docs/concepts/security/secrets-good-practices/
+  - title: "Kubernetes documentation: the operator pattern"
+    url: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
+  - title: Gateway API
+    url: https://gateway-api.sigs.k8s.io/
+    note: The successor to Ingress for routing traffic into a cluster.
+  - title: "Ingress NGINX retirement: what you need to know"
+    author: Kubernetes SIG Network and Security Response Committee
+    year: 2025
+    url: https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/
+  - title: "Large-scale cluster management at Google with Borg"
+    author: Abhishek Verma, Luis Pedrosa, Madhukar Korupolu, David Oppenheimer, Eric Tune and John Wilkes
+    year: 2015
+    url: https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/
+    note: The EuroSys paper on the internal system whose lessons shaped Kubernetes.
+  - title: "Borg, Omega, and Kubernetes"
+    author: Brendan Burns, Brian Grant, David Oppenheimer, Eric Brewer and John Wilkes
+    year: 2016
+    url: https://queue.acm.org/detail.cfm?id=2898444
+    note: Ten years of container management at Google, and what the designers changed for Kubernetes.
+  - title: Amazon EKS documentation
+    url: https://docs.aws.amazon.com/eks/
+  - title: Azure Kubernetes Service documentation
+    url: https://learn.microsoft.com/en-us/azure/aks/
+  - title: Google Kubernetes Engine documentation
+    url: https://cloud.google.com/kubernetes-engine/docs
+  - title: Alibaba Cloud Container Service for Kubernetes (ACK) documentation
+    url: https://www.alibabacloud.com/help/en/ack/
+  - title: CNCF Certified Kubernetes conformance programme
+    url: https://www.cncf.io/training/certification/software-conformance/
+  - title: The Kubebuilder book
+    url: https://book.kubebuilder.io/
+    note: A hands-on guide to writing controllers and operators in Go.
+---
+
+<Section id="motivation" kind="motivation" title="Forty containers and one pager">
+
+A small team in Lagos runs a food-delivery service as forty containers: an API, a payments service, a matching service that pairs orders with riders, a few workers and their caches. In <LessonLink slug="virtualisation-and-containers">Virtualisation and containers</LessonLink> we saw why containers are a good unit to ship. But someone still has to decide which of the twelve virtual machines each container runs on, restart it when it crashes, move it when its machine dies at three in the morning, tell the other services where it now lives, swap in a new version without dropping orders, and hand it its configuration and passwords. Done by hand with scripts, that work grows with every service and wakes someone up every week.
+
+**Kubernetes** is the system most of the industry now uses for that job. It grew out of Google's experience with Borg, the internal cluster manager behind Google's services since the mid-2000s; Google open-sourced Kubernetes in 2014, released version 1.0 in 2015, and gave it to the newly founded Cloud Native Computing Foundation (CNCF). As of 2026 it has contributors from hundreds of organisations, ships three minor releases a year, and every large cloud sells it as a managed service.
+
+Its central idea is older than computers: **say what you want, and let a feedback loop keep it true.** This lesson builds that loop in Python, simulates the scheduler and a rolling update, shows the configuration you would write (labelled, not run here), and ends with an honest question: when is all this more machinery than you need?
+
+</Section>
+
+<Section id="intuition" kind="intuition" title="Desired state and the control loop">
+
+There are two ways to run a service. The **imperative** way is a list of commands: start a container on machine 4, then another on machine 7, then point the load balancer at both. If machine 7 dies, someone must notice and issue new commands. The **declarative** way is a statement of the outcome: *three copies of version 2.4.1 of the API should be running, reachable under the name `menu-api`*. A program compares that statement with the world, over and over, and acts whenever they differ.
+
+<Analogy>
+
+A thermostat does not remember how many times it has switched the heater on. Every few seconds it reads the room temperature, compares it with the setting, and switches the heater on or off. Open a window or change the setting and it simply notices the new gap. It never needs to be told *what happened*, only *what is* and *what should be*.
+
+</Analogy>
+
+Kubernetes is a collection of such loops, called **controllers**. You write the desired state as objects (usually YAML) and send them to the **API server**, which stores them in **etcd**, a small, strongly consistent key-value store that uses the Raft consensus algorithm (see Lumenary CS's [replication and consensus](/en/cs/replication-and-consensus/)). Every other component watches the API server and works to make reality match:
+
+- **Controllers** in the **controller manager** handle one kind of object each. The Deployment controller makes sure the right ReplicaSets exist; the ReplicaSet controller makes sure the right number of pods exist; others manage nodes, endpoints and jobs. A separate **cloud controller manager** talks to the cloud provider, for instance to create a load balancer.
+- The **scheduler** watches for pods that have no node yet and assigns each one to a node.
+- On every node, the **kubelet** watches for pods assigned to its node and asks the **container runtime** (containerd or CRI-O, through the Container Runtime Interface) to start them, then reports their status back. A network component (kube-proxy, or an eBPF-based data plane in many clusters) makes service addresses work.
+
+No component gives orders to another. Each reads shared state from the API server and writes its own part back. That is why a crashed scheduler or controller can simply be restarted: it rereads the state and carries on.
+
+<Figure caption="A Kubernetes cluster. People and CI systems write desired state to the API server, which stores it in etcd. The scheduler and the controllers watch the API server and write decisions back; each node's kubelet watches for pods assigned to it and starts them through the container runtime. All communication goes through the API server.">
+<svg viewBox="0 0 560 300" role="img" aria-label="Block diagram. On the left a box labelled you or CI sends kubectl apply to the API server inside a large box labelled control plane. The control plane also contains the scheduler and the controllers above the API server, both connected to it by two-way arrows, and etcd below it, also connected by a two-way arrow. On the right are two worker nodes, each containing a kubelet, a container runtime and several pods. Each kubelet has a two-way arrow to the API server.">
+  <defs>
+    <marker id="k8s-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <g fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="10" y="128" width="78" height="40" rx="4" />
+    <rect x="112" y="12" width="222" height="276" rx="8" strokeDasharray="5 4" />
+    <rect x="150" y="128" width="146" height="40" rx="4" />
+    <rect x="150" y="226" width="146" height="40" rx="4" />
+    <rect x="124" y="40" width="94" height="40" rx="4" />
+    <rect x="228" y="40" width="96" height="40" rx="4" />
+    <rect x="372" y="12" width="178" height="128" rx="8" />
+    <rect x="372" y="160" width="178" height="128" rx="8" />
+    <rect x="384" y="38" width="70" height="30" rx="4" />
+    <rect x="464" y="38" width="76" height="30" rx="4" />
+    <rect x="384" y="186" width="70" height="30" rx="4" />
+    <rect x="464" y="186" width="76" height="30" rx="4" />
+  </g>
+  <g fill="var(--sky-soft)" stroke="currentColor" strokeWidth="1">
+    <rect x="388" y="90" width="44" height="34" rx="3" />
+    <rect x="440" y="90" width="44" height="34" rx="3" />
+    <rect x="492" y="90" width="44" height="34" rx="3" />
+    <rect x="388" y="238" width="44" height="34" rx="3" />
+    <rect x="440" y="238" width="44" height="34" rx="3" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12" textAnchor="middle">
+    <text x="49" y="152">you / CI</text>
+    <text x="223" y="30" fontSize="11">control plane</text>
+    <text x="223" y="152">API server</text>
+    <text x="223" y="244">etcd</text>
+    <text x="223" y="259" fontSize="10">the stored state</text>
+    <text x="171" y="64">scheduler</text>
+    <text x="276" y="64">controllers</text>
+    <text x="461" y="30" fontSize="11">node 1</text>
+    <text x="461" y="178" fontSize="11">node 2</text>
+    <text x="419" y="57" fontSize="11">kubelet</text>
+    <text x="502" y="57" fontSize="11">runtime</text>
+    <text x="419" y="205" fontSize="11">kubelet</text>
+    <text x="502" y="205" fontSize="11">runtime</text>
+    <text x="410" y="111" fontSize="10">pod</text>
+    <text x="462" y="111" fontSize="10">pod</text>
+    <text x="514" y="111" fontSize="10">pod</text>
+    <text x="410" y="259" fontSize="10">pod</text>
+    <text x="462" y="259" fontSize="10">pod</text>
+    <text x="49" y="190" fontSize="10">kubectl apply</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2" markerEnd="url(#k8s-arrow)">
+    <path d="M 88 148 L 148 148" />
+    <path d="M 171 82 L 190 126" markerStart="url(#k8s-arrow)" />
+    <path d="M 276 82 L 256 126" markerStart="url(#k8s-arrow)" />
+    <path d="M 223 170 L 223 224" markerStart="url(#k8s-arrow)" />
+    <path d="M 382 56 L 298 140" markerStart="url(#k8s-arrow)" />
+    <path d="M 382 200 L 298 158" markerStart="url(#k8s-arrow)" />
+    <path d="M 454 53 L 462 53" />
+    <path d="M 454 201 L 462 201" />
+  </g>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="objects" kind="definitions" title="The objects you declare">
+
+<Definition term="pod">
+
+A **pod** is the smallest unit Kubernetes runs: one or more containers that are always scheduled together on one node, share a network address and can share volumes. Most pods hold one application container, sometimes with a helper ("sidecar"). Pods are disposable: when one dies it is replaced by a new pod with a new name and address, never revived.
+
+</Definition>
+
+<Definition term="Deployment and ReplicaSet">
+
+A **ReplicaSet** keeps a stated number of identical pods running, recognising its pods by their **labels** (key–value tags such as `app: menu-api`). A **Deployment** manages ReplicaSets so that changing the pod template (a new image, say) rolls out gradually, with a history to roll back to. You almost always write Deployments, not ReplicaSets.
+
+</Definition>
+
+<Definition term="Service">
+
+A **Service** gives a changing set of pods, chosen by a label selector, one stable virtual IP address and DNS name inside the cluster. Traffic sent to it is spread over the pods that are currently ready. Type `ClusterIP` (the default) is reachable only inside the cluster; `NodePort` and `LoadBalancer` expose it outside, the latter by asking the cloud for a load balancer.
+
+</Definition>
+
+<Definition term="Ingress and Gateway API">
+
+An **Ingress** describes HTTP routing from outside the cluster to Services by host name and path, and is implemented by a separately installed ingress controller. The **Gateway API** is its successor: `Gateway` objects describe the entry points (often owned by a platform team) and `HTTPRoute` objects describe routes (owned by application teams).
+
+</Definition>
+
+A **node** is a machine, virtual or physical, that runs pods; a **namespace** partitions a cluster's objects, per team or environment, and is where access rules and quotas attach.
+
+Here is what the delivery team might write for its menu API: a Deployment of three pods, a Service in front of them, and a route from the outside world. This is configuration for a real cluster, shown and not run here.
+
+```yaml
+# Not run here: Kubernetes manifests (apps/v1, v1 and gateway.networking.k8s.io/v1 APIs)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: menu-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: menu-api
+  template:
+    metadata:
+      labels:
+        app: menu-api
+    spec:
+      containers:
+        - name: api
+          image: registry.example.org/menu-api:2.4.1
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m          # a quarter of a core, reserved for scheduling
+              memory: 256Mi
+            limits:
+              memory: 256Mi      # exceeding this gets the container killed and restarted
+          readinessProbe:        # receive traffic only once this answers
+            httpGet:
+              path: /ready
+              port: 8080
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: menu-api
+spec:
+  selector:
+    app: menu-api
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: menu-api
+spec:
+  parentRefs:
+    - name: public-gateway     # a Gateway the platform team created
+  hostnames:
+    - menu.example.org
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: menu-api
+          port: 80
+```
+
+The same route could be written as an `Ingress` (API `networking.k8s.io/v1`). Ingress remains supported but is frozen: new routing features go into the Gateway API. The widely used community `ingress-nginx` controller was retired in March 2026, and the Kubernetes project advised its users to migrate, recommending the Gateway API, which has implementations from several open-source projects and cloud providers.
+
+</Section>
+
+<Section id="reconciler" kind="computation" title="A reconciler in forty lines">
+
+Every controller has the same shape: **observe** the current state, **compare** it with the desired state, **act** to reduce the difference, repeat. Here is a toy ReplicaSet controller. The cluster is a dictionary; things happen to it (a pod crashes, a node loses power, someone edits the desired count, someone starts a stray pod by hand) and on every tick the controller makes one pass.
+
+```python run
+import itertools
+
+nodes = {"node-a": "Ready", "node-b": "Ready", "node-c": "Ready"}
+pods = {}                                   # observed state: what is actually running
+names = (f"web-{i:02d}" for i in itertools.count(1))
+desired = {"replicas": 4, "image": "web:1.0"}   # desired state: the only thing people edit
+
+def reconcile():
+    """One pass: look at the world as it is now and act to close the gap."""
+    actions = []
+    for name, p in list(pods.items()):      # 1. remove pods that can never become healthy
+        if p["phase"] == "Failed" or nodes[p["node"]] != "Ready":
+            del pods[name]
+            actions.append(f"delete {name} ({'failed' if p['phase'] == 'Failed' else 'node lost'})")
+    for name in sorted(pods)[desired["replicas"]:]:      # 2. too many: delete the surplus
+        del pods[name]
+        actions.append(f"delete {name} (surplus)")
+    ready = [n for n, s in sorted(nodes.items()) if s == "Ready"]
+    for _ in range(desired["replicas"] - len(pods)):     # 3. too few: create, spreading over nodes
+        load = {n: sum(p["node"] == n for p in pods.values()) for n in ready}
+        node = min(ready, key=lambda n: (load[n], n))
+        name = next(names)
+        pods[name] = {"node": node, "image": desired["image"], "phase": "Pending"}
+        actions.append(f"create {name} on {node}")
+    return actions
+
+def kubelets_start_pods():
+    for p in pods.values():
+        if p["phase"] == "Pending":
+            p["phase"] = "Running"
+
+events = {   # things that happen to the cluster whether or not anyone is watching
+    2: ("pod web-02 crashes", lambda: pods["web-02"].update(phase="Failed")),
+    4: ("node-b loses power", lambda: nodes.update({"node-b": "NotReady"})),
+    6: ("someone edits desired replicas to 6", lambda: desired.update(replicas=6)),
+    8: ("someone starts a stray pod by hand", lambda: pods.update(
+        {"web-99": {"node": "node-a", "image": "web:1.0", "phase": "Running"}})),
+}
+
+for tick in range(1, 10):
+    if tick in events:
+        label, happen = events[tick]
+        happen()
+        print(f"tick {tick}: EVENT {label}")
+    healthy = sum(p["phase"] == "Running" and nodes[p["node"]] == "Ready" for p in pods.values())
+    acts = reconcile()
+    kubelets_start_pods()
+    print(f"tick {tick}: saw {healthy} healthy of {desired['replicas']} wanted;",
+          "; ".join(acts) if acts else "nothing to do")
+
+print("final:", {n: sorted(k for k, p in pods.items() if p["node"] == n) for n in nodes})
+```
+
+The output tells the story. The crashed `web-02` is replaced by `web-05`; when `node-b` dies, its pod is replaced on a healthy node; raising the count to 6 creates two more; and the pod someone started by hand with the same label is deleted as surplus, because the controller does not care who created a pod, only how many match. After each disturbance the system returns to the desired state, and on quiet ticks the controller does nothing at all.
+
+<Narrator who="chloe">
+
+What makes this robust is that `reconcile` never asks *what changed?*, only *what is?* versus *what should be?* Engineers call this **level-triggered** rather than edge-triggered, after the two ways circuits react to a signal. If a notification is lost, a controller restarts, or two events arrive at once, the next pass still sees the true difference and fixes it.
+
+</Narrator>
+
+Real controllers wrap the same core in machinery. They receive changes through **watches** on the API server, keep a local cache, queue the names of changed objects, and periodically re-examine everything in case something slipped through. They write status back so that people can see progress. Every update carries the object's version, and the API server rejects a write based on an out-of-date read (optimistic concurrency), so two controllers cannot silently overwrite each other. And a node that stops reporting is not written off at once: by default its pods are evicted only after about five minutes, so that a brief network blip does not set off a stampede of rescheduling.
+
+</Section>
+
+<Section id="scheduling" kind="computation" title="Scheduling: filter, then score">
+
+When a pod is created it has no node. The **kube-scheduler** picks one in two phases for each pod, one pod at a time.
+
+1. **Filter.** Discard nodes that cannot run the pod: not enough unreserved CPU or memory for the pod's **requests**, a **node selector** or **affinity** rule the node does not match, or a **taint** the pod does not tolerate. A taint marks a node as reserved — for example, expensive GPU machines carry a taint so that only pods with a matching **toleration** land there.
+2. **Score.** Rank the remaining nodes with several scoring plugins, each giving 0 to 100, combine them in a weighted sum, and bind the pod to the best node (ties are broken at random).
+
+The scheduler counts **requests**, not actual usage. A request is the amount of CPU and memory the pod asks to have reserved; a **limit** is a ceiling enforced on the node. A container that exceeds its CPU limit is slowed down (throttled); one that exceeds its memory limit is killed and restarted ("OOMKilled"). The default resource-scoring rule, `LeastAllocated`, prefers nodes that would be emptiest after placement, which spreads load. The alternative `MostAllocated` prefers the fullest feasible node, which packs pods tightly and lets an autoscaler remove empty nodes. Both look at the fraction of each resource that would be requested:
+
+$$\text{LeastAllocated} = 100 \cdot \frac{1}{2}\left(\frac{C - c}{C} + \frac{M - m}{M}\right), \qquad \text{MostAllocated} = 100 \cdot \frac{1}{2}\left(\frac{c}{C} + \frac{m}{M}\right),$$
+
+where $C$ and $M$ are the node's allocatable CPU and memory and $c$ and $m$ are the totals requested on it including the new pod. The simulation below places six web pods, a GPU training job and a batch job on three general nodes and one tainted GPU node, under each rule.
+
+```python run
+def make_nodes():
+    # allocatable CPU in millicores (1000m = one core) and memory in MiB
+    return {
+        "node-a": {"cpu": 4000, "mem": 16384, "taints": set(), "labels": {"zone": "z1"}},
+        "node-b": {"cpu": 4000, "mem": 16384, "taints": set(), "labels": {"zone": "z2"}},
+        "node-c": {"cpu": 4000, "mem": 16384, "taints": set(), "labels": {"zone": "z3"}},
+        "gpu-1":  {"cpu": 8000, "mem": 65536, "taints": {"gpu"}, "labels": {"zone": "z1", "accel": "gpu"}},
+    }
+
+pods = [(f"web-{i}", {"cpu": 1000, "mem": 2048}) for i in range(1, 7)] + [
+    ("train-1", {"cpu": 6000, "mem": 32768, "tolerations": {"gpu"}, "selector": {"accel": "gpu"}}),
+    ("batch-1", {"cpu": 3500, "mem": 8192}),
+]
+
+def feasible(pod, node, used):
+    fits = all(used[r] + pod[r] <= node[r] for r in ("cpu", "mem"))            # resources fit
+    tolerated = node["taints"] <= pod.get("tolerations", set())                # every taint tolerated
+    selected = all(node["labels"].get(k) == v for k, v in pod.get("selector", {}).items())
+    return fits and tolerated and selected
+
+def score(pod, node, used, strategy):
+    after = [(used[r] + pod[r]) / node[r] for r in ("cpu", "mem")]             # fraction requested
+    if strategy == "LeastAllocated":                                          # emptier is better: spread
+        return int(100 * sum(1 - f for f in after) / 2)
+    return int(100 * sum(after) / 2)                                          # fuller is better: pack
+
+def schedule(strategy):
+    nodes = make_nodes()
+    used = {n: {"cpu": 0, "mem": 0} for n in nodes}
+    placement = {}
+    for name, pod in pods:                                   # one pod at a time, never revisited
+        candidates = [n for n in sorted(nodes) if feasible(pod, nodes[n], used[n])]      # filter
+        if not candidates:
+            placement[name] = "PENDING"
+            continue
+        scores = {n: score(pod, nodes[n], used[n], strategy) for n in candidates}       # score
+        best = max(candidates, key=scores.get)   # ties: first name (kube-scheduler picks at random)
+        if name == "web-2":
+            print("   scores for web-2:", scores)
+        for r in ("cpu", "mem"):
+            used[best][r] += pod[r]
+        placement[name] = best
+    return placement, used, nodes
+
+for strategy in ("LeastAllocated", "MostAllocated"):
+    print(f"== {strategy}")
+    placement, used, nodes = schedule(strategy)
+    print("  ", ", ".join(f"{p}->{n}" for p, n in placement.items()))
+    free = {n: nodes[n]["cpu"] - used[n]["cpu"] for n in nodes if not nodes[n]["taints"]}
+    print("   free CPU on general nodes (millicores):", free, "total", sum(free.values()))
+```
+
+The GPU node never receives a web pod, under either rule, because the web pods do not tolerate its taint; the training job, which tolerates it and selects it, lands there. The difference is in the batch job.
+
+<Narrator who="margaret">
+
+Under `LeastAllocated` the web pods spread two to a node, leaving 2000 millicores free on each: 6000 free in total, yet the batch job asking for 3500 stays pending because no *single* node has that much. Under `MostAllocated` the same pods pack onto two nodes, node-c stays empty, and the batch job fits. Spreading buys resilience — losing one node loses only a third of the web pods — at the price of **stranded capacity**.
+
+</Narrator>
+
+The real kube-scheduler runs more plugins in the same framework: balancing CPU against memory, spreading replicas across zones, preferring nodes that already hold the image, affinity and anti-affinity between pods, and pre-empting lower-priority pods when nothing fits.
+
+<Narrator who="gideon">
+
+Two caveats. A request is a promise, not a measurement: a pod that requests 250m and routinely uses two cores will crowd its neighbours, and one with no requests at all is treated as needing nothing. And placing pods on nodes is bin packing, NP-hard like placing VMs on hosts in <LessonLink slug="virtualisation-and-containers">Virtualisation and containers</LessonLink>, so the scheduler does not search for the best arrangement; it decides greedily, one pod at a time, and never moves a running pod to make room (separate tools such as the Kubernetes descheduler evict pods so they can be placed again).
+
+</Narrator>
+
+</Section>
+
+<Section id="config" kind="human" title="Configuration and secrets">
+
+The same image should run in testing and in production; what differs is configuration. Kubernetes holds it in two kinds of object. A **ConfigMap** stores non-secret settings (log level, feature switches, a currency code). A **Secret** stores sensitive values (database passwords, API tokens, TLS keys). Both can be handed to a container as environment variables or as files in a mounted volume; mounted files are updated when the object changes, environment variables only when the pod restarts.
+
+```yaml
+# Not run here: a ConfigMap, a Secret, and a container that uses both
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: menu-api-config
+data:
+  LOG_LEVEL: info
+  CURRENCY: NGN
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: menu-api-db
+type: Opaque
+stringData:                    # stored base64-encoded in the API: encoded, NOT encrypted
+  DATABASE_PASSWORD: placeholder-never-commit-real-values
+# in the Deployment's container spec:
+#   envFrom:
+#     - configMapRef:
+#         name: menu-api-config
+#   volumeMounts:
+#     - name: db
+#       mountPath: /etc/secrets
+#       readOnly: true
+# and in the pod spec:
+#   volumes:
+#     - name: db
+#       secret:
+#         secretName: menu-api-db
+```
+
+A Secret's protection comes from the cluster around it, not from the object. Its values are merely base64-encoded, so anyone who can read the object can read the password. What protects it is: **encryption at rest** in etcd, which the cluster operator must configure (managed services typically integrate with their key-management service: AWS KMS, Azure Key Vault, Google Cloud KMS, Alibaba Cloud KMS); **access control** (RBAC rules that let only the right service accounts read it — and anyone allowed to create pods in a namespace can mount its Secrets, so that permission is effectively read access); and keeping the plain values out of version control. Many teams keep the authoritative copy in an external secret manager, synced in by the open-source [External Secrets Operator](https://external-secrets.io/) or mounted by the [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/). Better still is no long-lived secret at all: managed clusters can give a pod a cloud identity of its own (workload identity), so it obtains short-lived credentials instead. <LessonLink slug="cloud-security-and-identity">Cloud security and identity</LessonLink> takes this further.
+
+</Section>
+
+<Section id="rollouts" kind="computation" title="Rolling updates">
+
+Change the image in a Deployment from `2.4.1` to `2.5.0` and the Deployment controller creates a new ReplicaSet and shifts pods from the old one to the new one in steps. Two settings bound each step:
+
+- **maxSurge**: how many pods above the desired count may exist during the update (a percentage is rounded **up**);
+- **maxUnavailable**: how many pods below the desired count may be unavailable (a percentage is rounded **down**).
+
+Both default to 25%. A new pod counts as available only once its readiness probe passes, which is what stops a broken version from replacing a working one: if new pods never become ready, the rollout stalls with most of the old pods still serving, and `kubectl rollout undo` returns to the previous ReplicaSet. The simulation below models the controller's two rules — scale up the new set while the total stays within `replicas + surge`, scale down the old set while availability stays at least `replicas − unavailable` — with new pods taking two ticks to become ready.
+
+```python run
+import math
+
+def rollout(replicas, max_surge, max_unavailable, start_ticks=2, show=False):
+    surge = math.ceil(max_surge * replicas) if isinstance(max_surge, float) else max_surge
+    unavail = math.floor(max_unavailable * replicas) if isinstance(max_unavailable, float) else max_unavailable
+    if surge == 0 and unavail == 0:
+        raise ValueError("maxSurge and maxUnavailable cannot both be 0: the rollout could never move")
+    old, starting, new_ready = replicas, [], 0        # starting: ticks left for each new pod
+    tick, lowest, highest = 0, replicas, replicas
+    if show:
+        print(f"  surge={surge} unavailable={unavail}")
+        print("  tick  old  new(starting)  new(ready)  total  available")
+    while new_ready < replicas or old > 0:
+        starting = [t - 1 for t in starting]           # new pods progress towards ready
+        new_ready += sum(1 for t in starting if t == 0)
+        starting = [t for t in starting if t > 0]
+        removable = max(0, (old + new_ready) - (replicas - unavail))
+        old -= min(old, removable)                     # scale down old, keeping availability
+        room = (replicas + surge) - (old + len(starting) + new_ready)
+        starting += [start_ticks] * max(0, min(room, replicas - new_ready - len(starting)))
+        total, available = old + len(starting) + new_ready, old + new_ready
+        lowest, highest = min(lowest, available), max(highest, total)
+        if show:
+            print(f"  {tick:4} {old:4} {len(starting):13} {new_ready:11} {total:6} {available:10}")
+        tick += 1
+    return tick - 1, lowest, highest
+
+print("10 replicas, maxSurge 25%, maxUnavailable 25% (the defaults):")
+rollout(10, 0.25, 0.25, show=True)
+print()
+print(f"{'strategy':34} {'ticks':>5} {'min available':>14} {'max pods':>9}")
+for label, s, u in [("defaults 25% / 25%", 0.25, 0.25),
+                    ("maxSurge 1, maxUnavailable 0", 1, 0),
+                    ("maxSurge 0, maxUnavailable 1", 0, 1),
+                    ("maxSurge 100%, maxUnavailable 0", 1.0, 0)]:
+    ticks, lo, hi = rollout(10, s, u)
+    print(f"{label:34} {ticks:5} {lo:14} {hi:9}")
+```
+
+With the defaults, 25% of 10 rounds to a surge of 3 and an unavailability of 2, so the rollout never has more than 13 pods or fewer than 8 available, and it finishes in 4 ticks. `maxSurge 1, maxUnavailable 0` never loses capacity but takes 20 ticks; `maxSurge 0` never needs spare room on the nodes but runs one pod short throughout; a surge of 100% is fastest and briefly doubles the footprint. The trade-off is between speed, capacity during the update, and headroom on the nodes. Kubernetes rejects a Deployment whose two settings are both zero, because no step would then be allowed.
+
+A readiness probe checks that a pod *answers*, not that the new version is *correct*. Progressive delivery goes further: send a few per cent of traffic to the new version, compare its error rate and latency with the old, and continue or roll back automatically. Open-source controllers such as Argo Rollouts and Flagger do this; the measurements behind it are the subject of <LessonLink slug="observability-and-autoscaling">Observability and autoscaling</LessonLink>.
+
+</Section>
+
+<Section id="operators" kind="human" title="The operator pattern">
+
+A Deployment knows how to run stateless copies. It does not know that a database needs a primary and replicas, that a failover must promote the most up-to-date replica, that backups must run nightly, or that an upgrade must go one instance at a time with checks in between. That knowledge lives in the heads of operators — the human kind — and in runbooks.
+
+The **operator pattern**, named in 2016, puts it into software. You extend the API with a **CustomResourceDefinition** (CRD), so the cluster accepts a new kind of object, and you write a controller that reconciles it. For example, an (invented, illustrative) database operator might accept:
+
+```yaml
+# Not run here: a custom resource for an imaginary operator (the db.example.org API does not exist)
+apiVersion: db.example.org/v1
+kind: PostgresCluster
+metadata:
+  name: orders-db
+spec:
+  instances: 3
+  postgresVersion: "17"
+  storage: 100Gi
+  backup:
+    schedule: "0 2 * * *"      # every night at 02:00
+    retentionDays: 14
+```
+
+Its reconciler would compare this with what exists and act exactly as our toy did, but with richer steps: create a StatefulSet (the workload object for pods with stable names and their own persistent volumes), configure replication, schedule backups, notice a failed primary and promote a replica, and report all of it in the object's `status`. Real, open-source examples include [CloudNativePG](https://cloudnative-pg.io/) for PostgreSQL and [Strimzi](https://strimzi.io/) for Apache Kafka, and the same pattern sits behind many tools that manage certificates, monitoring and cloud resources from inside the cluster. Controllers are usually written with the Go library controller-runtime (through Kubebuilder or the Operator SDK); frameworks exist for other languages, including Kopf for Python.
+
+An operator acts at machine speed without being asked, which is its power and its risk: a buggy reconciler deletes volumes as diligently as it creates them. Mature operators are conservative: they use **finalizers** to clean up before an object disappears, refuse destructive changes unless confirmed, and run with permissions limited to what they manage.
+
+</Section>
+
+<Section id="managed" kind="human" title="Managed Kubernetes on several clouds">
+
+Running the control plane yourself means operating etcd, upgrading every component three times a year, and keeping certificates valid. Every major cloud offers to run it for you, and charges for the nodes (ordinary virtual machines) separately. The figures below are list prices for the control plane as of late 2026, given as examples; prices differ by region and change, so check each provider's pricing page.
+
+| Provider | Service | Control-plane fee (example, late 2026) | Modes in which the provider also manages the nodes |
+| --- | --- | --- | --- |
+| AWS | [Amazon EKS](https://docs.aws.amazon.com/eks/) | USD 0.10 per cluster-hour while the Kubernetes version is in standard support; USD 0.60 in extended support | EKS Auto Mode; pods on AWS Fargate |
+| Microsoft Azure | [AKS](https://learn.microsoft.com/en-us/azure/aks/) | Free tier with no fee and no uptime SLA; Standard tier USD 0.10 per cluster-hour; a Premium tier adds long-term support | AKS Automatic; virtual nodes on Azure Container Instances |
+| Google Cloud | [GKE](https://cloud.google.com/kubernetes-engine/docs) | About USD 0.10 per cluster-hour, with a monthly credit that covers one zonal or Autopilot cluster per billing account | Autopilot mode |
+| Alibaba Cloud | [ACK](https://www.alibabacloud.com/help/en/ack/) | No fee for the Basic edition; about USD 0.09 per cluster-hour for the Pro edition | Serverless clusters whose pods run on Elastic Container Instance |
+
+Many other providers, among them Huawei Cloud, Tencent Cloud, Oracle, IBM, OVHcloud, Scaleway and DigitalOcean, offer managed Kubernetes too. The CNCF's [conformance programme](https://www.cncf.io/training/certification/software-conformance/) certifies that a distribution passes the same API tests, so manifests largely carry over; what does *not* carry over is everything around the API — load balancers, storage classes, identity and networking add-ons. To run Kubernetes yourself, on your own hardware or on plain VMs, there are open-source distributions such as kubeadm-built clusters, [k3s](https://k3s.io/) (small enough for edge devices), RKE2 and Talos Linux, and commercial platforms such as Red Hat OpenShift; for a laptop, [kind](https://kind.sigs.k8s.io/) and minikube run a whole cluster in containers or a VM.
+
+Each Kubernetes minor version receives patches for about fourteen months, so clusters must be upgraded at least once a year, together with every add-on installed in them. Managed providers automate much of this and charge more for staying behind: EKS's extended-support price above is six times its standard one.
+
+</Section>
+
+<Section id="overkill" kind="human" title="When Kubernetes is overkill">
+
+Kubernetes solves the problems of running *many* services on *many* machines with *many* people changing them. Without those problems you pay its costs without its benefits: a large API to learn, YAML to maintain, upgrades, add-ons to patch, a new security surface, and debugging across several layers. Ask what would be lost without it.
+
+- **One or a few services, modest traffic, a small team.** A pair of virtual machines running containers under systemd or Docker Compose, behind a managed load balancer, is simpler to understand and to recover at three in the morning.
+- **Stateless HTTP services and you want no cluster at all.** Managed container platforms take an image and run it, scaling with traffic and often to zero: [Google Cloud Run](https://cloud.google.com/run/docs), [Azure Container Apps](https://learn.microsoft.com/en-us/azure/container-apps/), [Amazon ECS](https://docs.aws.amazon.com/ecs/) with AWS Fargate, and [Alibaba Cloud Serverless App Engine](https://www.alibabacloud.com/help/en/sae/). Some of these run Kubernetes or Knative underneath, but you never see a node.
+- **Event-driven glue and spiky, short tasks.** Functions as a service fit better, as the next lesson, <LessonLink slug="serverless-and-event-driven">Serverless and event-driven design</LessonLink>, explains.
+
+Kubernetes earns its keep when you have dozens of services and several teams, need the same platform across clouds or on your own hardware, run workloads that benefit from operators, or want one consistent way to deploy, observe and secure everything. Even then, most organisations are better served by a managed control plane than by running their own.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Kubernetes runs my containers."** Kubernetes decides *where* containers should run and keeps them running; a container runtime such as containerd or CRI-O actually runs them, driven by the kubelet through the Container Runtime Interface. Kubernetes removed its built-in Docker Engine integration (dockershim) in version 1.24 in 2022, and images built with Docker still run unchanged, because they are standard OCI images.
+
+</Misconception>
+
+<Misconception>
+
+**"A Secret is encrypted."** Its values are base64-encoded, which anyone can decode. Encryption at rest must be configured, access must be restricted with RBAC, and the plain values must never be committed to a repository.
+
+</Misconception>
+
+<Misconception>
+
+**"A Service balances requests evenly across pods."** The usual Service implementation chooses a pod per *connection*, not per request. A client that keeps one long-lived HTTP/2 or gRPC connection sends every request to the same pod, however many replicas exist. Spreading those requests needs a layer-7 proxy, a service mesh, or a client that balances across pod addresses itself.
+
+</Misconception>
+
+<Misconception>
+
+**"Deploying on Kubernetes makes my application highly available."** Kubernetes replaces failed pods, but three replicas in one zone die together, a pod without a readiness probe receives traffic before it can serve, and a single-instance database is still a single point of failure. Availability comes from replicas spread across failure domains, disruption budgets for planned maintenance, and the application's own design.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

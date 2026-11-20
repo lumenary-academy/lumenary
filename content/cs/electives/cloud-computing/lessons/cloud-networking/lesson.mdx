@@ -1,0 +1,452 @@
+---
+title: Cloud networking
+subtitle: Virtual networks, subnets, routes and firewalls; load balancers, DNS, anycast and CDNs; private links; and the speed of light as a budget.
+minutes: 65
+objectives:
+  - Lay out a virtual network with public, private and data subnets across zones, and plan address ranges that will not collide
+  - Explain routing to the internet through gateways and NAT, and the difference between stateful security groups and stateless network ACLs
+  - Compare round-robin, least-connections, two-choice and consistent-hashing load balancing by simulation, including under skewed keys
+  - Explain DNS-based traffic steering, anycast and CDNs, and estimate a cache's hit ratio and the load left on the origin
+  - Describe private connectivity — VPNs, dedicated interconnects, private endpoints and peering
+  - Compute latency floors between regions and check a design against a latency budget
+narrators: [chloe, margaret, gideon]
+prerequisites: [what-is-the-cloud, virtualisation-and-containers]
+related: [math.prob.probability-theory, math.discrete.graph-basics]
+references:
+  - title: "Amazon VPC: what is Amazon VPC?"
+    url: https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html
+  - title: "Azure Virtual Network overview"
+    url: https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview
+  - title: "Google Cloud: VPC networks"
+    url: https://docs.cloud.google.com/vpc/docs/vpc
+  - title: "Alibaba Cloud: Virtual Private Cloud"
+    url: https://www.alibabacloud.com/help/en/vpc/
+  - title: "OpenStack Neutron (networking service)"
+    url: https://docs.openstack.org/neutron/latest/
+  - title: "RFC 1918: Address Allocation for Private Internets"
+    year: 1996
+    url: https://www.rfc-editor.org/rfc/rfc1918
+  - title: "RFC 8926: Geneve, Generic Network Virtualization Encapsulation"
+    year: 2020
+    url: https://www.rfc-editor.org/rfc/rfc8926
+  - title: "RFC 4786: Operation of Anycast Services"
+    year: 2006
+    url: https://www.rfc-editor.org/rfc/rfc4786
+  - title: "Maglev: A Fast and Reliable Software Network Load Balancer"
+    author: Daniel E. Eisenbud and colleagues
+    year: 2016
+    url: https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/
+  - title: "Consistent Hashing with Bounded Loads"
+    author: Vahab Mirrokni, Mikkel Thorup and Morteza Zadimoghaddam
+    year: 2016
+    url: https://arxiv.org/abs/1608.01350
+  - title: Envoy proxy
+    url: https://www.envoyproxy.io/
+    note: An open-source layer-7 proxy and load balancer.
+  - title: HAProxy
+    url: https://www.haproxy.org/
+    note: An open-source load balancer, widely used for decades.
+---
+
+<Section id="motivation" kind="motivation" title="From one server to a network">
+
+A team in Lagos launches a homework-help platform for secondary-school students in West Africa. Version one is a single virtual machine with a public IP address, running the web server and the database together, with every port open "for now". It works for a term. Then the problems arrive in the usual order: an automated scanner finds the database port and tries passwords all night; the machine's zone has an outage the week before exams; video explanations load slowly in Accra and Dakar; and a partner school's IT department asks for a private connection to share timetables without going over the public internet.
+
+Each of these is a networking problem, and each has a standard answer in every cloud. This lesson builds the answers up in order: a **virtual network** with subnets, routes and firewalls; **load balancers** spreading traffic over servers in several zones; **DNS**, **anycast** and **content delivery networks** bringing users to the nearest point; **private connectivity** to other networks; and the **latency budget** that the speed of light imposes on all of it. Lumenary CS's [networking](/en/cs/networking/) lesson — IP addresses and CIDR prefixes, TCP and UDP, DNS, TLS — is assumed throughout, and its [system design](/en/cs/system-design/) lesson introduced load balancers and caches; here we see how clouds provide them and how they behave under load.
+
+</Section>
+
+<Section id="virtual-networks" kind="definitions" title="Virtual networks and subnets">
+
+<Definition term="Virtual network and subnet">
+
+A **virtual network** (a *VPC*, virtual private cloud, in most providers' vocabulary; a *VNet* in Azure's) is a private, isolated IP network that a customer defines inside a provider's region (or, in Google Cloud, globally), with an address range of their choosing. A **subnet** is a smaller range carved out of it, in which virtual machines and other resources receive their addresses; routes and firewall rules are attached to subnets and to the machines' network interfaces.
+
+</Definition>
+
+Nothing in a virtual network is a physical cable. When a VM sends a packet to a neighbour's private address, the host's virtual switch — often running on an offload card, as the <LessonLink slug="virtualisation-and-containers">previous lesson</LessonLink> described — looks up which physical host the destination VM is on, wraps the packet in an outer packet addressed to that host (**encapsulation**, with protocols such as VXLAN or [Geneve](https://www.rfc-editor.org/rfc/rfc8926)), and sends it across the provider's ordinary data-centre network, the *underlay*. The receiving host unwraps it and delivers it. A mapping service tells every host where each virtual address currently lives, which is how thousands of customers can all use `10.0.0.0/16` at once without colliding, and how a VM can move between hosts and keep its address.
+
+<Narrator who="chloe">
+
+This is the oldest trick in networking — layering, from Lumenary CS's networking lesson — used once more. A tenant's whole IP network becomes the *payload* of the provider's IP network, just as an HTTP message is the payload of TCP. Each layer sees only its own addresses, so the provider can change the physical network without the tenant noticing, and the tenant can choose any addresses without the provider caring.
+
+</Narrator>
+
+**Planning addresses.** Virtual networks normally use private ranges from [RFC 1918](https://www.rfc-editor.org/rfc/rfc1918) — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` — and IPv6 alongside. Three habits save pain later. Make the network large enough to grow (a `/16` holds 65,536 addresses). Give each environment and each region its own non-overlapping range, because networks with overlapping ranges cannot be joined by a simple route later. And remember that providers reserve a few addresses in every subnet: AWS, for example, keeps the [first four and the last](https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html), so a `/24` subnet offers 251 usable addresses rather than 256.
+
+The same ideas carry different names and scopes from provider to provider, which matters when reading their documentation:
+
+| Concept | AWS | Azure | Google Cloud | Alibaba Cloud | OpenStack |
+| --- | --- | --- | --- | --- | --- |
+| Virtual network | VPC (one region) | VNet (one region) | VPC network (global) | VPC (one region) | Neutron network |
+| Subnet | subnet (one zone) | subnet (whole region) | subnet (whole region) | vSwitch (one zone) | subnet |
+| Stateful firewall | security groups | network security groups | VPC firewall rules and policies | security groups | security groups |
+| Load balancing | Elastic Load Balancing | Load Balancer, Application Gateway, Front Door | Cloud Load Balancing | Server Load Balancer | Octavia |
+| Private access to services | PrivateLink | Private Link | Private Service Connect | PrivateLink | — |
+| Dedicated line | Direct Connect | ExpressRoute | Cloud Interconnect | Express Connect | your own routers |
+| DNS | Route 53 | Azure DNS | Cloud DNS | Alibaba Cloud DNS | Designate |
+
+Each provider's documentation is linked at the end ([AWS](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html), [Azure](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-overview), [Google Cloud](https://docs.cloud.google.com/vpc/docs/vpc), [Alibaba Cloud](https://www.alibabacloud.com/help/en/vpc/), [OpenStack](https://docs.openstack.org/neutron/latest/)); open-source proxies such as [HAProxy](https://www.haproxy.org/), [Envoy](https://www.envoyproxy.io/) and NGINX do the load-balancing job anywhere.
+
+</Section>
+
+<Section id="routing" kind="intuition" title="Routes, gateways and firewalls">
+
+A typical layout for a web application uses three tiers of subnet in each of two or three zones, as in the figure.
+
+<Figure caption="A virtual network across two zones, drawn with one subnet per zone as on AWS and Alibaba Cloud (on Azure and Google Cloud a single regional subnet can span both zones). Only the load balancer and the NAT gateways sit in public subnets; application servers and databases have no public addresses.">
+
+<svg viewBox="0 0 680 350" role="img" aria-label="A large box labelled virtual network 10.20.0.0/16 in one region, split into zone A and zone B. At the top, the internet connects to an internet gateway. In each zone there are three subnets stacked vertically: a public subnet holding a load-balancer node and a NAT gateway, a private subnet holding application servers, and a data subnet holding the database, primary in zone A and standby in zone B. Arrows show requests going from the internet gateway to the load balancer, then to application servers in both zones, then to the database; outbound traffic from application servers goes through the NAT gateway to the internet gateway. Replication runs from the primary database to the standby.">
+  <defs>
+    <marker id="cn-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <text x="340" y="16" fill="currentColor" fontSize="12" textAnchor="middle">internet</text>
+  <rect x="285" y="24" width="110" height="26" rx="5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <text x="340" y="42" fill="currentColor" fontSize="12" textAnchor="middle">internet gateway</text>
+  <rect x="10" y="60" width="660" height="280" rx="10" fill="none" stroke="currentColor" strokeWidth="1.5" />
+  <text x="22" y="78" fill="currentColor" fontSize="12" fontWeight="600">virtual network 10.20.0.0/16</text>
+  <g fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="4 3">
+    <rect x="25" y="88" width="300" height="242" rx="8" />
+    <rect x="355" y="88" width="300" height="242" rx="8" />
+  </g>
+  <g fill="currentColor" fontSize="12" fontWeight="600">
+    <text x="35" y="104">zone A</text>
+    <text x="365" y="104">zone B</text>
+  </g>
+  <g fill="var(--sky-soft)" stroke="var(--sky)" strokeWidth="1.2">
+    <rect x="40" y="112" width="270" height="56" rx="5" />
+    <rect x="370" y="112" width="270" height="56" rx="5" />
+  </g>
+  <g fill="var(--gold-soft)" stroke="var(--gold)" strokeWidth="1.2">
+    <rect x="40" y="186" width="270" height="56" rx="5" />
+    <rect x="370" y="186" width="270" height="56" rx="5" />
+    <rect x="40" y="260" width="270" height="56" rx="5" />
+    <rect x="370" y="260" width="270" height="56" rx="5" />
+  </g>
+  <g fill="currentColor" fontSize="10">
+    <text x="46" y="124">public 10.20.0.0/20</text>
+    <text x="376" y="124">public 10.20.48.0/20</text>
+    <text x="46" y="198">private 10.20.16.0/20</text>
+    <text x="376" y="198">private 10.20.64.0/20</text>
+    <text x="46" y="272">data 10.20.32.0/20</text>
+    <text x="376" y="272">data 10.20.80.0/20</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="60" y="132" width="110" height="28" rx="4" />
+    <rect x="190" y="132" width="100" height="28" rx="4" />
+    <rect x="390" y="132" width="110" height="28" rx="4" />
+    <rect x="520" y="132" width="100" height="28" rx="4" />
+    <rect x="60" y="206" width="110" height="28" rx="4" />
+    <rect x="390" y="206" width="110" height="28" rx="4" />
+    <rect x="60" y="280" width="130" height="28" rx="4" />
+    <rect x="390" y="280" width="130" height="28" rx="4" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="115" y="150">load balancer</text>
+    <text x="240" y="150">NAT gateway</text>
+    <text x="445" y="150">load balancer</text>
+    <text x="570" y="150">NAT gateway</text>
+    <text x="115" y="224">app servers</text>
+    <text x="445" y="224">app servers</text>
+    <text x="125" y="298">database (primary)</text>
+    <text x="455" y="298">database (standby)</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.3" fill="none" markerEnd="url(#cn-arrow)">
+    <line x1="310" y1="50" x2="140" y2="130" />
+    <line x1="370" y1="50" x2="470" y2="130" />
+    <line x1="115" y1="160" x2="115" y2="204" />
+    <line x1="445" y1="160" x2="445" y2="204" />
+    <line x1="160" y1="160" x2="420" y2="204" />
+    <line x1="115" y1="234" x2="115" y2="278" />
+    <line x1="420" y1="234" x2="160" y2="280" />
+    <line x1="170" y1="212" x2="230" y2="162" />
+    <line x1="190" y1="300" x2="388" y2="300" strokeDasharray="5 3" />
+  </g>
+  <text x="290" y="296" fill="currentColor" fontSize="10" textAnchor="middle">replication</text>
+</svg>
+
+</Figure>
+
+**Routes.** Every subnet has a route table, consulted with longest-prefix matching. A route for the whole virtual network (`10.20.0.0/16 → local`) is always there. A **public subnet** also has a default route, `0.0.0.0/0`, to an **internet gateway**, which translates between the VM's private address and a public one. A **private subnet** has no route from the internet at all; its default route points to a **NAT gateway** in a public subnet, so its servers can *start* connections out — to download updates or call an external API — but nothing outside can start a connection in. The data subnet often has no internet route whatsoever.
+
+**Firewalls.** Two kinds of filter appear in cloud networks, and the difference between them is a frequent source of confusion.
+
+<Definition term="Stateful and stateless filtering">
+
+A **stateful** firewall tracks connections: if it allows a packet that starts a connection, it automatically allows the replies belonging to that connection. A **stateless** filter judges every packet on its own, so replies must be allowed by rules of their own.
+
+</Definition>
+
+**Security groups** (and their equivalents in the table above) are stateful, sit on each network interface, and are usually written as *allow* rules only, with everything else denied. A security group rule can name another group as its source, which expresses intent rather than addresses: "the database group accepts TCP 5432 from members of the app-server group", wherever those servers are and however many there are. AWS additionally offers stateless, ordered **network ACLs** on subnets, which can deny as well as allow; because they are stateless, a rule letting requests in to port 443 must be matched by one letting the replies *out* to the client's ephemeral port (typically 1024–65535). Azure's network security groups and Google Cloud's firewall rules are stateful but ordered by priority and can contain explicit deny rules.
+
+A sensible starting point for the homework platform: the load balancer's group accepts 443 from anywhere; the app servers' group accepts the application port only from the load balancer's group; the database's group accepts 5432 only from the app servers' group; administrative access goes through a bastion host, a VPN or the provider's session-manager service, never by opening SSH to the world. Every rule should be justifiable in one sentence, and rules are best written as code and reviewed (<LessonLink slug="infrastructure-as-code">infrastructure as code</LessonLink>).
+
+</Section>
+
+<Section id="load-balancing" kind="computation" title="Load balancers under load">
+
+Cloud load balancers come in the two kinds that Lumenary CS's system design lesson introduced: **layer 4** (network) load balancers forward TCP and UDP connections by address and port, very fast and protocol-agnostic; **layer 7** (application) load balancers terminate TLS and HTTP, so they can route by host name, path or header, retry failed idempotent requests and add or check headers. Both run **health checks** against every backend and stop sending to those that fail, spread traffic across zones, and *drain* a backend before removing it, letting its open requests finish. Behind the scenes, the provider runs them as large, distributed software systems on many machines: Google's [Maglev paper](https://research.google/pubs/maglev-a-fast-and-reliable-software-network-load-balancer/) describes one such design, built on consistent hashing so that every machine sends a given connection to the same backend.
+
+Which backend should each request go to? The simulation below sends 40,000 requests to 8 servers at 75% average load. Service times vary a lot (a log-normal distribution with a mean of 10 ms, so a few requests take ten times the average), and each request carries a *key* — a user, session or URL — whose popularity is skewed: the most popular key alone is 11% of traffic. It compares five policies: **round robin**; **least connections**, which sends each request to the server with the fewest requests in flight; **two random choices**, which samples two servers and picks the less busy; **consistent hashing** on the key, as in Lumenary CS's [storage at scale](/en/cs/storage-at-scale/) lesson, so that each key always reaches the same server and its cache; and **consistent hashing with bounded loads**, which follows the ring but skips any server already holding more than 1.25 times the average number of requests in flight.
+
+```python run
+import bisect, hashlib, math, random
+from collections import deque
+
+rng = random.Random(42)
+SERVERS, REQUESTS, KEYS = 8, 40_000, 5_000
+MEAN_SERVICE = 0.010                                   # seconds of work per request, on average
+LOAD = 0.75                                            # offered load: 75% of total capacity
+rate = LOAD * SERVERS / MEAN_SERVICE                   # requests per second arriving
+
+# Popularity of keys (users, sessions or URLs) is skewed: Zipf, exponent 1.
+weights = [1 / (r + 1) for r in range(KEYS)]
+cum = [0.0]
+for w in weights:
+    cum.append(cum[-1] + w)
+def draw_key():
+    return bisect.bisect_right(cum, rng.random() * cum[-1]) - 1
+
+sigma = 1.0                                            # heavy-ish tail of service times
+mu = math.log(MEAN_SERVICE) - sigma ** 2 / 2
+t, reqs = 0.0, []
+for _ in range(REQUESTS):
+    t += rng.expovariate(rate)
+    reqs.append((t, draw_key(), rng.lognormvariate(mu, sigma)))
+
+def h(s):
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:8], "big")
+ring = sorted((h(f"server-{s}#{v}"), s) for s in range(SERVERS) for v in range(100))
+points = [p for p, _ in ring]
+
+def simulate(policy):
+    free_at = [0.0] * SERVERS
+    inflight = [deque() for _ in range(SERVERS)]      # completion times, increasing
+    latencies, counts, seen = [], [0] * SERVERS, [set() for _ in range(SERVERS)]
+    pick_rng = random.Random(1)
+    rr = 0
+    for now, key, work in reqs:
+        for q in inflight:                             # forget finished requests
+            while q and q[0] <= now:
+                q.popleft()
+        if policy == "round robin":
+            s = rr % SERVERS
+            rr += 1
+        elif policy == "least connections":
+            s = min(range(SERVERS), key=lambda i: len(inflight[i]))
+        elif policy == "two random choices":
+            a, b = pick_rng.sample(range(SERVERS), 2)
+            s = a if len(inflight[a]) <= len(inflight[b]) else b
+        else:                                          # consistent hashing on the key
+            i = bisect.bisect_right(points, h(f"key-{key}")) % len(ring)
+            s = ring[i][1]
+            if policy == "hashing, bounded load":      # skip servers far above the average
+                cap = math.ceil(1.25 * (sum(map(len, inflight)) + 1) / SERVERS)
+                while len(inflight[s]) >= cap:
+                    i = (i + 1) % len(ring)
+                    s = ring[i][1]
+        start = max(now, free_at[s])
+        free_at[s] = start + work
+        inflight[s].append(free_at[s])
+        latencies.append(free_at[s] - now)
+        counts[s] += 1
+        seen[s].add(key)
+    latencies.sort()
+    return (1000 * sum(latencies) / len(latencies), 1000 * latencies[int(0.99 * len(latencies))],
+            max(counts) / REQUESTS, sum(map(len, seen)) / SERVERS)
+
+print(f"{SERVERS} servers at {LOAD:.0%} load, {REQUESTS} requests, top key = "
+      f"{weights[0] / cum[-1]:.1%} of traffic")
+print("policy                  mean ms   p99 ms   busiest server   distinct keys per server")
+for p in ["round robin", "least connections", "two random choices",
+          "consistent hashing", "hashing, bounded load"]:
+    mean, p99, busiest, keys = simulate(p)
+    print(f"{p:22} {mean:8.1f} {p99:8.1f} {busiest:12.1%} {keys:16.0f}")
+```
+
+<Narrator who="margaret">
+
+Round robin gives every server exactly 12.5% of the requests and still has a 99th-percentile latency of 196 ms, because it ignores *how long* requests take: a server stuck on a slow one keeps receiving its share. Least connections, which looks at the queues, cuts the tail to 80 ms. Plain consistent hashing sends the hottest key's server 20% of all traffic — 1.6 times its fair share, more than it can serve at this load — and its queue grows without limit: a p99 of 14.8 seconds. Bounding the load brings the tail back to 109 ms while each server still sees only 936 distinct keys instead of about 1500, so its cache is far more useful.
+
+</Narrator>
+
+The lesson generalises. Policies that look at current load beat blind ones when request costs vary. Sampling just two servers captures most of the benefit of examining all of them — a classic result about balls thrown into bins: when $n$ balls go into $n$ bins, the fullest bin holds about $\ln n / \ln \ln n$ balls if each ball picks one bin at random, but only about $\ln \ln n / \ln 2$ if each picks the less full of two — and it needs much less shared state, which matters when the load balancer is itself many machines. And affinity (sending a key to the same server) and balance pull against each other; bounded-load hashing, described by [Mirrokni, Thorup and Zadimoghaddam](https://arxiv.org/abs/1608.01350) and used in production caches and proxies, is a principled compromise.
+
+</Section>
+
+<Section id="dns-anycast" kind="intuition" title="DNS and anycast: getting users to the right place">
+
+Before a load balancer sees a request, the user's device must find it. Two mechanisms steer users across the globe.
+
+**DNS-based steering.** Cloud DNS services host authoritative records and answer differently depending on who asks: *latency-based* or *geolocation* routing returns the address of the region closest to the user's resolver, *weighted* routing splits traffic between versions, and *failover* routing stops returning a region whose health checks fail. Private DNS zones resolve internal names inside a virtual network only. The weakness is caching: resolvers keep an answer for its **time to live** (TTL), and some keep it longer, so a failover with a TTL of an hour can leave users knocking on a dead region for an hour. The usual practice is short TTLs (30–60 s) on records that fail over automatically, and, before a planned move, lowering a long TTL at least one old TTL in advance so that cached answers expire in time, then raising it again afterwards.
+
+<Definition term="Anycast">
+
+**Anycast** announces the same IP address prefix, through the internet's routing protocol BGP, from many locations at once. Each router forwards packets towards the announcement it prefers, so a user reaches one of the sites — usually a nearby one — without any DNS trick, and if a site stops announcing the prefix, traffic shifts to the others within the time BGP takes to converge.
+
+</Definition>
+
+Anycast carries the DNS root servers, large public DNS resolvers and most CDNs, and several providers' global load balancers and accelerators give customers a single anycast address that enters the provider's private backbone at the nearest edge site. Its operation is described in [RFC 4786](https://www.rfc-editor.org/rfc/rfc4786).
+
+<Narrator who="gideon">
+
+"Nearest" in BGP means *preferred by routing policy* — fewest networks to cross, cheapest transit for the operators — not lowest latency. A user in Kampala can be routed to a site in Europe when a closer one exists because their provider's upstream prefers it. And because the path can change mid-conversation, anycast suits short exchanges (DNS over UDP, short HTTP connections) best; long-lived TCP connections need the sites to share state or tolerate the occasional reset.
+
+</Narrator>
+
+</Section>
+
+<Section id="cdn" kind="computation" title="CDNs and cache hit ratios">
+
+A **content delivery network** keeps copies of content in caches at many edge sites, close to users. Each provider runs one (Amazon CloudFront, Azure Front Door, Google Cloud CDN, Alibaba Cloud CDN), and so do independent companies; a CDN also terminates TLS near the user, absorbs traffic floods, and often accelerates uncacheable requests by carrying them over its own backbone. The figure of merit is the **hit ratio**: the fraction of requests answered from the cache. Every miss goes back to the **origin** — your servers or object store — and costs latency for the user, load on the origin and, often, data-transfer fees.
+
+What hit ratio can a cache achieve? It depends on how popularity is spread. Measurements of web traffic since the 1990s have repeatedly found it roughly *Zipf-like*: the object of rank $r$ is requested with probability proportional to $1/r^\alpha$, with $\alpha$ typically between about 0.6 and 1. The simulation streams 300,000 requests over a catalogue of 100,000 objects through a least-recently-used (LRU) cache at one edge site.
+
+```python run
+import bisect, random
+from collections import Counter, OrderedDict
+
+OBJECTS, REQUESTS = 100_000, 300_000                   # catalogue size, requests at one edge site
+
+def zipf_stream(alpha, seed):
+    """Requests whose popularity falls off as 1 / rank**alpha."""
+    rng = random.Random(seed)
+    cum = [0.0]
+    for r in range(OBJECTS):
+        cum.append(cum[-1] + 1 / (r + 1) ** alpha)
+    return [bisect.bisect_right(cum, rng.random() * cum[-1]) - 1 for _ in range(REQUESTS)], cum
+
+def lru_hit_ratio(stream, capacity):
+    cache, hits = OrderedDict(), 0
+    for obj in stream:
+        if obj in cache:
+            hits += 1
+            cache.move_to_end(obj)                     # now the most recently used
+        else:
+            cache[obj] = True
+            if len(cache) > capacity:
+                cache.popitem(last=False)              # evict the least recently used
+    return hits / len(stream)
+
+for alpha in [0.8, 1.0]:
+    stream, cum = zipf_stream(alpha, seed=3)
+    once = sum(1 for n in Counter(stream).values() if n == 1)
+    print(f"popularity exponent {alpha}: {once:,} of {len(set(stream)):,} objects requested were requested only once")
+    print("   cache size        LRU hit ratio   if the top objects were pinned   origin load at 20,000 req/s")
+    for share in [0.01, 0.05, 0.2]:
+        c = int(share * OBJECTS)
+        lru = lru_hit_ratio(stream, c)
+        print(f"   {share:5.0%} of objects {lru:12.1%} {cum[c] / cum[-1]:24.1%} {20_000 * (1 - lru):26,.0f} req/s")
+```
+
+Three things stand out. Skew is everything: the same cache holding 5% of the catalogue answers 37% of requests when $\alpha = 0.8$ and 66% when $\alpha = 1$. Caches have diminishing returns: quadrupling the cache from 5% to 20% of the catalogue raises the hit ratio by about 13–21 points, not fourfold. And a long tail of **one-hit wonders** — about 29,000 objects requested exactly once at $\alpha = 0.8$ — can never be served from cache, and in an LRU cache they even push out useful objects; that is why the LRU hit ratios trail the ideal of pinning the most popular objects, and why production caches use admission policies that ignore objects on their first request.
+
+The origin feels the misses, not the hits. At 20,000 requests per second, going from a 66% to a 79% hit ratio (at $\alpha = 1$) cuts the origin's load from about 6,800 to 4,100 requests per second — 39% less, from a 13-point change — and raising a hit ratio from 95% to 99% cuts origin traffic fivefold.
+
+Real CDNs reach much higher hit ratios on static assets than this toy, for reasons you can design for: a customer's content is often far more concentrated than a whole catalogue; assets with versioned names (`app.3f9a1c.js`) can be cached for a year; and **tiered caching** routes edge misses through a few regional "shield" caches, so the origin sees one miss per region rather than one per edge site. Be careful what you cache: a response that varies by user must never be served to someone else, so cache keys and `Cache-Control` headers deserve review, and anything personal should be marked `private` or not cached at all.
+
+</Section>
+
+<Section id="private-connectivity" kind="human" title="Private connectivity">
+
+Not every connection should cross the public internet. Four tools connect cloud networks privately to each other and to the outside:
+
+- **Site-to-site VPNs** carry encrypted tunnels (usually IPsec; WireGuard in many self-managed setups) over the internet between a virtual network and an office, a data centre or another cloud. They are quick to set up and inexpensive, with internet-grade latency and bandwidth.
+- **Dedicated interconnects** are physical fibre links, from 1 Gbit/s to 100 Gbit/s or more, from your equipment (or a telecom partner's) in a colocation facility into the provider's network: steadier latency, more bandwidth and usually cheaper data transfer, at the cost of a contract and weeks of lead time.
+- **Private endpoints** expose a service — the provider's object store, a managed database, a partner's API — as a private address inside your virtual network, so traffic to it never leaves the provider's network and the service can be reached without any internet route.
+- **Peering and transit hubs** join virtual networks to each other. Plain peering is *not transitive*: if A peers with B and B with C, A cannot reach C through B. Organisations with many networks therefore use a hub (a transit gateway, virtual WAN or network-connectivity hub, depending on the provider) that routes between them centrally.
+
+<Narrator who="gideon">
+
+Every one of these fails silently in the same way: overlapping address ranges. If the partner school also uses `10.20.0.0/16`, no route can tell your `10.20.1.5` from theirs, and the fix — renumbering a live network or adding address translation — is painful. Allocate ranges from an organisation-wide plan from the first day, even for "temporary" environments.
+
+</Narrator>
+
+</Section>
+
+<Section id="latency" kind="computation" title="Latency budgets across regions">
+
+Physics sets a floor under every network design. Light in optical fibre travels at about two-thirds of its speed in vacuum, roughly 200,000 km/s, or **200 km per millisecond**. Real cables do not follow great circles, and routes detour through exchange points, so measured round trips are often 1.3 to 2 times the straight-line floor, and sometimes more. The block computes floors from a user in Nairobi to cities that host cloud regions, then prices a single page against a 300 ms budget for three designs.
+
+```python run
+import math
+
+CITIES = {                    # approximate latitude and longitude, degrees
+    "Nairobi": (-1.29, 36.82), "Johannesburg": (-26.20, 28.05), "Frankfurt": (50.11, 8.68),
+    "Mumbai": (19.08, 72.88), "Singapore": (1.35, 103.82), "Ashburn, Virginia": (39.04, -77.49),
+    "São Paulo": (-23.55, -46.63), "Tokyo": (35.68, 139.69),
+}
+FIBRE_KM_PER_MS = 200          # light in glass: about 200,000 km/s, i.e. 200 km per millisecond
+STRETCH = 1.5                  # cables are longer than the great circle, and routes detour
+
+def great_circle_km(a, b):
+    (lat1, lon1), (lat2, lon2) = (map(math.radians, CITIES[c]) for c in (a, b))
+    x = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(x))
+
+def rtt_ms(a, b, stretch=STRETCH):
+    return 2 * great_circle_km(a, b) * stretch / FIBRE_KM_PER_MS
+
+print("from Nairobi to        distance   physics floor   with stretch 1.5")
+for c in CITIES:
+    if c != "Nairobi":
+        d = great_circle_km("Nairobi", c)
+        print(f"  {c:18} {d:7,.0f} km {rtt_ms('Nairobi', c, 1.0):10.0f} ms {rtt_ms('Nairobi', c):14.0f} ms")
+
+def page_ms(user_to_app, app_to_db, db_queries=3, server_ms=20):
+    """A new HTTPS connection (TCP + TLS 1.3 = 2 round trips) and one request (1 round trip),
+    while the server spends server_ms computing and waits for db_queries sequential queries."""
+    return 3 * user_to_app + server_ms + db_queries * app_to_db
+
+same_zone_db = 0.5            # a query round trip inside one zone, in ms
+print()
+print("one page for a user in Nairobi (budget: 300 ms)")
+for label, app, db in [("app and database in Johannesburg", "Johannesburg", None),
+                       ("app and database in Frankfurt", "Frankfurt", None),
+                       ("app in Johannesburg, database in Frankfurt", "Johannesburg", "Frankfurt")]:
+    to_app = rtt_ms("Nairobi", app)
+    to_db = same_zone_db if db is None else rtt_ms(app, db)
+    print(f"  {label:44} {page_ms(to_app, to_db):5.0f} ms")
+```
+
+A region 2,900 km away costs at least 29 ms per round trip and realistically about 44; one in Virginia, 12,000 km away, about 180. A page that needs three round trips to the user before the first byte — TCP, TLS and the request itself — pays that three times, which is why the region in Frankfurt already overshoots the 300 ms budget. The worst design is the one that looks harmless on an architecture diagram: an application server near the user making **sequential** calls to a database in another region. Each query pays a 130 ms intercontinental round trip, and three of them cost more than everything else together.
+
+The remedies follow from the arithmetic. Put compute and the data it queries in the same region, and keep chatty calls inside a zone. Reuse connections, so that TCP and TLS handshakes are paid once (and TLS 1.3 and QUIC reduce them). Batch or parallelise dependent calls. Serve what can be cached from a CDN at the edge. And when users are spread across continents, either accept the latency for writes, or replicate data to several regions and accept weaker consistency — the trade-off the <LessonLink slug="cloud-storage-and-databases">next lesson</LessonLink> takes up.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A private subnet is secure."** A private subnet only lacks a route *from* the internet. Anything inside the network — a compromised web server, a misconfigured peering link — can still reach it. Security groups that allow only what each tier needs, and authentication on every service, are still required: defence in depth, not a perimeter.
+
+</Misconception>
+
+<Misconception>
+
+**"Round robin spreads load evenly."** It spreads *requests* evenly. When requests differ in cost, servers that happen to receive slow ones fall behind while still getting their full share; load-aware policies such as least connections or two random choices keep queues short.
+
+</Misconception>
+
+<Misconception>
+
+**"DNS failover is instant."** Resolvers and clients cache answers for the record's TTL, and some for longer. Plan failover with short TTLs set in advance, health-checked records, or an anycast front end that does not depend on DNS changes.
+
+</Misconception>
+
+<Misconception>
+
+**"More bandwidth will fix a slow cross-region call."** A round trip from Johannesburg to Frankfurt cannot be shorter than about 87 ms, whatever the link speed. Latency is fixed by distance and the number of round trips; only moving data closer, or making fewer trips, reduces it.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

@@ -61,8 +61,8 @@ function checkBlocks(body: string): string[] {
   return [...body.matchAll(/^```([\w#+-]+)[ \t]+check[ \t]*\n([\s\S]*?)^```\s*$/gm)].map((m) => m[1]!);
 }
 
-it("there are Lumenary CS, EE, Robotics, Chemistry, ME and Materials and the blockchain elective", () => {
-  expect(courseDirs).toEqual(expect.arrayContaining(["cs", "ee", "robotics", "chemistry", "me", "materials", "cs/electives/blockchains-verifiable-computation"]));
+it("there are Lumenary CS, Statistics, EE, Robotics, Chemistry, ME and Materials and the four CS electives", () => {
+  expect(courseDirs).toEqual(expect.arrayContaining(["cs", "ee", "robotics", "chemistry", "me", "materials", "statistics", "cs/electives/blockchains-verifiable-computation", "cs/electives/data-science", "cs/electives/data-engineering", "cs/electives/cloud-computing"]));
 });
 
 it("the index of course locales is current (node scripts/gen-content-locales.mjs)", () => {

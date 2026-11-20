@@ -1,0 +1,518 @@
+---
+title: Data quality and governance
+subtitle: Making data trustworthy and keeping it in good hands — contracts, tests, monitors, lineage, catalogs, access control, privacy law, and deletion that actually deletes.
+minutes: 85
+objectives:
+  - Name the main dimensions of data quality, and write a data contract between a producer and its consumers
+  - Implement a small validation framework in which every check is a query for the rows that break a rule, with severities, tolerances and quarantine
+  - Monitor freshness and volume, and explain why a same-weekday median beats a naive three-sigma rule
+  - Use lineage for impact analysis and root-cause analysis, and describe catalogs and their metadata
+  - Apply least privilege with roles, row-level security and masking
+  - Explain pseudonymisation, anonymisation and k-anonymity, and describe the GDPR and other privacy laws carefully
+  - Design retention and deletion that reach every copy of the data
+prerequisites: [pipelines-and-orchestration, stream-processing, lakehouses-and-table-formats]
+related: [math.discrete.graph-theory, math.prob.statistics]
+narrators: [chloe, margaret, gideon]
+references:
+  - title: Regulation (EU) 2016/679 (General Data Protection Regulation)
+    url: https://eur-lex.europa.eu/eli/reg/2016/679/oj
+    note: The official text, in every EU language.
+  - title: European Data Protection Board
+    url: https://www.edpb.europa.eu/
+    note: Guidelines on the GDPR, including on pseudonymisation and the right to erasure.
+  - title: UK Information Commissioner's Office
+    url: https://ico.org.uk/
+    note: Practical guidance on data protection, including anonymisation and pseudonymisation.
+  - title: Open Data Contract Standard
+    url: https://github.com/bitol-io/open-data-contract-standard
+    note: An open specification for data contracts, under the LF AI & Data Foundation.
+  - title: OpenLineage
+    url: https://openlineage.io/
+    note: An open standard for lineage events emitted by orchestrators and engines.
+  - title: Marquez
+    url: https://github.com/MarquezProject/marquez
+    note: An open-source metadata service that collects OpenLineage events.
+  - title: Great Expectations documentation
+    url: https://docs.greatexpectations.io/
+  - title: Deequ
+    url: https://github.com/awslabs/deequ
+    note: Unit tests for data on Apache Spark.
+  - title: Pandera
+    url: https://pandera.readthedocs.io/
+    note: Validation of data frames in Python.
+  - title: "k-anonymity: a model for protecting privacy"
+    author: Latanya Sweeney
+    year: 2002
+    note: International Journal of Uncertainty, Fuzziness and Knowledge-Based Systems 10(5).
+  - title: DataHub
+    url: https://github.com/datahub-project/datahub
+  - title: OpenMetadata
+    url: https://open-metadata.org/
+---
+
+<Section id="motivation" kind="motivation" title="Green pipelines, wrong numbers">
+
+A parcel company in Vietnam reports each client's on-time delivery rate every month. In March the rate for its largest client jumped from 91% to 97%, and the account manager sent a cheerful note. Three weeks later an analyst found the cause: a new version of the drivers' app wrote the status `DELIVERED` in capitals, the late-delivery query matched only `delivered`, and every late delivery recorded by the new app had quietly dropped out of the denominator. Every pipeline run had been green.
+
+Nothing in <LessonLink slug="pipelines-and-orchestration">Pipelines and orchestration</LessonLink> would have caught this: no task failed. The failure was in the *data*. This lesson is about two things that keep data trustworthy. **Data quality** is the engineering of checks, contracts and monitors that catch wrong data before people act on it. **Data governance** is the set of rules and tools that decide who owns data, who may use it and for what, how long it is kept, and how it is protected — especially when it is about people, where the duty is ethical and, in most countries, legal.
+
+<Narrator who="chloe">
+
+The question underneath is "how would we know?" A pipeline can only be trusted to the extent that its failures are *observable*. Every check in this lesson turns an assumption someone was silently making — statuses are lower case, every delivery has a customer, the table refreshes daily — into a statement a machine tests every day.
+
+</Narrator>
+
+</Section>
+
+<Section id="quality" kind="definitions" title="Quality, contracts and expectations">
+
+Data is good when it is fit for the use it is put to, and fitness has several dimensions. **Validity**: values have the right type, format and range. **Completeness**: required values and rows are present. **Uniqueness**: each real-world thing is recorded once. **Consistency**: values agree across tables (every delivery's customer exists). **Timeliness**: data is fresh enough for its use. **Accuracy**: values match the world, the hardest to check, because it needs a source of truth outside the data.
+
+Most quality failures happen at a boundary between teams: an application team changes its schema, a vendor changes a feed, and the data team finds out from a broken dashboard. A **data contract** makes that boundary explicit.
+
+<Definition term="Data contract">
+
+A **data contract** is an agreement, written down and versioned, between the producer of a dataset and its consumers. It states the schema (fields, types, which may be null), the meaning of each field and its units, quality rules, freshness and availability targets, the owner and how to reach them, how personal data in it is classified, and how changes will be announced — typically, that breaking changes need a new version and a notice period.
+
+</Definition>
+
+Contracts live as files beside the producer's code, reviewed like code. A minimal one might look like this (an illustrative format; the Open Data Contract Standard defines a fuller, shared schema for the same purpose):
+
+```yaml
+# Illustrative data contract, kept in the producing team's repository. Not run here.
+dataset: deliveries
+version: 2.1.0
+owner: delivery-app-team (on call: #delivery-data)
+description: One row per delivery attempt, written when a driver closes the attempt.
+schema:
+  - {name: delivery_id, type: string, required: true, unique: true}
+  - {name: customer_id, type: string, required: true, references: customers.customer_id}
+  - {name: status, type: string, required: true, allowed: [delivered, in_transit, returned]}
+  - {name: weight_kg, type: decimal, unit: kilogram, range: [0, 50]}
+  - {name: postcode, type: string, required: false, personal_data: quasi-identifier}
+quality:
+  - delivered_at is null or delivered_at >= created_at
+freshness: rows for day D available by 02:00 UTC on D + 1, on 99% of days
+changes: breaking changes need a new major version and 30 days' notice to consumers
+```
+
+The capitals bug of the motivation breaks the `allowed` rule on its first row. Where the stream carries schemas in Avro, Protobuf or JSON Schema, a **schema registry** (Confluent's, Apicurio, AWS Glue's and others) can reject incompatible schema changes before a producer deploys them, the compatibility rules of <LessonLink slug="data-models-and-file-formats">Data models and file formats</LessonLink> enforced by machine. Contracts work only if the producer agrees to them: they are as much an organisational change — producers owning the quality of what they publish — as a technical one.
+
+</Section>
+
+<Section id="checks" kind="computation" title="A validation framework in SQL">
+
+The idea behind dbt's tests, Soda's checks and many in-house frameworks is simple: **a check is a query that returns the rows that break a rule**, and the check passes if it returns none. The block builds such a framework on SQLite, with two refinements that real tools share: a **severity** (an `error` blocks publication; a `warn` only reports), and a tolerance, `mostly`, for rules that may fail on a small fraction of rows. Rows that fail blocking checks are moved to a **quarantine** table, where someone can inspect and repair them, and the rest are published.
+
+```python run
+import random
+import sqlite3
+
+# --- A small validation framework: every check is a SQL query that returns the rows breaking a rule.
+class Check:
+    def __init__(self, name, table, failing_sql, severity="error", mostly=1.0):
+        self.name, self.table, self.sql = name, table, failing_sql
+        self.severity, self.mostly = severity, mostly        # mostly=0.99: tolerate 1% failures
+
+def not_null(t, col, **kw):
+    return Check(f"{col} is not null", t, f"SELECT rowid FROM {t} WHERE {col} IS NULL", **kw)
+
+def unique(t, col, **kw):                                 # every copy after the first fails
+    return Check(f"{col} is unique", t, f"""SELECT rowid FROM {t} WHERE rowid NOT IN
+                 (SELECT MIN(rowid) FROM {t} GROUP BY {col})""", **kw)
+
+def accepted(t, col, values, **kw):
+    listed = ", ".join(f"'{v}'" for v in values)
+    return Check(f"{col} in accepted values", t, f"SELECT rowid FROM {t} WHERE {col} NOT IN ({listed})", **kw)
+
+def between(t, col, lo, hi, **kw):
+    return Check(f"{lo} <= {col} <= {hi}", t, f"SELECT rowid FROM {t} WHERE {col} NOT BETWEEN {lo} AND {hi}", **kw)
+
+def references(t, col, other, other_col, **kw):
+    return Check(f"{col} exists in {other}", t, f"""SELECT {t}.rowid FROM {t} LEFT JOIN {other}
+                 ON {t}.{col} = {other}.{other_col} WHERE {other}.{other_col} IS NULL""", **kw)
+
+def holds(t, name, condition, **kw):
+    return Check(name, t, f"SELECT rowid FROM {t} WHERE NOT ({condition})", **kw)
+
+def validate(db, checks):
+    """Run every check; return the rowids that failed blocking checks."""
+    bad = set()
+    for c in checks:
+        failing = [r for (r,) in db.execute(c.sql)]
+        total = db.execute(f"SELECT COUNT(*) FROM {c.table}").fetchone()[0]
+        ok = len(failing) <= (1 - c.mostly) * total
+        verdict = "pass" if ok else ("FAIL" if c.severity == "error" else "warn")
+        print(f"  {verdict:4s}  {c.name:34s} {len(failing):4d} of {total} rows")
+        if verdict == "FAIL":
+            bad.update(failing)
+    return bad
+
+# --- Today's delivery records from a parcel company (synthetic), with some planted faults.
+rng = random.Random(9)
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE customers (customer_id TEXT)")
+db.executemany("INSERT INTO customers VALUES (?)", [(f"C{i:05d}",) for i in range(2_000)])
+db.execute("""CREATE TABLE deliveries (delivery_id TEXT, customer_id TEXT, status TEXT,
+              weight_kg REAL, created_at TEXT, delivered_at TEXT, postcode TEXT)""")
+rows = []
+for i in range(1_000):
+    created = f"2026-03-14T{rng.randrange(6, 18):02d}:{rng.randrange(60):02d}"
+    status = rng.choice(["delivered"] * 8 + ["in_transit", "returned"])
+    delivered = f"2026-03-15T{rng.randrange(8, 20):02d}:00" if status == "delivered" else None
+    rows.append([f"D{i:06d}", f"C{rng.randrange(2_000):05d}", status, round(rng.uniform(0.2, 30), 1),
+                 created, delivered, f"{rng.randrange(10_000, 99_999)}" if rng.random() > 0.004 else None])
+rows[10][3] = -2.0                      # a scale that was not zeroed
+rows[11][1] = "C99999"                  # a customer the customer table has never heard of
+rows[12][2] = "DELIVERED"               # a new app version that shouts
+rows[13][5] = "2026-03-13T09:00"        # delivered before it was created
+rows.append(list(rows[20]))             # a duplicate from a retried export
+db.executemany("INSERT INTO deliveries VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+
+checks = [
+    not_null("deliveries", "delivery_id"),
+    unique("deliveries", "delivery_id"),
+    references("deliveries", "customer_id", "customers", "customer_id"),
+    accepted("deliveries", "status", ["delivered", "in_transit", "returned"]),
+    between("deliveries", "weight_kg", 0, 50),
+    holds("deliveries", "delivered after created", "delivered_at IS NULL OR delivered_at >= created_at"),
+    not_null("deliveries", "postcode", severity="warn", mostly=0.995),    # optional: tolerate 0.5% missing
+]
+print("validating deliveries:")
+bad = validate(db, checks)
+with db:                                # quarantine failing rows; publish the rest
+    db.execute("CREATE TABLE quarantine AS SELECT * FROM deliveries WHERE 0")
+    marks = ",".join("?" * len(bad))
+    db.execute(f"INSERT INTO quarantine SELECT * FROM deliveries WHERE rowid IN ({marks})", sorted(bad))
+    db.execute(f"DELETE FROM deliveries WHERE rowid IN ({marks})", sorted(bad))
+print(f"quarantined {len(bad)} rows; {db.execute('SELECT COUNT(*) FROM deliveries').fetchone()[0]} published")
+print("re-validating what is published:")
+validate(db, checks)
+```
+
+Five planted faults, five failing checks: the duplicate from a retried export (only the second copy fails, so the first is kept), a customer that does not exist, the shouting status, a negative weight from a scale that was not zeroed, and a delivery recorded before it was created. The six missing postcodes exceed the 0.5% tolerance and raise a warning, but an optional field never blocks a delivery. After quarantine, 996 rows are published and every blocking check passes.
+
+<Narrator who="gideon">
+
+Quarantine is itself a decision with consequences. The duplicate is safe to drop, but the delivery with the unknown customer is probably a real delivery, and removing it understates the day's volume. A quarantine table needs an owner, a process for repairing and re-admitting rows, and a count on a dashboard; otherwise it becomes the place where inconvenient data goes to be forgotten.
+
+</Narrator>
+
+Where should checks run? At **ingestion**, against the contract, so that bad data is caught at the boundary and the producer is told. **Between transformation and publication**, in the write-audit-publish pattern of <LessonLink slug="pipelines-and-orchestration">Pipelines and orchestration</LessonLink>, so that consumers never see a failing table. And on **outputs** — totals that must reconcile with a finance system, counts that must match between source and warehouse — which catch errors no single-table rule can. The open-source tools differ mainly in where they live: dbt tests and Soda checks are SQL run in the warehouse; Great Expectations and Pandera validate data frames in Python; Deequ (from AWS) runs on Spark; and commercial data-observability services add automatic monitors across a whole warehouse.
+
+</Section>
+
+<Section id="monitoring" kind="computation" title="Freshness and volume">
+
+Rules catch values that are wrong. Some of the commonest failures produce values that are each perfectly valid: a load that did not run (the table is **stale**), a load that ran on half the source (too **few rows**), a load that ran twice (too **many**). Two monitors catch these: **freshness**, the time since the last successful load, against a target; and **volume**, today's row count against what is expected.
+
+Expected is the hard part. Business data has rhythms — a parcel company delivers far less on Sundays — and grows. The block simulates eight weeks of daily row counts with a weekly pattern, slow growth and noise, plants a partial load and a duplicated load, and compares two rules over the last four weeks: the change from the median of the **same weekday** in the previous four weeks, alerting beyond 20%, and a naive rule that alerts when a count is more than three standard deviations from the mean of the last 28 days.
+
+```python run
+import datetime as dt
+import random
+import statistics
+
+# Eight weeks of daily row counts for the deliveries table (synthetic), starting Monday 19 January 2026.
+rng = random.Random(21)
+start = dt.date(2026, 1, 19)
+WEEKDAY_LEVEL = [10_400, 10_100, 10_200, 10_600, 11_800, 7_300, 4_100]    # Monday ... Sunday
+days, counts = [], []
+for i in range(56):
+    day = start + dt.timedelta(days=i)
+    n = round(WEEKDAY_LEVEL[day.weekday()] * (1 + 0.002 * i) * rng.gauss(1, 0.04))   # slow growth, noise
+    days.append(day)
+    counts.append(n)
+counts[45] = round(counts[45] * 0.62)   # a partial load: one region's export failed
+counts[51] *= 2                         # a retried load appended everything twice
+
+def expected(i):
+    """The median of the same weekday over the previous four weeks: robust to one bad day,
+    and it follows both the weekly pattern and slow growth."""
+    return statistics.median(counts[i - 7 * k] for k in range(1, 5))
+
+print("day          rows   expected   change   same-weekday rule   naive 3-sigma rule")
+flagged = 0
+for i in range(28, 56):
+    change = counts[i] / expected(i) - 1
+    window = counts[i - 28:i]                                    # naive: last 28 days, any weekday
+    naive = abs(counts[i] - statistics.mean(window)) > 3 * statistics.stdev(window)
+    if abs(change) > 0.20 or naive:
+        flagged += 1
+        print(f"{days[i]:%a %d %b}  {counts[i]:6,}   {expected(i):8,.0f}   {change:+6.0%}"
+              f"   {'ALERT' if abs(change) > 0.20 else 'ok':>17s}   {'ALERT' if naive else 'ok':>18s}")
+print(f"({28 - flagged} other days checked: no alert under either rule)")
+
+# Freshness: when did the latest successful load finish, against a 26-hour objective?
+loads = [dt.datetime(2026, 3, 15, 2, 10), dt.datetime(2026, 3, 14, 2, 25)]   # most recent first
+now = dt.datetime(2026, 3, 16, 5, 40)
+age = now - max(loads)
+print(f"\nfreshness: last load {max(loads):%d %b %H:%M}, age {age}, objective 26:00:00 -> "
+      f"{'LATE by ' + str(age - dt.timedelta(hours=26)) if age > dt.timedelta(hours=26) else 'fresh'}")
+```
+
+The same-weekday rule catches both incidents and nothing else. The naive rule catches only the doubled load: the partial load on Thursday 5 March, 41% below normal, sits comfortably within three standard deviations of a 28-day mean, because the weekly swing between busy weekdays and quiet Sundays makes the standard deviation enormous. And the freshness monitor reports the table 1 hour 30 minutes past its 26-hour objective — a load that did not happen, which no rule about values can see.
+
+<Narrator who="margaret">
+
+Every alert costs attention, so count both kinds of error. Over 28 days the same-weekday rule raised 2 alerts, both real. A rule that fired on one day in ten would page someone about three times a month for nothing, and within a quarter people would mute it. Tune thresholds on history, and attach each alert to an owner and a runbook, as Lumenary CS's [reliability engineering](/en/cs/reliability-engineering/) lesson recommends for any service.
+
+</Narrator>
+
+</Section>
+
+<Section id="lineage" kind="intuition" title="Lineage and catalogs">
+
+When a check fails, two questions follow at once. *What is affected?* — which tables, dashboards and models downstream will be wrong. And *where did it come from?* — which upstream source or transformation introduced the fault. Both are graph searches over **lineage**.
+
+<Definition term="Lineage">
+
+**Lineage** is the graph of how datasets are derived from one another: an edge from dataset $A$ to dataset $B$ means a job read $A$ to write $B$. **Table-level** lineage records which tables feed which; **column-level** lineage records which input columns each output column is computed from. Searching the graph downstream gives **impact analysis**; searching upstream gives candidates for **root-cause analysis**.
+
+</Definition>
+
+<Figure caption="Lineage for the parcel company's revenue reporting. The exchange-rate feed is broken; searching downstream from raw_fx finds everything affected — staged orders, daily revenue, customer features, the revenue dashboard and the churn model — while the payments branch is untouched and can be trusted.">
+
+<svg viewBox="0 0 680 235" role="img" aria-label="A lineage graph in five columns. Sources: orders in the shop database, the payments API and the exchange-rate service. Raw tables: raw_orders, raw_payments and raw_fx, which is marked broken. Staging: stg_orders, fed by raw_orders and raw_fx, and stg_payments, fed by raw_payments. Marts: daily_revenue, fed by stg_orders and stg_payments, and customer_features, fed by stg_orders. Uses: a revenue dashboard fed by daily_revenue and a churn model fed by customer_features. Everything downstream of raw_fx is highlighted as affected.">
+  <defs>
+    <marker id="dq-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+    <marker id="dq-arrow-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--gold)" />
+    </marker>
+  </defs>
+  <g fill="none" strokeWidth="1.5">
+    <rect x="10" y="20" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="10" y="95" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="10" y="170" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="140" y="20" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="140" y="95" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="140" y="170" width="110" height="28" rx="4" stroke="var(--bad)" strokeWidth="2.4" />
+    <rect x="275" y="55" width="110" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="275" y="130" width="110" height="28" rx="4" stroke="currentColor" />
+    <rect x="410" y="55" width="110" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="410" y="150" width="110" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="545" y="55" width="125" height="28" rx="4" stroke="var(--gold)" />
+    <rect x="545" y="150" width="125" height="28" rx="4" stroke="var(--gold)" />
+  </g>
+  <g fill="currentColor" fontSize="11" textAnchor="middle">
+    <text x="65" y="38">orders (shop DB)</text>
+    <text x="65" y="113">payments API</text>
+    <text x="65" y="188">FX rate service</text>
+    <text x="195" y="38">raw_orders</text>
+    <text x="195" y="113">raw_payments</text>
+    <text x="195" y="188">raw_fx (broken)</text>
+    <text x="330" y="73">stg_orders</text>
+    <text x="330" y="148">stg_payments</text>
+    <text x="465" y="73">daily_revenue</text>
+    <text x="465" y="168">customer_features</text>
+    <text x="607" y="73">revenue dashboard</text>
+    <text x="607" y="168">churn model</text>
+    <text x="340" y="226">highlighted: downstream of raw_fx, so affected</text>
+  </g>
+  <g stroke="currentColor" strokeWidth="1.1" markerEnd="url(#dq-arrow)">
+    <line x1="120" y1="34" x2="138" y2="34" />
+    <line x1="120" y1="109" x2="138" y2="109" />
+    <line x1="120" y1="184" x2="138" y2="184" />
+    <line x1="250" y1="34" x2="273" y2="64" />
+    <line x1="250" y1="109" x2="273" y2="142" />
+    <line x1="385" y1="144" x2="408" y2="74" />
+  </g>
+  <g stroke="var(--gold)" strokeWidth="1.6" markerEnd="url(#dq-arrow-gold)">
+    <line x1="250" y1="184" x2="273" y2="76" />
+    <line x1="385" y1="69" x2="408" y2="69" />
+    <line x1="385" y1="74" x2="408" y2="160" />
+    <line x1="520" y1="69" x2="543" y2="69" />
+    <line x1="520" y1="164" x2="543" y2="164" />
+  </g>
+</svg>
+
+</Figure>
+
+Lineage can be declared (dbt knows it from `ref()`; Dagster from asset dependencies), parsed from SQL, or reported by engines and orchestrators as they run. **OpenLineage**, an open standard under the LF AI & Data Foundation, defines the events: each run of a job reports its inputs and outputs, with optional facets such as schemas and column-level lineage. Spark, Airflow, Flink, dbt and others have OpenLineage integrations, and **Marquez** is an open-source service that collects the events. An abridged event looks like this:
+
+```json
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2026-03-15T02:41:07Z",
+  "run": {"runId": "0b6c2f3e-5d1a-4c7e-9a52-7f0e8d3b1c44"},
+  "job": {"namespace": "parcel-pipelines", "name": "daily_revenue"},
+  "inputs": [{"namespace": "warehouse", "name": "staging.stg_orders"},
+             {"namespace": "warehouse", "name": "staging.stg_payments"}],
+  "outputs": [{"namespace": "warehouse", "name": "marts.daily_revenue"}]
+}
+```
+
+A **data catalog** gathers lineage with the other metadata people need to find and trust data: **technical** metadata (schemas, locations, partitions, sizes), **business** metadata (descriptions, a glossary of terms such as "active customer", owners and stewards), **operational** metadata (freshness, check results, usage) and **classification** (which columns hold personal or confidential data). Open-source catalogs include DataHub (from LinkedIn), OpenMetadata, Amundsen (from Lyft) and Apache Atlas; commercial products include Collibra, Alation and Atlan, and each cloud and platform has its own — Microsoft Purview, Google's Dataplex, AWS's catalog services, Databricks' Unity Catalog, Snowflake's governance features. A catalog is only as good as its metadata: one nobody updates is soon distrusted and then ignored, so the best catalogs collect most of it automatically and ask people only for what machines cannot know.
+
+</Section>
+
+<Section id="access" kind="human" title="Access control">
+
+The principle is **least privilege**: every person and every program can read and change only what its job needs, for as long as it needs it — the same principle as in Lumenary CS's [security](/en/cs/security/) lesson and the Cloud Computing elective's [cloud security and identity](/en/cs/electives/cloud-computing/cloud-security-and-identity/). In data platforms it takes four forms.
+
+- **Roles** (role-based access control): grant privileges on schemas and tables to roles such as `analyst` or `support`, and roles to people, so access follows the job rather than the person.
+- **Attributes and tags** (attribute-based access control): classify columns as personal, financial or public in the catalog, and write policies over the classifications ("only the fraud team reads columns tagged *personal*") instead of over thousands of tables one by one.
+- **Row-level security**: one table, different rows for different readers — each regional office sees its own region's deliveries.
+- **Masking**: show a column in a reduced form — the last three digits of a phone number, a year instead of a birth date — to readers who need the row but not the value.
+
+In PostgreSQL, for example (not run here; warehouses have equivalents with their own syntax):
+
+```sql
+-- Not run here: PostgreSQL.
+CREATE ROLE analyst;
+GRANT SELECT ON marts.daily_revenue TO analyst;              -- aggregates, not raw records
+REVOKE ALL ON raw.customers FROM analyst;
+CREATE VIEW support.customers_masked AS                      -- support sees a masked phone number
+  SELECT customer_id, '*******' || right(phone, 3) AS phone, district FROM raw.customers;
+ALTER TABLE raw.deliveries ENABLE ROW LEVEL SECURITY;        -- each office sees its own region
+CREATE POLICY own_region ON raw.deliveries USING (region = current_setting('app.region'));
+```
+
+Two habits complete the picture. **Audit**: log who read what and when, and look at the logs. And **protect the pipelines themselves**: they hold credentials to every system they touch, so those credentials belong in a secrets manager, scoped to what each job needs, and rotated.
+
+</Section>
+
+<Section id="privacy" kind="computation" title="Pseudonymisation, anonymisation and k-anonymity">
+
+Removing names is not anonymisation. Two techniques are often confused.
+
+<Definition term="Pseudonymisation and anonymisation">
+
+**Pseudonymisation** replaces direct identifiers (a name, a phone number, a customer number) with a pseudonym, so that the data can no longer be linked to a person *without additional information kept separately*, such as a secret key or a lookup table. **Anonymisation** transforms data so that people can no longer be identified by any means reasonably likely to be used, by anyone. Under the GDPR, pseudonymised data remains personal data, certainly for whoever holds the means to re-identify it; truly anonymous data is not personal data at all.
+
+</Definition>
+
+The block shows two ways to get this wrong, on synthetic customers. First, it pseudonymises 6-digit loyalty numbers with a plain SHA-256 hash, then checks how many hashes can be matched back by hashing every possible number — the check any careful reviewer should make of their own data. Then it measures **k-anonymity**: a table is $k$-anonymous if every combination of **quasi-identifiers** — attributes such as age, district and sex that are not identifying alone but are in combination — is shared by at least $k$ people.
+
+```python run
+import hashlib
+import hmac
+import random
+from collections import Counter
+
+rng = random.Random(5)
+# Synthetic customers: a 6-digit loyalty number, plus three quasi-identifiers.
+districts = {"Ba Dinh": "Hanoi", "Hoan Kiem": "Hanoi", "Cau Giay": "Hanoi",
+             "District 1": "Ho Chi Minh City", "District 3": "Ho Chi Minh City", "Thu Duc": "Ho Chi Minh City"}
+people = [{"loyalty": f"{rng.randrange(1_000_000):06d}", "age": rng.randint(18, 85),
+           "district": rng.choice(sorted(districts)), "sex": rng.choice("FM")} for _ in range(3_000)]
+
+# 1. A plain hash is not anonymisation: anyone can hash every possible 6-digit number.
+plain = {hashlib.sha256(p["loyalty"].encode()).hexdigest() for p in people}
+lookup = {}
+for n in range(1_000_000):
+    digest = hashlib.sha256(f"{n:06d}".encode()).hexdigest()
+    if digest in plain:
+        lookup[digest] = f"{n:06d}"
+print(f"plain SHA-256: {len(lookup)} of {len(plain)} hashed ids recovered by trying all 10^6 numbers")
+
+# A keyed hash (HMAC) with a secret kept apart from the data cannot be rebuilt that way.
+KEY = b"stored in a secrets manager, not next to the data"      # illustrative only
+def pseudonym(value):
+    return hmac.new(KEY, value.encode(), hashlib.sha256).hexdigest()[:16]
+print("HMAC pseudonym of one id:", pseudonym(people[0]["loyalty"]), "(same input, same pseudonym: joins still work)")
+
+# 2. k-anonymity: how many people share each combination of quasi-identifiers?
+def smallest_groups(rows, key, k=5):
+    groups = Counter(key(r) for r in rows)
+    at_risk = sum(c for c in groups.values() if c < k)
+    return min(groups.values()), at_risk, len(groups)
+
+for label, key in [
+    ("exact age, district, sex", lambda r: (r["age"], r["district"], r["sex"])),
+    ("10-year band, district, sex", lambda r: (r["age"] // 10 * 10, r["district"], r["sex"])),
+    ("10-year band, city, sex", lambda r: (r["age"] // 10 * 10, districts[r["district"]], r["sex"])),
+]:
+    k_min, at_risk, n_groups = smallest_groups(people, key)
+    print(f"{label:28s} {n_groups:4d} groups, smallest has {k_min:3d}; "
+          f"{at_risk:4d} people in groups smaller than 5")
+```
+
+All 2,995 distinct hashed ids were matched back in well under a second on the machine that checked this lesson (a few seconds in a browser): a hash of a value from a small, known set is a lookup table waiting to be built. A **keyed** hash such as HMAC, with the key stored in a secrets manager away from the data, gives stable pseudonyms that still join across tables but cannot be reversed without the key — which is exactly why the result is pseudonymised, not anonymous: whoever holds the key can re-identify.
+
+The quasi-identifiers tell the second story. With exact age, district and sex, 1,550 of 3,000 people — over half — are in a group of fewer than five, and many are unique: anyone who knows a neighbour's age, district and sex could pick out their row. Coarsening age to ten-year bands brings the smallest group to 6; coarsening district to city as well, to 23. Each step loses detail an analyst might have wanted, and that trade-off between usefulness and protection is the heart of the subject.
+
+<Narrator who="gideon">
+
+k-anonymity is a necessary check, not a guarantee. If all six people in a group share the same sensitive value, the group reveals it anyway; and an attacker with other datasets can link records across them. For publishing statistics about people, **differential privacy** gives a mathematical bound on what any output reveals about any individual; Lumenary Statistics' [privacy and official statistics](/en/statistics/privacy-and-official-statistics/) lesson explains it, including its use in national censuses.
+
+</Narrator>
+
+</Section>
+
+<Section id="law" kind="human" title="Privacy law, described carefully">
+
+Laws about personal data differ by country, change often, and are interpreted by regulators and courts. What follows describes the main ideas of the best-known laws as of 2026 so that you recognise them; it is not legal advice, and decisions about real data need the organisation's data protection officer or lawyers and the regulators' own guidance.
+
+The **EU General Data Protection Regulation** (GDPR), which has applied since May 2018, is the most influential. Its main ideas:
+
+- **Scope.** It covers processing of personal data — any information relating to an identified or identifiable person — by organisations in the EU, and by organisations elsewhere that offer goods or services to people in the EU or monitor their behaviour there.
+- **Principles** (Article 5): lawfulness, fairness and transparency; **purpose limitation** (collect for specified purposes and do not reuse incompatibly); **data minimisation** (only what the purpose needs); accuracy; **storage limitation** (keep identifiable data no longer than necessary); integrity and confidentiality (security); and accountability (be able to show compliance).
+- **Lawful bases** (Article 6): processing needs one of six — consent, a contract, a legal obligation, vital interests, a public task, or legitimate interests weighed against the person's rights. Consent is only one, and where it is used it must be freely given, specific, informed and as easy to withdraw as to give. Special categories, such as health data, have stricter conditions.
+- **Rights** of the people the data is about: to be informed, of access, to rectification, to erasure (with exceptions, for example where the law requires the data to be kept), to restrict processing, to data portability, to object, and rights about solely automated decisions with significant effects.
+- **Duties** of organisations: data protection by design and by default; records of processing; data protection impact assessments for high-risk processing; notifying the supervisory authority of a personal-data breach without undue delay and, where feasible, within 72 hours, unless it is unlikely to result in a risk; and safeguards for transfers outside the European Economic Area.
+
+Many countries have comprehensive laws with similar foundations and important differences: the UK GDPR and Data Protection Act 2018; Brazil's LGPD; India's Digital Personal Data Protection Act 2023; China's Personal Information Protection Law (2021); South Africa's POPIA; Kenya's Data Protection Act 2019; Japan's APPI; Singapore's PDPA; Canada's PIPEDA; and, in the United States, state laws such as California's CCPA (as amended by the CPRA) alongside sector laws such as HIPAA for health information. Regulators publish practical guidance — the European Data Protection Board and the UK's Information Commissioner's Office, linked below, are good places to start.
+
+For a data engineer the law turns into concrete engineering: classify personal data in the catalog; collect only what a documented purpose needs; pseudonymise early in pipelines; restrict and audit access; keep data only as long as the retention schedule says; be able to find and delete one person's data everywhere; and know whom to tell, and how fast, when something goes wrong. These are good practice wherever you work, because the people behind the rows deserve them whatever the local law requires.
+
+</Section>
+
+<Section id="retention" kind="examples" title="Retention and deletion">
+
+A **retention schedule** says, for each kind of data, how long it is kept and why: raw application logs 30 days, delivery records seven years because tax law requires it, support chat transcripts one year. **Legal holds** suspend deletion for data relevant to a dispute. Retention is enforced by jobs — partitions older than the limit are dropped — and those jobs need monitoring like any other.
+
+Deletion is hard because data is copied. Lineage tells you where a person's data flowed; each copy needs its own mechanism.
+
+<Example title="Erasing one customer, everywhere">
+
+A customer of the parcel company asks for their data to be erased, and no legal exception applies. Following lineage from the `customers` source:
+
+1. **Source and replicas.** The application deletes the row; log-based change data capture, as in <LessonLink slug="stream-processing">Stream processing</LessonLink>, carries the delete to every replica. A polling pipeline would never see it.
+2. **Lakehouse tables.** A `DELETE` by customer id commits a new snapshot; the rows remain physically until older snapshots expire and unreferenced files are removed, as <LessonLink slug="lakehouses-and-table-formats">Lakehouses and table formats</LessonLink> showed, so the retention of snapshots must fit inside the deadline for erasure.
+3. **Derived tables.** Rows keyed by the customer's pseudonym are deleted too; aggregates that no longer identify anyone, such as deliveries per district per day, can stay.
+4. **Logs, extracts and streams.** Short retention handles most of them; topics with long retention need compaction with a deletion marker for the key, or encryption as below.
+5. **Backups.** Rewriting backups is rarely practical. A common approach is to let backups expire on a fixed schedule and, if one is ever restored, re-apply the erasures recorded since.
+6. **Models.** A model trained on the data may have memorised some of it; the usual practice is to retrain on cleaned data at the next scheduled training, and removing an individual's influence from a trained model without retraining ("machine unlearning") remains an active research area.
+
+</Example>
+
+One technique makes erasure tractable at scale: **crypto-shredding**. Encrypt each person's sensitive fields with a key of their own, kept in a key-management service; to erase the person, destroy the key, and every copy of the ciphertext — in backups, logs and replicas — becomes unreadable at once. It costs key management and some query complexity, and it is worth considering for data that spreads widely.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"Hashing an identifier anonymises it."** A hash of a value from a known, small set — phone numbers, national ids, loyalty numbers — can be reversed by hashing every candidate. Even a keyed hash only pseudonymises: for the organisation holding the key, the data is still personal data and needs protecting as such.
+
+</Misconception>
+
+<Misconception>
+
+**"If the pipeline succeeded, the data is good."** Success means no task raised an error. Wrong-but-valid data, missing rows and duplicates pass straight through unless checks and monitors look for them.
+
+</Misconception>
+
+<Misconception>
+
+**"Governance is paperwork that slows engineers down."** Done well, it is mostly automation — classifications in the catalog, policies applied by tag, lineage collected by the engines, deletion propagated by jobs — that lets engineers move faster with less risk. Done badly, as a committee that approves spreadsheets, it does slow everyone down and protects no one.
+
+</Misconception>
+
+<Misconception>
+
+**"We have consent, so we can use the data for anything."** Consent, where it is the lawful basis, is given for specific purposes, can be withdrawn, and does not override data minimisation or storage limitation. A new purpose usually needs a new assessment.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>

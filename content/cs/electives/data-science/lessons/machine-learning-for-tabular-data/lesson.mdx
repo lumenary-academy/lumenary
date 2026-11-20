@@ -1,0 +1,612 @@
+---
+title: Machine learning for tabular data
+subtitle: Pipelines, features and the four model families that matter on tables — and how to evaluate them without fooling yourself.
+minutes: 85
+objectives:
+  - Build scikit-learn pipelines that combine imputation, scaling, encoding and a model into one estimator
+  - Engineer features from domain knowledge, and say when they matter more than the choice of model
+  - Compare linear models, decision trees, random forests and gradient boosting fairly with cross-validation
+  - Choose a cross-validation scheme that matches how the model will be used (stratified, grouped, forward in time, nested)
+  - Recognise data leakage, find it in a worked example, and fix it with point-in-time features
+  - Handle class imbalance without wrecking calibration, and choose a decision threshold from costs
+  - State the evidence for gradient-boosted trees on tabular data, and its limits
+narrators: [chloe, margaret, gideon]
+prerequisites: [the-data-science-workflow, data-wrangling, exploratory-data-analysis]
+related: [math.prob.statistics, math.applied.optimisation, math.algebra.linear-algebra]
+references:
+  - title: scikit-learn user guide
+    url: https://scikit-learn.org/stable/user_guide.html
+    note: The reference for every estimator used here; its pages on pipelines, cross-validation and calibration are especially good.
+  - title: "Common pitfalls and recommended practices (scikit-learn)"
+    url: https://scikit-learn.org/stable/common_pitfalls.html
+    note: Inconsistent preprocessing, data leakage and randomness, with examples.
+  - title: Random forests
+    author: Leo Breiman
+    year: 2001
+    url: https://doi.org/10.1023/A:1010933404324
+  - title: "Greedy function approximation: a gradient boosting machine"
+    author: Jerome H. Friedman
+    year: 2001
+    url: https://doi.org/10.1214/aos/1013203451
+  - title: "XGBoost: a scalable tree boosting system"
+    author: Tianqi Chen and Carlos Guestrin
+    year: 2016
+    url: https://arxiv.org/abs/1603.02754
+  - title: "CatBoost: unbiased boosting with categorical features"
+    author: Liudmila Prokhorenkova and colleagues
+    year: 2018
+    url: https://arxiv.org/abs/1706.09516
+  - title: LightGBM documentation
+    url: https://lightgbm.readthedocs.io/
+  - title: Why do tree-based models still outperform deep learning on typical tabular data?
+    author: Léo Grinsztajn, Edouard Oyallon and Gaël Varoquaux
+    year: 2022
+    url: https://arxiv.org/abs/2207.08815
+  - title: "Tabular data: deep learning is not all you need"
+    author: Ravid Shwartz-Ziv and Amitai Armon
+    year: 2022
+    url: https://arxiv.org/abs/2106.03253
+  - title: When do neural nets outperform boosted trees on tabular data?
+    author: Duncan McElfresh and colleagues
+    year: 2023
+    url: https://arxiv.org/abs/2305.02997
+  - title: "TabPFN: a transformer that solves small tabular classification problems in a second"
+    author: Noah Hollmann, Samuel Müller, Katharina Eggensperger and Frank Hutter
+    year: 2023
+    url: https://arxiv.org/abs/2207.01848
+  - title: Accurate predictions on small data with a tabular foundation model
+    author: Noah Hollmann and colleagues
+    year: 2025
+    url: https://doi.org/10.1038/s41586-024-08328-6
+    note: TabPFN v2, published in Nature.
+  - title: Leakage and the reproducibility crisis in machine-learning-based science
+    author: Sayash Kapoor and Arvind Narayanan
+    year: 2023
+    url: https://arxiv.org/abs/2207.07048
+    note: A survey of leakage across hundreds of published papers, with a taxonomy of how it happens.
+  - title: On over-fitting in model selection and subsequent selection bias in performance evaluation
+    author: Gavin C. Cawley and Nicola L. C. Talbot
+    year: 2010
+    url: https://jmlr.org/papers/v11/cawley10a.html
+  - title: The harm of class imbalance corrections for risk prediction models
+    author: Ruben van den Goorbergh, Maarten van Smeden, Dirk Timmerman and Ben Van Calster
+    year: 2022
+    url: https://doi.org/10.1093/jamia/ocac093
+---
+
+<Section id="motivation" kind="motivation" title="A table, a target and a budget">
+
+A rural water agency looks after 5,000 water points: boreholes with hand pumps, solar pumps and motorised pumps, spread over eight districts. Every quarter, a broken pump means a village walking further for water until a technician arrives. The agency has enough technicians for a few hundred preventive visits a quarter, and it asks its data scientist a precise question: *which pumps are most likely to break down in the next 90 days, so that we can visit them first?*
+
+The data are a table, one row per water point: district, pump type, age, borehole depth, how many people use it a day, the iron content of the water (iron corrodes pump parts), and the days since its last service. The target is one column: did it break down within 90 days? This is the most common shape of machine learning in practice: a few dozen columns of mixed types, missing values, and a few thousand to a few million rows, whether the rows are sales, loans, shipments or maintenance logs.
+
+The theory of learning from examples (losses, gradient descent, train and test sets, overfitting) is taught in [learning from data](/en/cs/learning-from-data/) in Lumenary CS, and the precision, recall and ROC curves you need to evaluate a classifier are in [training in practice](/en/cs/training-in-practice/). This lesson is about the craft that sits on top: building models so that the evaluation is honest, comparing the model families that matter on tables, and avoiding the mistakes that make a model look excellent in a notebook and fail in the field. The data throughout are synthetic, generated with fixed seeds, so that we know the truth and can check every method against it.
+
+</Section>
+
+<Section id="api" kind="definitions" title="The scikit-learn API and pipelines">
+
+Python's [scikit-learn](https://scikit-learn.org/) is the most widely used library for classical machine learning, and its design has been imitated by many others. (R users have [tidymodels](https://www.tidymodels.org/) and Julia users [MLJ](https://github.com/JuliaAI/MLJ.jl), built on similar ideas.) Almost everything in it is one of three kinds of object.
+
+<Definition term="estimator, transformer, predictor">
+
+An **estimator** is any object that learns from data with `fit(X, y)`. A **transformer** is an estimator that also has `transform(X)`, which returns a changed version of the data (imputing missing values, scaling, encoding categories). A **predictor** is an estimator with `predict(X)` (and, for classifiers, usually `predict_proba(X)`). Settings chosen before fitting, such as a tree's maximum depth, are **hyperparameters**, passed to the constructor; quantities learned by `fit`, such as a scaler's means, end in an underscore (`mean_`).
+
+</Definition>
+
+<Definition term="pipeline">
+
+A **pipeline** chains transformers and a final predictor into one estimator. Calling `fit` on the pipeline fits each step in turn on the output of the previous one; calling `predict` applies the already-fitted transformations and then the model. A **column transformer** applies different transformations to different columns (for example, scaling to numbers and one-hot encoding to categories) and joins the results.
+
+</Definition>
+
+Pipelines look like a convenience; they are really a correctness tool. Every quantity a preprocessing step learns (a median for filling gaps, the means used for scaling, the list of categories) is information about the data it was fitted on. Compute it on all your data and then cross-validate, and the validation rows have helped build the model being tested on them. Inside a pipeline, cross-validation refits every step on the training folds alone.
+
+<Figure caption="A pipeline inside cross-validation. Every step that learns something (the imputer's medians, the scaler's means, the encoder's categories, the model's parameters) is fitted on the training folds only, and then applied, unchanged, to the validation fold. Repeating this for each fold gives an honest estimate of performance on new data.">
+<svg viewBox="0 0 660 230" role="img" aria-label="Diagram. On the left, a table split into five folds; four are labelled training folds and one is labelled validation fold. An arrow labelled fit goes from the training folds through three boxes in a row: impute, scale and one-hot encode, model. A second arrow from the validation fold goes through the same three boxes, now labelled apply only, to a box labelled score. A note says this repeats for each of the five folds.">
+  <defs>
+    <marker id="mltab-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="20" y="30" width="90" height="26" fill="var(--sky-soft)" stroke="currentColor" />
+  <rect x="20" y="56" width="90" height="26" fill="var(--sky-soft)" stroke="currentColor" />
+  <rect x="20" y="82" width="90" height="26" fill="var(--sky-soft)" stroke="currentColor" />
+  <rect x="20" y="108" width="90" height="26" fill="var(--sky-soft)" stroke="currentColor" />
+  <rect x="20" y="160" width="90" height="26" fill="var(--gold)" fillOpacity="0.35" stroke="currentColor" />
+  <text x="65" y="22" textAnchor="middle" fill="currentColor" fontSize="12">training folds</text>
+  <text x="65" y="204" textAnchor="middle" fill="currentColor" fontSize="12">validation fold</text>
+  <text x="65" y="177" textAnchor="middle" fill="currentColor" fontSize="11">fold 5</text>
+  <text x="65" y="47" textAnchor="middle" fill="currentColor" fontSize="11">fold 1</text>
+  <text x="65" y="73" textAnchor="middle" fill="currentColor" fontSize="11">fold 2</text>
+  <text x="65" y="99" textAnchor="middle" fill="currentColor" fontSize="11">fold 3</text>
+  <text x="65" y="125" textAnchor="middle" fill="currentColor" fontSize="11">fold 4</text>
+  <rect x="180" y="62" width="100" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <rect x="320" y="62" width="120" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <rect x="480" y="62" width="90" height="40" rx="6" fill="var(--card)" stroke="currentColor" />
+  <text x="230" y="87" textAnchor="middle" fill="currentColor" fontSize="12">impute</text>
+  <text x="380" y="80" textAnchor="middle" fill="currentColor" fontSize="12">scale and</text>
+  <text x="380" y="95" textAnchor="middle" fill="currentColor" fontSize="12">one-hot encode</text>
+  <text x="525" y="87" textAnchor="middle" fill="currentColor" fontSize="12">model</text>
+  <line x1="110" y1="82" x2="178" y2="82" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#mltab-arrow)" />
+  <line x1="280" y1="82" x2="318" y2="82" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#mltab-arrow)" />
+  <line x1="440" y1="82" x2="478" y2="82" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#mltab-arrow)" />
+  <text x="144" y="76" textAnchor="middle" fill="currentColor" fontSize="11">fit</text>
+  <path d="M 110 173 L 380 173" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 3" />
+  <path d="M 230 102 L 230 168" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="2 3" />
+  <path d="M 380 102 L 380 168" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="2 3" />
+  <path d="M 525 102 L 525 168" fill="none" stroke="currentColor" strokeWidth="1" strokeDasharray="2 3" />
+  <path d="M 380 173 L 578 173" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="5 3" markerEnd="url(#mltab-arrow)" />
+  <text x="300" y="192" textAnchor="middle" fill="currentColor" fontSize="11">apply only: nothing is refitted</text>
+  <rect x="580" y="158" width="64" height="30" rx="6" fill="var(--gold)" fillOpacity="0.35" stroke="currentColor" />
+  <text x="612" y="178" textAnchor="middle" fill="currentColor" fontSize="12">score</text>
+  <text x="400" y="30" textAnchor="middle" fill="currentColor" fontSize="11">repeat for each of the 5 folds, then average the scores</text>
+</svg>
+</Figure>
+
+</Section>
+
+<Section id="models" kind="intuition" title="Four model families">
+
+Four families of model cover most tabular work. Here is what each one *is*, in a sentence or two, and what it is good at; the papers linked give the full story.
+
+- **Linear and logistic regression** predict with a weighted sum of the features (passed through a sigmoid for probabilities). They are fast, stable and easy to explain, and they extrapolate smoothly. They capture only what you put into the features: a threshold, a curve or an interaction has to be engineered as a column. The statistics behind them is in [generalised linear models](/en/statistics/generalised-linear-models/).
+- **A decision tree** asks a sequence of yes-or-no questions ("age above 12.3 years? pump type hand?"), choosing at each step the split that best separates the outcomes, and predicts the average outcome in the leaf it reaches. Trees find thresholds and interactions on their own and do not care about scaling. A single tree is also unstable: a slightly different sample gives a quite different tree.
+- **A random forest** averages hundreds of deep trees, each grown on a bootstrap sample of the rows and allowed to consider only a random subset of features at each split. Averaging many decorrelated trees cancels much of their instability ([Breiman, 2001](https://doi.org/10.1023/A:1010933404324)).
+- **Gradient boosting** builds trees *in sequence*: each new, small tree is fitted to the errors (more precisely, the gradient of the loss) of the ensemble so far, and added with a small weight, the learning rate ([Friedman, 2001](https://doi.org/10.1214/aos/1013203451)). Hundreds of small corrections add up to a flexible model. The widely used libraries are [XGBoost](https://xgboost.readthedocs.io/), [LightGBM](https://lightgbm.readthedocs.io/), [CatBoost](https://catboost.ai/) and scikit-learn's own `HistGradientBoostingClassifier`, which bins each feature into at most 256 values to make splitting fast, and handles missing values natively.
+
+<Narrator who="chloe">
+
+What question are we really asking? Not "which pumps will fail", which no model can know, but "which pumps have the highest *risk*", a probability we can rank by and act on. That is why we score the models below with log loss as well as AUC: AUC asks only whether the ranking is good, while log loss also asks whether a predicted 30% really means about 3 failures in 10.
+
+</Narrator>
+
+</Section>
+
+<Section id="comparison" kind="computation" title="Feature engineering and a fair comparison">
+
+The block below builds the synthetic water points, defines one pipeline per model, and scores each by five-fold stratified cross-validation. In the world we generated, risk jumps after a pump turns 12 (a threshold), rises with use but only for hand pumps (an interaction), jumps again when high-iron water meets an older pump, and jumps when a service is more than a year overdue. There is also one effect that the agency's engineers never suspected: solar pumps on boreholes deeper than 80 m fail more. The engineered logistic regression is given features for everything the engineers suspected, and nothing else.
+
+```python run
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+def make_pumps(n, seed):
+    """Synthetic water points: features on the prediction date, and whether each broke down within 90 days."""
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "district": rng.choice(list("ABCDEFGH"), n),
+        "pump_type": rng.choice(["hand", "solar", "motorised"], n, p=[0.6, 0.25, 0.15]),
+        "age_years": rng.uniform(0, 25, n).round(1),
+        "depth_m": rng.uniform(15, 120, n).round(0),
+        "users_per_day": rng.lognormal(np.log(250), 0.6, n).round(0),
+        "iron_mg_l": rng.lognormal(np.log(0.3), 0.8, n).round(2),
+        "days_since_service": rng.integers(0, 730, n),
+    })
+    district_effect = dict(zip("ABCDEFGH", rng.normal(0, 0.4, 8)))
+    logit = (-3.0
+             + 1.3 * (df["age_years"] > 12)                                     # a threshold, not a slope
+             + 1.0 * np.log(df["users_per_day"] / 250) * (df["pump_type"] == "hand")
+             + 0.8 * (df["iron_mg_l"] > 0.6) * (df["age_years"] > 8)            # an interaction
+             + 0.9 * (df["days_since_service"] > 365)
+             + 1.5 * ((df["pump_type"] == "solar") & (df["depth_m"] > 80))     # nobody suspected this one
+             + df["district"].map(district_effect))
+    df["true_risk"] = 1 / (1 + np.exp(-logit))                                 # known only because we made it
+    df["failed_90d"] = (rng.random(n) < df["true_risk"]).astype(int)
+    df.loc[rng.random(n) < 0.15, "iron_mg_l"] = np.nan                          # not every site was tested
+    return df
+
+pumps = make_pumps(5000, seed=11)
+X, y = pumps.drop(columns=["failed_90d", "true_risk"]), pumps["failed_90d"]
+print(f"{len(pumps)} water points, {y.mean():.1%} broke down within 90 days, "
+      f"{X['iron_mg_l'].isna().sum()} without an iron test")
+
+num = ["age_years", "depth_m", "users_per_day", "iron_mg_l", "days_since_service"]
+cat = ["district", "pump_type"]
+
+def engineer(d):
+    """Features the engineers suggested: two thresholds, a log, two interactions."""
+    d = d.copy()
+    d["old"] = (d["age_years"] > 12).astype(float)
+    d["overdue"] = (d["days_since_service"] > 365).astype(float)
+    d["log_users_hand"] = np.log(d["users_per_day"] / 250) * (d["pump_type"] == "hand")
+    d["iron_high_and_old"] = ((d["iron_mg_l"] > 0.6) & (d["age_years"] > 8)).astype(float)
+    return d
+
+def linear_prep(cols):
+    return ColumnTransformer([
+        ("num", make_pipeline(SimpleImputer(strategy="median", add_indicator=True), StandardScaler()), cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat),
+    ])
+tree_prep = ColumnTransformer([                              # trees need no scaling, and accept NaN
+    ("num", "passthrough", num),
+    ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat),
+])
+extra = ["old", "overdue", "log_users_hand", "iron_high_and_old"]
+
+models = {
+    "logistic, raw features": make_pipeline(linear_prep(num), LogisticRegression(max_iter=1000)),
+    "logistic, engineered": make_pipeline(FunctionTransformer(engineer), linear_prep(num + extra),
+                                          LogisticRegression(max_iter=1000)),
+    "decision tree (depth 4)": make_pipeline(tree_prep, DecisionTreeClassifier(max_depth=4, random_state=0)),
+    "random forest": make_pipeline(tree_prep, RandomForestClassifier(
+        n_estimators=150, min_samples_leaf=5, random_state=0)),
+    "gradient boosting": make_pipeline(tree_prep, HistGradientBoostingClassifier(
+        learning_rate=0.05, max_iter=200, max_leaf_nodes=8, min_samples_leaf=40, random_state=0)),
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+print(f"\n{'model':26s} {'ROC AUC':>13s} {'log loss':>14s}")
+for name, model in models.items():
+    r = cross_validate(model, X, y, cv=cv, scoring=["roc_auc", "neg_log_loss"])
+    auc, ll = r["test_roc_auc"], -r["test_neg_log_loss"]
+    print(f"{name:26s} {auc.mean():.3f} ± {auc.std():.3f} {ll.mean():8.3f} ± {ll.std():.3f}")
+
+# Only a synthetic world lets us score the truth itself, on the same folds.
+oracle = np.array([(roc_auc_score(y.iloc[te], pumps["true_risk"].iloc[te]),
+                    log_loss(y.iloc[te], pumps["true_risk"].iloc[te])) for _, te in cv.split(X, y)])
+print(f"{'the true risk (oracle)':26s} {oracle[:, 0].mean():.3f} ± {oracle[:, 0].std():.3f} "
+      f"{oracle[:, 1].mean():8.3f} ± {oracle[:, 1].std():.3f}")
+```
+
+Five things stand out, and each generalises.
+
+1. **The ceiling is low, and that is normal.** Even the true risk, which no model can beat on average, reaches an AUC of only 0.787: whether a particular pump breaks in a particular quarter is partly chance. In real work you cannot compute the ceiling, but you should expect one, and not chase improvements that do not exist.
+2. **Feature engineering moved the linear model from 0.737 to 0.767.** Four columns based on what engineers already knew were worth as much as switching to the best algorithm.
+3. **Gradient boosting matched the engineered model without being told anything**, at 0.766, and had the best log loss of the trained models (0.411 against 0.414). It found the thresholds and interactions itself, including the deep-solar-pump effect that the engineered features missed. The random forest was close behind.
+4. **The single tree was the worst**, especially on log loss (0.477, with the largest spread between folds): four levels of questions give coarse, overconfident probabilities.
+5. **The differences among the top three are about one standard deviation of the fold scores.** On this evidence they are tied. Choosing among them should depend on what else matters: explanation, speed, robustness to new pump types, ease of monitoring.
+
+<Narrator who="margaret">
+
+I checked the deep-solar effect directly with out-of-fold predictions. Boosting predicted an average risk of 0.395 for solar pumps on boreholes deeper than 80 m and 0.167 for shallower ones, against true risks of 0.419 and 0.161. The engineered logistic regression, which had no column for it, predicted 0.318 and 0.232.
+
+</Narrator>
+
+Notice also what the pipeline did quietly. The iron test was missing for 735 pumps; for the linear models, `SimpleImputer(add_indicator=True)` filled each gap with the median *of the training folds* and added a column saying "this was missing", which matters because a missing test is itself informative (sites that were never tested may be the remote ones). The tree models took the missing values as they were.
+
+<Note>
+
+Useful feature engineering on tables usually comes from a short list: ratios that a domain expert would compute (users per tap, debt per income, energy per square metre); logs of skewed amounts; thresholds and bands that match rules in the real world; date parts (day of week, month, public holidays); **time since** an event, and **counts or averages over a recent window** (failures in the last year), computed as of the prediction date; and indicators for missing values. High-cardinality categories (thousands of villages) can be **target-encoded**, replacing each category by the average outcome in it. That uses the target, so it must be cross-fitted; scikit-learn's `TargetEncoder` does this internally.
+
+</Note>
+
+</Section>
+
+<Section id="cross-validation" kind="examples" title="Cross-validation done right">
+
+Cross-validation estimates how a modelling *procedure* will perform on new data from the same source. Its estimate is honest only if every split imitates the way the model will be used. Four rules cover most cases.
+
+**Stratify when the outcome is rare.** With 4% positives and five folds, an unlucky split can put few positives in one fold. `StratifiedKFold` keeps the proportion the same in every fold.
+
+**Group rows that are not independent.** If the table has one row per pump per year, the same pump appears several times. A random split puts some of its years in training and others in validation, and the model can recognise the pump rather than learn about pumps. Split by pump (`GroupKFold`), and by village or district if the model will be used in new places.
+
+**Go forward in time when you predict the future.** A model used next quarter should be validated on quarters after the ones it was trained on (`TimeSeriesSplit`, or a hand-written rolling split), with a gap if labels take time to arrive. Random splits let the model learn from the future, and they hide drift (the subject of <LessonLink slug="data-science-in-production">data science in production</LessonLink>).
+
+**Keep every decision inside the loop.** Anything that looks at the target (selecting features, tuning hyperparameters, choosing among models) is part of the procedure being evaluated, and must be repeated inside each training fold. The next block shows the size of the error on data that are pure noise.
+
+<Figure caption="Three ways to split the same data. Each square is a row; gold squares are the validation rows of one split. A shuffled split scatters rows of the same pump across both sides; a grouped split keeps each pump's rows together; a forward-in-time split always trains on the past and validates on what came next.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Three rows of small squares. The first row, shuffled k-fold, has twenty squares with four gold validation squares scattered at random. The second row, grouped k-fold, has twenty squares in five groups of four, one per pump, and one whole group is gold. The third part, forward in time, shows three splits one above another: in each, training squares on the left grow longer and the next three squares to their right are gold, with an arrow labelled time.">
+  <text x="10" y="30" fill="currentColor" fontSize="12">shuffled k-fold</text>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="160" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="182" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="204" y="16" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" /><rect x="226" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="256" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="278" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="300" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="322" y="16" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="352" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="374" y="16" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="396" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="418" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="448" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="470" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="492" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="514" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="544" y="16" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" /><rect x="566" y="16" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="588" y="16" width="20" height="20" fill="var(--sky-soft)" /><rect x="610" y="16" width="20" height="20" fill="var(--sky-soft)" />
+  </g>
+  <text x="10" y="80" fill="currentColor" fontSize="12">grouped k-fold</text>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="160" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="182" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="204" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="226" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="256" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="278" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="300" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="322" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="352" y="66" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" /><rect x="374" y="66" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="396" y="66" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" /><rect x="418" y="66" width="20" height="20" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="448" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="470" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="492" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="514" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="544" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="566" y="66" width="20" height="20" fill="var(--sky-soft)" />
+    <rect x="588" y="66" width="20" height="20" fill="var(--sky-soft)" /><rect x="610" y="66" width="20" height="20" fill="var(--sky-soft)" />
+  </g>
+  <text x="203" y="102" textAnchor="middle" fill="currentColor" fontSize="10">pump 1</text>
+  <text x="299" y="102" textAnchor="middle" fill="currentColor" fontSize="10">pump 2</text>
+  <text x="395" y="102" textAnchor="middle" fill="currentColor" fontSize="10">pump 3</text>
+  <text x="491" y="102" textAnchor="middle" fill="currentColor" fontSize="10">pump 4</text>
+  <text x="587" y="102" textAnchor="middle" fill="currentColor" fontSize="10">pump 5</text>
+  <text x="10" y="160" fill="currentColor" fontSize="12">forward in time</text>
+  <g stroke="currentColor" strokeWidth="1">
+    <rect x="160" y="124" width="132" height="16" fill="var(--sky-soft)" /><rect x="296" y="124" width="64" height="16" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="160" y="150" width="200" height="16" fill="var(--sky-soft)" /><rect x="364" y="150" width="64" height="16" fill="var(--gold)" fillOpacity="0.6" />
+    <rect x="160" y="176" width="268" height="16" fill="var(--sky-soft)" /><rect x="432" y="176" width="64" height="16" fill="var(--gold)" fillOpacity="0.6" />
+  </g>
+  <text x="226" y="136" textAnchor="middle" fill="currentColor" fontSize="10">train</text>
+  <text x="328" y="136" textAnchor="middle" fill="currentColor" fontSize="10">validate</text>
+  <line x1="160" y1="214" x2="620" y2="214" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#mltab-arrow)" />
+  <text x="610" y="232" textAnchor="end" fill="currentColor" fontSize="11">time</text>
+  <rect x="160" y="226" width="12" height="12" fill="var(--sky-soft)" stroke="currentColor" />
+  <text x="178" y="236" fill="currentColor" fontSize="11">training row</text>
+  <rect x="270" y="226" width="12" height="12" fill="var(--gold)" fillOpacity="0.6" stroke="currentColor" />
+  <text x="288" y="236" fill="currentColor" fontSize="11">validation row</text>
+</svg>
+</Figure>
+
+```python run
+import numpy as np
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+
+# Pure noise: 120 samples, 2,000 random features, labels from coin flips.
+# No procedure can honestly do better than an AUC of 0.5 here.
+rng = np.random.default_rng(3)
+X = rng.normal(size=(120, 2000))
+y = rng.permutation(np.repeat([0, 1], 60))
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
+
+# Wrong: choose the 20 features most associated with y using ALL the rows, then cross-validate.
+X_chosen = SelectKBest(f_classif, k=20).fit_transform(X, y)
+wrong = cross_val_score(LogisticRegression(max_iter=1000), X_chosen, y, cv=cv, scoring="roc_auc")
+
+# Right: make selection a step of the pipeline, so it is refitted on each training fold only.
+pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=1000))
+right = cross_val_score(pipe, X, y, cv=cv, scoring="roc_auc")
+print(f"selection before CV  : AUC {wrong.mean():.2f}  (folds: {np.round(wrong, 2)})")
+print(f"selection inside CV  : AUC {right.mean():.2f}  (folds: {np.round(right, 2)})")
+
+# Tuning: the best score found by a search is itself optimistic.
+grid = {"selectkbest__k": [5, 10, 20, 50, 100], "logisticregression__C": [0.01, 0.1, 1, 10]}
+search = GridSearchCV(pipe, grid, cv=cv, scoring="roc_auc").fit(X, y)
+print(f"best of 20 settings  : AUC {search.best_score_:.2f}  {search.best_params_}")
+outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=2)
+nested = cross_val_score(GridSearchCV(pipe, grid, cv=cv, scoring="roc_auc"), X, y, cv=outer, scoring="roc_auc")
+print(f"nested CV            : AUC {nested.mean():.2f}  (the whole search is repeated inside each outer fold)")
+```
+
+Selecting features on all the rows produced an AUC of 0.90 on coin flips. With 2,000 random features and only 120 rows, some features line up with the labels by chance, and selecting them with the validation rows included guarantees they will line up there too. Moved inside the pipeline, the same procedure scores 0.49: correctly, nothing. (The fold scores, from 0.26 to 0.62, are also a lesson: 24 rows per fold make a very noisy measurement.) This is not a contrived example. It is the classic illustration in Hastie, Tibshirani and Friedman's *The Elements of Statistical Learning* of how not to cross-validate, and the error still appears in published research ([Kapoor and Narayanan, 2023](https://arxiv.org/abs/2207.07048)).
+
+The last two lines show a subtler version. The best of 20 hyperparameter settings scored 0.57, because picking the maximum of 20 noisy estimates picks luck. **Nested cross-validation** repeats the whole search inside each outer fold and scores the winner on data the search never saw: 0.53, close to the truth. When you report a tuned model's performance, report a nested estimate or a score on a test set that no decision has touched ([Cawley and Talbot, 2010](https://jmlr.org/papers/v11/cawley10a.html)). The statistical theory of why selection inflates estimates is in [likelihood and model selection](/en/statistics/likelihood-and-model-selection/) and [multiple testing and reproducibility](/en/statistics/multiple-testing-and-reproducibility/).
+
+<Narrator who="margaret">
+
+One seed proves little, so I reran the noise experiment with 20 seeds. Selection before CV averaged an AUC of 0.91, selection inside CV 0.50, and the best of the grid 0.56: the leak is enormous every time, and the optimism of "best of 20" averages 0.06.
+
+</Narrator>
+
+</Section>
+
+<Section id="leakage" kind="examples" title="Leakage: a worked example and its fix">
+
+<Definition term="data leakage">
+
+**Leakage** is information in the training or evaluation data that would not be available, in the same form, at the moment the model is used. A leaky model scores well in evaluation because it is partly reading the answer, and does worse, sometimes much worse, in use.
+
+</Definition>
+
+Leaks come in a few recurring forms: preprocessing or selection fitted on all the data (the noise example above); the same entity on both sides of a split; random splits of data that should be split in time; and, most dangerous, **features that are recorded after the outcome**. The last kind is rarely as obvious as a column called `repair_cost`. It hides in columns whose *meaning changes depending on when you query them*.
+
+<Example title="The service date that knew the future">
+
+The agency's analyst builds a training table for last year's pumps: features as of 1 March, and whether each pump broke down by 30 May. She runs the query in June. The column `days_since_service` comes from the asset database, which stores the *latest* service date, and a repair is logged as a service. So by June, most pumps that broke down in the spring look freshly serviced, and every pump that did not break down is 90 days further from its last service. The block simulates exactly that, then fixes it by rebuilding the column **as of the prediction date** from the full service history. Both models are then used the only way production allows: on this year's pumps, with features computed on the day of prediction.
+
+</Example>
+
+```python run
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import cross_val_score
+
+def make_pumps(n, seed):
+    """A condensed version of the synthetic water points above (numeric features only)."""
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "age_years": rng.uniform(0, 25, n),
+        "users_per_day": rng.lognormal(np.log(250), 0.6, n),
+        "depth_m": rng.uniform(15, 120, n),
+        "days_since_service": rng.integers(0, 730, n),        # as it was ON the prediction date
+    })
+    logit = (-3.0 + 1.3 * (df["age_years"] > 12) + 0.8 * np.log(df["users_per_day"] / 250)
+             + 0.9 * (df["days_since_service"] > 365))
+    df["failed_90d"] = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+    # What a query run 90 days LATER returns. A repair is logged as a service, so most pumps
+    # that failed look freshly serviced; a few other pumps had routine services meanwhile.
+    serviced_since = np.where(df["failed_90d"] == 1, rng.random(n) < 0.7, rng.random(n) < 0.15)
+    df["days_since_service_today"] = np.where(serviced_since, rng.integers(0, 90, n),
+                                              df["days_since_service"] + 90)
+    return df
+
+train = make_pumps(4000, seed=21)            # last year's pumps, labelled
+fresh = make_pumps(4000, seed=22)            # this year's pumps, scored on the day of prediction
+base = ["age_years", "users_per_day", "depth_m"]
+model = HistGradientBoostingClassifier(max_iter=100, random_state=0)
+
+for label, col in [("leaky: service date from today's database", "days_since_service_today"),
+                   ("fixed: service date as of the prediction date", "days_since_service")]:
+    cv_auc = cross_val_score(model, train[base + [col]], train["failed_90d"], cv=5, scoring="roc_auc").mean()
+    fitted = model.fit(train[base + [col]], train["failed_90d"])
+    # In production the feature can only be computed as of the prediction date.
+    live = fresh[base + ["days_since_service"]].set_axis(base + [col], axis=1)
+    live_auc = roc_auc_score(fresh["failed_90d"], fitted.predict_proba(live)[:, 1])
+    print(f"{label}\n    cross-validated AUC {cv_auc:.3f}   AUC on next year's pumps {live_auc:.3f}")
+
+g = train.groupby("failed_90d")[["days_since_service", "days_since_service_today"]].median()
+print("\nmedian days since service, by outcome:")
+print(g.rename(index={0: "did not fail", 1: "failed"}).round(0).astype(int).to_string())
+```
+
+The leaky model cross-validates at 0.818 and the honest one at 0.642: in a model-selection meeting, the leaky one wins easily. On next year's pumps the order reverses, 0.624 against 0.687. The last table shows why. As of the prediction date, pumps that went on to fail had gone *longer* without a service (a median of 454 days against 337), which is the real, useful signal. In the June snapshot, they appear to have been serviced *more recently* (a median of 62 days against 367). The leaky model learned the opposite of the truth, a rule ("recently serviced pumps fail") that does not hold in production.
+
+The fix is a habit, not a trick: **build every feature as of the moment the prediction would have been made**, from event histories with timestamps, never from "current value" columns. In pandas this is a filter on event dates before aggregating, or `merge_asof` for joining on time (<LessonLink slug="data-wrangling">wrangling data with pandas</LessonLink>); feature stores automate it at scale (<LessonLink slug="data-science-in-production">data science in production</LessonLink>). And treat a model that is much better than you expected as a bug report until proven otherwise: look at which features it relies on most, and ask, for each one, *when* that value becomes known.
+
+<Narrator who="gideon">
+
+Notice what cross-validation could not catch. Every fold was drawn from the same June snapshot, so every fold contained the same leak, and the folds agreed with each other perfectly well. Cross-validation checks a model against the data you have; only a question about *how the data were produced* checks the data.
+
+</Narrator>
+
+</Section>
+
+<Section id="imbalance" kind="computation" title="Class imbalance, calibration and thresholds">
+
+Many tabular problems have a rare outcome: fraud, defaults, a pump so badly damaged that it must be replaced. Two pieces of folk wisdom cause trouble here. The first is that imbalance must be "fixed" by oversampling the rare class, undersampling the common one, or weighting the classes. The second is that the model should then predict "positive" when its score passes 0.5.
+
+<Definition term="calibration">
+
+A classifier is **calibrated** if, among the cases to which it gives probability $p$, the outcome happens about a fraction $p$ of the time. A **reliability diagram** plots the observed frequency against the predicted probability in bins; a calibrated model lies on the diagonal. The **Brier score**, the mean of $(p - y)^2$, and the log loss reward calibration and ranking together.
+
+</Definition>
+
+Ranking metrics such as AUC are blind to calibration: any increasing transformation of the scores leaves the ranking, and so the AUC, unchanged. Decisions are not blind to it. If a visit costs 40 and prevents a failure that would cost 900, a pump is worth visiting when its probability of failure exceeds $40 / 900 \approx 0.044$, and that rule works only if 0.044 means 0.044.
+
+```python run
+import numpy as np
+import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Rare outcome: a pump fails so badly that it must be replaced (synthetic, about 4% of pumps).
+rng = np.random.default_rng(5)
+n = 12000
+X = pd.DataFrame({"age_years": rng.uniform(0, 25, n),
+                  "log_users": rng.normal(0, 0.6, n),
+                  "overdue": (rng.random(n) < 0.3).astype(float),
+                  "depth_m": rng.uniform(15, 120, n)})
+logit = -5.4 + 0.12 * X["age_years"] + 0.9 * X["log_users"] + 0.8 * X["overdue"]
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.5, stratify=y, random_state=0)
+print(f"replacement rate: {y.mean():.1%} ({y_te.sum()} of {len(y_te)} test pumps)\n")
+
+models = {
+    "logistic": make_pipeline(StandardScaler(), LogisticRegression()),
+    "logistic, balanced weights": make_pipeline(StandardScaler(), LogisticRegression(class_weight="balanced")),
+    "random forest": RandomForestClassifier(n_estimators=150, min_samples_leaf=3, random_state=0),
+    "forest + isotonic calibration": CalibratedClassifierCV(
+        RandomForestClassifier(n_estimators=150, min_samples_leaf=3, random_state=0), method="isotonic", cv=3),
+}
+bins = [0, 0.02, 0.05, 0.1, 0.2, 1]
+VISIT, REPLACEMENT = 40, 900          # cost of an inspection visit; cost of a failure it would prevent
+rows, reliability = {}, {}
+for name, m in models.items():
+    p = m.fit(X_tr, y_tr).predict_proba(X_te)[:, 1]
+    visit = p > VISIT / REPLACEMENT   # visit when the expected saving exceeds the visit's cost
+    rows[name] = {"AUC": roc_auc_score(y_te, p), "avg precision": average_precision_score(y_te, p),
+                  "Brier": brier_score_loss(y_te, p), "mean p": p.mean(), "visits": int(visit.sum()),
+                  "caught": int(y_te[visit].sum()),
+                  "total cost": int(VISIT * visit.sum() + REPLACEMENT * (y_te[~visit]).sum())}
+    groups = pd.cut(p, bins)
+    reliability[name] = pd.Series(np.asarray(y_te)).groupby(groups, observed=False).mean()
+table = pd.DataFrame(rows).T
+table[["visits", "caught", "total cost"]] = table[["visits", "caught", "total cost"]].astype(int)
+print(table.round(3).to_string())
+print(f"for comparison, visiting nobody costs {REPLACEMENT * y_te.sum()} and visiting every pump {VISIT * len(y_te)}")
+print("\nobserved replacement rate within each band of predicted probability:")
+print(pd.DataFrame(reliability).T.round(3).to_string())
+```
+
+Read the first two rows together. Balancing the class weights left the ranking almost untouched (AUC 0.788 against 0.786, average precision 0.151 against 0.149) and wrecked the probabilities: the balanced model's average prediction is 0.379 for an outcome that happens 4.1% of the time. Its Brier score is five times worse. Applied with the cost rule, it sends a technician to 5,876 of 6,000 pumps, for a total cost of 235,040: worse than visiting nobody (220,500). The unweighted logistic regression, calibrated because the log loss it minimises rewards calibration, visits 1,762 pumps, catches 172 of the 245 failures, and costs 136,180. Medical statisticians have documented the same effect for clinical risk models ([van den Goorbergh and colleagues, 2022](https://doi.org/10.1093/jamia/ocac093)).
+
+The random forest ranks worse here (the true risk in this world is a smooth logistic curve, which suits the linear model) and is overconfident at the top: of the pumps it puts above 20%, only 15.1% failed. Isotonic calibration, fitted on held-out folds by `CalibratedClassifierCV`, repairs most of that (of the pumps the calibrated forest puts above 20%, 23.4% failed) and cuts the cost from 155,180 to 147,440. Calibration repairs probabilities; it cannot repair ranking.
+
+<Figure caption="Reliability diagram for the test pumps, with each model's predictions split into five equal groups. The unweighted logistic regression (circles) lies on the diagonal near the origin: its probabilities mean what they say. The class-weighted model (squares) ranks the pumps just as well, so its observed rates rise in the same way, but its predictions are inflated many times over (an average of 0.379 for a 4.1% outcome), so all its points lie far below the diagonal.">
+<svg viewBox="0 0 440 360" role="img" aria-label="Scatter plot with predicted probability from 0 to 0.8 on the horizontal axis and observed failure rate from 0 to 0.8 on the vertical axis, and a dashed diagonal line. Five circles for the unweighted logistic model sit close to the diagonal between 0 and 0.12. Five squares for the balanced-weights model sit at predicted 0.09, 0.21, 0.34, 0.52 and 0.74 but observed rates only 0.002, 0.011, 0.028, 0.052 and 0.110, far below the diagonal.">
+  <line x1="60" y1="300" x2="380" y2="300" stroke="currentColor" strokeWidth="1" />
+  <line x1="60" y1="300" x2="60" y2="-20" stroke="currentColor" strokeWidth="1" />
+  <line x1="60" y1="300" x2="380" y2="-20" stroke="currentColor" strokeWidth="1" strokeDasharray="5 4" />
+  <text x="60" y="316" textAnchor="middle" fill="currentColor" fontSize="10">0</text>
+  <text x="140" y="316" textAnchor="middle" fill="currentColor" fontSize="10">0.2</text>
+  <text x="220" y="316" textAnchor="middle" fill="currentColor" fontSize="10">0.4</text>
+  <text x="300" y="316" textAnchor="middle" fill="currentColor" fontSize="10">0.6</text>
+  <text x="380" y="316" textAnchor="middle" fill="currentColor" fontSize="10">0.8</text>
+  <text x="54" y="303" textAnchor="end" fill="currentColor" fontSize="10">0</text>
+  <text x="54" y="223" textAnchor="end" fill="currentColor" fontSize="10">0.2</text>
+  <text x="54" y="143" textAnchor="end" fill="currentColor" fontSize="10">0.4</text>
+  <text x="54" y="63" textAnchor="end" fill="currentColor" fontSize="10">0.6</text>
+  <text x="220" y="340" textAnchor="middle" fill="currentColor" fontSize="12">predicted probability</text>
+  <text x="18" y="150" textAnchor="middle" fill="currentColor" fontSize="12" transform="rotate(-90 18 150)">observed failure rate</text>
+  <text x="250" y="100" fill="currentColor" fontSize="11">perfect calibration</text>
+  <g fill="var(--sky)" stroke="currentColor" strokeWidth="0.8">
+    <circle cx="62" cy="299.2" r="4" /><circle cx="64.8" cy="295.2" r="4" /><circle cx="69.2" cy="290.4" r="4" />
+    <circle cx="77.6" cy="279.6" r="4" /><circle cx="106.8" cy="254.4" r="4" />
+  </g>
+  <g fill="var(--gold)" stroke="currentColor" strokeWidth="0.8">
+    <rect x="93.2" y="295.2" width="8" height="8" /><rect x="139.6" y="291.6" width="8" height="8" />
+    <rect x="192.8" y="284.8" width="8" height="8" /><rect x="262" y="275.2" width="8" height="8" />
+    <rect x="350.4" y="252" width="8" height="8" />
+  </g>
+  <circle cx="250" cy="170" r="4" fill="var(--sky)" stroke="currentColor" strokeWidth="0.8" />
+  <text x="260" y="174" fill="currentColor" fontSize="11">logistic, unweighted</text>
+  <rect x="246" y="186" width="8" height="8" fill="var(--gold)" stroke="currentColor" strokeWidth="0.8" />
+  <text x="260" y="194" fill="currentColor" fontSize="11">logistic, balanced weights</text>
+</svg>
+</Figure>
+
+The practical rules are short. Evaluate rare outcomes with metrics that notice them (average precision, recall at the number of cases you can act on, and cost), not accuracy. Prefer an unweighted model with a proper loss and choose the threshold from costs and capacity: if the agency can make only 300 visits, visit the 300 highest-risk pumps, whatever their probabilities. If you do reweight or resample (sometimes it helps a model to learn a very rare class at all), recalibrate afterwards on data with the true class balance. And if the prevalence will differ in deployment, say so: calibration is relative to a population.
+
+</Section>
+
+<Section id="professional" kind="human" title="Why boosted trees still dominate tables, and the limits of that claim">
+
+Working data scientists report, and benchmarks largely confirm, that on typical tabular problems gradient-boosted trees are the strongest single family of models, with random forests close behind and deep neural networks usually behind both. The evidence, as of 2026:
+
+- **Benchmarks.** [Grinsztajn, Oyallon and Varoquaux (2022)](https://arxiv.org/abs/2207.08815) compared tuned tree ensembles and deep models on a curated benchmark of medium-sized datasets (around 10,000 rows) and found the trees ahead, even with large tuning budgets for the networks. They traced the gap to properties of tabular data: target functions with sharp, irregular changes (which trees model easily and networks smooth over), many uninformative features, and columns with individual meanings (rotating the feature space, which a network is indifferent to, destroys information that trees use). [Shwartz-Ziv and Armon (2022)](https://arxiv.org/abs/2106.03253) found that several deep architectures proposed for tables did worse than XGBoost on datasets other than those in their own papers. [McElfresh and colleagues (2023)](https://arxiv.org/abs/2305.02997), comparing many algorithms on well over a hundred datasets, found the differences between the best neural networks and boosted trees often negligible, with light tuning of boosted trees mattering more than the choice between them.
+- **Practice.** Write-ups of winning solutions in public tabular competitions have for a decade relied heavily on gradient boosting, usually in ensembles with careful feature engineering. In industry it is a common default for credit, fraud and churn scores, partly for accuracy and partly because it trains in minutes on a laptop, needs little preprocessing and handles missing values.
+- **The challengers.** **Tabular foundation models** are the most serious change. TabPFN, a transformer pre-trained on millions of synthetic datasets, predicts for a new small dataset in a single forward pass ([Hollmann and colleagues, 2023](https://arxiv.org/abs/2207.01848)); its second version, published in *Nature*, outperformed tuned boosted trees on benchmark datasets of up to 10,000 rows ([Hollmann and colleagues, 2025](https://doi.org/10.1038/s41586-024-08328-6)). Other groups have released similar models since. As of 2026 these are strong on small and medium data and actively developed, with open questions about scale, cost at prediction time, and how well benchmark results carry over to messy industrial tables.
+
+The limits matter as much as the claim. Benchmarks choose their datasets (no text columns, no images, medium sizes, mostly independent rows) and their tuning budgets, and averages hide many datasets where the ranking flips. Trees are piecewise constant, so they cannot extrapolate: a boosted model of demand will never predict a value higher than it has seen, which a linear trend can. When the columns are really text, images, sequences or graphs (<LessonLink slug="text-images-and-other-data">text, images and other kinds of data</LessonLink>), neural networks are the natural tool, often feeding embeddings into a tabular model. And with a few hundred rows, or when the structure is known, a well-specified regression may be as accurate and far easier to explain, as the engineered logistic model showed above. "Start with gradient boosting and a strong simple baseline, compare them honestly, and let the problem decide" is the defensible version of the folklore.
+
+<Note>
+
+Explaining a model's predictions is often a requirement, not a luxury. Permutation importance (how much the score drops when a column is shuffled) and SHAP values ([Lundberg and Lee, 2017](https://arxiv.org/abs/1705.07874)) show which features a model *uses*. Neither says what would happen if you *changed* a feature: that is a causal question ([causal inference](/en/statistics/causal-inference/)), and a model trained on observational data does not answer it.
+
+</Note>
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"A higher cross-validation score means a better model."** Only if the difference is larger than the noise between folds, and only if the validation imitates use. A leak raises the score and lowers real performance; the June-snapshot model above won in cross-validation and lost in the field.
+
+</Misconception>
+
+<Misconception>
+
+**"Class imbalance must always be corrected."** Imbalance is a fact about the world, not a defect in the data. Resampling and class weights mostly move the probabilities, which breaks any decision rule based on them. Choose metrics and thresholds that reflect costs; reweight only for a reason, and recalibrate if you do.
+
+</Misconception>
+
+<Misconception>
+
+**"The most important feature is the cause."** Importance measures what the model relies on to predict. In the leaky model, the most important feature was a consequence of the outcome. Even without leaks, a feature can be predictive because it is correlated with an unmeasured cause.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
