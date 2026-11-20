@@ -4,7 +4,8 @@ import { LOCALE_META, type Locale } from "@/i18n/config";
 import { Messages } from "@/i18n/Messages";
 import { getT } from "@/i18n/server";
 import { getTopic } from "@/lib/content";
-import { COLLECTIONS, getCourseExercises, getCourseLesson, guideSet, lessonCodeStatus, type LoadedCourse } from "@/lib/courses";
+import { COLLECTIONS, getCourseExercises, getCourseLesson, guideSet, lessonCodeStatus, localizedCourse, type LoadedCourse } from "@/lib/courses";
+import { TranslationNotice } from "@/components/lesson/TranslationNotice";
 import { renderExerciseList } from "@/lib/exercises";
 import { href } from "@/lib/href";
 import { mdInline, mdToHtml } from "@/lib/markdown";
@@ -29,7 +30,7 @@ function parentOf(c: LoadedCourse, locale: string): { href: string; label: strin
 /** A course's front page: its description, anything the subject adds (`extra`), and every level with its lessons. */
 export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; locale: Locale; extra?: React.ReactNode }) {
   const parent = parentOf(c, locale);
-  const { course } = c;
+  const course = localizedCourse(c, locale);
   const t = await getT(locale);
   const guides = guideSet(c);
   let n = 0;
@@ -99,7 +100,7 @@ export async function CourseOverview({ c, locale, extra }: { c: LoadedCourse; lo
             <p className="mt-2 max-w-3xl text-ink-2" dangerouslySetInnerHTML={{ __html: mdInline(level.summary) }} />
             <ol className="mt-6 grid gap-3 md:grid-cols-2">
               {level.lessons.map((slug) => {
-                const { frontmatter: fm } = getCourseLesson(c, slug);
+                const { frontmatter: fm } = getCourseLesson(c, slug, locale);
                 n += 1;
                 return (
                   <li key={slug}>
@@ -158,11 +159,13 @@ function References({ refs }: { refs: LoadedCourse["course"]["references"] }) {
 
 /** One lesson of a course: header, objectives, the MDX body with its exercises, references, and the way on. */
 export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; slug: string; locale: Locale }) {
-  const { course } = c;
+  const course = localizedCourse(c, locale);
   const t = await getT(locale);
-  const lesson = getCourseLesson(c, slug);
+  const lesson = getCourseLesson(c, slug, locale);
   const fm = lesson.frontmatter;
-  const exercises = renderExerciseList(getCourseExercises(c, slug), slug, fm.title);
+  const exercises = renderExerciseList(getCourseExercises(c, slug, locale), slug, fm.title);
+  /** The page's language: a translation's, or the course's own (an untranslated lesson is only generated in the course's language). */
+  const lang = lesson.locale;
   const components = {
     ...makeMdxComponents({ locale, t, exercises, guides: guideSet(c) }),
     pre: CodeBlock,
@@ -179,7 +182,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
       if (!c.slugs.includes(to)) throw new Error(`<LessonLink slug="${to}">: no such lesson in ${c.dir}`);
       return (
         <Link prefetch={false} href={lessonHref(locale, c, to)} className="underline decoration-gold/60 underline-offset-2 hover:decoration-gold">
-          {children ?? getCourseLesson(c, to).frontmatter.title}
+          {children ?? getCourseLesson(c, to, locale).frontmatter.title}
         </Link>
       );
     },
@@ -197,7 +200,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
 
   return (
     <Messages locale={locale} ns={["exercise", "python", "lesson", ...widgetMessageNamespaces(lesson.body)]}>
-      <div lang={course.locale} dir={LOCALE_META[course.locale].dir}>
+      <div lang={lang} dir={LOCALE_META[lang].dir}>
         <header className="relative overflow-hidden border-b border-line">
           <div className="bg-grid pointer-events-none absolute inset-0 opacity-40 [mask-image:radial-gradient(ellipse_at_top_right,black,transparent_65%)]" aria-hidden="true" />
           <div className="container-page relative py-10 sm:py-14">
@@ -237,6 +240,11 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                   <VerificationBadge label="ai-drafted" text={ui.aiDrafted} />
                   <VerificationBadge label="awaiting" text={ui.awaitingReview} />
                 </div>
+                {lang !== c.course.locale && (
+                  <div className="mt-5 max-w-2xl">
+                    <TranslationNotice t={t} requested={locale} rendered={lang} fallback={false} stale={lesson.stale} status={fm.translation?.status ?? "machine-draft"} page={`${c.path}/${slug}`} />
+                  </div>
+                )}
                 {fm.narrators.length > 0 && (
                   <div data-cat className="mt-6 flex flex-wrap items-center gap-x-3 gap-y-1">
                     <div className="flex -space-x-2 rtl:space-x-reverse">
@@ -271,7 +279,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                     {fm.prerequisites.map((p) => (
                       <li key={p}>
                         <Link prefetch={false} href={lessonHref(locale, c, p)} className="chip hover:border-line-2 hover:text-ink">
-                          {getCourseLesson(c, p).frontmatter.title}
+                          {getCourseLesson(c, p, locale).frontmatter.title}
                         </Link>
                       </li>
                     ))}
@@ -306,7 +314,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                           className={`flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm ${current ? "bg-ink text-paper" : "text-ink-2 hover:bg-paper-2"}`}
                         >
                           <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold ${current ? "bg-gold text-[#1b1406]" : "bg-paper-2 text-muted"}`}>{i + 1}</span>
-                          {getCourseLesson(c, s).frontmatter.title}
+                          {getCourseLesson(c, s, locale).frontmatter.title}
                         </Link>
                       </li>
                     );
@@ -333,7 +341,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                   <ArrowLeft size={18} className="text-muted transition-transform group-hover:-translate-x-0.5 rtl:rotate-180" aria-hidden="true" />
                   <span>
                     <span className="block text-xs text-muted">{ui.previous}</span>
-                    <span className="font-display text-lg font-semibold text-ink">{getCourseLesson(c, prev).frontmatter.title}</span>
+                    <span className="font-display text-lg font-semibold text-ink">{getCourseLesson(c, prev, locale).frontmatter.title}</span>
                   </span>
                 </Link>
               ) : (
@@ -343,7 +351,7 @@ export async function CourseLessonPage({ c, slug, locale }: { c: LoadedCourse; s
                 <Link prefetch={false} href={lessonHref(locale, c, next)} className="card group flex items-center justify-end gap-3 p-4 text-end hover:shadow-[var(--shadow-lg)]">
                   <span>
                     <span className="block text-xs text-muted">{ui.next}</span>
-                    <span className="font-display text-lg font-semibold text-ink">{getCourseLesson(c, next).frontmatter.title}</span>
+                    <span className="font-display text-lg font-semibold text-ink">{getCourseLesson(c, next, locale).frontmatter.title}</span>
                   </span>
                   <ArrowRight size={18} className="text-muted transition-transform group-hover:translate-x-0.5 rtl:rotate-180" aria-hidden="true" />
                 </Link>

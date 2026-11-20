@@ -77,7 +77,7 @@ export default async function TrailPage({ params }: Params) {
             {fm.title}
           </h1>
           <div className="mt-6">
-            <TranslationNotice t={t} requested={locale} rendered={trail.locale} fallback={trail.fallback} stale={trail.stale} status={fm.translation.status} />
+            <TranslationNotice t={t} requested={locale} rendered={trail.locale} fallback={trail.fallback} stale={trail.stale} status={fm.translation.status} page={`math/trails/${slug}`} />
           </div>
         </div>
       </header>

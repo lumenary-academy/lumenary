@@ -5,6 +5,8 @@ languages, and how its status is recorded. The aim (see `prompts/init.md` §9.3
 and §15) is mathematical correctness first. A large number of unreviewed
 translations is worth less than a small number of correct ones.
 
+Lumenary Scientia's courses (Lumenary CS, EE, Robotics, Statistics, Chemistry, ME, Materials) are translated the same way, and volunteers' AI drafts, corrections and expert review are organised by **Lumenary Every Nation**: see [every-nation.md](every-nation.md).
+
 **Current state (October 2026):** no translation has been reviewed by a human,
 and the English source itself is AI-drafted and unreviewed. There are no
 registered reviewers yet. Every status shown on the site must reflect this.
@@ -46,8 +48,8 @@ Rules:
   `Translation` in `src/lib/schema.ts`):
   - `status`: `machine-draft`, `human-reviewed`, `math-reviewed` or `incomplete`;
   - `source`: the source language tag (normally `en`);
-  - `sourceHash`: the first 12 hex characters of the SHA-256 of the canonical file
-    the translation was made from;
+  - `sourceHash`: the first 12 hex characters of the SHA-256 of the canonical
+    file's body (without its frontmatter) that the translation was made from;
   - `translatedAt`: ISO date;
   - `reviewers`: the named reviewers, empty until a human review has happened.
 
@@ -57,9 +59,9 @@ When the canonical file changes, every translation made from the old version is
 **stale**.
 
 ```bash
-# hash of the current canonical file (first 12 hex chars); in the current layout
-# the canonical lesson is content/math/lessons/<slug>/en.mdx
-sha256sum content/math/lessons/<slug>/en.mdx | cut -c1-12
+# hash of the current canonical body (first 12 hex chars), as the site computes it;
+# node scripts/translation-jobs.mjs lists every missing or stale translation with its hash
+node -e "const m=require('gray-matter');console.log(require('crypto').createHash('sha256').update(m.read(process.argv[1]).content).digest('hex').slice(0,12))" content/math/lessons/<slug>/en.mdx
 ```
 
 - If a translation's `sourceHash` differs from the current hash, it is stale. The

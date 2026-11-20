@@ -10,10 +10,21 @@ const courses = (contentLocales as { courses?: Record<string, string> }).courses
 /** A subject's pages, including its nested courses (cs/languages/rust is taught like cs). */
 const COURSE = /^([a-z][a-z-]*)(\/|$)/;
 
+/** Translated course pages and lessons, by course path and locale (docs/i18n/every-nation.md). */
+const courseTranslations = (contentLocales as { courseTranslations?: Record<string, Record<string, { course: boolean; lessons: string[] }>> }).courseTranslations ?? {};
+const translatedCoursePaths = Object.keys(courseTranslations).sort((a, b) => b.length - a.length);
+
 /** The locale in which a page is actually generated: the requested one, or English as a fallback. */
 export function pageLocale(locale: string, path: string): string {
+  const p = path.replace(/^\/+/, "").replace(/\/+$/, "");
+  // A translated course page or lesson exists in that locale; anything else in the course falls back below.
+  const tc = translatedCoursePaths.find((cp) => p === cp || p.startsWith(`${cp}/`));
+  const t = tc ? courseTranslations[tc]?.[locale] : undefined;
+  if (t) {
+    const rest = p.slice(tc!.length).replace(/^\//, "");
+    if ((rest === "" && t.course) || (rest !== "" && !rest.includes("/") && t.lessons.includes(rest))) return locale;
+  }
   if (locale === "en") return locale;
-  const p = path.replace(/^\/+/, "");
   if (ENGLISH_ONLY.test(p)) return "en";
   const c = p.match(COURSE);
   if (c && courses[c[1]]) return courses[c[1]];

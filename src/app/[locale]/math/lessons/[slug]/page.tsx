@@ -139,7 +139,7 @@ export default async function LessonPage({ params }: Params) {
             </aside>
           </div>
           <div className="mt-6 max-w-3xl">
-            <TranslationNotice t={t} requested={locale} rendered={lesson.locale} fallback={lesson.fallback} stale={lesson.stale} status={fm.translation.status} />
+            <TranslationNotice t={t} requested={locale} rendered={lesson.locale} fallback={lesson.fallback} stale={lesson.stale} status={fm.translation.status} page={`math/lessons/${slug}`} />
           </div>
         </div>
       </header>
