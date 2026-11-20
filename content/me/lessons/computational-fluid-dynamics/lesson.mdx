@@ -1,0 +1,528 @@
+---
+title: Computational fluid dynamics
+subtitle: The Navier–Stokes equations and how computers solve them — finite differences and finite volumes, an advection–diffusion solver and a lid-driven cavity in NumPy, stability and accuracy, turbulence models, verification and validation, and how industry uses CFD.
+minutes: 85
+objectives:
+  - Explain each term of the incompressible Navier–Stokes equations and what the Reynolds number does to them
+  - Discretise a transport equation by finite differences and finite volumes, and explain why industrial codes conserve fluxes cell by cell
+  - Solve 1-D advection–diffusion and a 2-D lid-driven cavity in NumPy, and see numerical diffusion and wiggles at first hand
+  - State the CFL condition, check stability by von Neumann analysis, and measure the order of accuracy from a grid-convergence study
+  - Describe RANS, LES and DNS in outline, distinguish verification from validation, and describe the industrial CFD workflow and its tools
+narrators: [chloe, margaret, gideon]
+prerequisites: [fluid-statics-and-bernoulli, viscous-flow-and-pipes, heat-transfer]
+related: [math.analysis.pde-intro, math.comp.numerical-analysis, math.comp.numerical-methods, math.analysis.multivariable-calculus, math.algebra.linear-algebra]
+references:
+  - title: "High-Re solutions for incompressible flow using the Navier–Stokes equations and a multigrid method"
+    author: U. Ghia, K. N. Ghia and C. T. Shin
+    year: 1982
+    url: https://doi.org/10.1016/0021-9991(82)90058-4
+    note: Journal of Computational Physics 48, 387–411. The lid-driven cavity benchmark that codes are still checked against.
+  - title: Numerical Heat Transfer and Fluid Flow
+    author: Suhas V. Patankar
+    year: 1980
+    note: The classic, readable book on the finite-volume method and the SIMPLE algorithm.
+  - title: OpenFOAM (OpenFOAM Foundation)
+    url: https://openfoam.org/
+    note: One of the two main distributions of the open-source finite-volume CFD toolbox.
+  - title: OpenFOAM (ESI-OpenCFD)
+    url: https://www.openfoam.com/
+    note: The other main OpenFOAM distribution, with its own release cycle and documentation.
+  - title: SU2
+    url: https://su2code.github.io/
+    note: An open-source suite for CFD and shape optimisation, begun at Stanford University and widely used in aerospace research.
+  - title: code_saturne
+    url: https://www.code-saturne.org/
+    note: EDF's open-source general-purpose finite-volume CFD code.
+  - title: NASA Turbulence Modeling Resource
+    author: NASA Langley Research Center
+    url: https://turbmodels.larc.nasa.gov/
+    note: Precise definitions of widely used RANS turbulence models, with verification and validation cases.
+  - title: ASME
+    url: https://www.asme.org/
+    note: Publishes the V&V 20 standard for verification and validation in computational fluid dynamics and heat transfer.
+  - title: ERCOFTAC
+    url: https://www.ercoftac.org/
+    note: The European Research Community on Flow, Turbulence and Combustion, which publishes best-practice guidelines and validation cases for industrial CFD.
+---
+
+<Section id="motivation" kind="motivation" title="Why compute a flow?">
+
+The last two lessons ran on formulas: the Colebrook equation, loss coefficients, Nusselt-number correlations. Each was distilled from experiments on simple shapes (straight pipes, flat plates, single spheres) and each works well for those shapes. Now try the air flowing through a data-centre aisle, the blood through a heart valve, the wind round a stadium roof in Doha, the cooling flow inside a turbine blade, the mixing in a bioreactor. There is no correlation for any of them, and building and measuring every variant would take years.
+
+**Computational fluid dynamics** (CFD) solves the equations of fluid motion numerically, on a mesh of millions of small cells, and lets engineers see velocity, pressure and temperature everywhere, including in places no probe can reach. It is now a routine design tool in aerospace, automotive, energy, buildings, chemical processes and medicine. It is also easy to misuse: a CFD run always produces a beautiful coloured picture, whether or not the picture is right.
+
+This lesson opens the box. You will meet the Navier–Stokes equations, discretise them, write two small solvers in NumPy (a 1-D transport problem and a 2-D cavity flow that matches a published benchmark), learn why some schemes explode and others smear, see in outline how turbulence is modelled, and learn the discipline, verification and validation, that separates engineering CFD from colourful pictures.
+
+</Section>
+
+<Section id="equations" kind="definitions" title="The Navier–Stokes equations">
+
+Newton's second law for a small parcel of fluid, plus conservation of mass, gives the governing equations. For a Newtonian fluid of constant density and viscosity (incompressible flow, the usual case for liquids and for gases well below the speed of sound):
+
+<Definition term="incompressible Navier–Stokes equations">
+
+$$\nabla\cdot\mathbf u = 0,$$
+
+$$\rho\left(\frac{\partial \mathbf u}{\partial t} + (\mathbf u\cdot\nabla)\mathbf u\right) = -\nabla p + \mu\,\nabla^2\mathbf u + \rho\,\mathbf g,$$
+
+where $\mathbf u(\mathbf x, t)$ is the velocity field, $p$ the pressure, $\mu$ the viscosity and $\mathbf g$ gravity (or any other body force per unit mass).
+
+</Definition>
+
+Read the momentum equation term by term, as mass times acceleration equals force, per unit volume. On the left, $\partial\mathbf u/\partial t$ is the change of velocity at a fixed point, and $(\mathbf u\cdot\nabla)\mathbf u$ is **convection** (or advection): the parcel moving to a place where the velocity is different. On the right, the pressure gradient pushes fluid from high to low pressure; $\mu\nabla^2\mathbf u$ is **viscous diffusion** of momentum, the shearing of <LessonLink slug="viscous-flow-and-pipes">viscous flow</LessonLink>; and gravity acts on the whole parcel. The energy equation, solved alongside when temperatures matter, has the same shape: convection of heat plus the conduction of <LessonLink slug="heat-transfer">heat transfer</LessonLink>.
+
+Measure lengths in units of a size $L$, velocities in units of a speed $U$, and pressure in units of $\rho U^2$, and the equation becomes
+
+$$\frac{\partial \mathbf u^*}{\partial t^*} + (\mathbf u^*\cdot\nabla^*)\mathbf u^* = -\nabla^* p^* + \frac{1}{\mathrm{Re}}\,\nabla^{*2}\mathbf u^*, \qquad \mathrm{Re} = \frac{\rho U L}{\mu}.$$
+
+So the Reynolds number is the only parameter: low Re means viscous diffusion dominates and the flow is smooth; high Re means the nonlinear convection term dominates, and the flow develops thin layers, instabilities and turbulence.
+
+Three features make these equations hard. The convection term is **nonlinear**, so solutions do not superpose and small scales are generated from large ones. **Pressure** has no equation of its own in incompressible flow: it adjusts instantly so that $\nabla\cdot\mathbf u = 0$ everywhere, which couples every point to every other. And at high Re the flow has features on scales from the size of the object down to fractions of a millimetre. Mathematicians have not even proved that smooth solutions of the 3-D equations always exist: it is one of the [Clay Mathematics Institute](https://www.claymath.org/)'s Millennium Prize problems. Engineers solve them numerically every day all the same.
+
+</Section>
+
+<Section id="discretisation" kind="definitions" title="Discretisation: finite differences and finite volumes">
+
+A computer cannot store a function, only numbers. **Discretisation** replaces the continuous field by values on a mesh and the derivatives by algebra connecting neighbouring values.
+
+**Finite differences** start from Taylor series. On a grid of spacing $\Delta x$,
+
+$$\frac{\partial\phi}{\partial x}\bigg|_i \approx \frac{\phi_{i+1} - \phi_{i-1}}{2\Delta x}\ \ (\text{central, error } O(\Delta x^2)), \qquad \frac{\phi_i - \phi_{i-1}}{\Delta x}\ \ (\text{upwind for } u > 0,\ O(\Delta x)),$$
+
+and $\partial^2\phi/\partial x^2 \approx (\phi_{i+1} - 2\phi_i + \phi_{i-1})/\Delta x^2$, as in the conduction solver of <LessonLink slug="heat-transfer">heat transfer</LessonLink>. The power of $\Delta x$ in the leading error term is the scheme's **order of accuracy**: halve the spacing and a second-order scheme's error falls fourfold, a first-order scheme's only twofold.
+
+**Finite volumes** start from the conservation law in integral form. Divide the domain into cells; for each cell, the rate of change of what it contains equals what flows in through its faces minus what flows out, plus any source. The unknowns are cell averages, and the work is in estimating the **flux** through each face from the neighbouring cell values.
+
+<Figure caption="A finite-volume cell P with its neighbours W, E, S and N. The faces w, e, s and n lie halfway between cell centres. The scheme balances the fluxes through the four faces; because the flux leaving P through face e is exactly the flux entering E, mass, momentum and energy are conserved cell by cell and over the whole mesh.">
+<svg viewBox="0 0 400 300" role="img" aria-label="A three by three block of square cells. The centre cell is labelled P and shaded; its neighbours are labelled W to the left, E to the right, S below and N above, each with a dot at its centre. Arrows cross the four faces of P, labelled w, e, s and n, showing flux in through the west and south faces and out through the east and north faces. The cell width is marked delta x and its height delta y.">
+  <defs>
+    <marker id="cfd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="150" y="100" width="100" height="100" fill="var(--sky-soft)" fillOpacity="0.5" />
+  <g fill="none" stroke="currentColor" strokeWidth="1.2">
+    <path d="M 50 100 L 350 100 M 50 200 L 350 200 M 150 20 L 150 280 M 250 20 L 250 280" />
+    <path d="M 50 100 L 50 200 M 350 100 L 350 200 M 150 20 L 250 20 M 150 280 L 250 280" />
+  </g>
+  <g fill="currentColor">
+    <circle cx="200" cy="150" r="4" />
+    <circle cx="100" cy="150" r="3" />
+    <circle cx="300" cy="150" r="3" />
+    <circle cx="200" cy="60" r="3" />
+    <circle cx="200" cy="240" r="3" />
+  </g>
+  <g fill="none" stroke="var(--human)" strokeWidth="2" markerEnd="url(#cfd-arrow)">
+    <path d="M 128 132 L 172 132" />
+    <path d="M 228 132 L 272 132" />
+    <path d="M 218 222 L 218 178" />
+    <path d="M 218 122 L 218 78" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="14" textAnchor="middle">
+    <text x="200" y="170">P</text>
+    <text x="100" y="170">W</text>
+    <text x="300" y="170">E</text>
+    <text x="200" y="45">N</text>
+    <text x="200" y="262">S</text>
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="138" y="124">w</text>
+    <text x="256" y="124">e</text>
+    <text x="226" y="214">s</text>
+    <text x="226" y="94">n</text>
+  </g>
+  <g fill="none" stroke="currentColor" strokeWidth="1">
+    <path d="M 150 290 L 250 290 M 150 285 L 150 295 M 250 285 L 250 295" />
+    <path d="M 360 100 L 360 200 M 355 100 L 365 100 M 355 200 L 365 200" />
+  </g>
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="11" textAnchor="middle">
+    <text x="200" y="300">Δx</text>
+    <text x="378" y="154">Δy</text>
+  </g>
+</svg>
+</Figure>
+
+Most industrial CFD codes, open-source and commercial alike, use finite volumes on unstructured meshes of tetrahedra, prisms, hexahedra or general polyhedra, because the method handles complicated geometry and conserves exactly what the physics conserves. **Finite elements** (the method of <LessonLink slug="finite-element-method">structural analysis</LessonLink>) are also used for flow, especially in multiphysics packages; **spectral** methods give extreme accuracy in simple geometries for research; and **lattice Boltzmann** methods, which evolve particle distributions on a regular lattice, have found a niche in automotive aerodynamics.
+
+<Narrator who="chloe">
+
+Why does conservation by construction matter so much in practice? Because the numbers engineers act on are integrals: the drag on a car, the heat removed by a cooler, the mass flow through a valve. A scheme that leaks a fraction of a per cent of mass in each of a million cells can still draw a plausible picture while getting those totals badly wrong; a finite-volume scheme cannot lose what it carries from one cell to the next.
+
+</Narrator>
+
+</Section>
+
+<Section id="advection-diffusion" kind="computation" title="A model problem: advection and diffusion">
+
+Every transport equation in CFD has the same skeleton as the Navier–Stokes momentum equation: a quantity $\phi$ is carried by the flow and spreads by diffusion. In one dimension, with constant velocity $u$ and diffusivity $\Gamma$,
+
+$$\frac{\partial\phi}{\partial t} + u\,\frac{\partial\phi}{\partial x} = \Gamma\,\frac{\partial^2\phi}{\partial x^2}.$$
+
+Steady, on $0 \lt x \lt L$ with $\phi(0) = 0$ and $\phi(L) = 1$, it has the exact solution $\phi = (e^{\mathrm{Pe}\,x/L} - 1)/(e^{\mathrm{Pe}} - 1)$, where the **Péclet number** $\mathrm{Pe} = uL/\Gamma$ plays the role the Reynolds number plays for momentum. At $\mathrm{Pe} = 50$ the solution is nearly zero across the domain and then rises steeply in a thin layer at the outflow, a one-dimensional cousin of a boundary layer.
+
+The finite-volume balance for cell P is (convective flux out of face e minus in at face w) = (diffusive flux in at e minus out at w). Diffusive fluxes use the two neighbours, $\Gamma(\phi_E - \phi_P)/\Delta x$. For the convective flux $u\phi_e$ we need $\phi$ on the face, and there is a choice: the **central** estimate $(\phi_P + \phi_E)/2$, second-order accurate, or the **upwind** estimate $\phi_P$ (the cell the flow comes from), first-order. The program assembles both, solves the linear systems, and compares with the exact solution.
+
+```python run
+import numpy as np
+
+# Steady 1-D advection-diffusion, u dphi/dx = Gamma d2phi/dx2 on 0 < x < 1,
+# with phi(0) = 0 and phi(1) = 1, by finite volumes on N equal cells.
+u, Gamma = 1.0, 0.02                          # Peclet number u L / Gamma = 50
+
+def exact(x):
+    return np.expm1(u * x / Gamma) / np.expm1(u / Gamma)
+
+def solve(N, scheme):
+    """Balance for cell P: (u phi)_east - (u phi)_west = (Gamma dphi/dx)_east - (Gamma dphi/dx)_west."""
+    dx = 1.0 / N
+    F, D = u, Gamma / dx
+    A, b = np.zeros((N, N)), np.zeros(N)
+    for P in range(N):
+        # west face: inflow (u > 0)
+        if P == 0:                            # boundary at half a cell: phi_A = 0 carried in
+            A[P, P] += 2 * D
+        elif scheme == "central":             # face value = mean of the two neighbours
+            A[P, P] += D - F / 2
+            A[P, P - 1] += -D - F / 2
+        else:                                 # upwind: face value = the cell upstream
+            A[P, P] += D
+            A[P, P - 1] += -D - F
+        # east face: outflow
+        if P == N - 1:                        # boundary at half a cell: phi_B = 1
+            if scheme == "central":
+                A[P, P] += 2 * D
+                b[P] += 2 * D - F
+            else:
+                A[P, P] += 2 * D + F
+                b[P] += 2 * D
+        elif scheme == "central":
+            A[P, P] += D + F / 2
+            A[P, P + 1] += -D + F / 2
+        else:
+            A[P, P] += D + F
+            A[P, P + 1] += -D
+    return (np.arange(N) + 0.5) * dx, np.linalg.solve(A, b)
+
+N = 10
+xs, c = solve(N, "central")
+_, w = solve(N, "upwind")
+print(f"N = {N} cells, cell Peclet number u dx / Gamma = {u / N / Gamma:g}")
+print("     x      exact    central    upwind")
+for k in range(4, N):
+    print(f"   {xs[k]:5.3f}   {exact(xs[k]):7.4f}   {c[k]:8.4f}   {w[k]:7.4f}")
+
+print("\n   N   cell Pe   max error central   max error upwind")
+for N in [10, 25, 50, 100, 200, 400, 800]:
+    xs, c = solve(N, "central")
+    _, w = solve(N, "upwind")
+    e = exact(xs)
+    print(f" {N:4d}   {u / N / Gamma:5.2f}      {np.abs(c - e).max():9.2e}          {np.abs(w - e).max():9.2e}")
+```
+
+On ten cells the central scheme produces nonsense: values alternating in sign, reaching −1.5 next to a boundary held at +1, for a quantity that physically must stay between 0 and 1. The upwind scheme stays smooth and bounded but smears the steep layer: 0.29 in the last cell where the truth is 0.08. The convergence table tells the rest of the story. Once the **cell Péclet number** $u\Delta x/\Gamma$ is below 2, the central scheme behaves, and its error falls by a factor of 4 each time the cells halve (second order: 0.0288, 0.0075, 0.0019, 0.00048). Upwind's error only halves (first order), so at 800 cells it is still 0.011, more than twenty times central's.
+
+Both failures have a precise explanation. With central differencing, the coefficient linking a cell to its downstream neighbour, $\Gamma/\Delta x - u/2$, turns negative when $u\Delta x/\Gamma \gt 2$, and negative coefficients let a cell move opposite to its neighbours: wiggles. Upwind keeps every coefficient positive, so it can never wiggle, but a Taylor expansion shows it actually solves the equation with an extra **numerical diffusion** $\Gamma_\text{num} = u\Delta x/2$. Industrial codes use blended and limited schemes (second-order "upwind-biased" schemes with flux limiters, or TVD schemes) that are second-order where the solution is smooth and fall back towards upwind where it is steep.
+
+</Section>
+
+<Section id="stability" kind="definitions" title="Stability, the CFL condition and accuracy">
+
+In unsteady problems the time step adds a second constraint. Using the explicit scheme with upwind convection, $\phi_i^{n+1} = \phi_i^n - C(\phi_i^n - \phi_{i-1}^n)$ for pure advection, information travels one cell per step at most; the physical signal travels $u\Delta t$. If the physical signal outruns the numerical one, the scheme cannot possibly be right.
+
+<Definition term="Courant number and the CFL condition">
+
+The **Courant number** is $C = u\,\Delta t/\Delta x$, the number of cells the flow crosses in one time step. The **Courant–Friedrichs–Lewy (CFL) condition** requires that the numerical domain of dependence contain the physical one; for explicit schemes whose stencil reaches one cell upstream, that means $C \le 1$.
+
+</Definition>
+
+<Theorem name="Stability of the upwind scheme (von Neumann)">
+
+For $\phi_t + u\phi_x = 0$ with $u \gt 0$ on a periodic grid, the explicit upwind scheme is stable if and only if $0 \le C \le 1$.
+
+</Theorem>
+
+<Proof>
+
+Any grid function on a periodic grid is a sum of Fourier modes $\phi_j^n = G^n e^{\mathrm i j\theta}$, $0 \le \theta \lt 2\pi$, and a linear scheme with constant coefficients maps each mode to a multiple of itself. Substituting into the scheme, $G = 1 - C(1 - e^{-\mathrm i\theta})$. Then
+
+$$|G|^2 = (1 - C + C\cos\theta)^2 + C^2\sin^2\theta = 1 - 2C(1 - C)(1 - \cos\theta).$$
+
+Since $1 - \cos\theta \ge 0$, $|G| \le 1$ for every mode exactly when $C(1 - C) \ge 0$, that is, $0 \le C \le 1$. If $C \gt 1$, the mode $\theta = \pi$ has $|G| = |1 - 2C| \gt 1$ and grows without bound.
+
+</Proof>
+
+The same analysis gives $\Gamma\Delta t/\Delta x^2 \le \tfrac12$ for explicit diffusion (the Fourier-number limit you met in <LessonLink slug="heat-transfer">heat transfer</LessonLink>), and the **Lax equivalence theorem** (Lax and Richtmyer, 1956) ties it together for linear problems: a consistent scheme converges to the true solution as the mesh is refined if and only if it is stable. Implicit schemes, which solve a linear system each step, are stable for much larger time steps, which is why steady industrial calculations march in "pseudo-time" with them; but a large time step still costs accuracy in a genuinely unsteady flow.
+
+The next program carries a Gaussian pulse of dye across a periodic domain with a small diffusivity, using the upwind scheme and the second-order **Lax–Wendroff** scheme, at several Courant numbers.
+
+```python run
+import numpy as np
+
+# A pulse of dye carried by a uniform flow, u dphi/dx plus diffusion, on a periodic domain of length 1.
+u, Gamma, N = 1.0, 0.0005, 200
+dx = 1.0 / N
+x = (np.arange(N) + 0.5) * dx
+s0, t_end = 0.03, 0.5
+
+def exact(t):                                 # the Gaussian moves at u and spreads by diffusion
+    s2 = s0**2 + 2 * Gamma * t
+    xc = (x - 0.25 - u * t + 0.5) % 1.0 - 0.5
+    return s0 / np.sqrt(s2) * np.exp(-xc**2 / (2 * s2))
+
+def run(scheme, C):
+    dt = C * dx / u
+    d = Gamma * dt / dx**2                    # diffusion number
+    phi = exact(0.0)
+    for _ in range(int(round(t_end / dt))):
+        E, W = np.roll(phi, -1), np.roll(phi, 1)
+        if scheme == "upwind":                # first order in space and time
+            phi = phi - C * (phi - W) + d * (E - 2 * phi + W)
+        else:                                 # Lax-Wendroff: second order
+            phi = phi - C / 2 * (E - W) + (C**2 / 2 + d) * (E - 2 * phi + W)
+    return phi, d
+
+ref = exact(t_end)
+print(f"exact solution at t = {t_end}: peak {ref.max():.3f} at x = {x[ref.argmax()]:.3f}\n")
+print(" scheme         CFL   diffusion no.   peak    at x     total     max error")
+for scheme, C in [("upwind", 0.5), ("upwind", 0.8), ("Lax-Wendroff", 0.5), ("Lax-Wendroff", 0.8),
+                  ("upwind", 1.1)]:
+    phi, d = run(scheme, C)
+    print(f" {scheme:13s}  {C:3.1f}      {d:5.3f}      {phi.max():9.3g}  {x[phi.argmax()]:5.3f}"
+          f"  {phi.sum() * dx:8.4f}  {np.abs(phi - ref).max():10.3g}")
+```
+
+The exact pulse arrives at $x = 0.75$ with its peak lowered by diffusion to 0.800. Upwind at $C = 0.5$ delivers a peak of only 0.582: its numerical diffusion, $u\Delta x(1 - C)/2 = 0.00125$, is two and a half times the physical diffusivity, and the answer is almost exactly what the physical equation would give with diffusivity 0.00175. At $C = 0.8$ the numerical diffusion shrinks and the peak rises to 0.689. Lax–Wendroff gets the peak right to within 0.002 at both Courant numbers, with a small wavy (dispersive) error elsewhere. Every scheme conserves the total amount of dye (0.0752), because each is written in conservative form. And at $C = 1.1$ the upwind scheme violates the CFL condition and the "dye concentration" reaches $1.6 \times 10^4$.
+
+<Narrator who="gideon">
+
+Keeping $C \le 1$ is necessary, not sufficient. With diffusion added, the explicit upwind scheme needs $C + 2\,\Gamma\Delta t/\Delta x^2 \le 1$, and Lax–Wendroff needs $C^2 + 2\,\Gamma\Delta t/\Delta x^2 \le 1$; in the run above, upwind at $C = 0.9$ would already break the first condition. Instabilities also start in the shortest, grid-scale modes, which a smooth initial pulse barely contains, so a slightly unstable run can look fine for hundreds of steps before it blows up. Check the condition; do not wait for the explosion.
+
+</Narrator>
+
+**Accuracy** is checked by a **grid-convergence study**. Solve on three meshes, each refined by a ratio $r$ (often 2), and track a quantity of interest $f$: coarse $f_3$, medium $f_2$, fine $f_1$. If the solutions are in the asymptotic range, the observed order of accuracy is
+
+$$p = \frac{\ln\big((f_3 - f_2)/(f_2 - f_1)\big)}{\ln r},$$
+
+and **Richardson extrapolation**, $f_\text{exact} \approx f_1 + (f_1 - f_2)/(r^p - 1)$, estimates the grid-independent answer. Patrick Roache's **grid convergence index** turns the same numbers into an error band with a safety factor, and it is the method most journals and the ASME V&V 20 standard ask for.
+
+</Section>
+
+<Section id="cavity" kind="computation" title="A 2-D solver: the lid-driven cavity">
+
+The classic test of an incompressible Navier–Stokes solver is a square box full of fluid whose lid slides sideways at constant speed. The lid drags the fluid into a large circulating vortex, with small counter-rotating eddies in the lower corners. The geometry is trivial, the boundary conditions are clean, and accurate published solutions exist, so every new code is run on it.
+
+<Figure caption="The lid-driven cavity. The lid moves to the right at speed U; the other three walls are fixed, and the fluid sticks to all four (no slip). The fluid turns in a large clockwise primary vortex whose centre sits right of and above the middle, with small counter-rotating eddies in the two lower corners.">
+<svg viewBox="0 0 360 300" role="img" aria-label="A square box. An arrow along the top edge points right, labelled lid, speed U. Inside, a large clockwise loop with arrowheads fills most of the box, its centre a little right of and above the middle. Two small loops turning the other way sit in the bottom left and bottom right corners. The three other walls are labelled fixed, no slip.">
+  <defs>
+    <marker id="cfd-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <rect x="80" y="50" width="200" height="200" fill="var(--sky-soft)" fillOpacity="0.3" stroke="currentColor" strokeWidth="2.5" />
+  <path d="M 90 34 L 270 34" fill="none" stroke="currentColor" strokeWidth="2" markerEnd="url(#cfd-arrow2)" />
+  <ellipse cx="200" cy="125" rx="78" ry="62" fill="none" stroke="currentColor" strokeWidth="1.6" />
+  <ellipse cx="200" cy="120" rx="40" ry="30" fill="none" stroke="currentColor" strokeWidth="1.2" />
+  <g fill="none" stroke="currentColor" strokeWidth="1.6" markerEnd="url(#cfd-arrow2)">
+    <path d="M 196 63 L 212 63" />
+    <path d="M 204 187 L 188 187" />
+    <path d="M 278 118 L 278 134" />
+    <path d="M 122 132 L 122 116" />
+  </g>
+  <circle cx="200" cy="120" r="3" fill="currentColor" />
+  <path d="M 84 246 C 84 222, 108 222, 108 246" fill="none" stroke="var(--human)" strokeWidth="1.4" />
+  <path d="M 276 246 C 276 214, 246 214, 246 246" fill="none" stroke="var(--human)" strokeWidth="1.4" />
+  <g fill="currentColor" fontFamily="sans-serif" fontSize="12">
+    <text x="120" y="24">lid, speed U</text>
+    <text x="10" y="155">fixed wall</text>
+    <text x="288" y="155">fixed wall</text>
+    <text x="150" y="272">fixed wall</text>
+    <text x="206" y="116" fontSize="10">vortex centre</text>
+    <text x="40" y="292" fontSize="10">corner eddy</text>
+    <text x="250" y="292" fontSize="10">corner eddy</text>
+  </g>
+</svg>
+</Figure>
+
+In two dimensions the pressure can be eliminated altogether. Define the **streamfunction** $\psi$ by $u = \partial\psi/\partial y$, $v = -\partial\psi/\partial x$, which satisfies $\nabla\cdot\mathbf u = 0$ automatically, and the **vorticity** $\omega = \partial v/\partial x - \partial u/\partial y$, the local spin of the fluid. Taking the curl of the momentum equation removes the pressure gradient and leaves two equations:
+
+$$\frac{\partial\omega}{\partial t} + u\frac{\partial\omega}{\partial x} + v\frac{\partial\omega}{\partial y} = \nu\nabla^2\omega, \qquad \nabla^2\psi = -\omega.$$
+
+The first is an advection–diffusion equation for vorticity, exactly the model problem above; the second is a Poisson equation, the same as steady conduction with heat generation. The solver steps the vorticity forward explicitly, with central differences, a diffusion number of 0.2 and a Courant number of at most 0.5. It solves the Poisson equation exactly at every step with a fast solver built from the sine eigenvectors of the discrete Laplacian (two small matrix products each way), and sets the vorticity on the walls from the no-slip condition by Thom's formula, $\omega_\text{wall} = -2\psi_1/h^2 - 2U_\text{wall}/h$, where $\psi_1$ is the streamfunction one grid spacing inside. It runs at $\mathrm{Re} = 100$ on three grids until the flow stops changing.
+
+```python run
+import numpy as np
+
+def cavity(N, Re=100.0, tol=1e-6, t_max=60.0):
+    """Lid-driven cavity (side 1, lid speed 1) by the vorticity-streamfunction method
+    on an (N+1) x (N+1) grid. Arrays are indexed [j, i] with j along y, i along x."""
+    h, nu = 1.0 / N, 1.0 / Re
+    dt = min(0.2 * h * h / nu, 0.5 * h)       # diffusion number 0.2, CFL number at most 0.5
+    k = np.arange(1, N)                       # fast Poisson solver: sine eigenvectors
+    S = np.sqrt(2.0 / N) * np.sin(np.pi * np.outer(k, k) / N)
+    lam = -4.0 / h**2 * np.sin(np.pi * k / (2 * N)) ** 2
+    denom = lam[:, None] + lam[None, :]
+    psi = np.zeros((N + 1, N + 1))
+    w = np.zeros((N + 1, N + 1))
+    t, step = 0.0, 0
+    while t < t_max:
+        w[0, :] = -2.0 * psi[1, :] / h**2                 # bottom wall (Thom's formula)
+        w[-1, :] = -2.0 * psi[-2, :] / h**2 - 2.0 / h     # moving lid
+        w[:, 0] = -2.0 * psi[:, 1] / h**2                 # left wall
+        w[:, -1] = -2.0 * psi[:, -2] / h**2               # right wall
+        u = (psi[2:, 1:-1] - psi[:-2, 1:-1]) / (2 * h)     # u =  d(psi)/dy
+        v = -(psi[1:-1, 2:] - psi[1:-1, :-2]) / (2 * h)    # v = -d(psi)/dx
+        wx = (w[1:-1, 2:] - w[1:-1, :-2]) / (2 * h)
+        wy = (w[2:, 1:-1] - w[:-2, 1:-1]) / (2 * h)
+        lap = (w[1:-1, 2:] + w[1:-1, :-2] + w[2:, 1:-1] + w[:-2, 1:-1] - 4 * w[1:-1, 1:-1]) / h**2
+        w[1:-1, 1:-1] += dt * (-u * wx - v * wy + nu * lap)
+        new = S @ ((S @ (-w[1:-1, 1:-1]) @ S) / denom) @ S   # solve lap(psi) = -w exactly
+        change = np.abs(new - psi[1:-1, 1:-1]).max() / dt
+        psi[1:-1, 1:-1] = new
+        t, step = t + dt, step + 1
+        if change < tol:
+            break
+    return psi, t, step
+
+results = []
+for N in [16, 32, 64]:
+    psi, t, steps = cavity(N)
+    j, i = np.unravel_index(np.argmin(psi), psi.shape)
+    h = 1.0 / N
+    u_mid = (psi[2:, N // 2] - psi[:-2, N // 2]) / (2 * h)  # u on the vertical centreline
+    m = np.argmin(u_mid)
+    results.append(psi.min())
+    print(f"N = {N:3d}: {steps:5d} steps to t = {t:5.1f};  psi_min = {psi.min():.5f} at "
+          f"({i * h:.3f}, {j * h:.3f});  min u on x = 0.5: {u_mid[m]:.4f} at y = {(m + 1) * h:.3f}")
+
+f1, f2, f3 = results[2], results[1], results[0]              # fine, medium, coarse
+p = np.log((f3 - f2) / (f2 - f1)) / np.log(2.0)
+print(f"\nobserved order of accuracy p = {p:.2f}")
+print(f"Richardson extrapolation: psi_min -> {f1 + (f1 - f2) / (2**p - 1):.5f}")
+print("Ghia, Ghia and Shin (1982), 129 x 129 grid: psi_min = -0.10342 at (0.617, 0.734); "
+      "min u = -0.2109 at y = 0.453")
+
+print("\nstreamfunction on the 32 x 32 grid (darker = faster circulation):")
+psi, _, _ = cavity(32)
+shades = " .:-=+*#%@"
+for j in range(32, -1, -2):
+    print("   " + "".join(shades[min(9, int(10 * psi[j, i] / psi.min()))] * 2 for i in range(0, 33, 2)))
+```
+
+On the $64 \times 64$ grid the solver reaches a steady state after about 4000 steps, with the streamfunction minimum, the strength of the primary vortex, at $-0.1027$ near $(0.61, 0.73)$, and the strongest return flow on the vertical centreline, $u = -0.2115$ at $y = 0.453$. The three grids give an observed order of accuracy of 2.01, exactly what second-order central differences promise, and Richardson extrapolation gives $\psi_\text{min} \approx -0.1035$, within 0.1% of the value Ghia, Ghia and Shin obtained on a $129 \times 129$ grid with a multigrid method in 1982. The character map shows the vortex sitting high and to the right, pushed downstream by the lid.
+
+<Narrator who="margaret">
+
+Look at what the coarse grid would have told you on its own: a vortex 12% weaker than the truth, with nothing in the picture to warn you. Only the sequence of grids revealed the error, its rate of decrease, and an estimate of the converged value. In an industrial study the same three-grid exercise on a car or a valve might mean meshes of 10, 30 and 80 million cells, which is why it is budgeted from the start.
+
+</Narrator>
+
+At higher Reynolds numbers the same code needs finer grids, smaller cells near the walls and many more steps, and above about $\mathrm{Re} \approx 8000$ the 2-D cavity flow stops being steady altogether. Real cavities are three-dimensional, and laboratory experiments on them in the 1980s found corner vortices and spanwise structures that no 2-D model can show. Which brings us to turbulence.
+
+</Section>
+
+<Section id="turbulence" kind="human" title="Turbulence modelling, in outline">
+
+Turbulent flow has eddies from the size of the object down to the **Kolmogorov scale**, where viscosity finally dissipates them. The ratio of largest to smallest scale grows as $\mathrm{Re}^{3/4}$, so resolving every eddy in three dimensions takes roughly $\mathrm{Re}^{9/4}$ grid points, and with the time steps the cost grows as about $\mathrm{Re}^3$. Engineering therefore works at three levels of modelling.
+
+- **DNS** (direct numerical simulation) resolves everything with no turbulence model. It is the computational equivalent of a perfect experiment, used in research on simple geometries (channels, pipes, boxes of turbulence) at modest Reynolds numbers, and its results are used to build and test models.
+- **LES** (large-eddy simulation) resolves the large, energy-carrying eddies, which depend on the geometry, and models only the small ones, which are more universal, with a subgrid model such as Smagorinsky's (1963). It captures unsteady separation, mixing and noise far better than averaged models, at perhaps 10 to 1000 times their cost; its weak point is near walls, where even the "large" eddies are tiny, so wall-modelled LES and hybrid RANS–LES methods (detached-eddy simulation and its successors) are an active area.
+- **RANS** (Reynolds-averaged Navier–Stokes) splits each quantity into a mean and a fluctuation, $u = \bar u + u'$, and solves only for the mean. Averaging produces new unknowns, the **Reynolds stresses** $-\rho\,\overline{u_i'u_j'}$, which must be modelled; most models express them through an **eddy viscosity** $\mu_t$ obtained from one or two extra transport equations. The workhorses are Spalart–Allmaras (1992, one equation, popular in aerospace), $k$–$\varepsilon$ (Launder and Spalding, 1974) and Menter's $k$–$\omega$ SST (1994). RANS is cheap enough to run hundreds of design variants, and it remains the industrial workhorse in 2026.
+
+<Narrator who="margaret">
+
+Put numbers on that cost. Air past a car at motorway speed has $\mathrm{Re} \approx 10^7$ based on its length, so a DNS would need of the order of $(10^7)^{9/4} \approx 6 \times 10^{15}$ grid points, far beyond any computer, while a RANS model of the same car runs on tens of millions of cells overnight. Every tenfold increase in Reynolds number multiplies DNS cost by about a thousand.
+
+</Narrator>
+
+RANS models are calibrated against experiments and DNS on canonical flows and are least trustworthy far from them: strong separation, swirl, curvature, transition. The [NASA Turbulence Modeling Resource](https://turbmodels.larc.nasa.gov/) defines the common models precisely and documents test cases, because "the same" model can differ between codes. As of 2026, graphics processors run LES at scales that were impractical a decade ago, and machine-learned corrections to turbulence models are an active research field, though most certified engineering work still rests on established RANS and LES methods.
+
+</Section>
+
+<Section id="vv" kind="human" title="Verification and validation">
+
+Two questions decide whether a CFD result can be trusted, and they are different questions.
+
+- **Verification: are we solving the equations right?** *Code verification* checks that the software solves its equations with the claimed order of accuracy, often by the **method of manufactured solutions**: choose any smooth function, compute what source term would make it an exact solution, add that source to the code, and check that the error falls at the expected rate as the grid is refined. *Solution verification* estimates the numerical error of a particular run: iterative convergence (the residuals and, more importantly, the quantities of interest have stopped changing) and grid convergence, as in the cavity study above.
+- **Validation: are we solving the right equations?** It compares the model, with all its assumptions (turbulence model, boundary conditions, geometry simplifications, fluid properties), with *experiments*, with the uncertainties of both quantified. Comparing with Ghia's numbers was verification, a check against an accurate numerical solution of the same equations; only a measurement on a real cavity could validate the 2-D model, and as the last section said, it would fail at high Reynolds number.
+
+Professional practice is set out in the ASME V&V 20 standard for CFD and heat transfer (via [ASME](https://www.asme.org/)) and the AIAA's guide for verification and validation, and organisations such as [ERCOFTAC](https://www.ercoftac.org/) publish best-practice guidelines and validation databases. The habit to form is simple: never report a CFD number without saying how big its numerical error is, and what experiment the model has been checked against for this kind of flow.
+
+</Section>
+
+<Section id="industry" kind="human" title="How CFD is used in industry">
+
+An industrial CFD study follows a workflow that looks much the same in every sector:
+
+1. **Define the question**: which numbers decide the design (a pressure drop, a peak temperature, a drag coefficient), and how accurately they are needed.
+2. **Prepare the geometry** from CAD, removing features that do not matter (small fillets, bolt heads) and keeping those that do.
+3. **Mesh** it: millions of cells, fine near walls and in shear layers. Near-wall resolution is set by the dimensionless wall distance $y^+$, which must suit the wall treatment of the turbulence model.
+4. **Set up the physics**: fluid properties, boundary conditions, turbulence model, heat transfer, perhaps combustion, multiphase flow or moving parts.
+5. **Solve**, usually in parallel on hundreds to thousands of processor cores or on GPUs, monitoring residuals and quantities of interest.
+6. **Verify, validate and post-process**: grid convergence, comparison with test data, then the contour plots, and finally a decision.
+
+The open-source tools include [OpenFOAM](https://openfoam.org/) (in two main distributions, from the [OpenFOAM Foundation](https://openfoam.org/) and from [ESI-OpenCFD](https://www.openfoam.com/)), [SU2](https://su2code.github.io/), EDF's [code_saturne](https://www.code-saturne.org/) and, for high-fidelity research, spectral-element codes such as Argonne's Nek5000 family. Widely used commercial codes include Ansys Fluent and CFX, Siemens Simcenter STAR-CCM+, Dassault Systèmes' lattice-Boltzmann PowerFLOW, Cadence's Fidelity CFD, Convergent Science's CONVERGE and COMSOL Multiphysics; each sector has its favourites, and they all rest on the ideas in this lesson. OpenFOAM, for instance, reads its set-up from plain-text dictionaries; here is the velocity boundary-condition file for a simple pipe, for illustration only:
+
+```text
+// OpenFOAM case file 0/U for a pipe: an illustration, not run here
+FoamFile { version 2.0; format ascii; class volVectorField; object U; }
+
+dimensions      [0 1 -1 0 0 0 0];     // m/s
+internalField   uniform (0 0 0);      // start from rest
+
+boundaryField
+{
+    inlet   { type fixedValue;   value uniform (0 0 1.5); }   // 1.5 m/s along z
+    outlet  { type zeroGradient; }                            // let the flow leave freely
+    wall    { type noSlip; }                                  // u = 0 on the pipe wall
+}
+```
+
+Where it is used: the external aerodynamics of aircraft, cars, trains and buildings; turbomachinery and the wind and water turbines of <LessonLink slug="wind-and-water-turbines">a later lesson</LessonLink>; combustion in engines and gas turbines; cooling of electronics and data centres (see <LessonLink slug="thermal-management-for-computing">thermal management for computing</LessonLink>); ventilation, smoke movement and fire safety in buildings; mixing, separation and reaction in process plants; blood flow in medical devices; and pollutant dispersion in cities. Increasingly it is coupled to optimisers that change the shape automatically, the subject of <LessonLink slug="simulation-driven-design">simulation-driven design</LessonLink>. CFD has not replaced testing: wind tunnels, flow rigs and full-scale trials remain the last word, and certification of aircraft and safety-critical equipment rests on test evidence that CFD helps to plan and interpret.
+
+</Section>
+
+<Section id="history" kind="history" title="A short history">
+
+Lewis Fry Richardson tried to forecast the weather by solving the equations of fluid motion by hand during the First World War, publishing the attempt in 1922; his six-hour forecast was wildly wrong, for reasons (an unbalanced initial state) later understood. Richard Courant, Kurt Friedrichs and Hans Lewy published their stability condition in 1928, in a paper on difference equations for mathematical physics, before any electronic computer existed. John von Neumann's stability analysis came out of wartime work at Los Alamos, where Francis Harlow's group later built some of the first incompressible-flow codes in the 1960s. Suhas Patankar and Brian Spalding at Imperial College London developed the SIMPLE algorithm and the finite-volume method in the early 1970s, and Antony Jameson's codes of the 1970s and 1980s made transonic wing design by computer practical; the first commercial CFD packages appeared in the early 1980s. OpenFOAM, which began as a research code at Imperial, was released as open source in 2004. Since then the story has been one of scale: meshes of billions of cells, LES of whole aircraft components, and GPU-native solvers.
+
+</Section>
+
+<Section id="misconceptions" kind="misconceptions" title="Common misconceptions">
+
+<Misconception>
+
+**"The solution converged, so it is right."** Falling residuals show that the *iterations* have converged: the discrete equations are satisfied. They say nothing about the grid error (solution verification) or whether the equations and models describe reality (validation).
+
+</Misconception>
+
+<Misconception>
+
+**"A finer mesh is always better."** Beyond grid independence, refinement only costs time. And with wall functions, cells too close to the wall (too small a $y^+$) can make the answer *worse*, because the model assumes the first cell lies in a particular part of the boundary layer.
+
+</Misconception>
+
+<Misconception>
+
+**"An implicit scheme can take any time step."** It remains stable, but accuracy in unsteady flow still requires time steps that resolve the physics: a vortex shed every millisecond cannot be captured with ten-millisecond steps.
+
+</Misconception>
+
+<Misconception>
+
+**"LES has made RANS obsolete."** LES is far more expensive, especially near walls, and RANS remains the right tool for most steady design studies. The art is choosing the cheapest model that is trustworthy for the question.
+
+</Misconception>
+
+<Misconception>
+
+**"Upwind schemes are wrong and central schemes are right."** Each has a failure mode: upwind adds numerical diffusion, central schemes wiggle when cells are too coarse for the local Péclet number. Practical codes blend and limit them, and the mesh must be fine enough either way.
+
+</Misconception>
+
+</Section>
+
+<Section id="exercises" kind="exercises" title="Exercises">
+
+<Exercises/>
+
+</Section>
